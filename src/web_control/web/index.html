@@ -75,6 +75,13 @@
       <input id="lin" type="range" min="0.05" max="0.4" step="0.01" value="0.25">
       <label>Max angular <span id="angv">1.5</span> rad/s</label>
       <input id="ang" type="range" min="0.2" max="3.0" step="0.1" value="1.5">
+      <h2>OLED</h2>
+      <label style="flex-direction:column;align-items:stretch;gap:6px">
+        <input id="oledText" type="text" maxlength="21" placeholder="text for the screen…">
+        <button id="oledSend" class="primary">Send to OLED</button>
+      </label>
+      <p class="hint">Publishes <b>std_msgs/String</b> on <b>/oled_text</b>; the OLED
+        shows it under the clock. Up to ~21 chars fit. <kbd>Enter</kbd> sends.</p>
       <h2>View</h2>
       <label>Max range <input id="maxr" type="number" value="6" step="0.5" style="width:70px"> m</label>
       <p class="hint">Drive with the pad or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> /
@@ -96,7 +103,7 @@ let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
 
 // ---- ROS state ----
-let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, connected=false;
+let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null, connected=false;
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -126,7 +133,16 @@ function subscribe(){
     throttle_rate:100,queue_length:1});
   odomTopic.subscribe(onOdom);
   cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
+  textTopic=new ROSLIB.Topic({ros,name:"/oled_text",messageType:"std_msgs/msg/String"});
 }
+
+// ---- OLED text ----
+function sendOled(){
+  if(!textTopic){ return; }
+  textTopic.publish(new ROSLIB.Message({data:$("oledText").value}));
+}
+$("oledSend").onclick=sendOled;
+$("oledText").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();sendOled();} });
 
 function onScan(msg){
   const pts=[], maxr=Number($("maxr").value)||1e9;
@@ -174,12 +190,14 @@ $("stop").onclick=()=>{setCmd(0,0);publishCmd();};
 
 // keyboard
 const keys={};
+const typing=e=>/^(input|textarea|select)$/i.test(e.target.tagName);
 addEventListener("keydown",e=>{
+  if(typing(e)) return;   // don't teleop while typing in a field (e.g. OLED text)
   if(["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase()))
     e.preventDefault();
   keys[e.key.toLowerCase()]=true; updateKeys();
 });
-addEventListener("keyup",e=>{ keys[e.key.toLowerCase()]=false; updateKeys(); });
+addEventListener("keyup",e=>{ if(typing(e)) return; keys[e.key.toLowerCase()]=false; updateKeys(); });
 function updateKeys(){
   let v=0,w=0;
   if(keys["w"]||keys["arrowup"])v+=1;

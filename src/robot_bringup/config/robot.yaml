@@ -65,7 +65,7 @@ motor_control:
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:
   ros__parameters:
-    i2c_bus: 1                # /dev/i2c-1 (shares the bus with the PCA9685)
+    i2c_bus: 0                # /dev/i2c-0 (OLED wired to I2C0, PA11/PA12)
     i2c_address: 0x3C         # SSD1306 default
     width: 128
     height: 64
