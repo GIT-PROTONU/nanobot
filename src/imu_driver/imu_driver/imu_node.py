@@ -40,6 +40,11 @@ ANG_SCALE = 180.0 / 32768.0                 # raw int16 -> degrees (+/-180)
 HEADER = 0x55
 FRAME_LEN = 11
 T_ACC, T_GYRO, T_ANGLE, T_MAG = 0x51, 0x52, 0x53, 0x54
+_WANTED = (T_ACC, T_GYRO, T_ANGLE, T_MAG)
+# WitMotion output-rate register (RRATE 0x03) codes — used to slow the device
+# down from its 200 Hz default so the node has far fewer frames to parse.
+RATE_CODES = {1: 0x03, 2: 0x04, 5: 0x05, 10: 0x06, 20: 0x07,
+              50: 0x08, 100: 0x09, 200: 0x0b}
 
 
 def euler_to_quat(roll, pitch, yaw):
@@ -63,9 +68,11 @@ class ImuNode(Node):
             ("baud", 115200),
             ("frame_id", "imu_link"),
             ("publish_rate", 50.0),
+            ("output_rate_hz", 50),     # tell the sensor to stream at this rate
         ])
         g = self.get_parameter
         self.frame_id = g("frame_id").value
+        self.output_rate = int(g("output_rate_hz").value)
         # The sensor streams ~200 Hz; cap published rate to keep CPU/bus load down
         # (nothing here needs more than this, and the web UI only shows ~10 Hz).
         rate = max(1.0, g("publish_rate").value)
@@ -84,20 +91,34 @@ class ImuNode(Node):
         self.mag = (0.0, 0.0, 0.0)
         self.euler_deg = (0.0, 0.0, 0.0)
 
+        self.port = g("port").value
+        self.baud = g("baud").value
         self.ser = None
         self._stop = threading.Event()
         if not HAVE_SERIAL:
             self.get_logger().error(f"pyserial unavailable: {_SERIAL_ERR}")
             return
-        try:
-            self.ser = serial.Serial(g("port").value, g("baud").value, timeout=0.2)
-            self.get_logger().info(
-                f"BWT901CL open on {g('port').value} @{g('baud').value}")
-        except Exception as exc:
-            self.get_logger().error(f"IMU open failed: {exc}")
-            return
+        # The IMU is on a USB-serial adapter that can be unplugged/re-enumerated;
+        # the reader thread (re)opens the port and reconnects on its own, so the
+        # node recovers automatically without a restart.
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
+
+    def _configure_device(self):
+        """Slow the BWT901CL to output_rate (WitMotion unlock + set RRATE). Not
+        saved to flash — re-sent on every (re)connect, so no wear and it resets
+        to default on power-cycle."""
+        code = RATE_CODES.get(self.output_rate)
+        if code is None:
+            return
+        try:
+            self.ser.write(b"\xff\xaa\x69\x88\xb5")              # unlock
+            time.sleep(0.05)
+            self.ser.write(bytes((0xff, 0xaa, 0x03, code, 0x00)))  # set RRATE
+            time.sleep(0.05)
+            self.ser.reset_input_buffer()
+        except Exception as exc:
+            self.get_logger().warning(f"IMU rate config failed: {exc}")
 
     def _on_params(self, params):
         for p in params:
@@ -106,15 +127,37 @@ class ImuNode(Node):
         return SetParametersResult(successful=True)
 
     def _reader(self):
-        """Blocking read loop: accumulate bytes, emit checksum-valid frames."""
+        """Open (with retry) and read the port; reconnect if it goes away."""
         buf = bytearray()
         while not self._stop.is_set():
+            if self.ser is None:
+                try:
+                    self.ser = serial.Serial(self.port, self.baud, timeout=0.2)
+                    self._configure_device()
+                    self.get_logger().info(
+                        f"BWT901CL open on {self.port} @{self.baud} "
+                        f"(output {self.output_rate} Hz)")
+                    buf.clear()
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"IMU port {self.port} unavailable ({exc}); retrying",
+                        throttle_duration_sec=10.0)
+                    self._stop.wait(2.0)        # back off before retrying
+                    continue
             try:
-                chunk = self.ser.read(self.ser.in_waiting or 1)
+                # Read in batches (blocks until 64 bytes or the 0.2 s timeout)
+                # instead of draining to 1 byte at a time — that per-byte spin was
+                # the bulk of the CPU. 64 B ≈ one full output cycle.
+                chunk = self.ser.read(64)
             except Exception as exc:
                 if not self._stop.is_set():
-                    self.get_logger().error(f"serial read error: {exc}")
-                return
+                    self.get_logger().warning(f"serial error ({exc}); reconnecting")
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None                 # trigger reopen on next loop
+                continue
             if not chunk:
                 continue
             buf.extend(chunk)
@@ -133,6 +176,8 @@ class ImuNode(Node):
 
     def _handle(self, fr):
         t = fr[1]
+        if t not in _WANTED:            # skip time/port/etc. frames -> no unpack
+            return
         a, b, c, _ = struct.unpack("<hhhh", fr[2:10])
         if t == T_ACC:
             self.acc = (a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE)

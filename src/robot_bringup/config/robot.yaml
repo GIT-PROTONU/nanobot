@@ -81,7 +81,8 @@ imu_driver:
     port: "/dev/ttyUSB0"      # CH340 USB-serial adapter
     baud: 115200              # BWT901CL is fixed at 115200
     frame_id: "imu_link"
-    publish_rate: 50.0        # Hz; sensor streams ~200 Hz, throttle to save CPU/bus
+    publish_rate: 50.0        # Hz; cap on /imu/data publishing
+    output_rate_hz: 50        # tell the sensor to stream at this rate (was 200) -> less parse CPU
 
 # ---- Board health monitor -> diagnostic_msgs/DiagnosticArray on /diagnostics -
 sys_monitor:
