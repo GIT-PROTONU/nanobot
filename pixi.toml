@@ -15,6 +15,9 @@ RMW_IMPLEMENTATION = "rmw_zenoh_cpp"
 ROS_DOMAIN_ID = "0"
 # rmw_zenoh logs through this; keep it quiet on the constrained board.
 RUST_LOG = "warn"
+# Build with Ninja (shipped) rather than the default "Unix Makefiles" generator,
+# which would require a separate `make` package that isn't in the env.
+CMAKE_GENERATOR = "Ninja"
 
 [dependencies]
 # --- ROS 2 Humble core (ros-base = no Rviz/Gazebo/GUI, keeps the footprint small) ---
@@ -26,7 +29,9 @@ ros-humble-tf-transformations = "*"
 
 # --- colcon / C++ build tooling (for robot_msgs) ---
 colcon-common-extensions = "*"
-cmake = ">=3.22"
+# ROS 2 Humble's ament/rosidl CMake modules predate CMake 4 (its FindPython
+# rewrite breaks rosidl_generator_py), so pin to the 3.x series.
+cmake = ">=3.22,<4"
 ninja = "*"
 cxx-compiler = "*"
 pkg-config = "*"
@@ -47,8 +52,9 @@ luma-oled = "*"         # SSD1306 OLED over I2C
 gpiod = ">=2.0"         # libgpiod v2 python bindings for encoder edge events
 
 [tasks]
-# Build the colcon workspace (msgs + all python packages).
-build = { cmd = "colcon build --symlink-install --event-handlers console_direct+" }
+# Build the colcon workspace (msgs + all python packages). See scripts/build.sh
+# for why the explicit Python hints are needed under RoboStack.
+build = "bash scripts/build.sh"
 # Build the Rust LDS node against the active ROS env.
 build-lds = { cmd = "cargo build --release", cwd = "src/lds_driver" }
 build-all = { depends-on = ["build", "build-lds"] }
