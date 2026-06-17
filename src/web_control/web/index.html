@@ -42,6 +42,10 @@
   .imu{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;align-items:baseline}
   .imu span{color:#8b949e}
   .imu b{text-align:right;font-variant-numeric:tabular-nums}
+  .chk{display:flex;gap:6px;align-items:center;cursor:pointer;margin-top:2px}
+  .chk input{width:auto;cursor:pointer}
+  #cam{display:none;width:100%;border:1px solid var(--line);border-radius:6px;
+    background:#000;aspect-ratio:4/3}
 </style>
 </head>
 <body>
@@ -62,6 +66,11 @@
   <main>
     <div id="wrap"><canvas id="cv"></canvas></div>
     <div id="side">
+      <h2>Camera</h2>
+      <label class="chk"><input type="checkbox" id="camOn"> show webcam</label>
+      <img id="cam" alt="">
+      <p class="hint" id="camHint" style="display:none">USB webcam MJPEG
+        (<b>/stream.mjpg</b>). Streams only while shown.</p>
       <h2>Teleop</h2>
       <div class="pad">
         <span class="blank"></span>
@@ -123,6 +132,14 @@
         arrow keys (hold). Release or <kbd>Space</kbd> = stop. Scroll = zoom, drag = pan.
         Publishes <b>geometry_msgs/Twist</b> on <b>/cmd_vel</b>; subscribes
         <b>sensor_msgs/LaserScan</b> on <b>/scan</b>.</p>
+      <h2>Power</h2>
+      <div style="display:grid;gap:6px">
+        <button id="btnReset">↻ Reset stack</button>
+        <button id="btnShutdown" class="danger">⏻ Shutdown SBC</button>
+      </div>
+      <p class="hint">Reset restarts the ROS stack (the page reconnects in a few
+        seconds). Shutdown powers off the whole board — you then power it back on
+        by hand.</p>
     </div>
   </main>
 </div>
@@ -162,6 +179,28 @@ $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
 $("imuRate").onchange=()=>setNodeRate(imuParamSrv,Number($("imuRate").value));
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
 $("ldsRate").onchange=()=>setNodeRate(ldsParamSrv,Number($("ldsRate").value));
+
+// Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
+// server). Toggling off drops the connection so the camera stops (ref-counted).
+$("camOn").addEventListener("change",e=>{
+  const img=$("cam"), hint=$("camHint");
+  if(e.target.checked){ img.src="/stream.mjpg?t="+Date.now();
+    img.style.display="block"; hint.style.display="block"; }
+  else { img.removeAttribute("src"); img.style.display="none"; hint.style.display="none"; }
+});
+$("cam").onerror=()=>{ if($("camOn").checked) $("cam").style.background="#3d1418"; };
+
+// Power controls -> POST to the web server (same origin). Both are confirmed.
+$("btnReset").onclick=()=>{
+  if(!confirm("Restart the whole ROS stack? The page will reconnect in a few seconds.")) return;
+  fetch("/system/restart",{method:"POST"}).catch(()=>{});
+  setConn(false);
+};
+$("btnShutdown").onclick=()=>{
+  if(!confirm("SHUT DOWN the SBC?\nIt powers off completely — you must turn it back on by hand.")) return;
+  fetch("/system/shutdown",{method:"POST"}).catch(()=>{});
+  setConn(false);
+};
 
 function connect(){
   ros=new ROSLIB.Ros({url:`ws://${$("host").value}`});
