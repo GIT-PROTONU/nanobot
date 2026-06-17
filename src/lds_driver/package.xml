@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<!--
+  This package is a plain Cargo crate (not colcon-built) — it is listed here only
+  so `ros2 pkg` tooling can see it. Build it with `pixi run build-lds`, which runs
+  `cargo build --release` against the active ROS env; the binary lands in
+  src/lds_driver/target/release/lds_driver and is launched directly by bringup.
+-->
+<package format="3">
+  <name>lds_driver</name>
+  <version>0.1.0</version>
+  <description>Roborock LDS02RR serial -> sensor_msgs/LaserScan (Rust / r2r).</description>
+  <maintainer email="ib.elfaramawy@gmail.com">ib</maintainer>
+  <license>MIT</license>
+  <exec_depend>sensor_msgs</exec_depend>
+</package>

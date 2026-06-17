@@ -1,0 +1,21 @@
+# pixi
+.pixi/
+*.lock
+
+# colcon
+/build/
+/install/
+/log/
+
+# rust
+src/lds_driver/target/
+**/*.rs.bk
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# editor
+.vscode/
+.idea/

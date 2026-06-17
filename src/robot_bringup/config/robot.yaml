@@ -1,0 +1,79 @@
+# =============================================================================
+# Central hardware/parameter config for the Nano robot.
+# All values are tuned for the NanoPi NEO Plus2 (Allwinner H5) — cross-check pin
+# / bus choices against ../../nanopi-neo-plus2-pinmap.md.
+#
+# Bus reminders from the pinmap:
+#   I2C0 -> /dev/i2c-0 (PA11/PA12)   I2C1 -> /dev/i2c-1 (PA18/PA19)
+#   I2C2 -> /dev/i2c-2 (PE12/PE13)   UART2 -> /dev/ttyS2 (PA0/PA1)
+#   GPIO main PIO = /dev/gpiochip0, global# = bank*32 + pin (PA0=0, PG=192, ...)
+# Enable the buses first via armbianEnv.txt overlays (see README + pinmap).
+# =============================================================================
+
+# ---- Rust LDS node (sensor_msgs/LaserScan on /scan) -------------------------
+lds_driver:
+  ros__parameters:
+    port: "/dev/ttyS2"        # Roborock LDS data UART (LDS02RR @ 115200)
+    baud: 115200
+    frame_id: "laser"
+    clockwise: true           # LDS02RR spins CW; node converts to ROS CCW frame
+    angle_offset_deg: 0.0     # mechanical mounting offset of the 0deg ray
+    range_min: 0.12           # metres
+    range_max: 6.0            # metres
+
+# ---- Wheel encoders -> odometry (nav_msgs/Odometry on /odom + TF) -----------
+wheel_odometry:
+  ros__parameters:
+    gpio_chip: "/dev/gpiochip0"
+    # Quadrature A/B lines per wheel — GLOBAL gpio numbers (bank*32+pin).
+    # TODO: set these to the actual header pins you wire to (see pinmap).
+    left_pin_a: 7             # e.g. PA7
+    left_pin_b: 8             # e.g. PA8
+    right_pin_a: 198          # e.g. PG6  (avoid pins claimed in the pinmap!)
+    right_pin_b: 199          # e.g. PG7
+    ticks_per_rev: 1440       # encoder counts per wheel revolution (x4 quadrature)
+    wheel_radius: 0.0335      # metres
+    wheel_separation: 0.16    # metres between wheel contact points
+    invert_left: false
+    invert_right: false
+    publish_rate: 30.0        # Hz, odom/TF publish rate
+    publish_tf: true
+    odom_frame: "odom"
+    base_frame: "base_link"
+
+# ---- cmd_vel -> PCA9685 PWM motor driver ------------------------------------
+motor_control:
+  ros__parameters:
+    i2c_bus: 1                # /dev/i2c-1
+    i2c_address: 0x40         # PCA9685 default
+    pwm_freq_hz: 1000.0       # motor-driver PWM carrier (servos: use 50)
+    # Differential drive limits.
+    wheel_separation: 0.16
+    max_linear_speed: 0.4     # m/s mapped to full PWM
+    max_angular_speed: 3.0    # rad/s mapped to full PWM
+    cmd_timeout: 0.5          # s; stop motors if no /cmd_vel arrives
+    # PCA9685 channel wiring. Two channels per motor when driving an H-bridge
+    # in PWM+PWM mode (forward channel / reverse channel).
+    left_fwd_ch: 0
+    left_rev_ch: 1
+    right_fwd_ch: 2
+    right_rev_ch: 3
+    # Optional: drive the LDS spin motor at a constant duty from a spare channel.
+    lds_motor_ch: -1          # -1 = disabled
+    lds_motor_duty: 0.55
+
+# ---- Status -> SSD1306 OLED -------------------------------------------------
+oled_display:
+  ros__parameters:
+    i2c_bus: 1                # /dev/i2c-1 (shares the bus with the PCA9685)
+    i2c_address: 0x3C         # SSD1306 default
+    width: 128
+    height: 64
+    refresh_rate: 2.0         # Hz
+    show_ip: true             # show the wlan/eth IP so you can find the web UI
+
+# ---- Web control (rosbridge websocket + static page) ------------------------
+web_control:
+  ros__parameters:
+    web_port: 8080            # http://<robot-ip>:8080
+    rosbridge_port: 9090      # websocket roslib connects to

@@ -1,0 +1,69 @@
+[workspace]
+name = "nano-robot"
+version = "0.1.0"
+description = "Lightweight ROS 2 Humble robot stack for a NanoPi NEO Plus2 (H5): Roborock LDS, wheel encoders, I2C OLED + PCA9685, web control."
+authors = ["ib <ib.elfaramawy@gmail.com>"]
+channels = ["conda-forge", "robostack-staging"]
+# linux-aarch64 = the board (Armbian on the H5). linux-64 kept so you can develop
+# the non-hardware bits (msgs, web, rosbridge) on a desktop too.
+platforms = ["linux-aarch64", "linux-64"]
+
+# rmw_zenoh is dramatically lighter on RAM/discovery than the default FastDDS,
+# which matters on the 1 GB H5. Set once here so every task/shell inherits it.
+[activation.env]
+RMW_IMPLEMENTATION = "rmw_zenoh_cpp"
+ROS_DOMAIN_ID = "0"
+# rmw_zenoh logs through this; keep it quiet on the constrained board.
+RUST_LOG = "warn"
+
+[dependencies]
+# --- ROS 2 Humble core (ros-base = no Rviz/Gazebo/GUI, keeps the footprint small) ---
+ros-humble-ros-base = "*"
+ros-humble-rmw-zenoh-cpp = "*"
+ros-humble-rosbridge-suite = "*"
+# common_interfaces (sensor_msgs/nav_msgs/geometry_msgs) + tf2 ship with ros-base.
+ros-humble-tf-transformations = "*"
+
+# --- colcon / C++ build tooling (for robot_msgs) ---
+colcon-common-extensions = "*"
+cmake = ">=3.22"
+ninja = "*"
+cxx-compiler = "*"
+pkg-config = "*"
+
+# --- Rust toolchain + r2r build deps (for the lds_driver node) ---
+# r2r generates bindings from the installed ROS interfaces at build time and
+# uses libclang to parse the generated C headers, so clang must be present.
+rust = ">=1.75"
+clang = "*"
+libclang = "*"
+
+# --- Python hardware libraries (pure-python, available on conda-forge) ---
+pyserial = "*"          # (fallback serial access; LDS is read by the Rust node)
+smbus2 = "*"            # I2C for the PCA9685 driver
+
+[pypi-dependencies]
+luma-oled = "*"         # SSD1306 OLED over I2C
+gpiod = ">=2.0"         # libgpiod v2 python bindings for encoder edge events
+
+[tasks]
+# Build the colcon workspace (msgs + all python packages).
+build = { cmd = "colcon build --symlink-install --event-handlers console_direct+" }
+# Build the Rust LDS node against the active ROS env.
+build-lds = { cmd = "cargo build --release", cwd = "src/lds_driver" }
+build-all = { depends-on = ["build", "build-lds"] }
+
+# rmw_zenoh needs its router running for discovery. Start it (own terminal / service).
+zenohd = "ros2 run rmw_zenoh_cpp rmw_zenohd"
+
+# Bring up the full robot. Sources the local overlay on top of the conda ROS env.
+bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup robot.launch.py'", depends-on = ["build"] }
+
+# Run the Rust LDS node standalone (after build-lds).
+lds = { cmd = "bash -c 'source install/setup.bash && ./target/release/lds_driver --ros-args -p port:=/dev/ttyS2'", cwd = "src/lds_driver", depends-on = ["build-lds"] }
+
+# Web control page + rosbridge only (handy for UI dev). Web UI on :8080, ws on :9090.
+web = { cmd = "bash -c 'source install/setup.bash && ros2 launch web_control web.launch.py'", depends-on = ["build"] }
+
+# Convenience: open a shell with everything sourced.
+shell = "bash -c 'source install/setup.bash 2>/dev/null; exec bash'"

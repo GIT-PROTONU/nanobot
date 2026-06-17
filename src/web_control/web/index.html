@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nano Robot · Control</title>
+<!-- roslib: talks to rosbridge_server over websocket. For a fully offline robot,
+     download this file into web/ and change the src to "roslib.min.js". -->
+<script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--txt:#c9d1d9;
+    --accent:#58a6ff;--green:#3fb950;--red:#f85149;--amber:#d29922}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  #app{display:flex;flex-direction:column;height:100%}
+  header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+    padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{font-size:14px;margin:0 12px 0 0;color:var(--accent)}
+  button,select,input{background:#21262d;color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);color:#0d1117;border-color:var(--accent);font-weight:600}
+  button.danger{background:var(--red);color:#0d1117;border-color:var(--red);font-weight:600}
+  .spacer{flex:1}
+  .stat{color:#8b949e}.stat b{color:var(--txt)}
+  #dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--red);margin-right:5px}
+  #dot.ok{background:var(--green)}
+  main{flex:1;display:flex;min-height:0}
+  #wrap{flex:1;position:relative;min-width:0}
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
+  canvas:active{cursor:grabbing}
+  #side{width:240px;display:flex;flex-direction:column;background:var(--panel);
+    border-left:1px solid var(--line);padding:12px;gap:14px}
+  #side h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0}
+  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+  .pad button{padding:14px 0;font-size:16px}
+  .pad .blank{visibility:hidden}
+  label{display:flex;justify-content:space-between;gap:8px;align-items:center}
+  .hint{color:#6e7681;font-size:11px}
+  kbd{background:#21262d;border:1px solid var(--line);border-radius:4px;padding:0 4px}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>NANO</h1>
+    <span class="stat"><span id="dot"></span><b id="conn">disconnected</b></span>
+    <label>ws:// <input id="host" style="width:150px"> </label>
+    <button id="connect" class="primary">Connect</button>
+    <button id="fit">Auto-fit</button>
+    <div class="spacer"></div>
+    <span class="stat">scan Hz <b id="hz">0</b></span>
+    <span class="stat">pts <b id="pts">0</b></span>
+    <span class="stat">x <b id="px">0</b></span>
+    <span class="stat">y <b id="py">0</b></span>
+    <span class="stat">θ <b id="pth">0</b></span>
+  </header>
+  <main>
+    <div id="wrap"><canvas id="cv"></canvas></div>
+    <div id="side">
+      <h2>Teleop</h2>
+      <div class="pad">
+        <span class="blank"></span>
+        <button data-v="1"  data-w="0">▲</button>
+        <span class="blank"></span>
+        <button data-v="0"  data-w="1">◀</button>
+        <button id="stop" class="danger">■</button>
+        <button data-v="0"  data-w="-1">▶</button>
+        <span class="blank"></span>
+        <button data-v="-1" data-w="0">▼</button>
+        <span class="blank"></span>
+      </div>
+      <label>Max linear <span id="linv">0.25</span> m/s</label>
+      <input id="lin" type="range" min="0.05" max="0.4" step="0.01" value="0.25">
+      <label>Max angular <span id="angv">1.5</span> rad/s</label>
+      <input id="ang" type="range" min="0.2" max="3.0" step="0.1" value="1.5">
+      <h2>View</h2>
+      <label>Max range <input id="maxr" type="number" value="6" step="0.5" style="width:70px"> m</label>
+      <p class="hint">Drive with the pad or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> /
+        arrow keys (hold). Release or <kbd>Space</kbd> = stop. Scroll = zoom, drag = pan.
+        Publishes <b>geometry_msgs/Twist</b> on <b>/cmd_vel</b>; subscribes
+        <b>sensor_msgs/LaserScan</b> on <b>/scan</b>.</p>
+    </div>
+  </main>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const cv=$("cv"), ctx=cv.getContext("2d");
+
+// ---- view state ----
+let scale=40, panX=0, panY=0;            // px per metre
+let dragging=false,dsx=0,dsy=0,dpx=0,dpy=0;
+let frame=[];                            // [{x,y}] metres, latest scan
+let scanCount=0, lastHzT=performance.now(), scanHz=0;
+
+// ---- ROS state ----
+let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, connected=false;
+$("host").value = `${location.hostname||"localhost"}:9090`;
+
+$("connect").onclick=()=>connected?disconnect():connect();
+$("fit").onclick=autoFit;
+$("lin").oninput=()=>$("linv").textContent=$("lin").value;
+$("ang").oninput=()=>$("angv").textContent=$("ang").value;
+
+function connect(){
+  ros=new ROSLIB.Ros({url:`ws://${$("host").value}`});
+  ros.on("connection",()=>{connected=true;setConn(true);subscribe();});
+  ros.on("close",()=>{connected=false;setConn(false);});
+  ros.on("error",()=>{setConn(false);});
+}
+function disconnect(){ if(ros) ros.close(); connected=false; setConn(false); }
+function setConn(ok){
+  $("dot").classList.toggle("ok",ok);
+  $("conn").textContent=ok?"connected":"disconnected";
+  $("connect").textContent=ok?"Disconnect":"Connect";
+  $("connect").classList.toggle("primary",!ok);
+}
+
+function subscribe(){
+  scanTopic=new ROSLIB.Topic({ros,name:"/scan",messageType:"sensor_msgs/msg/LaserScan",
+    throttle_rate:50,queue_length:1,compression:"cbor"});
+  scanTopic.subscribe(onScan);
+  odomTopic=new ROSLIB.Topic({ros,name:"/odom",messageType:"nav_msgs/msg/Odometry",
+    throttle_rate:100,queue_length:1});
+  odomTopic.subscribe(onOdom);
+  cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
+}
+
+function onScan(msg){
+  const pts=[], maxr=Number($("maxr").value)||1e9;
+  const a0=msg.angle_min, da=msg.angle_increment;
+  for(let i=0;i<msg.ranges.length;i++){
+    const r=msg.ranges[i];
+    if(!isFinite(r)||r<=0||r>maxr) continue;
+    const a=a0+i*da;
+    pts.push({x:r*Math.cos(a), y:r*Math.sin(a)});
+  }
+  frame=pts; $("pts").textContent=pts.length;
+  scanCount++;
+  const now=performance.now();
+  if(now-lastHzT>=1000){ scanHz=scanCount*1000/(now-lastHzT); scanCount=0; lastHzT=now;
+    $("hz").textContent=scanHz.toFixed(1); }
+}
+function onOdom(msg){
+  const p=msg.pose.pose.position, q=msg.pose.pose.orientation;
+  const yaw=Math.atan2(2*(q.w*q.z),1-2*(q.z*q.z));
+  $("px").textContent=p.x.toFixed(2); $("py").textContent=p.y.toFixed(2);
+  $("pth").textContent=(yaw*180/Math.PI).toFixed(0);
+}
+
+// ---- teleop ----
+let curV=0, curW=0;
+function setCmd(v,w){ curV=v; curW=w; }
+function publishCmd(){
+  if(!cmdTopic) return;
+  cmdTopic.publish(new ROSLIB.Message({
+    linear:{x:curV*Number($("lin").value),y:0,z:0},
+    angular:{x:0,y:0,z:curW*Number($("ang").value)}}));
+}
+setInterval(()=>{ if(connected && (curV||curW)) publishCmd(); },100); // 10 Hz while moving
+
+// pad buttons: press-and-hold
+document.querySelectorAll(".pad button[data-v]").forEach(btn=>{
+  const v=Number(btn.dataset.v), w=Number(btn.dataset.w);
+  const down=e=>{e.preventDefault();setCmd(v,w);publishCmd();};
+  const up  =e=>{e.preventDefault();setCmd(0,0);publishCmd();};
+  btn.addEventListener("pointerdown",down);
+  btn.addEventListener("pointerup",up);
+  btn.addEventListener("pointerleave",up);
+});
+$("stop").onclick=()=>{setCmd(0,0);publishCmd();};
+
+// keyboard
+const keys={};
+addEventListener("keydown",e=>{
+  if(["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase()))
+    e.preventDefault();
+  keys[e.key.toLowerCase()]=true; updateKeys();
+});
+addEventListener("keyup",e=>{ keys[e.key.toLowerCase()]=false; updateKeys(); });
+function updateKeys(){
+  let v=0,w=0;
+  if(keys["w"]||keys["arrowup"])v+=1;
+  if(keys["s"]||keys["arrowdown"])v-=1;
+  if(keys["a"]||keys["arrowleft"])w+=1;
+  if(keys["d"]||keys["arrowright"])w-=1;
+  if(keys[" "]){v=0;w=0;}
+  setCmd(v,w); publishCmd();
+}
+
+// ---- render ----
+function resize(){const r=cv.getBoundingClientRect(),d=devicePixelRatio||1;
+  cv.width=r.width*d;cv.height=r.height*d;ctx.setTransform(d,0,0,d,0,0);}
+new ResizeObserver(resize).observe($("wrap"));
+
+function draw(){
+  const w=cv.clientWidth,h=cv.clientHeight; ctx.clearRect(0,0,w,h);
+  const cx=w/2+panX, cy=h/2+panY;
+  ctx.strokeStyle="#21262d"; ctx.fillStyle="#484f58";
+  for(let r=1;r<=8;r++){ctx.beginPath();ctx.arc(cx,cy,r*scale,0,7);ctx.stroke();}
+  ctx.strokeStyle="#30363d";ctx.beginPath();
+  ctx.moveTo(0,cy);ctx.lineTo(w,cy);ctx.moveTo(cx,0);ctx.lineTo(cx,h);ctx.stroke();
+  ctx.fillStyle="#6e7681";ctx.fillText("rings = 1 m",8,h-8);
+  // robot heading +x is to the right; draw a little nose
+  ctx.fillStyle="#f85149";ctx.beginPath();ctx.arc(cx,cy,5,0,7);ctx.fill();
+  ctx.strokeStyle="#f85149";ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+14,cy);ctx.stroke();
+  // points: ROS x forward (up on screen), y left
+  ctx.fillStyle="#58a6ff";
+  for(const p of frame){ const X=cx-p.y*scale, Y=cy-p.x*scale; ctx.fillRect(X-1.5,Y-1.5,3,3); }
+  requestAnimationFrame(draw);
+}
+function autoFit(){
+  if(!frame.length) return; let mx=0;
+  for(const p of frame) mx=Math.max(mx,Math.hypot(p.x,p.y));
+  if(mx>0){ scale=(Math.min(cv.clientWidth,cv.clientHeight)*0.45)/mx; panX=panY=0; }
+}
+cv.addEventListener("wheel",e=>{e.preventDefault();
+  scale*=e.deltaY<0?1.12:1/1.12; scale=Math.min(400,Math.max(4,scale));},{passive:false});
+cv.addEventListener("pointerdown",e=>{dragging=true;dsx=e.clientX;dsy=e.clientY;dpx=panX;dpy=panY;cv.setPointerCapture(e.pointerId);});
+cv.addEventListener("pointermove",e=>{if(dragging){panX=dpx+(e.clientX-dsx);panY=dpy+(e.clientY-dsy);}});
+cv.addEventListener("pointerup",()=>dragging=false);
+
+resize(); requestAnimationFrame(draw);
+connect();   // auto-connect on load
+</script>
+</body>
+</html>

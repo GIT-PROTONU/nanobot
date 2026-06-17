@@ -1,0 +1,20 @@
+[package]
+name = "lds_driver"
+version = "0.1.0"
+edition = "2021"
+description = "Roborock LDS02RR serial driver -> sensor_msgs/LaserScan (ROS 2 via r2r)"
+license = "MIT"
+
+[[bin]]
+name = "lds_driver"
+path = "src/main.rs"
+
+[dependencies]
+# r2r links against the ROS 2 C libraries provided by the RoboStack pixi env and
+# generates message bindings at build time, so build inside `pixi shell`/tasks.
+r2r = "0.9"
+serialport = "4"
+
+[profile.release]
+opt-level = 3
+lto = true
