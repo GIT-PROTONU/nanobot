@@ -1,0 +1,7 @@
+# The NanoPi NEO Plus2 has only ~970 MB RAM. r2r pulls in a large bindgen + link
+# step; building it with the default one-job-per-core (4×) blows past RAM and
+# sends the board into swap-thrash so hard that sshd stops responding.
+# Pin to a SINGLE codegen job so peak memory stays bounded. Slower, but the board
+# stays alive and responsive. Do not remove this on the board.
+[build]
+jobs = 1

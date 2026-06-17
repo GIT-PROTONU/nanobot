@@ -55,8 +55,12 @@ gpiod = ">=2.0"         # libgpiod v2 python bindings for encoder edge events
 # Build the colcon workspace (msgs + all python packages). See scripts/build.sh
 # for why the explicit Python hints are needed under RoboStack.
 build = "bash scripts/build.sh"
-# Build the Rust LDS node against the active ROS env.
-build-lds = { cmd = "cargo build --release", cwd = "src/lds_driver" }
+# Build the Rust LDS node against the active ROS env. Two board-survival notes:
+#  - r2r runs bindgen, which needs libclang; clang-sys doesn't look in the conda
+#    env, so point it there ($CONDA_PREFIX expands at runtime under pixi).
+#  - On the 970 MB board this compile is brutal: `.cargo/config.toml` pins it to
+#    one job and `nice` keeps sshd responsive so it can't lock the board up.
+build-lds = { cmd = "bash -c 'export LIBCLANG_PATH=$CONDA_PREFIX/lib; nice -n 19 cargo build --release'", cwd = "src/lds_driver" }
 build-all = { depends-on = ["build", "build-lds"] }
 
 # rmw_zenoh needs its router running for discovery. Start it (own terminal / service).
