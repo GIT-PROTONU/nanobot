@@ -60,7 +60,12 @@ class DisplayNode(Node):
         ])
         g = self.get_parameter
         self.show_ip = g("show_ip").value
+        self.width = g("width").value
+        # 128x64 0.96" panel: cap rows that fit the height and chars that fit the
+        # width so nothing is ever drawn off-screen. cols is refined from the
+        # real glyph advance once the font is loaded (default bitmap font ~6 px).
         self.max_lines = max(1, g("height").value // ROW_PX)
+        self.cols = max(1, self.width // 6)
 
         # Latest telemetry — written by callbacks, read by the render timer.
         self.pose = (0.0, 0.0, 0.0)
@@ -82,6 +87,10 @@ class DisplayNode(Node):
                 self.device = ssd1306(serial, width=g("width").value,
                                       height=g("height").value)
                 self.font = ImageFont.load_default()
+                try:
+                    self.cols = max(1, int(self.width // (self.font.getlength("0") or 6)))
+                except Exception:
+                    pass
                 self.get_logger().info(
                     f"SSD1306 ready on /dev/i2c-{g('i2c_bus').value} "
                     f"@0x{g('i2c_address').value:02x}")
@@ -129,14 +138,17 @@ class DisplayNode(Node):
         if self.text:
             lines.append(self.text)
         if self.show_ip:
-            lines.append(f"{self.host} {self._cached_ip()}")
+            ip = self._cached_ip()
+            ipline = f"{self.host} {ip}"
+            lines.append(ipline if len(ipline) <= self.cols else ip)  # keep IP visible
         lines.append(f"x{x:+.2f} y{y:+.2f}")
         lines.append(f"th{math.degrees(th):+4.0f} v{v:+.2f} w{w:+.2f}")
         lines.append(f"lidar {self.scan_hz:4.1f} Hz")
 
         with canvas(self.device) as draw:
+            # clamp to rows that fit the height and chars that fit the width
             for i, line in enumerate(lines[:self.max_lines]):
-                draw.text((0, i * ROW_PX), line, font=self.font, fill=255)
+                draw.text((0, i * ROW_PX), line[:self.cols], font=self.font, fill=255)
 
     def destroy_node(self):
         if self.device:
