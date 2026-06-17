@@ -1,0 +1,21 @@
+[Unit]
+Description=Nano robot ROS 2 stack (rmw_zenoh router + nodes + web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# stack.sh up launches the router + nodes (each detached via setsid) and returns,
+# so this is a oneshot that stays "active" while the detached nodes run.
+Type=oneshot
+RemainAfterExit=yes
+User=ibster
+WorkingDirectory=/home/ibster/Nano
+ExecStart=/home/ibster/.pixi/bin/pixi run bash scripts/stack.sh up
+ExecStop=/home/ibster/.pixi/bin/pixi run bash scripts/stack.sh down
+# Don't let systemd kill the detached node processes when ExecStart exits; the
+# nodes are stopped explicitly by ExecStop (stack.sh down).
+KillMode=process
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

@@ -40,10 +40,20 @@ udevadm trigger --subsystem-match=i2c-dev || true
 echo "== 3/4  groups: $USER_NAME in dialout (serial + i2c) and video (webcam) =="
 usermod -aG dialout,video "$USER_NAME"
 
-echo "== 4/4  sudoers: passwordless poweroff/reboot for the web UI Shutdown button =="
+echo "== 4/5  sudoers: passwordless poweroff/reboot for the web UI Shutdown button =="
 install -m 0440 "$HERE/sudoers/nano-power" /etc/sudoers.d/nano-power
 [ "$USER_NAME" = ibster ] || sed -i "s/^ibster /$USER_NAME /" /etc/sudoers.d/nano-power
 visudo -cf /etc/sudoers.d/nano-power
 
+echo "== 5/5  systemd: start the stack on boot (nano-stack.service) =="
+install -m 0644 "$HERE/systemd/nano-stack.service" /etc/systemd/system/nano-stack.service
+if [ "$USER_NAME" != ibster ]; then
+  sed -i "s|ibster|$USER_NAME|g; s|/home/ibster|$(eval echo "~$USER_NAME")|g" \
+    /etc/systemd/system/nano-stack.service
+fi
+systemctl daemon-reload
+systemctl enable nano-stack.service
+
 echo
-echo "Done. Now: sudo reboot   (then build + run — see README)."
+echo "Done. The stack auto-starts on boot. Build first (pixi install/build), then:"
+echo "  sudo reboot   — OR start now with:  sudo systemctl start nano-stack"
