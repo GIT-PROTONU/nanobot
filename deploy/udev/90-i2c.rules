@@ -1,0 +1,8 @@
+# Give non-root access to the I2C buses on Armbian (the stock image has no
+# `i2c` group). `ibster` is already in `dialout`, so grant that group.
+#
+# Install:
+#   sudo cp deploy/udev/90-i2c.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=i2c-dev
+SUBSYSTEM=="i2c-dev", GROUP="dialout", MODE="0660"

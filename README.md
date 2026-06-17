@@ -134,4 +134,20 @@ against the pinmap and avoid lines it lists as already claimed.
   a single `pixi run` unit) so the robot comes up headless on power-on.
 - **`LDS_Visualizer.html`** (repo root) is the original Web-Serial bench tool — plug
   the LDS straight into a laptop to sanity-check the sensor independently of ROS.
-```
+
+## Verified deployment (NanoPi NEO Plus2)
+
+Brought up on the real board: **Armbian 26.8 / kernel 6.18.35**, aarch64 ×4, ~970 MiB
+RAM, 7 GB rootfs. Notes specific to this image:
+
+- **I2C** needs enabling: `overlays=… i2c0 i2c1 i2c2` in `/boot/armbianEnv.txt`
+  (overlay_prefix is `sun50i-h5`), then reboot → `/dev/i2c-0/1/2`. The stock image has
+  **no `i2c` group**, so non-root access is granted via a udev rule — install
+  `deploy/udev/90-i2c.rules` (uses the `dialout` group, which the default user is in).
+- **UARTs** `/dev/ttyS0–7` are present without overlays (`ttyS2` is free for the LDS;
+  `ttyS0` is the console).
+- Scan the bus with `pixi run python scripts/i2c_scan.py` (expect `0x40` PCA9685,
+  `0x3c` SSD1306 on bus 1).
+- The build needs CMake **3.x** (not 4) plus Ninja + explicit Python hints — handled by
+  `scripts/build.sh` / `pixi.toml`; see that script's header for the why.
+
