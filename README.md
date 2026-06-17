@@ -45,7 +45,14 @@ Topic graph:
 
 ## 1. Prepare Armbian (enable the buses)
 
-The H5 buses must be muxed before Linux exposes `/dev/i2c-*`, `/dev/ttyS2`, etc.
+> **Reflash recovery / one-shot:** `sudo bash deploy/sbc-setup.sh` applies all the
+> OS-level config automatically and idempotently — device-tree overlays
+> (`i2c0 i2c1 i2c2 uart1 usbhost1 usbhost2`), the I2C udev rule, the `dialout` +
+> `video` group memberships, and the scoped passwordless `poweroff`/`reboot` sudoers
+> rule the web UI's **Shutdown** button uses. Then `sudo reboot` and continue at §2.
+> The rest of this section is the manual equivalent / explanation.
+
+The H5 buses must be muxed before Linux exposes `/dev/i2c-*`, `/dev/ttyS1`, etc.
 See [`nanopi-neo-plus2-pinmap.md`](nanopi-neo-plus2-pinmap.md) for the full mapping.
 Easiest: `sudo armbian-config` → *System → Hardware*, enable **i2c1**, **uart2**,
 then reboot. Or edit `/boot/armbianEnv.txt`:

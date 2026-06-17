@@ -1,0 +1,4 @@
+# Lets the web UI "Shutdown" / reset controls power the board off/reboot without
+# a password — scoped to ONLY these two systemctl verbs, nothing else.
+# Installed to /etc/sudoers.d/nano-power (mode 0440) by deploy/sbc-setup.sh.
+ibster ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot
