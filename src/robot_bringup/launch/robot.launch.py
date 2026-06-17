@@ -58,6 +58,14 @@ def generate_launch_description():
         Node(package="oled_display", executable="display_node",
              name="oled_display", parameters=[params], output="screen"),
 
+        # --- BWT901CL IMU -> /imu/data, /imu/mag, /imu/euler -----------------
+        Node(package="imu_driver", executable="imu_node",
+             name="imu_driver", parameters=[params], output="screen"),
+
+        # --- Board health -> /diagnostics ------------------------------------
+        Node(package="sys_monitor", executable="monitor_node",
+             name="sys_monitor", parameters=[params], output="screen"),
+
         # --- Web control (rosbridge + static page) ---------------------------
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([

@@ -30,25 +30,50 @@ launch() {
 }
 
 do_up() {
+  # Launch every node DIRECTLY by its installed executable, not via `ros2 run` /
+  # `ros2 launch`: each of those leaves a ~27-40 MB Python CLI wrapper resident
+  # for the lifetime of the node. On the 970 MB board that overhead added up to
+  # ~175 MB across the stack. rosapi is also dropped — the web page talks to known
+  # topics and never enumerates, so it isn't needed (~65 MB more).
+  local ros="$CONDA_PREFIX/lib"     # ROS package libexec dirs in the pixi env
+  local own="$NANO/install"         # our colcon packages
   pgrep -f 'rmw_zenohd' >/dev/null \
-    || { launch zenohd "ros2 run rmw_zenoh_cpp rmw_zenohd"; sleep 6; }
+    || { launch zenohd "$ros/rmw_zenoh_cpp/rmw_zenohd"; sleep 6; }
   pgrep -f 'rosbridge_websocket' >/dev/null \
-    || launch web "ros2 launch web_control web.launch.py"
+    || launch rosbridge "$ros/rosbridge_server/rosbridge_websocket --ros-args -p port:=9090"
+  pgrep -f 'web_control/lib/web_control' >/dev/null \
+    || launch web "$own/web_control/lib/web_control/web_server --ros-args -p web_port:=8080 -p rosbridge_port:=9090"
   pgrep -f 'oled_display/lib/oled_display' >/dev/null \
-    || launch oled "ros2 run oled_display display_node --ros-args --params-file $PARAMS"
+    || launch oled "$own/oled_display/lib/oled_display/display_node --ros-args --params-file $PARAMS"
+  pgrep -f 'imu_driver/lib/imu_driver' >/dev/null \
+    || launch imu "$own/imu_driver/lib/imu_driver/imu_node --ros-args --params-file $PARAMS"
+  pgrep -f 'sys_monitor/lib/sys_monitor' >/dev/null \
+    || launch sys "$own/sys_monitor/lib/sys_monitor/monitor_node --ros-args --params-file $PARAMS"
+  # LDS: Python driver (the Rust lds_driver doesn't build against this RoboStack).
+  pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
+    || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
 }
 
 do_down() {
-  for p in 'oled_display/lib/oled_display' 'ros2 run oled_display' \
-           'web_control/lib/web_control' 'rosbridge_websocket' 'rosapi_node' \
-           'ros2 launch web_control' 'rmw_zenohd'; do
+  # Node path substrings match whether launched directly or via ros2 run/launch.
+  # rosapi_node + ros2cli.daemon sweep up anything left by older launches or by
+  # `ros2 ...` CLI probes (each spawns a ~60 MB daemon).
+  for p in 'lds_driver_py/lib/lds_driver_py' \
+           'sys_monitor/lib/sys_monitor' \
+           'imu_driver/lib/imu_driver' \
+           'oled_display/lib/oled_display' \
+           'web_control/lib/web_control' \
+           'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon' \
+           'rmw_zenohd'; do
     pkill -f "$p" 2>/dev/null
   done
 }
 
 status() {
   for s in "zenohd:rmw_zenohd" "rosbridge:rosbridge_websocket" \
-           "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display"; do
+           "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
+           "imu:imu_driver/lib/imu_driver" "sys:sys_monitor/lib/sys_monitor" \
+           "lds:lds_driver_py/lib/lds_driver_py"; do
     if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi
   done
 }
