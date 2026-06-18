@@ -18,6 +18,7 @@ single-channel and counted with lightweight GPIO interrupts.
 | pub | `wheel_ticks` | `std_msgs/Int64MultiArray`  | `[left, right]` cumulative raw counts (unsigned, single-channel) |
 | pub | `left_wheel_suspended`  | `std_msgs/Bool`   | left wheel off the ground (microswitch); `true`=suspended |
 | pub | `right_wheel_suspended` | `std_msgs/Bool`   | right wheel off the ground (microswitch); `true`=suspended |
+| pub | `esp32_temp`  | `std_msgs/Float32`          | ESP32 internal die temperature (°C, ~1 Hz; coarse/uncalibrated) |
 
 End-to-end smoke test once the agent is running:
 `ros2 topic pub --once /led std_msgs/msg/Bool '{data: true}'` should light the

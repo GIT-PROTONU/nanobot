@@ -58,6 +58,7 @@
       <div class="stat"><span class="dot" id="d-ticks"></span> <span id="t-rate">wheel_ticks: — Hz</span></div>
       <div class="stat"><span class="dot" id="d-suspL"></span> <span id="t-suspL">L wheel: —</span></div>
       <div class="stat"><span class="dot" id="d-suspR"></span> <span id="t-suspR">R wheel: —</span></div>
+      <div class="stat">🌡 <span id="t-temp">ESP32: — °C</span></div>
       <div class="stat"><span class="dot off" id="d-web"></span> <span id="t-web">web link</span></div>
     </div>
   </div>
@@ -183,6 +184,8 @@ async function poll() {
   // wheel suspension: green = on the ground (ready to drive), red = up/suspended.
   wheelSusp('d-suspL', 't-suspL', 'L wheel', s.susp_left);
   wheelSusp('d-suspR', 't-suspR', 'R wheel', s.susp_right);
+  document.getElementById('t-temp').textContent =
+      `ESP32: ${typeof s.temp === 'number' ? s.temp.toFixed(1) : '—'} °C`;
 
   document.getElementById('meta').textContent =
       s.info || `${s.rmw} · ${s.dev} · ${s.node ? 'ESP32 connected' : 'waiting for ESP32…'}`;

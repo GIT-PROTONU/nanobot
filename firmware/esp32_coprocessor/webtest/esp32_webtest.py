@@ -53,6 +53,7 @@ class State:
         self.node_present = False   # is the esp32_coprocessor node in the graph?
         self.susp_left = None       # left wheel off the ground? None until first msg
         self.susp_right = None      # right wheel off the ground?
+        self.temp = None            # ESP32 internal die temperature (deg C)
         self.rmw = ""
         self.dev = ""
 
@@ -67,6 +68,7 @@ class State:
                 "node": self.node_present,
                 "susp_left": self.susp_left,
                 "susp_right": self.susp_right,
+                "temp": self.temp,
                 "rmw": self.rmw,
                 "dev": self.dev,
             }
@@ -195,7 +197,7 @@ def main():
 
     import rclpy
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from std_msgs.msg import Bool, Int64MultiArray
+    from std_msgs.msg import Bool, Float32, Int64MultiArray
     from geometry_msgs.msg import Twist
 
     cmd = agent_command(args)
@@ -235,6 +237,12 @@ def main():
 
     node.create_subscription(Bool, "left_wheel_suspended", on_susp_left, 10)
     node.create_subscription(Bool, "right_wheel_suspended", on_susp_right, 10)
+
+    def on_temp(msg):
+        with state.lock:
+            state.temp = float(msg.data)
+
+    node.create_subscription(Float32, "esp32_temp", on_temp, 10)
 
     def publish_led(on):
         led_pub.publish(Bool(data=bool(on)))

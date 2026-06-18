@@ -54,6 +54,8 @@ the board), else the `~/uros_ws` overlay (sourced + `ros2 run`).
   climbs (single-channel encoder, unsigned counts).
 - **L/R wheel** — green "down" / red "UP (suspended)" per wheel, from the D18 (left)
   and D27 (right) microswitches.
+- **🌡 ESP32** — internal die temperature (`/esp32_temp`, °C, ~1 Hz). Coarse/uncalibrated
+  — a relative health value, not calibrated ambient.
 - **web link** — the browser ↔ server poll is alive.
 
 The LED toggle and motor nudge exercise the host → ESP32 (subscribe) direction.

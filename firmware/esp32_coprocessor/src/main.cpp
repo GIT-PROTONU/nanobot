@@ -5,6 +5,7 @@
 //   pub  wheel_ticks    std_msgs/Int64MultiArray [left, right] raw cumulative counts
 //   pub  left_wheel_suspended  std_msgs/Bool     left wheel off the ground (switch)
 //   pub  right_wheel_suspended std_msgs/Bool     right wheel off the ground (switch)
+//   pub  esp32_temp    std_msgs/Float32         ESP32 internal die temperature (deg C)
 //
 // Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
 // here so the SBC is offloaded. The SBC's wheel_odometry samples wheel_ticks on
@@ -27,6 +28,7 @@
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/int64_multi_array.h>
 #include <std_msgs/msg/bool.h>
+#include <std_msgs/msg/float32.h>
 
 #include "config.h"
 
@@ -45,6 +47,7 @@ rcl_publisher_t    left_susp_pub;
 #if RIGHT_SUSPEND_PIN >= 0
 rcl_publisher_t    right_susp_pub;
 #endif
+rcl_publisher_t    temp_pub;
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -60,6 +63,7 @@ std_msgs__msg__Bool                 left_susp_msg;
 #if RIGHT_SUSPEND_PIN >= 0
 std_msgs__msg__Bool                 right_susp_msg;
 #endif
+std_msgs__msg__Float32              temp_msg;
 
 // ---- shared control state ----------------------------------------------------
 // Single-channel encoders: each ISR just bumps a 32-bit counter (atomic to read
@@ -175,6 +179,14 @@ static void enc_cb(rcl_timer_t *timer, int64_t) {
   static SuspendState rs = {false, false, 0, 0xFFFF};
   serviceSuspend(RIGHT_SUSPEND_PIN, &right_susp_pub, &right_susp_msg, &rs);
 #endif
+
+  // ESP32 internal die temperature at ~1 Hz (slow-changing, no need for 30 Hz).
+  static uint16_t temp_div = ENC_PUBLISH_HZ;  // publish on the first tick
+  if (++temp_div >= ENC_PUBLISH_HZ) {
+    temp_div = 0;
+    temp_msg.data = temperatureRead();
+    RCSOFTCHECK(rcl_publish(&temp_pub, &temp_msg, NULL));
+  }
 }
 
 // ---- entity lifecycle (created on connect, destroyed on disconnect) ----------
@@ -208,6 +220,10 @@ static bool createEntities() {
       &right_susp_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "right_wheel_suspended"));
 #endif
+
+  RCCHECK(rclc_publisher_init_default(
+      &temp_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "esp32_temp"));
 
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
@@ -246,6 +262,7 @@ static void destroyEntities() {
 #if RIGHT_SUSPEND_PIN >= 0
   rcl_publisher_fini(&right_susp_pub, &node);
 #endif
+  rcl_publisher_fini(&temp_pub, &node);
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);
