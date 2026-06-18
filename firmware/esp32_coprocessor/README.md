@@ -19,6 +19,7 @@ single-channel and counted with lightweight GPIO interrupts.
 | pub | `left_wheel_suspended`  | `std_msgs/Bool`   | left wheel off the ground (microswitch); `true`=suspended |
 | pub | `right_wheel_suspended` | `std_msgs/Bool`   | right wheel off the ground (microswitch); `true`=suspended |
 | pub | `esp32_temp`  | `std_msgs/Float32`          | ESP32 internal die temperature (°C, ~1 Hz; coarse/uncalibrated) |
+| pub | `esp32_hall`  | `std_msgs/Int32`            | ESP32 internal hall sensor (raw, ~1 Hz) |
 
 End-to-end smoke test once the agent is running:
 `ros2 topic pub --once /led std_msgs/msg/Bool '{data: true}'` should light the

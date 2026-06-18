@@ -6,6 +6,7 @@
 //   pub  left_wheel_suspended  std_msgs/Bool     left wheel off the ground (switch)
 //   pub  right_wheel_suspended std_msgs/Bool     right wheel off the ground (switch)
 //   pub  esp32_temp    std_msgs/Float32         ESP32 internal die temperature (deg C)
+//   pub  esp32_hall    std_msgs/Int32           ESP32 internal hall sensor (raw)
 //
 // Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
 // here so the SBC is offloaded. The SBC's wheel_odometry samples wheel_ticks on
@@ -20,6 +21,7 @@
 //    whenever the link is down.
 #include <Arduino.h>
 #include <micro_ros_platformio.h>
+#include <esp_bt.h>
 
 #include <rcl/rcl.h>
 #include <rclc/rclc.h>
@@ -29,6 +31,7 @@
 #include <std_msgs/msg/int64_multi_array.h>
 #include <std_msgs/msg/bool.h>
 #include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/int32.h>
 
 #include "config.h"
 
@@ -48,6 +51,7 @@ rcl_publisher_t    left_susp_pub;
 rcl_publisher_t    right_susp_pub;
 #endif
 rcl_publisher_t    temp_pub;
+rcl_publisher_t    hall_pub;
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -64,6 +68,7 @@ std_msgs__msg__Bool                 left_susp_msg;
 std_msgs__msg__Bool                 right_susp_msg;
 #endif
 std_msgs__msg__Float32              temp_msg;
+std_msgs__msg__Int32                hall_msg;
 
 // ---- shared control state ----------------------------------------------------
 // Single-channel encoders: each ISR just bumps a 32-bit counter (atomic to read
@@ -180,12 +185,15 @@ static void enc_cb(rcl_timer_t *timer, int64_t) {
   serviceSuspend(RIGHT_SUSPEND_PIN, &right_susp_pub, &right_susp_msg, &rs);
 #endif
 
-  // ESP32 internal die temperature at ~1 Hz (slow-changing, no need for 30 Hz).
-  static uint16_t temp_div = ENC_PUBLISH_HZ;  // publish on the first tick
-  if (++temp_div >= ENC_PUBLISH_HZ) {
-    temp_div = 0;
+  // Slow on-die telemetry at ~1 Hz (no need for 30 Hz): internal temperature
+  // and hall sensor. Both use internal sensors only — no GPIO/pin conflicts.
+  static uint16_t slow_div = ENC_PUBLISH_HZ;  // publish on the first tick
+  if (++slow_div >= ENC_PUBLISH_HZ) {
+    slow_div = 0;
     temp_msg.data = temperatureRead();
     RCSOFTCHECK(rcl_publish(&temp_pub, &temp_msg, NULL));
+    hall_msg.data = hallRead();
+    RCSOFTCHECK(rcl_publish(&hall_pub, &hall_msg, NULL));
   }
 }
 
@@ -224,6 +232,9 @@ static bool createEntities() {
   RCCHECK(rclc_publisher_init_default(
       &temp_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "esp32_temp"));
+  RCCHECK(rclc_publisher_init_default(
+      &hall_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "esp32_hall"));
 
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
@@ -263,6 +274,7 @@ static void destroyEntities() {
   rcl_publisher_fini(&right_susp_pub, &node);
 #endif
   rcl_publisher_fini(&temp_pub, &node);
+  rcl_publisher_fini(&hall_pub, &node);
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);
@@ -272,6 +284,13 @@ static void destroyEntities() {
 
 // ---- setup / loop ------------------------------------------------------------
 void setup() {
+  // Radios are unused — the micro-ROS link is USB serial. WiFi and Bluetooth are
+  // never initialized, so the RF stays powered down (cuts current draw + RF noise
+  // near the motor/encoder wiring). We deliberately do NOT pull in <WiFi.h> just to
+  // call WIFI_OFF — it links the whole stack (~600 KB flash). Releasing the BT
+  // controller's reserved RAM back to the heap makes "BT off" explicit too.
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+
   // Serial0 (USB) is the micro-ROS transport.
   Serial.begin(115200);
   set_microros_serial_transports(Serial);

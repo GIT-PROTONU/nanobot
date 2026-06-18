@@ -54,6 +54,7 @@ class State:
         self.susp_left = None       # left wheel off the ground? None until first msg
         self.susp_right = None      # right wheel off the ground?
         self.temp = None            # ESP32 internal die temperature (deg C)
+        self.hall = None            # ESP32 internal hall sensor (raw)
         self.rmw = ""
         self.dev = ""
 
@@ -69,6 +70,7 @@ class State:
                 "susp_left": self.susp_left,
                 "susp_right": self.susp_right,
                 "temp": self.temp,
+                "hall": self.hall,
                 "rmw": self.rmw,
                 "dev": self.dev,
             }
@@ -197,7 +199,7 @@ def main():
 
     import rclpy
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from std_msgs.msg import Bool, Float32, Int64MultiArray
+    from std_msgs.msg import Bool, Float32, Int32, Int64MultiArray
     from geometry_msgs.msg import Twist
 
     cmd = agent_command(args)
@@ -242,7 +244,12 @@ def main():
         with state.lock:
             state.temp = float(msg.data)
 
+    def on_hall(msg):
+        with state.lock:
+            state.hall = int(msg.data)
+
     node.create_subscription(Float32, "esp32_temp", on_temp, 10)
+    node.create_subscription(Int32, "esp32_hall", on_hall, 10)
 
     def publish_led(on):
         led_pub.publish(Bool(data=bool(on)))

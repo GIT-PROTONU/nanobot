@@ -56,6 +56,8 @@ the board), else the `~/uros_ws` overlay (sourced + `ros2 run`).
   and D27 (right) microswitches.
 - **🌡 ESP32** — internal die temperature (`/esp32_temp`, °C, ~1 Hz). Coarse/uncalibrated
   — a relative health value, not calibrated ambient.
+- **🧲 hall** — internal hall-effect sensor (`/esp32_hall`, raw int, ~1 Hz). Bring a
+  magnet near the chip and the value swings.
 - **web link** — the browser ↔ server poll is alive.
 
 The LED toggle and motor nudge exercise the host → ESP32 (subscribe) direction.
