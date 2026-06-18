@@ -20,6 +20,8 @@ single-channel and counted with lightweight GPIO interrupts.
 | pub | `right_wheel_suspended` | `std_msgs/Bool`   | right wheel off the ground (microswitch); `true`=suspended |
 | pub | `esp32_temp`  | `std_msgs/Float32`          | ESP32 internal die temperature (°C, ~1 Hz; coarse/uncalibrated) |
 | pub | `esp32_hall`  | `std_msgs/Int32`            | ESP32 internal hall sensor (raw, ~1 Hz) |
+| pub | `lds_rpm`     | `std_msgs/Float32`          | spin-lidar speed (RPM, ~5 Hz, from UART2; scan data ignored) |
+| sub | `lds_motor`   | `std_msgs/Float32`          | LDS spin-motor PWM duty `[0..1]` (open-loop) |
 
 End-to-end smoke test once the agent is running:
 `ros2 topic pub --once /led std_msgs/msg/Bool '{data: true}'` should light the
@@ -35,7 +37,7 @@ H-bridge: DRV8833 / TB6612-style, two PWM inputs per motor.
 | signal        | GPIO | notes                                  |
 |---------------|------|----------------------------------------|
 | LEFT_IN_FWD       | 25   | LEDC PWM                           |
-| LEFT_IN_REV       | 16   | LEDC PWM (moved off 26)            |
+| LEFT_IN_REV       | 4    | LEDC PWM (moved off 16 → LDS RX)   |
 | RIGHT_IN_FWD      | 32   | LEDC PWM                           |
 | RIGHT_IN_REV      | 33   | LEDC PWM                           |
 | MOTOR_STBY        | 17   | TB6612 STBY (HIGH=enable, moved off 27); `-1` if N/A |
@@ -43,6 +45,8 @@ H-bridge: DRV8833 / TB6612-style, two PWM inputs per motor.
 | RIGHT_ENC         | 26   | single-channel, rising-edge IRQ, pull-up |
 | LEFT_SUSPEND_PIN  | 18   | suspension microswitch, INPUT_PULLUP, HIGH=suspended |
 | RIGHT_SUSPEND_PIN | 27   | suspension microswitch, INPUT_PULLUP, HIGH=suspended |
+| LDS_RX_PIN        | 16   | UART2 RX ← LDS data TX (read-only, RPM) |
+| LDS_MOTOR_PIN     | 21   | LEDC PWM → LDS spin-motor driver   |
 | LED_PIN           | 2    | onboard LED                        |
 
 UART0/USB is the micro-ROS link (115200) — don't use `Serial.print` for debug.

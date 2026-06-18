@@ -6,7 +6,7 @@
 // ---- Motor H-bridge (DRV8833 / TB6612-style: two PWM inputs per motor) -------
 // Forward = PWM on INx_FWD, INx_REV held low; reverse swaps them (slow-decay).
 #define LEFT_IN_FWD    25
-#define LEFT_IN_REV    16   // moved off 26 (now the right encoder); 16 = free, no special fn
+#define LEFT_IN_REV    4    // moved off 16 (now LDS UART2 RX); 4 = free, no special fn
 #define RIGHT_IN_FWD   32
 #define RIGHT_IN_REV   33
 #define MOTOR_STBY     17   // moved off 27 (now the right switch). HIGH=enable; -1 if N/A
@@ -48,3 +48,13 @@
 // Bool topic (true=on). GPIO2 is a boot strapping pin but is free to drive after
 // boot. Set to -1 if your board has no usable onboard LED.
 #define LED_PIN            2
+
+// ---- Spin lidar (LDS02RR) ----------------------------------------------------
+// Read RPM only: the LDS data TX wire -> ESP32 UART2 RX. We parse just the speed
+// field from the packet stream (scan data ignored). The LDS spin motor is driven
+// open-loop by a PWM (LEDC) pin through its transistor/driver; the duty (and thus
+// speed) is settable live over /lds_motor (Float32 0..1) and starts at LDS_MOTOR_DUTY.
+#define LDS_RX_PIN         16      // UART2 RX (LDS TX wire)
+#define LDS_BAUD           115200
+#define LDS_MOTOR_PIN      21      // PWM out to the LDS motor driver; -1 to disable
+#define LDS_MOTOR_DUTY     0.6f    // startup spin duty [0..1] (keep webui slider in sync)

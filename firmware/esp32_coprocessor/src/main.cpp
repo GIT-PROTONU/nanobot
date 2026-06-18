@@ -7,6 +7,8 @@
 //   pub  right_wheel_suspended std_msgs/Bool     right wheel off the ground (switch)
 //   pub  esp32_temp    std_msgs/Float32         ESP32 internal die temperature (deg C)
 //   pub  esp32_hall    std_msgs/Int32           ESP32 internal hall sensor (raw)
+//   pub  lds_rpm       std_msgs/Float32         spin-lidar speed (RPM, from UART2)
+//   sub  lds_motor     std_msgs/Float32         LDS spin-motor PWM duty [0..1]
 //
 // Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
 // here so the SBC is offloaded. The SBC's wheel_odometry samples wheel_ticks on
@@ -40,11 +42,15 @@
 #define CH_LEFT_REV   1
 #define CH_RIGHT_FWD  2
 #define CH_RIGHT_REV  3
+#define CH_LDS        4   // LDS spin-motor PWM
 static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 
 // ---- micro-ROS entities ------------------------------------------------------
 rcl_subscription_t cmd_sub;
 rcl_subscription_t led_sub;
+#if LDS_MOTOR_PIN >= 0
+rcl_subscription_t lds_motor_sub;
+#endif
 rcl_publisher_t    enc_pub;
 rcl_publisher_t    left_susp_pub;
 #if RIGHT_SUSPEND_PIN >= 0
@@ -52,6 +58,7 @@ rcl_publisher_t    right_susp_pub;
 #endif
 rcl_publisher_t    temp_pub;
 rcl_publisher_t    hall_pub;
+rcl_publisher_t    lds_rpm_pub;
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -69,6 +76,10 @@ std_msgs__msg__Bool                 right_susp_msg;
 #endif
 std_msgs__msg__Float32              temp_msg;
 std_msgs__msg__Int32                hall_msg;
+std_msgs__msg__Float32              lds_rpm_msg;
+#if LDS_MOTOR_PIN >= 0
+std_msgs__msg__Float32              lds_motor_msg;
+#endif
 
 // ---- shared control state ----------------------------------------------------
 // Single-channel encoders: each ISR just bumps a 32-bit counter (atomic to read
@@ -83,6 +94,26 @@ static void IRAM_ATTR leftEncISR()  { g_left_ticks++; }
 #if RIGHT_ENC >= 0
 static void IRAM_ATTR rightEncISR() { g_right_ticks++; }
 #endif
+
+static volatile float g_lds_rpm = 0.0f;   // latest valid spin-lidar speed (RPM)
+
+// Minimal LDS02RR frame parser — extracts RPM only (scan data ignored). 22-byte
+// packets: 0xFA, index, speed_lo, speed_hi, 16 data, chk_lo, chk_hi. RPM = speed/64.
+// Checksum (same as the SBC lds_driver_py) is validated so noise can't fake an RPM.
+static void ldsFeed(uint8_t byte) {
+  static uint8_t pkt[22];
+  static uint8_t len = 0;
+  if (len == 0 && byte != 0xFA) return;     // hunt for the start byte
+  pkt[len++] = byte;
+  if (len < 22) return;
+  len = 0;                                  // full frame captured; reset for next
+  uint32_t chk = 0;
+  for (int ix = 0; ix < 20; ix += 2)
+    chk = (chk * 2u + pkt[ix] + (pkt[ix + 1] << 8)) & 0xFFFFFFFFu;
+  uint32_t cs = ((chk & 0x7FFF) + (chk >> 15)) & 0x7FFF;
+  if ((cs & 0xFF) == pkt[20] && ((cs >> 8) & 0xFF) == pkt[21])
+    g_lds_rpm = ((pkt[3] << 8) | pkt[2]) / 64.0f;
+}
 
 // ---- connection state machine ------------------------------------------------
 enum AgentState { WAITING_AGENT, AGENT_AVAILABLE, AGENT_CONNECTED, AGENT_DISCONNECTED };
@@ -144,6 +175,14 @@ static void led_cb(const void *msgin) {
 }
 #endif
 
+// /lds_motor -> LDS spin-motor PWM duty [0..1] (open-loop; clamped).
+#if LDS_MOTOR_PIN >= 0
+static void lds_motor_cb(const void *msgin) {
+  const std_msgs__msg__Float32 *m = (const std_msgs__msg__Float32 *)msgin;
+  ledcWrite(CH_LDS, (uint32_t)(clampf(m->data, 0.0f, 1.0f) * PWM_MAX));
+}
+#endif
+
 // Control tick: apply latest command, or coast if cmd_vel went stale (watchdog).
 static void control_cb(rcl_timer_t *, int64_t) {
   if (millis() - g_last_cmd_ms > CMD_TIMEOUT_MS) {
@@ -195,6 +234,14 @@ static void enc_cb(rcl_timer_t *timer, int64_t) {
     hall_msg.data = hallRead();
     RCSOFTCHECK(rcl_publish(&hall_pub, &hall_msg, NULL));
   }
+
+  // Spin-lidar RPM at ~5 Hz (more dynamic than temp/hall — useful for tuning speed).
+  static uint8_t rpm_div = 0;
+  if (++rpm_div >= ENC_PUBLISH_HZ / 5) {
+    rpm_div = 0;
+    lds_rpm_msg.data = g_lds_rpm;
+    RCSOFTCHECK(rcl_publish(&lds_rpm_pub, &lds_rpm_msg, NULL));
+  }
 }
 
 // ---- entity lifecycle (created on connect, destroyed on disconnect) ----------
@@ -211,6 +258,11 @@ static bool createEntities() {
   RCCHECK(rclc_subscription_init_default(
       &led_sub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "led"));
+#endif
+#if LDS_MOTOR_PIN >= 0
+  RCCHECK(rclc_subscription_init_default(
+      &lds_motor_sub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_motor"));
 #endif
 
   // Best-effort: high-rate sensor stream, no point ACKing each sample over serial.
@@ -235,17 +287,22 @@ static bool createEntities() {
   RCCHECK(rclc_publisher_init_default(
       &hall_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "esp32_hall"));
+  RCCHECK(rclc_publisher_init_default(
+      &lds_rpm_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_rpm"));
 
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
   RCCHECK(rclc_timer_init_default(
       &enc_timer, &support, RCL_MS_TO_NS(1000 / ENC_PUBLISH_HZ), enc_cb));
 
-  // Handles: cmd_sub + control_timer + enc_timer (+ led_sub when enabled).
+  // Handles: cmd_sub + control_timer + enc_timer, plus led_sub / lds_motor_sub.
+  size_t num_handles = 3;
 #if LED_PIN >= 0
-  const size_t num_handles = 4;
-#else
-  const size_t num_handles = 3;
+  num_handles += 1;
+#endif
+#if LDS_MOTOR_PIN >= 0
+  num_handles += 1;
 #endif
   executor = rclc_executor_get_zero_initialized_executor();
   RCCHECK(rclc_executor_init(&executor, &support.context, num_handles, &allocator));
@@ -254,6 +311,10 @@ static bool createEntities() {
 #if LED_PIN >= 0
   RCCHECK(rclc_executor_add_subscription(
       &executor, &led_sub, &led_msg, &led_cb, ON_NEW_DATA));
+#endif
+#if LDS_MOTOR_PIN >= 0
+  RCCHECK(rclc_executor_add_subscription(
+      &executor, &lds_motor_sub, &lds_motor_msg, &lds_motor_cb, ON_NEW_DATA));
 #endif
   RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
   RCCHECK(rclc_executor_add_timer(&executor, &enc_timer));
@@ -268,6 +329,9 @@ static void destroyEntities() {
 #if LED_PIN >= 0
   rcl_subscription_fini(&led_sub, &node);
 #endif
+#if LDS_MOTOR_PIN >= 0
+  rcl_subscription_fini(&lds_motor_sub, &node);
+#endif
   rcl_publisher_fini(&enc_pub, &node);
   rcl_publisher_fini(&left_susp_pub, &node);
 #if RIGHT_SUSPEND_PIN >= 0
@@ -275,6 +339,7 @@ static void destroyEntities() {
 #endif
   rcl_publisher_fini(&temp_pub, &node);
   rcl_publisher_fini(&hall_pub, &node);
+  rcl_publisher_fini(&lds_rpm_pub, &node);
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);
@@ -326,6 +391,16 @@ void setup() {
   pinMode(RIGHT_SUSPEND_PIN, INPUT_PULLUP);
 #endif
 
+  // Spin lidar: UART2 RX-only for the data stream (we parse RPM in loop()). Bigger
+  // RX buffer so a slow loop pass doesn't drop bytes at 115200.
+  Serial2.setRxBufferSize(512);
+  Serial2.begin(LDS_BAUD, SERIAL_8N1, LDS_RX_PIN, -1);
+#if LDS_MOTOR_PIN >= 0
+  ledcSetup(CH_LDS, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttachPin(LDS_MOTOR_PIN, CH_LDS);
+  ledcWrite(CH_LDS, (uint32_t)(LDS_MOTOR_DUTY * PWM_MAX));   // start spinning
+#endif
+
   // Int64MultiArray payload points at our static buffer (no dynamic alloc).
   enc_msg.data.data = enc_data;
   enc_msg.data.size = 2;
@@ -339,6 +414,10 @@ void setup() {
 }
 
 void loop() {
+  // Always drain the LDS UART so its buffer never overflows (independent of the
+  // agent link); ldsFeed() updates g_lds_rpm from valid frames.
+  while (Serial2.available()) ldsFeed((uint8_t)Serial2.read());
+
   switch (state) {
     case WAITING_AGENT:
       EXECUTE_EVERY_N_MS(500,

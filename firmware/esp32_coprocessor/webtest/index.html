@@ -60,6 +60,7 @@
       <div class="stat"><span class="dot" id="d-suspR"></span> <span id="t-suspR">R wheel: —</span></div>
       <div class="stat">🌡 <span id="t-temp">ESP32: — °C</span></div>
       <div class="stat">🧲 <span id="t-hall">hall: —</span></div>
+      <div class="stat">🌀 <span id="t-lds">LDS: — rpm</span></div>
       <div class="stat"><span class="dot off" id="d-web"></span> <span id="t-web">web link</span></div>
     </div>
   </div>
@@ -81,6 +82,16 @@
         <button onclick="zero()">Zero display</button>
         <span class="mut" id="encDelta">Δ 0 / 0</span>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>LDS spin motor (/lds_motor)</h2>
+      <div class="big" id="ldsRpm">— <span class="mut" style="font-size:14px">rpm</span></div>
+      <div class="row" style="margin-top:10px">
+        <label>duty <input type="range" id="lds" min="0" max="1" step="0.02" value="0.6"></label>
+        <span class="mut" id="ldsv">0.60</span>
+      </div>
+      <p class="warn">PWM duty to the LDS spin motor (open-loop); starts at the firmware default.</p>
     </div>
 
     <div class="card wide">
@@ -120,6 +131,13 @@ function arm() { document.getElementById('motorFs').disabled = !document.getElem
 
 const spd = document.getElementById('spd');
 spd.oninput = () => document.getElementById('spdv').textContent = (+spd.value).toFixed(2);
+
+// LDS spin-motor duty slider -> /lds_motor
+const lds = document.getElementById('lds');
+lds.oninput = () => {
+  document.getElementById('ldsv').textContent = (+lds.value).toFixed(2);
+  post('/lds_motor', {duty: +lds.value});
+};
 
 // Hold-to-drive: repeat cmd_vel at 10 Hz so the firmware watchdog stays fed.
 let held = null;
@@ -189,6 +207,10 @@ async function poll() {
       `ESP32: ${typeof s.temp === 'number' ? s.temp.toFixed(1) : '—'} °C`;
   document.getElementById('t-hall').textContent =
       `hall: ${typeof s.hall === 'number' ? s.hall : '—'}`;
+  const rpm = typeof s.lds_rpm === 'number' ? s.lds_rpm.toFixed(0) : '—';
+  document.getElementById('t-lds').textContent = `LDS: ${rpm} rpm`;
+  document.getElementById('ldsRpm').innerHTML =
+      `${rpm} <span class="mut" style="font-size:14px">rpm</span>`;
 
   document.getElementById('meta').textContent =
       s.info || `${s.rmw} · ${s.dev} · ${s.node ? 'ESP32 connected' : 'waiting for ESP32…'}`;

@@ -9,7 +9,7 @@ running **Armbian**, with **ROS 2 Humble** installed as conda packages via
 (chosen for low RAM; needs `rmw_zenohd` running). The web UI is **rosbridge + a
 static HTML page** (`web_control`), not Foxglove.
 
-Hardware: Roborock **LDS02RR** lidar (UART1 `/dev/ttyS1`), quadrature **wheel
+Hardware: Roborock **LDS02RR** lidar (UART1 `/dev/ttyS1`), single-channel **wheel
 encoders** + **motors** (now via an **ESP32-WROOM coprocessor**, see below),
 **PCA9685** PWM (I2C, now unused by the stack), **SSD1306** OLED (I2C), **BWT901CL**
 IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
@@ -30,14 +30,32 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 
 ## ESP32 motor/encoder coprocessor (`firmware/esp32_coprocessor/`)
 - micro-ROS (PlatformIO + Arduino) over USB serial. Subscribes `/cmd_vel`
-  (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM) and publishes
-  `/wheel_ticks` (std_msgs/Int64MultiArray `[L,R]`, best-effort) from hardware PCNT
-  quadrature. Standard messages only so a stock `micro_ros_agent` bridges it.
-- Bridged by **`micro_ros_agent`** (conda pkg), started by `stack.sh` after the
-  router under `rmw_zenoh_cpp`. Serial dev = `$AGENT_DEV` (default `/dev/esp32`).
-- Build/flash from the dev PC: `cd firmware/esp32_coprocessor && pio run -t upload`.
-  Tunables (pins, diff-drive limits — keep in sync with `robot.yaml`) in
-  `include/config.h`. **Don't build the firmware on the board.**
+  (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM) and `/led` (Bool, onboard-
+  LED pipeline test). Publishes `/wheel_ticks` (Int64MultiArray `[L,R]`, best-effort)
+  from **single-channel** rising-edge GPIO-interrupt counts (unsigned, **no
+  direction**; PCNT/quadrature was dropped), plus `/left_wheel_suspended` +
+  `/right_wheel_suspended` (Bool per-wheel off-ground microswitch) and `/esp32_temp`
+  (Float32) + `/esp32_hall` (Int32) on-die telemetry. Also reads a **spin-lidar**
+  (LDS02RR) on UART2 → `/lds_rpm` (Float32, RPM only — scan data ignored) and drives
+  its spin motor open-loop via `/lds_motor` (Float32 duty 0..1). WiFi/BT kept off.
+  Pins/tunables in `include/config.h` (encoders L=19 R=26, switches 18/27, motor
+  STBY=17, LEFT_IN_REV=4, LDS UART2 RX=16, LDS motor PWM=21; keep diff-drive limits
+  synced to `robot.yaml`).
+- **Agent built from source, not a conda pkg** — `ros-humble-micro-ros-agent` vanished
+  from RoboStack. Build once: `pixi run bash firmware/esp32_coprocessor/webtest/build_agent.sh`
+  → installs into `~/uros_ws` (uses `-DUAGENT_LOGGER_PROFILE=OFF` to dodge an fmt-12
+  build break). `stack.sh` runs it after the router; serial dev = `$AGENT_DEV`
+  (default `/dev/esp32`).
+- **CRITICAL: the agent is Fast-DDS-only** (links `librmw_fastrtps_shared_cpp`) — it
+  bridges the ESP32 onto a Fast-DDS graph regardless of `RMW_IMPLEMENTATION`, so a
+  pure `rmw_zenoh_cpp` graph **can't see its topics**. The SBC likely never actually
+  receives `/wheel_ticks` under zenoh — **unresolved** (needs Fast-DDS for the agent
+  path, or a zenoh↔DDS bridge). The dev-host browser rig `webtest/esp32_webtest.py`
+  defaults to `rmw_fastrtps_cpp` and works (toggle `/led`, watch ticks/suspension/
+  temp/hall, nudge `/cmd_vel`).
+- Build/flash from the dev PC: `cd firmware/esp32_coprocessor && pio run -t upload`
+  (pio lives in `~/pio-venv`). Tunables in `include/config.h`. **Don't build the
+  firmware on the board.**
 
 ## Build / run
 - Build: `pixi run build` (colcon, msgs + all python pkgs). There is **no

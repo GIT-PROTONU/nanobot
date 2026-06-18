@@ -3,7 +3,8 @@
 A no-CLI way to exercise the flashed **micro-ROS** firmware end to end from a
 browser: toggle the onboard LED (`/led`), watch `/wheel_ticks` stream live, see the
 per-wheel suspension switches (`/left_wheel_suspended`, `/right_wheel_suspended`),
-and (with an explicit safety opt-in) nudge the motors (`/cmd_vel`).
+read the spin-lidar RPM (`/lds_rpm`) and set its motor duty (`/lds_motor`), and (with
+an explicit safety opt-in) nudge the drive motors (`/cmd_vel`).
 
 ```
 Browser ──HTTP──▶ esp32_webtest.py (rclpy + native micro_ros_agent) ──micro-ROS──▶ ESP32
@@ -58,6 +59,8 @@ the board), else the `~/uros_ws` overlay (sourced + `ros2 run`).
   — a relative health value, not calibrated ambient.
 - **🧲 hall** — internal hall-effect sensor (`/esp32_hall`, raw int, ~1 Hz). Bring a
   magnet near the chip and the value swings.
+- **🌀 LDS** — spin-lidar speed (`/lds_rpm`, ~5 Hz). The **LDS spin motor** card's slider
+  sets the motor duty (`/lds_motor`); raise it and the RPM should climb.
 - **web link** — the browser ↔ server poll is alive.
 
 The LED toggle and motor nudge exercise the host → ESP32 (subscribe) direction.
