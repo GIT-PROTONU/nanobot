@@ -82,7 +82,8 @@
       <p class="hint" id="camHint" style="display:none">USB webcam MJPEG
         (<b>/stream.mjpg</b>). Streams only while shown.</p>
       <h2>Mic</h2>
-      <label class="chk"><input type="checkbox" id="micOn"> listen <span id="micState" class="hint"></span></label>
+      <label class="chk"><input type="checkbox" id="micOn"> listen
+        <span id="micState" class="hint"></span> <b id="micPct"></b></label>
       <div class="meter"><i id="micBar"></i></div>
       <p class="hint">Webcam microphone, raw PCM (<b>/audio.pcm</b>). Captures only
         while listening; bar shows the input level.</p>
@@ -210,17 +211,25 @@ $("cam").onerror=()=>{ if($("camOn").checked) $("cam").style.background="#3d1418
 // API. We schedule small AudioBuffers on a short jitter buffer (~180 ms) for low
 // latency; if playback falls behind (underrun) we resync to "now". Toggling off
 // aborts the fetch, which drops the connection and stops arecord (ref-counted).
-let audioCtx=null, micAbort=null, micPlayhead=0, micLevel=0, micRaf=0;
+let audioCtx=null, micAbort=null, micPlayhead=0, micRaf=0, micAnalyser=null, micBuf=null;
 const MIC_LEAD=0.18;                 // s of jitter buffer (latency vs. dropouts)
 function micSet(s){ $("micState").textContent=s; }
-// Level meter: micLevel collects the peak amplitude (0..1) since the last animation
-// frame; the rAF loop shows it with a smooth fall-off (VU style) and resets it.
+// Level meter: read the live audio through an AnalyserNode each animation frame
+// (the canonical Web Audio way), take the peak deviation, and show it with a
+// smooth fall-off (VU style). Driven by the same audio you hear.
 function micMeter(){
-  const bar=$("micBar"); let shown=0;
+  const bar=$("micBar"), pct=$("micPct"); let shown=0;
   const tick=()=>{
-    shown = Math.max(micLevel, shown*0.86); micLevel = 0;
+    let peak=0;
+    if(micAnalyser){
+      micAnalyser.getByteTimeDomainData(micBuf);
+      for(let i=0;i<micBuf.length;i++){ const d=Math.abs(micBuf[i]-128); if(d>peak) peak=d; }
+      peak/=128;                      // 0..1
+    }
+    shown = Math.max(peak, shown*0.86);
     bar.style.width = Math.min(100, Math.sqrt(shown)*100).toFixed(1)+"%";  // perceptual
     bar.style.background = shown>0.8 ? "var(--red)" : shown>0.4 ? "var(--amber)" : "var(--green)";
+    if(pct) pct.textContent = Math.round(shown*100)+"%";
     micRaf = requestAnimationFrame(tick);
   };
   tick();
@@ -229,6 +238,10 @@ async function micStart(){
   try{
     audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
     await audioCtx.resume();
+    micAnalyser = audioCtx.createAnalyser();        // metering tap (source->analyser->out)
+    micAnalyser.fftSize = 2048;
+    micBuf = new Uint8Array(micAnalyser.fftSize);
+    micAnalyser.connect(audioCtx.destination);
     micAbort = new AbortController();
     const res = await fetch("/audio.pcm?t="+Date.now(), {signal:micAbort.signal});
     if(!res.ok || !res.body){ micSet("(unavailable)"); return; }
@@ -247,12 +260,9 @@ async function micStart(){
       const dv = new DataView(buf.buffer, buf.byteOffset, n);
       const ab = audioCtx.createBuffer(1, samples, rate);
       const ch = ab.getChannelData(0);
-      let peak=0;
-      for(let i=0;i<samples;i++){ const v=dv.getInt16(i*2,true)/32768; ch[i]=v;
-        const a=v<0?-v:v; if(a>peak) peak=a; }
-      if(peak>micLevel) micLevel=peak;          // feed the level meter
+      for(let i=0;i<samples;i++) ch[i] = dv.getInt16(i*2,true)/32768;
       const src = audioCtx.createBufferSource();
-      src.buffer = ab; src.connect(audioCtx.destination);
+      src.buffer = ab; src.connect(micAnalyser);   // through the meter tap to output
       const now = audioCtx.currentTime;
       if(micPlayhead < now + 0.01) micPlayhead = now + MIC_LEAD;  // (re)sync on underrun
       src.start(micPlayhead); micPlayhead += ab.duration;
@@ -262,7 +272,7 @@ async function micStart(){
 function micStop(){
   if(micAbort){ micAbort.abort(); micAbort=null; }
   if(micRaf){ cancelAnimationFrame(micRaf); micRaf=0; }
-  micLevel=0; $("micBar").style.width="0%";
+  micAnalyser=null; $("micBar").style.width="0%"; $("micPct").textContent="";
   micSet("");
 }
 $("micOn").addEventListener("change",e=>{ e.target.checked ? micStart() : micStop(); });
