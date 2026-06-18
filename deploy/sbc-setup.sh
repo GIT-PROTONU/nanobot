@@ -8,7 +8,7 @@
 #
 # Then build + run as your normal user (see README §2-4):
 #     ~/.pixi/bin/pixi install
-#     ~/.pixi/bin/pixi run build && ~/.pixi/bin/pixi run build-lds
+#     ~/.pixi/bin/pixi run build
 #     ~/.pixi/bin/pixi run bash scripts/stack.sh up
 #
 # Idempotent — safe to re-run. A backup of armbianEnv.txt is left at *.nano.bak.

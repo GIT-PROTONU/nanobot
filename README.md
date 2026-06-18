@@ -10,7 +10,7 @@ Hardware:
 
 | Peripheral | Bus | Node | Topic |
 |---|---|---|---|
-| Roborock **LDS02RR** lidar | UART (`/dev/ttyS2`) | `lds_driver` (Rust) | `/scan` |
+| Roborock **LDS02RR** lidar | UART (`/dev/ttyS1`) | `lds_driver_py` (Python) | `/scan` |
 | Wheel **encoders** (quadrature ×2) | GPIO (`/dev/gpiochip0`) | `wheel_odometry` | `/odom`, `/joint_states`, `/wheel_encoders`, TF |
 | **PCA9685** PWM (motor driver) | I2C (`/dev/i2c-1`) | `motor_control` | sub `/cmd_vel` |
 | **SSD1306** OLED | I2C (`/dev/i2c-1`) | `oled_display` | sub `/odom`, `/scan` |
@@ -25,7 +25,8 @@ debugged in isolation. Packages live under `src/`:
 ```
 robot_msgs        custom interfaces (WheelEncoders, MotorCommand)         [ament_cmake]
 robot_bringup     launch files + the single config/robot.yaml             [ament_python]
-lds_driver        serial LDS02RR -> /scan  (the hot path)                 [Rust / r2r]
+lds_driver_py     serial LDS02RR -> /scan                                 [rclpy]
+lds_driver        abandoned Rust/r2r LDS node (doesn't build; kept for ref) [Rust / r2r]
 wheel_odometry    GPIO encoders -> /odom + TF                             [rclpy]
 motor_control     /cmd_vel -> PCA9685 PWM                                 [rclpy]
 oled_display      status dashboard -> SSD1306                             [rclpy]
@@ -80,18 +81,19 @@ sudo usermod -aG i2c,dialout,gpio $USER   # re-login afterwards
 ```bash
 curl -fsSL https://pixi.sh/install.sh | bash    # if not already installed
 cd ~/Nano
-pixi install          # resolves ROS 2 Humble + rmw_zenoh + Rust + hw libs (aarch64)
+pixi install          # resolves ROS 2 Humble + rmw_zenoh + hw libs (aarch64)
 ```
 
 ## 3. Build
 
 ```bash
-pixi run build-all    # colcon build (msgs + python pkgs) + cargo build the Rust LDS node
+pixi run build        # colcon build (msgs + all python pkgs)
 ```
 
-> The Rust node is built with `cargo` (not colcon) against the active ROS env;
-> `r2r` generates its message bindings at build time, so it must run inside the pixi
-> environment. The binary lands at `src/lds_driver/target/release/lds_driver`.
+> The LDS is driven by the Python `lds_driver_py` node (built by `pixi run build`
+> like the rest). The old Rust `lds_driver` is abandoned — it doesn't build against
+> this RoboStack Humble, and its toolchain is intentionally **not** in `pixi.toml`
+> (it cost ~1.6 GB). The source is kept under `src/lds_driver/` for reference only.
 
 ## 4. Run
 
@@ -115,7 +117,6 @@ Useful subsets:
 
 ```bash
 pixi run web         # just rosbridge + the control page (UI development)
-pixi run lds         # just the Rust LDS node
 pixi run shell       # a shell with everything sourced, for ad-hoc ros2 commands
 ```
 
@@ -132,8 +133,10 @@ against the pinmap and avoid lines it lists as already claimed.
 
 - **First boot debugging:** UART0 (`/dev/ttyS0`, PA4/5) stays the Armbian serial
   console — keep a USB-TTL adapter handy. Don't use it for the LDS.
-- **r2r version:** parameter plumbing in `lds_driver/src/main.rs` targets r2r 0.9's
-  `node.params` API. If you bump r2r and it stops compiling, that's the spot to fix.
+- **Rust LDS node (abandoned):** `lds_driver/src/main.rs` targets r2r 0.9, which
+  does not compile against this RoboStack Humble. `lds_driver_py` replaced it. Its
+  build toolchain (rust/clang/llvm, ~1.6 GB) is deliberately excluded from
+  `pixi.toml`; re-add those deps only if you revive the node.
 - **Offline robot:** `web/index.html` loads `roslib` from a CDN. For a robot with no
   internet, download `roslib.min.js` into `src/web_control/web/` and change the
   `<script src>` to a local path, then rebuild.
