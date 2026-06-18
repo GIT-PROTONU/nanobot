@@ -6,8 +6,9 @@ contains index.html). The page talks to ROS over the rosbridge websocket, not to
 this server — this only delivers the HTML/JS and the camera stream.
 
 `/stream.mjpg` serves the USB webcam as multipart/x-mixed-replace, fed by a
-zero-dependency V4L2 MJPEG passthrough (see mjpeg_camera). The camera is opened
-only while a client is connected, so it costs nothing when nobody is watching.
+zero-dependency V4L2 MJPEG passthrough (see mjpeg_camera). `/audio.pcm` streams
+the webcam mic as raw PCM via arecord (see mic_audio). Both the camera and the
+mic are started only while a client is connected, so they cost nothing idle.
 """
 import functools
 import http.server
@@ -20,6 +21,7 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 
 from .mjpeg_camera import CameraStream
+from .mic_audio import AudioStream
 
 
 class WebServerNode(Node):
@@ -31,6 +33,8 @@ class WebServerNode(Node):
         self.declare_parameter("cam_width", 640)
         self.declare_parameter("cam_height", 480)
         self.declare_parameter("cam_fps", 15)
+        self.declare_parameter("mic_device", "")       # "" = auto-detect USB mic
+        self.declare_parameter("mic_rate", 16000)      # Hz; 16k mono = 32 KB/s
         g = self.get_parameter
         port = g("web_port").value
 
@@ -39,8 +43,13 @@ class WebServerNode(Node):
             width=g("cam_width").value, height=g("cam_height").value,
             fps=g("cam_fps").value, logger=self.get_logger().info)
 
+        self._mic = AudioStream(
+            device=g("mic_device").value or None,
+            rate=g("mic_rate").value, channels=1, logger=self.get_logger().info)
+
         web_dir = os.path.join(get_package_share_directory("web_control"), "web")
-        handler = functools.partial(_Handler, directory=web_dir, stream=self._cam)
+        handler = functools.partial(_Handler, directory=web_dir,
+                                    stream=self._cam, audio=self._mic)
         self._httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -56,13 +65,17 @@ class WebServerNode(Node):
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, stream=None, **kwargs):
+    def __init__(self, *args, stream=None, audio=None, **kwargs):
         self._stream = stream
+        self._audio = audio
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
-        if self.path.split("?", 1)[0] == "/stream.mjpg":
+        path = self.path.split("?", 1)[0]
+        if path == "/stream.mjpg":
             return self._stream_mjpeg()
+        if path == "/audio.pcm":
+            return self._stream_audio()
         return super().do_GET()
 
     def do_POST(self):
@@ -123,6 +136,36 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             pass                       # client closed the stream
         finally:
             self._stream.remove_viewer()
+
+    def _stream_audio(self):
+        if self._audio is None:
+            self.send_error(503, "no microphone")
+            return
+        q = self._audio.add_listener()
+        try:
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            # raw signed 16-bit little-endian PCM; rate/channels in headers so the
+            # browser can configure the Web Audio decoder without hardcoding.
+            self.send_header("Content-Type", "audio/L16;rate=%d;channels=%d"
+                             % (self._audio.rate, self._audio.channels))
+            self.send_header("X-Sample-Rate", str(self._audio.rate))
+            self.send_header("X-Channels", str(self._audio.channels))
+            self.end_headers()
+            import queue as _q
+            while True:
+                try:
+                    data = q.get(timeout=5.0)
+                except _q.Empty:
+                    if not self._audio.running():
+                        break          # mic failed / no device
+                    continue
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass                       # client stopped listening
+        finally:
+            self._audio.remove_listener(q)
 
     def log_message(self, *args):      # silence per-request stderr spam
         pass

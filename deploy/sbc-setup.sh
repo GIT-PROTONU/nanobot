@@ -42,8 +42,8 @@ udevadm control --reload-rules || true
 udevadm trigger --subsystem-match=i2c-dev || true
 udevadm trigger --subsystem-match=tty --subsystem-match=video4linux --subsystem-match=usb || true
 
-echo "== 3/4  groups: $USER_NAME in dialout (serial + i2c) and video (webcam) =="
-usermod -aG dialout,video "$USER_NAME"
+echo "== 3/4  groups: $USER_NAME in dialout (serial+i2c), video (webcam), audio (mic) =="
+usermod -aG dialout,video,audio "$USER_NAME"
 
 echo "== 4/5  sudoers: passwordless poweroff/reboot for the web UI Shutdown button =="
 install -m 0440 "$HERE/sudoers/nano-power" /etc/sudoers.d/nano-power

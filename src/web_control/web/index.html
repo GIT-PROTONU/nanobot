@@ -78,6 +78,10 @@
       <img id="cam" alt="">
       <p class="hint" id="camHint" style="display:none">USB webcam MJPEG
         (<b>/stream.mjpg</b>). Streams only while shown.</p>
+      <h2>Mic</h2>
+      <label class="chk"><input type="checkbox" id="micOn"> listen <span id="micState" class="hint"></span></label>
+      <p class="hint">Webcam microphone, raw PCM (<b>/audio.pcm</b>). Captures only
+        while listening.</p>
       <h2>Teleop</h2>
       <div class="pad">
         <span class="blank"></span>
@@ -197,6 +201,50 @@ $("camOn").addEventListener("change",e=>{
   else { img.removeAttribute("src"); img.style.display="none"; hint.style.display="none"; }
 });
 $("cam").onerror=()=>{ if($("camOn").checked) $("cam").style.background="#3d1418"; };
+
+// Webcam mic: stream raw S16LE PCM from /audio.pcm and play it via the Web Audio
+// API. We schedule small AudioBuffers on a short jitter buffer (~180 ms) for low
+// latency; if playback falls behind (underrun) we resync to "now". Toggling off
+// aborts the fetch, which drops the connection and stops arecord (ref-counted).
+let audioCtx=null, micAbort=null, micPlayhead=0;
+const MIC_LEAD=0.18;                 // s of jitter buffer (latency vs. dropouts)
+function micSet(s){ $("micState").textContent=s; }
+async function micStart(){
+  try{
+    audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+    await audioCtx.resume();
+    micAbort = new AbortController();
+    const res = await fetch("/audio.pcm?t="+Date.now(), {signal:micAbort.signal});
+    if(!res.ok || !res.body){ micSet("(unavailable)"); return; }
+    const rate = Number(res.headers.get("X-Sample-Rate")) || 16000;
+    micPlayhead = 0; micSet("● live");
+    const reader = res.body.getReader();
+    let carry = new Uint8Array(0);
+    for(;;){
+      const {value,done} = await reader.read();
+      if(done) break;
+      // join any odd trailing byte from the previous chunk (16-bit samples)
+      let buf = value;
+      if(carry.length){ const t=new Uint8Array(carry.length+value.length); t.set(carry); t.set(value,carry.length); buf=t; carry=new Uint8Array(0); }
+      const n = buf.length & ~1; if(n<buf.length) carry = buf.slice(n);
+      const samples = n>>1; if(!samples) continue;
+      const dv = new DataView(buf.buffer, buf.byteOffset, n);
+      const ab = audioCtx.createBuffer(1, samples, rate);
+      const ch = ab.getChannelData(0);
+      for(let i=0;i<samples;i++) ch[i] = dv.getInt16(i*2,true)/32768;
+      const src = audioCtx.createBufferSource();
+      src.buffer = ab; src.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if(micPlayhead < now + 0.01) micPlayhead = now + MIC_LEAD;  // (re)sync on underrun
+      src.start(micPlayhead); micPlayhead += ab.duration;
+    }
+  }catch(e){ if(e.name!=="AbortError") micSet("(error)"); }
+}
+function micStop(){
+  if(micAbort){ micAbort.abort(); micAbort=null; }
+  micSet("");
+}
+$("micOn").addEventListener("change",e=>{ e.target.checked ? micStart() : micStop(); });
 
 // Power controls -> POST to the web server (same origin). Both are confirmed.
 $("btnReset").onclick=()=>{
