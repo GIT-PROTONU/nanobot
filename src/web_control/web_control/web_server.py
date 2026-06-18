@@ -143,6 +143,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
         q = self._audio.add_listener()
         try:
+            # Stream as HTTP/1.1 chunked. Browsers buffer an HTTP/1.0 (close-
+            # delimited) streaming body and never hand it to fetch()'s reader until
+            # the connection closes — which for a live mic is never — so without
+            # chunked the page would receive nothing. Chunked is surfaced live.
+            self.protocol_version = "HTTP/1.1"
             self.send_response(200)
             self.send_header("Cache-Control", "no-cache, private")
             self.send_header("Pragma", "no-cache")
@@ -152,6 +157,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                              % (self._audio.rate, self._audio.channels))
             self.send_header("X-Sample-Rate", str(self._audio.rate))
             self.send_header("X-Channels", str(self._audio.channels))
+            self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             import queue as _q
             while True:
@@ -161,7 +167,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     if not self._audio.running():
                         break          # mic failed / no device
                     continue
+                # one HTTP chunk: <hex len>CRLF <data> CRLF, flushed immediately
+                self.wfile.write(b"%X\r\n" % len(data))
                 self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass                       # client stopped listening
         finally:
