@@ -7,7 +7,8 @@
 //   pub  right_wheel_suspended std_msgs/Bool     right wheel off the ground (switch)
 //   pub  esp32_temp    std_msgs/Float32         ESP32 internal die temperature (deg C)
 //   pub  esp32_hall    std_msgs/Int32           ESP32 internal hall sensor (raw)
-//   pub  lds_rpm       std_msgs/Float32         spin-lidar speed (RPM, from UART2)
+//   pub  lds_rpm       std_msgs/Float32         spin-lidar speed (RPM; 0 if no data)
+//   pub  lds_hz        std_msgs/Float32         LDS valid-frame rate (Hz; 0 = no data)
 //   sub  lds_motor     std_msgs/Float32         LDS spin-motor PWM duty [0..1]
 //
 // Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
@@ -59,6 +60,7 @@ rcl_publisher_t    right_susp_pub;
 rcl_publisher_t    temp_pub;
 rcl_publisher_t    hall_pub;
 rcl_publisher_t    lds_rpm_pub;
+rcl_publisher_t    lds_hz_pub;
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -77,6 +79,7 @@ std_msgs__msg__Bool                 right_susp_msg;
 std_msgs__msg__Float32              temp_msg;
 std_msgs__msg__Int32                hall_msg;
 std_msgs__msg__Float32              lds_rpm_msg;
+std_msgs__msg__Float32              lds_hz_msg;
 #if LDS_MOTOR_PIN >= 0
 std_msgs__msg__Float32              lds_motor_msg;
 #endif
@@ -95,7 +98,9 @@ static void IRAM_ATTR leftEncISR()  { g_left_ticks++; }
 static void IRAM_ATTR rightEncISR() { g_right_ticks++; }
 #endif
 
-static volatile float g_lds_rpm = 0.0f;   // latest valid spin-lidar speed (RPM)
+static volatile float    g_lds_rpm    = 0.0f;   // latest valid spin-lidar speed (RPM)
+static volatile uint32_t g_lds_frames = 0;      // cumulative valid frames (for rate)
+static volatile uint32_t g_lds_last_ms = 0;     // millis() of last valid frame (staleness)
 
 // Minimal LDS02RR frame parser — extracts RPM only (scan data ignored). 22-byte
 // packets: 0xFA, index, speed_lo, speed_hi, 16 data, chk_lo, chk_hi. RPM = speed/64.
@@ -111,8 +116,11 @@ static void ldsFeed(uint8_t byte) {
   for (int ix = 0; ix < 20; ix += 2)
     chk = (chk * 2u + pkt[ix] + (pkt[ix + 1] << 8)) & 0xFFFFFFFFu;
   uint32_t cs = ((chk & 0x7FFF) + (chk >> 15)) & 0x7FFF;
-  if ((cs & 0xFF) == pkt[20] && ((cs >> 8) & 0xFF) == pkt[21])
+  if ((cs & 0xFF) == pkt[20] && ((cs >> 8) & 0xFF) == pkt[21]) {
     g_lds_rpm = ((pkt[3] << 8) | pkt[2]) / 64.0f;
+    g_lds_frames++;
+    g_lds_last_ms = millis();
+  }
 }
 
 // ---- connection state machine ------------------------------------------------
@@ -235,12 +243,23 @@ static void enc_cb(rcl_timer_t *timer, int64_t) {
     RCSOFTCHECK(rcl_publish(&hall_pub, &hall_msg, NULL));
   }
 
-  // Spin-lidar RPM at ~5 Hz (more dynamic than temp/hall — useful for tuning speed).
-  static uint8_t rpm_div = 0;
+  // Spin-lidar at ~5 Hz: report RPM (0 if the stream went stale so a powered-down LDS
+  // doesn't keep showing its last speed) and the live valid-frame rate (0 = no data).
+  static uint8_t  rpm_div = 0;
+  static uint32_t last_frames = 0;
+  static uint32_t last_ms = 0;
   if (++rpm_div >= ENC_PUBLISH_HZ / 5) {
     rpm_div = 0;
-    lds_rpm_msg.data = g_lds_rpm;
+    uint32_t now = millis();
+    uint32_t frames = g_lds_frames;
+    float hz = (last_ms && now > last_ms) ? (frames - last_frames) * 1000.0f / (now - last_ms) : 0.0f;
+    last_frames = frames;
+    last_ms = now;
+    bool stale = (now - g_lds_last_ms) > LDS_TIMEOUT_MS;
+    lds_rpm_msg.data = stale ? 0.0f : g_lds_rpm;
     RCSOFTCHECK(rcl_publish(&lds_rpm_pub, &lds_rpm_msg, NULL));
+    lds_hz_msg.data = hz;
+    RCSOFTCHECK(rcl_publish(&lds_hz_pub, &lds_hz_msg, NULL));
   }
 }
 
@@ -290,6 +309,9 @@ static bool createEntities() {
   RCCHECK(rclc_publisher_init_default(
       &lds_rpm_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_rpm"));
+  RCCHECK(rclc_publisher_init_default(
+      &lds_hz_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_hz"));
 
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
@@ -340,6 +362,7 @@ static void destroyEntities() {
   rcl_publisher_fini(&temp_pub, &node);
   rcl_publisher_fini(&hall_pub, &node);
   rcl_publisher_fini(&lds_rpm_pub, &node);
+  rcl_publisher_fini(&lds_hz_pub, &node);
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);

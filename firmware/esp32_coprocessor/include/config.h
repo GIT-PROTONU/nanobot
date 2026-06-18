@@ -58,3 +58,4 @@
 #define LDS_BAUD           115200
 #define LDS_MOTOR_PIN      21      // PWM out to the LDS motor driver; -1 to disable
 #define LDS_MOTOR_DUTY     0.6f    // startup spin duty [0..1] (keep webui slider in sync)
+#define LDS_TIMEOUT_MS     300     // no valid frame within this → report rpm 0 / not receiving

@@ -59,8 +59,10 @@ the board), else the `~/uros_ws` overlay (sourced + `ros2 run`).
   — a relative health value, not calibrated ambient.
 - **🧲 hall** — internal hall-effect sensor (`/esp32_hall`, raw int, ~1 Hz). Bring a
   magnet near the chip and the value swings.
-- **🌀 LDS** — spin-lidar speed (`/lds_rpm`, ~5 Hz). The **LDS spin motor** card's slider
-  sets the motor duty (`/lds_motor`); raise it and the RPM should climb.
+- **LDS** — green while frames are arriving, shows speed + frame rate (`/lds_rpm`,
+  `/lds_hz`); red **"no data"** when the stream stops (RPM is zeroed, not held). The
+  **LDS spin motor** card's slider sets the motor duty (`/lds_motor`); raise it and the
+  RPM should climb.
 - **web link** — the browser ↔ server poll is alive.
 
 The LED toggle and motor nudge exercise the host → ESP32 (subscribe) direction.

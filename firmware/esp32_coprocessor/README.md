@@ -20,7 +20,8 @@ single-channel and counted with lightweight GPIO interrupts.
 | pub | `right_wheel_suspended` | `std_msgs/Bool`   | right wheel off the ground (microswitch); `true`=suspended |
 | pub | `esp32_temp`  | `std_msgs/Float32`          | ESP32 internal die temperature (°C, ~1 Hz; coarse/uncalibrated) |
 | pub | `esp32_hall`  | `std_msgs/Int32`            | ESP32 internal hall sensor (raw, ~1 Hz) |
-| pub | `lds_rpm`     | `std_msgs/Float32`          | spin-lidar speed (RPM, ~5 Hz, from UART2; scan data ignored) |
+| pub | `lds_rpm`     | `std_msgs/Float32`          | spin-lidar speed (RPM, ~5 Hz; **0 when no data**, scan data ignored) |
+| pub | `lds_hz`      | `std_msgs/Float32`          | LDS valid-frame rate (Hz, ~5 Hz; `0` = not receiving) |
 | sub | `lds_motor`   | `std_msgs/Float32`          | LDS spin-motor PWM duty `[0..1]` (open-loop) |
 
 End-to-end smoke test once the agent is running:

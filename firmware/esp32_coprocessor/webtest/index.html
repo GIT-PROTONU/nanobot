@@ -60,7 +60,7 @@
       <div class="stat"><span class="dot" id="d-suspR"></span> <span id="t-suspR">R wheel: —</span></div>
       <div class="stat">🌡 <span id="t-temp">ESP32: — °C</span></div>
       <div class="stat">🧲 <span id="t-hall">hall: —</span></div>
-      <div class="stat">🌀 <span id="t-lds">LDS: — rpm</span></div>
+      <div class="stat"><span class="dot" id="d-lds"></span> <span id="t-lds">LDS: — rpm</span></div>
       <div class="stat"><span class="dot off" id="d-web"></span> <span id="t-web">web link</span></div>
     </div>
   </div>
@@ -207,10 +207,17 @@ async function poll() {
       `ESP32: ${typeof s.temp === 'number' ? s.temp.toFixed(1) : '—'} °C`;
   document.getElementById('t-hall').textContent =
       `hall: ${typeof s.hall === 'number' ? s.hall : '—'}`;
-  const rpm = typeof s.lds_rpm === 'number' ? s.lds_rpm.toFixed(0) : '—';
-  document.getElementById('t-lds').textContent = `LDS: ${rpm} rpm`;
-  document.getElementById('ldsRpm').innerHTML =
-      `${rpm} <span class="mut" style="font-size:14px">rpm</span>`;
+  // LDS: green dot only while frames are actually arriving (lds_hz > 0); RPM is
+  // already zeroed by the firmware when the stream goes stale.
+  const ldsRx = typeof s.lds_hz === 'number' && s.lds_hz > 0;
+  const rpm = typeof s.lds_rpm === 'number' ? s.lds_rpm.toFixed(0) : '0';
+  const hz = typeof s.lds_hz === 'number' ? s.lds_hz.toFixed(0) : '0';
+  dot('d-lds', ldsRx);
+  document.getElementById('t-lds').textContent =
+      ldsRx ? `LDS: ${rpm} rpm · ${hz} Hz` : 'LDS: no data';
+  document.getElementById('ldsRpm').innerHTML = ldsRx
+      ? `${rpm} <span class="mut" style="font-size:14px">rpm · ${hz} Hz</span>`
+      : `<span class="mut" style="font-size:18px">no data</span>`;
 
   document.getElementById('meta').textContent =
       s.info || `${s.rmw} · ${s.dev} · ${s.node ? 'ESP32 connected' : 'waiting for ESP32…'}`;

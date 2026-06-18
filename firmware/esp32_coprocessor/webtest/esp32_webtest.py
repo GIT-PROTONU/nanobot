@@ -55,7 +55,8 @@ class State:
         self.susp_right = None      # right wheel off the ground?
         self.temp = None            # ESP32 internal die temperature (deg C)
         self.hall = None            # ESP32 internal hall sensor (raw)
-        self.lds_rpm = None         # spin-lidar speed (RPM)
+        self.lds_rpm = None         # spin-lidar speed (RPM; 0 when stale)
+        self.lds_hz = None          # LDS valid-frame rate (Hz; 0 = not receiving)
         self.rmw = ""
         self.dev = ""
 
@@ -73,6 +74,7 @@ class State:
                 "temp": self.temp,
                 "hall": self.hall,
                 "lds_rpm": self.lds_rpm,
+                "lds_hz": self.lds_hz,
                 "rmw": self.rmw,
                 "dev": self.dev,
             }
@@ -259,9 +261,14 @@ def main():
         with state.lock:
             state.lds_rpm = float(msg.data)
 
+    def on_lds_hz(msg):
+        with state.lock:
+            state.lds_hz = float(msg.data)
+
     node.create_subscription(Float32, "esp32_temp", on_temp, 10)
     node.create_subscription(Int32, "esp32_hall", on_hall, 10)
     node.create_subscription(Float32, "lds_rpm", on_lds_rpm, 10)
+    node.create_subscription(Float32, "lds_hz", on_lds_hz, 10)
 
     def publish_led(on):
         led_pub.publish(Bool(data=bool(on)))
