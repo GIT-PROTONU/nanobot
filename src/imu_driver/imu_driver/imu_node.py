@@ -41,10 +41,21 @@ HEADER = 0x55
 FRAME_LEN = 11
 T_ACC, T_GYRO, T_ANGLE, T_MAG = 0x51, 0x52, 0x53, 0x54
 _WANTED = (T_ACC, T_GYRO, T_ANGLE, T_MAG)
+# Precompiled little-endian 4x int16 decode — avoids re-parsing the format string
+# on every frame (this runs hundreds of times a second).
+_UNPACK_FROM = struct.Struct("<hhhh").unpack_from
 # WitMotion output-rate register (RRATE 0x03) codes — used to slow the device
 # down from its 200 Hz default so the node has far fewer frames to parse.
 RATE_CODES = {1: 0x03, 2: 0x04, 5: 0x05, 10: 0x06, 20: 0x07,
               50: 0x08, 100: 0x09, 200: 0x0b}
+
+
+def _dev_rate_for(hz):
+    """Smallest supported device stream rate that still covers `hz` (capped 200)."""
+    for r in (1, 2, 5, 10, 20, 50, 100, 200):
+        if r >= hz:
+            return r
+    return 200
 
 
 def euler_to_quat(roll, pitch, yaw):
@@ -64,26 +75,55 @@ class ImuNode(Node):
     def __init__(self):
         super().__init__("imu_driver")
         self.declare_parameters("", [
-            ("port", "/dev/ttyUSB0"),
+            ("port", "/dev/imu"),
             ("baud", 115200),
             ("frame_id", "imu_link"),
             ("publish_rate", 50.0),
-            ("output_rate_hz", 50),     # tell the sensor to stream at this rate
+            ("euler_rate", 25.0),       # /imu/euler only drives the web angle readout
+            ("mag_rate", 10.0),         # /imu/mag is slow-moving + unused by the UI
+            ("output_rate_hz", 0),      # device stream rate; 0 = auto-follow publish
         ])
         g = self.get_parameter
         self.frame_id = g("frame_id").value
-        self.output_rate = int(g("output_rate_hz").value)
-        # The sensor streams ~200 Hz; cap published rate to keep CPU/bus load down
-        # (nothing here needs more than this, and the web UI only shows ~10 Hz).
-        rate = max(1.0, g("publish_rate").value)
-        self._pub_period = 1.0 / rate
+        # The device streams continuously; the reader parses EVERY frame, so the
+        # cheapest lever for CPU is to make the device stream no faster than we
+        # publish. `output_rate_hz` > 0 pins the device rate; 0 = auto-follow.
+        self.force_rate = int(g("output_rate_hz").value)
+        self.publish_rate = max(1.0, g("publish_rate").value)
+        self._pub_period = 1.0 / self.publish_rate
+        # /imu/euler + /imu/mag have no high-rate consumer (the standard /imu/data
+        # already carries orientation) — cap each well below /imu/data.
+        self.euler_rate = max(0.0, float(g("euler_rate").value))
+        self._eul_period = (1.0 / self.euler_rate) if self.euler_rate > 0 else None
+        self.mag_rate = max(0.0, float(g("mag_rate").value))
+        self._mag_period = (1.0 / self.mag_rate) if self.mag_rate > 0 else None
         self._next_pub = 0.0
+        self._next_eul = 0.0
+        self._next_mag = 0.0
+        self._dev_hz = 0                # last rate actually programmed into device
+        self._need_reconfig = threading.Event()
         # let the web UI slider retune the rate live via /imu_driver/set_parameters
         self.add_on_set_parameters_callback(self._on_params)
 
         self.pub_imu = self.create_publisher(Imu, "imu/data", 10)
         self.pub_mag = self.create_publisher(MagneticField, "imu/mag", 10)
         self.pub_eul = self.create_publisher(Vector3Stamped, "imu/euler", 10)
+
+        # Pre-allocate the messages and set every constant field once; the hot path
+        # only mutates the live values + stamp and re-publishes. Avoids building
+        # three messages (and re-writing the covariances) on every cycle.
+        self._imu = Imu()
+        self._imu.header.frame_id = self.frame_id
+        self._imu.orientation_covariance[0] = self._imu.orientation_covariance[4] = \
+            self._imu.orientation_covariance[8] = 0.01
+        self._imu.angular_velocity_covariance[0] = self._imu.angular_velocity_covariance[4] = \
+            self._imu.angular_velocity_covariance[8] = 0.001
+        self._imu.linear_acceleration_covariance[0] = self._imu.linear_acceleration_covariance[4] = \
+            self._imu.linear_acceleration_covariance[8] = 0.04
+        self._mag_msg = MagneticField()
+        self._mag_msg.header.frame_id = self.frame_id
+        self._eul_msg = Vector3Stamped()
+        self._eul_msg.header.frame_id = self.frame_id
 
         # Latest decoded values, filled in frame-type order each cycle.
         self.acc = (0.0, 0.0, 0.0)
@@ -105,16 +145,26 @@ class ImuNode(Node):
         self._thread.start()
 
     def _configure_device(self):
-        """Slow the BWT901CL to output_rate (WitMotion unlock + set RRATE). Not
-        saved to flash — re-sent on every (re)connect, so no wear and it resets
+        """Program the BWT901CL stream rate (WitMotion unlock + set RRATE) to match
+        what we actually publish, so the reader parses no more frames than needed.
+        Not saved to flash — re-sent on every (re)connect, so no wear and it resets
         to default on power-cycle."""
-        code = RATE_CODES.get(self.output_rate)
-        if code is None:
-            return
+        want = self.force_rate if self.force_rate > 0 else self.publish_rate
+        self._dev_hz = _dev_rate_for(want)
+        code = RATE_CODES[self._dev_hz]
+        # RSW (0x02) is a bitmask of WHICH frame types the device emits each cycle.
+        # By default it streams time+accel+gyro+angle+mag (5 frames). We only use
+        # accel+gyro+angle (+mag if enabled) — dropping the rest cuts serial bytes
+        # AND parse work by ~40-60%, the biggest single CPU lever at high rates.
+        rsw = 0x02 | 0x04 | 0x08                 # accel | gyro | angle
+        if self.mag_rate > 0:
+            rsw |= 0x10                          # mag
         try:
             self.ser.write(b"\xff\xaa\x69\x88\xb5")              # unlock
             time.sleep(0.05)
-            self.ser.write(bytes((0xff, 0xaa, 0x03, code, 0x00)))  # set RRATE
+            self.ser.write(bytes((0xff, 0xaa, 0x02, rsw, 0x00)))  # set RSW (content)
+            time.sleep(0.05)
+            self.ser.write(bytes((0xff, 0xaa, 0x03, code, 0x00)))  # set RRATE (rate)
             time.sleep(0.05)
             self.ser.reset_input_buffer()
         except Exception as exc:
@@ -123,7 +173,18 @@ class ImuNode(Node):
     def _on_params(self, params):
         for p in params:
             if p.name == "publish_rate":
-                self._pub_period = 1.0 / max(1.0, float(p.value))
+                self.publish_rate = max(1.0, float(p.value))
+                self._pub_period = 1.0 / self.publish_rate
+                self._need_reconfig.set()   # auto-follow: re-tune the device rate
+            elif p.name == "euler_rate":
+                self.euler_rate = max(0.0, float(p.value))
+                self._eul_period = (1.0 / self.euler_rate) if self.euler_rate > 0 else None
+            elif p.name == "mag_rate":
+                self.mag_rate = max(0.0, float(p.value))
+                self._mag_period = (1.0 / self.mag_rate) if self.mag_rate > 0 else None
+            elif p.name == "output_rate_hz":
+                self.force_rate = int(p.value)
+                self._need_reconfig.set()
         return SetParametersResult(successful=True)
 
     def _reader(self):
@@ -133,10 +194,11 @@ class ImuNode(Node):
             if self.ser is None:
                 try:
                     self.ser = serial.Serial(self.port, self.baud, timeout=0.2)
+                    self._need_reconfig.clear()
                     self._configure_device()
                     self.get_logger().info(
                         f"BWT901CL open on {self.port} @{self.baud} "
-                        f"(output {self.output_rate} Hz)")
+                        f"(stream {self._dev_hz} Hz, publish {self.publish_rate:g} Hz)")
                     buf.clear()
                 except Exception as exc:
                     self.get_logger().warning(
@@ -144,6 +206,11 @@ class ImuNode(Node):
                         throttle_duration_sec=10.0)
                     self._stop.wait(2.0)        # back off before retrying
                     continue
+            # A live publish_rate change retunes the device stream rate (done here,
+            # in the reader thread, so the serial port is only ever touched here).
+            if self._need_reconfig.is_set():
+                self._need_reconfig.clear()
+                self._configure_device()
             try:
                 # Read in batches (blocks until 64 bytes or the 0.2 s timeout)
                 # instead of draining to 1 byte at a time — that per-byte spin was
@@ -162,23 +229,28 @@ class ImuNode(Node):
                 continue
             buf.extend(chunk)
             i, n = 0, len(buf)
-            while n - i >= FRAME_LEN:
-                if buf[i] != HEADER:
-                    i += 1
-                    continue
-                fr = buf[i:i + FRAME_LEN]
-                if (sum(fr[:10]) & 0xFF) != fr[10]:
-                    i += 1            # bad checksum -> resync one byte at a time
-                    continue
-                self._handle(fr)
-                i += FRAME_LEN
+            try:
+                while n - i >= FRAME_LEN:
+                    if buf[i] != HEADER:
+                        i += 1
+                        continue
+                    if (sum(buf[i:i + 10]) & 0xFF) != buf[i + 10]:
+                        i += 1        # bad checksum -> resync one byte at a time
+                        continue
+                    self._handle(buf[i + 1], buf, i + 2)   # type, buffer, data off
+                    i += FRAME_LEN
+            except Exception as exc:
+                # Never let a parse/publish error kill the reader thread (that would
+                # silence the IMU until a full restart). Log once and keep going.
+                if not self._stop.is_set() and rclpy.ok():
+                    self.get_logger().warning(f"IMU parse error ({exc})",
+                                              throttle_duration_sec=5.0)
             del buf[:i]               # keep the trailing partial frame
 
-    def _handle(self, fr):
-        t = fr[1]
+    def _handle(self, t, buf, off):
         if t not in _WANTED:            # skip time/port/etc. frames -> no unpack
             return
-        a, b, c, _ = struct.unpack("<hhhh", fr[2:10])
+        a, b, c, _ = _UNPACK_FROM(buf, off)     # decode straight from the buffer
         if t == T_ACC:
             self.acc = (a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE)
         elif t == T_GYRO:
@@ -191,36 +263,41 @@ class ImuNode(Node):
             now = time.monotonic()
             if now >= self._next_pub:
                 self._next_pub = now + self._pub_period
-                self._publish()
+                self._publish(now)
 
-    def _publish(self):
-        now = self.get_clock().now().to_msg()
+    def _publish(self, mono):
+        # The reader is a daemon thread; during shutdown/restart the rclpy context
+        # can be torn down out from under it. Bail rather than raise (an unhandled
+        # exception here would kill the reader thread and silence the IMU).
+        if self._stop.is_set() or not rclpy.ok():
+            return
+        stamp = self.get_clock().now().to_msg()
         roll, pitch, yaw = (v * DEG2RAD for v in self.euler_deg)
         qx, qy, qz, qw = euler_to_quat(roll, pitch, yaw)
 
-        imu = Imu()
-        imu.header.stamp = now
-        imu.header.frame_id = self.frame_id
+        # /imu/data — reuse the pre-built message (constants already set in __init__).
+        imu = self._imu
+        imu.header.stamp = stamp
         imu.orientation.x, imu.orientation.y, imu.orientation.z, imu.orientation.w = qx, qy, qz, qw
         imu.angular_velocity.x, imu.angular_velocity.y, imu.angular_velocity.z = self.gyro
         imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z = self.acc
-        # Rough fixed diagonals — the BWT901CL doesn't report per-axis variance.
-        imu.orientation_covariance[0] = imu.orientation_covariance[4] = imu.orientation_covariance[8] = 0.01
-        imu.angular_velocity_covariance[0] = imu.angular_velocity_covariance[4] = imu.angular_velocity_covariance[8] = 0.001
-        imu.linear_acceleration_covariance[0] = imu.linear_acceleration_covariance[4] = imu.linear_acceleration_covariance[8] = 0.04
         self.pub_imu.publish(imu)
 
-        mag = MagneticField()
-        mag.header.stamp = now
-        mag.header.frame_id = self.frame_id
-        mag.magnetic_field.x, mag.magnetic_field.y, mag.magnetic_field.z = self.mag
-        self.pub_mag.publish(mag)
+        # /imu/euler — drives the web UI angle readout; its own (lower) rate.
+        if self._eul_period is not None and mono >= self._next_eul:
+            self._next_eul = mono + self._eul_period
+            eul = self._eul_msg
+            eul.header.stamp = stamp
+            eul.vector.x, eul.vector.y, eul.vector.z = self.euler_deg
+            self.pub_eul.publish(eul)
 
-        eul = Vector3Stamped()
-        eul.header.stamp = now
-        eul.header.frame_id = self.frame_id
-        eul.vector.x, eul.vector.y, eul.vector.z = self.euler_deg
-        self.pub_eul.publish(eul)
+        # /imu/mag — slow-moving and unused by the UI; published at its own low rate.
+        if self._mag_period is not None and mono >= self._next_mag:
+            self._next_mag = mono + self._mag_period
+            mag = self._mag_msg
+            mag.header.stamp = stamp
+            mag.magnetic_field.x, mag.magnetic_field.y, mag.magnetic_field.z = self.mag
+            self.pub_mag.publish(mag)
 
     def destroy_node(self):
         self._stop.set()

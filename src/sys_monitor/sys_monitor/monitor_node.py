@@ -3,7 +3,8 @@ at a fixed rate, read straight from /proc and sysfs — no psutil, no allocation
 churn, negligible cost on the 1 GB H5.
 
 A single DiagnosticStatus named "system" carries KeyValue fields:
-    cpu_percent, load1, mem_used_mb, mem_total_mb, mem_percent,
+    cpu_percent, cpu_cores (per-core busy%, "12,4,6,8"), load1,
+    mem_used_mb, mem_total_mb, mem_percent,
     cpu_temp_c, gpu_temp_c, disk_percent, uptime_s
 and a level (OK/WARN) flagged when temp/mem/disk cross soft thresholds. The web
 UI renders these in a System panel.
@@ -61,18 +62,30 @@ class MonitorNode(Node):
 
     @staticmethod
     def _cpu_times():
-        try:
-            parts = [int(x) for x in _read("/proc/stat").split("\n")[0].split()[1:]]
+        """{'cpu':(idle,total), 'cpu0':(idle,total), ...} — aggregate + per core."""
+        out = {}
+        for line in _read("/proc/stat").splitlines():
+            if not line.startswith("cpu"):
+                break                       # cpu* lines are first in /proc/stat
+            f = line.split()
+            try:
+                parts = [int(x) for x in f[1:]]
+            except ValueError:
+                continue
             idle = parts[3] + (parts[4] if len(parts) > 4 else 0)  # idle + iowait
-            return idle, sum(parts)
-        except Exception:
-            return 0, 0
+            out[f[0]] = (idle, sum(parts))
+        return out
 
-    def _cpu_percent(self) -> float:
-        idle, total = self._cpu_times()
-        di, dt = idle - self._prev[0], total - self._prev[1]
-        self._prev = (idle, total)
-        return 100.0 * (1.0 - di / dt) if dt > 0 else 0.0
+    def _cpu_percents(self):
+        """Delta-based busy% for every cpu line since the last call."""
+        cur = self._cpu_times()
+        res = {}
+        for name, (idle, total) in cur.items():
+            pi, pt = self._prev.get(name, (idle, total))
+            di, dt = idle - pi, total - pt
+            res[name] = 100.0 * (1.0 - di / dt) if dt > 0 else 0.0
+        self._prev = cur
+        return res
 
     def _temp(self, zone_type: str) -> float:
         raw = _read(self.zones.get(zone_type, "")).strip()
@@ -97,13 +110,20 @@ class MonitorNode(Node):
             disk_pct = 0.0
 
         load1 = os.getloadavg()[0]
-        cpu_pct = self._cpu_percent()
+        cpu = self._cpu_percents()
+        cpu_pct = cpu.get("cpu", 0.0)
+        # per-core busy%, in core order (cpu0, cpu1, ...) -> "12,4,6,8"
+        cores, i = [], 0
+        while f"cpu{i}" in cpu:
+            cores.append(f"{cpu[f'cpu{i}']:.0f}")
+            i += 1
         cpu_t = self._temp("cpu-thermal")
         gpu_t = self._temp("gpu-thermal")
         uptime = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
 
         fields = {
             "cpu_percent": f"{cpu_pct:.1f}",
+            "cpu_cores": ",".join(cores),     # per-core busy%, core order
             "load1": f"{load1:.2f}",
             "mem_used_mb": f"{used_mb:.0f}",
             "mem_total_mb": f"{total_mb:.0f}",

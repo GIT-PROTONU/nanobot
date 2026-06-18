@@ -42,6 +42,13 @@
   .imu{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;align-items:baseline}
   .imu span{color:#8b949e}
   .imu b{text-align:right;font-variant-numeric:tabular-nums}
+  .exp{cursor:pointer;user-select:none}
+  .cores{grid-column:1/-1;display:none;flex-direction:column;gap:4px;margin:2px 0 0 6px}
+  .core{display:grid;grid-template-columns:1.4em 1fr 2.6em;gap:6px;align-items:center}
+  .core .lbl{color:#8b949e}
+  .core .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden}
+  .core .bar i{display:block;height:100%;width:0;background:var(--green);transition:width .25s}
+  .core b{text-align:right;font-variant-numeric:tabular-nums}
   .chk{display:flex;gap:6px;align-items:center;cursor:pointer;margin-top:2px}
   .chk input{width:auto;cursor:pointer}
   #cam{display:none;width:100%;border:1px solid var(--line);border-radius:6px;
@@ -109,7 +116,8 @@
         accel m/s², gyro °/s. Slider retunes the node publish rate live.</p>
       <h2>System</h2>
       <div class="imu">
-        <span>CPU</span><b id="sysCpu">–</b>
+        <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
+        <div class="cores" id="sysCores"></div>
         <span>load</span><b id="sysLoad">–</b>
         <span>mem</span><b id="sysMem">–</b>
         <span>temp</span><b id="sysTemp">–</b>
@@ -260,10 +268,30 @@ function fmtUptime(s){
   const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
   return d>0 ? `${d}d${h}h` : `${h}h${String(m).padStart(2,"0")}m`;
 }
+$("cpuToggle").onclick=()=>{
+  const box=$("sysCores"), open=box.style.display!=="flex";
+  box.style.display=open?"flex":"none";
+  $("cpuToggle").textContent=(open?"▾":"▸")+" CPU";
+};
+function renderCores(s){
+  const box=$("sysCores");
+  const vals=(s||"").split(",").filter(x=>x!=="").map(Number);
+  if(box.childElementCount!==vals.length)            // (re)build rows on count change
+    box.innerHTML=vals.map((_,i)=>
+      `<div class="core"><span class="lbl">c${i}</span>`+
+      `<span class="bar"><i id="core${i}"></i></span><b id="corev${i}">–</b></div>`).join("");
+  vals.forEach((v,i)=>{
+    const f=$("core"+i);
+    if(f){f.style.width=Math.max(0,Math.min(100,v))+"%";
+      f.style.background=v>=85?"var(--red)":v>=60?"var(--amber)":"var(--green)";}
+    const b=$("corev"+i); if(b) b.textContent=v.toFixed(0)+"%";
+  });
+}
 function onDiag(msg){
   const st=(msg.status||[]).find(s=>s.name==="system"); if(!st) return;
   const kv={}; for(const p of st.values) kv[p.key]=p.value;
   $("sysCpu").textContent=(kv.cpu_percent??"–")+"%";
+  renderCores(kv.cpu_cores);
   $("sysLoad").textContent=kv.load1??"–";
   $("sysMem").textContent=`${kv.mem_used_mb??"?"}/${kv.mem_total_mb??"?"}MB (${kv.mem_percent??"?"}%)`;
   $("sysTemp").textContent=(kv.cpu_temp_c??"–")+"°C";

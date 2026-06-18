@@ -1,0 +1,22 @@
+# Nano robot — port-independent, hotswap-friendly USB peripherals.
+#
+# Devices are matched by USB vendor:product, NOT by /dev/ttyUSBn or /dev/videoN
+# (those renumber depending on which port you plug into and the order of plugging).
+# These rules give each peripheral a stable name and re-create it automatically on
+# every hot-plug, so it works the same no matter which USB port it lands in.
+
+# --- BWT901CL 9-axis IMU (WitMotion) via a CH340 USB-serial bridge -> /dev/imu ---
+SUBSYSTEM=="tty", ACTION=="add|change", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+  SYMLINK+="imu", GROUP="dialout", MODE="0660"
+
+# --- Logitech C270 webcam: capture interface (index 0) -> /dev/camera ------------
+# (web_control auto-detects the UVC node too, but a stable name is handy.)
+SUBSYSTEM=="video4linux", ACTION=="add|change", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0825", \
+  ATTR{index}=="0", SYMLINK+="camera", GROUP="video", MODE="0660"
+
+# --- Keep these peripherals always powered (disable USB autosuspend) so that ------
+#     unplug/replug and continuous streaming stay reliable. Matches the usb_device.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="7523", \
+  TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="046d", ATTR{idProduct}=="0825", \
+  TEST=="power/control", ATTR{power/control}="on"

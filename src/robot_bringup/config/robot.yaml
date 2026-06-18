@@ -78,11 +78,14 @@ oled_display:
 # ---- BWT901CL 9-axis IMU (WitMotion, USB-serial via CH340) ------------------
 imu_driver:
   ros__parameters:
-    port: "/dev/ttyUSB0"      # CH340 USB-serial adapter
+    port: "/dev/imu"          # stable udev symlink (CH340 by VID:PID, any USB port)
     baud: 115200              # BWT901CL is fixed at 115200
     frame_id: "imu_link"
-    publish_rate: 50.0        # Hz; cap on /imu/data publishing
-    output_rate_hz: 50        # tell the sensor to stream at this rate (was 200) -> less parse CPU
+    publish_rate: 50.0        # Hz; /imu/data rate. The device stream rate auto-
+                              # follows this (so lowering it cuts parse CPU too).
+    euler_rate: 25.0          # Hz; /imu/euler only feeds the web angle display
+    mag_rate: 10.0            # Hz; /imu/mag is slow-moving + unused by the UI
+    output_rate_hz: 0         # 0 = device streams at publish_rate; >0 pins it
 
 # ---- Board health monitor -> diagnostic_msgs/DiagnosticArray on /diagnostics -
 sys_monitor:
