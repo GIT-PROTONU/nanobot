@@ -26,6 +26,9 @@ ros-humble-rmw-zenoh-cpp = "*"
 ros-humble-rosbridge-suite = "*"
 # common_interfaces (sensor_msgs/nav_msgs/geometry_msgs) + tf2 ship with ros-base.
 ros-humble-tf-transformations = "*"
+# Bridges the ESP32 micro-ROS coprocessor (serial) into the graph. Runs under
+# rmw_zenoh like everything else; started by stack.sh after the router.
+ros-humble-micro-ros-agent = "*"
 
 # --- colcon / C++ build tooling (for robot_msgs) ---
 colcon-common-extensions = "*"
@@ -48,7 +51,7 @@ smbus2 = "*"            # I2C for the PCA9685 driver
 
 [pypi-dependencies]
 luma-oled = "*"         # SSD1306 OLED over I2C
-gpiod = ">=2.0"         # libgpiod v2 python bindings for encoder edge events
+# (gpiod removed: wheel encoders now decode on the ESP32 coprocessor, not GPIO.)
 
 [tasks]
 # Build the colcon workspace (msgs + all python packages). See scripts/build.sh

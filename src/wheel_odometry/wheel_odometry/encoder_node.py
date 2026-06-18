@@ -1,43 +1,34 @@
-"""Quadrature wheel-encoder odometry.
+"""Wheel-encoder odometry from the ESP32 coprocessor.
 
-Reads four GPIO lines (A/B per wheel) as edge events via libgpiod v2, decodes
-quadrature into signed tick counts on a background thread, then integrates a
-differential-drive model and publishes:
+The ESP32 (micro-ROS) decodes quadrature in hardware (PCNT) and publishes raw
+cumulative counts on:
+
+    /wheel_ticks     std_msgs/Int64MultiArray   data = [left, right]
+
+This node samples those counts on its own timer and integrates a differential-
+drive model — exactly as it did when it read GPIO directly, so its outputs are
+unchanged:
 
     /odom            nav_msgs/Odometry
     /joint_states    sensor_msgs/JointState   (left_wheel_joint, right_wheel_joint)
     /wheel_encoders  robot_msgs/WheelEncoders  (raw counts, for debugging)
     TF: odom -> base_link
 
-The GPIO numbers in robot.yaml are GLOBAL libgpiod offsets (bank*32 + pin) — see
-nanopi-neo-plus2-pinmap.md. Make sure none collide with lines the pinmap lists
-as already claimed.
+Direction sign fixes normally live on the ESP32 (config.h INVERT_*_ENC); the
+invert params here are an SBC-side fallback.
 """
 import math
-import threading
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Quaternion, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Int64MultiArray
 from tf2_ros import TransformBroadcaster
 
 from robot_msgs.msg import WheelEncoders
-
-try:
-    import gpiod
-    from gpiod.line import Edge
-    from gpiod import EdgeEvent
-    _RISING = EdgeEvent.Type.RISING_EDGE
-    HAVE_GPIOD = True
-except Exception as exc:  # pragma: no cover - hardware lib
-    HAVE_GPIOD = False
-    _GPIOD_ERR = exc
-
-# Quadrature state machine: index = (prev_state << 2) | new_state, where
-# state = (A << 1) | B. +1 = forward, -1 = reverse, 0 = invalid/no-move.
-_QUAD_LUT = (0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0)
 
 
 def _yaw_to_quat(yaw: float) -> Quaternion:
@@ -51,10 +42,8 @@ class EncoderNode(Node):
     def __init__(self):
         super().__init__("wheel_odometry")
 
-        p = self.declare_parameters("", [
-            ("gpio_chip", "/dev/gpiochip0"),
-            ("left_pin_a", 7), ("left_pin_b", 8),
-            ("right_pin_a", 198), ("right_pin_b", 199),
+        self.declare_parameters("", [
+            ("ticks_topic", "wheel_ticks"),
             ("ticks_per_rev", 1440),
             ("wheel_radius", 0.0335),
             ("wheel_separation", 0.16),
@@ -65,9 +54,6 @@ class EncoderNode(Node):
             ("base_frame", "base_link"),
         ])
         g = self.get_parameter
-        self.chip_path = g("gpio_chip").value
-        self.la, self.lb = g("left_pin_a").value, g("left_pin_b").value
-        self.ra, self.rb = g("right_pin_a").value, g("right_pin_b").value
         self.ticks_per_rev = g("ticks_per_rev").value
         self.wheel_radius = g("wheel_radius").value
         self.wheel_sep = g("wheel_separation").value
@@ -76,17 +62,16 @@ class EncoderNode(Node):
         self.publish_tf = g("publish_tf").value
         self.odom_frame = g("odom_frame").value
         self.base_frame = g("base_frame").value
+        ticks_topic = g("ticks_topic").value
         rate = g("publish_rate").value
 
         # metres travelled per encoder tick
         self.m_per_tick = (2.0 * math.pi * self.wheel_radius) / self.ticks_per_rev
 
-        # Shared tick counters (updated by the reader thread).
-        self._lock = threading.Lock()
+        # Latest counts received from the coprocessor (None until first message).
         self.left_ticks = 0
         self.right_ticks = 0
-        self._state_l = 0
-        self._state_r = 0
+        self._have_ticks = False
 
         # Integrated pose + last sampled counts (timer thread only).
         self.x = self.y = self.th = 0.0
@@ -99,62 +84,37 @@ class EncoderNode(Node):
         self.enc_pub = self.create_publisher(WheelEncoders, "wheel_encoders", 20)
         self.tf_bc = TransformBroadcaster(self)
 
-        if not HAVE_GPIOD:
-            self.get_logger().error(
-                f"python 'gpiod' (libgpiod v2) not available: {_GPIOD_ERR}. "
-                "Encoder counts will stay at zero. `pixi add --pypi gpiod`.")
-        else:
-            self._stop = threading.Event()
-            self._reader = threading.Thread(target=self._read_loop, daemon=True)
-            self._reader.start()
+        # Best-effort to match the ESP32's high-rate sensor publisher.
+        ticks_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST, depth=10)
+        self.create_subscription(
+            Int64MultiArray, ticks_topic, self._on_ticks, ticks_qos)
 
         self.create_timer(1.0 / rate, self._publish)
         self.get_logger().info(
-            f"wheel_odometry up: chip={self.chip_path} L=({self.la},{self.lb}) "
-            f"R=({self.ra},{self.rb}) {self.ticks_per_rev} ticks/rev")
+            f"wheel_odometry up: integrating {ticks_topic} "
+            f"({self.ticks_per_rev} ticks/rev) at {rate:.0f} Hz")
 
-    # --- GPIO reader thread --------------------------------------------------
-    def _read_loop(self):
-        offsets = [self.la, self.lb, self.ra, self.rb]
-        settings = gpiod.LineSettings(edge_detection=Edge.BOTH)
-        try:
-            request = gpiod.request_lines(
-                self.chip_path, consumer="wheel_odometry",
-                config={tuple(offsets): settings})
-        except Exception as exc:  # pragma: no cover
-            self.get_logger().error(f"failed to request GPIO lines: {exc}")
+    def _on_ticks(self, msg: Int64MultiArray):
+        if len(msg.data) < 2:
             return
-
-        with request:
-            vals = {o: request.get_value(o) for o in offsets}
-            self._state_l = (_v(vals[self.la]) << 1) | _v(vals[self.lb])
-            self._state_r = (_v(vals[self.ra]) << 1) | _v(vals[self.rb])
-            while not self._stop.is_set():
-                if not request.wait_edge_events(0.2):
-                    continue
-                for ev in request.read_edge_events():
-                    vals[ev.line_offset] = 1 if ev.event_type == _RISING else 0
-                    if ev.line_offset in (self.la, self.lb):
-                        new = (_v(vals[self.la]) << 1) | _v(vals[self.lb])
-                        delta = _QUAD_LUT[(self._state_l << 2) | new]
-                        self._state_l = new
-                        with self._lock:
-                            self.left_ticks += delta * self.inv_l
-                    else:
-                        new = (_v(vals[self.ra]) << 1) | _v(vals[self.rb])
-                        delta = _QUAD_LUT[(self._state_r << 2) | new]
-                        self._state_r = new
-                        with self._lock:
-                            self.right_ticks += delta * self.inv_r
+        self.left_ticks = int(msg.data[0]) * self.inv_l
+        self.right_ticks = int(msg.data[1]) * self.inv_r
+        if not self._have_ticks:
+            # Seed the deltas so the first integration step doesn't lurch.
+            self._prev_l, self._prev_r = self.left_ticks, self.right_ticks
+            self._have_ticks = True
 
     # --- odometry integration / publishing -----------------------------------
     def _publish(self):
+        if not self._have_ticks:
+            return
         now = self.get_clock().now()
         dt = (now - self._prev_time).nanoseconds * 1e-9
         if dt <= 0.0:
             return
-        with self._lock:
-            l, r = self.left_ticks, self.right_ticks
+        l, r = self.left_ticks, self.right_ticks
         dl = (l - self._prev_l) * self.m_per_tick
         dr = (r - self._prev_r) * self.m_per_tick
         self._prev_l, self._prev_r, self._prev_time = l, r, now
@@ -204,17 +164,6 @@ class EncoderNode(Node):
         enc.left_velocity = (dl / self.wheel_radius) / dt
         enc.right_velocity = (dr / self.wheel_radius) / dt
         self.enc_pub.publish(enc)
-
-    def destroy_node(self):
-        if HAVE_GPIOD and hasattr(self, "_stop"):
-            self._stop.set()
-            self._reader.join(timeout=1.0)
-        super().destroy_node()
-
-
-def _v(value) -> int:
-    """Normalise a gpiod Value (enum or int) to 0/1."""
-    return 1 if int(getattr(value, "value", value)) else 0
 
 
 def main():

@@ -46,13 +46,20 @@ def generate_launch_description():
             output="screen",
         ),
 
-        # --- Wheel encoders -> odometry --------------------------------------
+        # --- ESP32 coprocessor bridge (cmd_vel -> motors, encoders out) ------
+        # micro_ros_agent bridges the ESP32 over serial: it subscribes /cmd_vel
+        # (-> H-bridge PWM on the MCU) and publishes /wheel_ticks. Replaces the
+        # old motor_control (PCA9685) + GPIO encoder reading.
+        ExecuteProcess(
+            cmd=["micro_ros_agent", "serial", "--dev",
+                 os.environ.get("AGENT_DEV", "/dev/esp32"), "-b", "115200"],
+            name="micro_ros_agent",
+            output="screen",
+        ),
+
+        # --- /wheel_ticks -> odometry ----------------------------------------
         Node(package="wheel_odometry", executable="encoder_node",
              name="wheel_odometry", parameters=[params], output="screen"),
-
-        # --- cmd_vel -> PCA9685 motors ---------------------------------------
-        Node(package="motor_control", executable="motor_node",
-             name="motor_control", parameters=[params], output="screen"),
 
         # --- Status OLED ------------------------------------------------------
         Node(package="oled_display", executable="display_node",

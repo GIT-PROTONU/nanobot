@@ -10,8 +10,9 @@ running **Armbian**, with **ROS 2 Humble** installed as conda packages via
 static HTML page** (`web_control`), not Foxglove.
 
 Hardware: Roborock **LDS02RR** lidar (UART1 `/dev/ttyS1`), quadrature **wheel
-encoders** (GPIO), **PCA9685** PWM (I2C), **SSD1306** OLED (I2C), **BWT901CL** IMU
-(WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
+encoders** + **motors** (now via an **ESP32-WROOM coprocessor**, see below),
+**PCA9685** PWM (I2C, now unused by the stack), **SSD1306** OLED (I2C), **BWT901CL**
+IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 
 ## Layout (`src/`)
 - `robot_msgs` — custom interfaces (ament_cmake).
@@ -20,15 +21,31 @@ encoders** (GPIO), **PCA9685** PWM (I2C), **SSD1306** OLED (I2C), **BWT901CL** I
 - `lds_driver_py` — **the LDS driver in use** (rclpy, publishes `/scan`).
 - `lds_driver` — **abandoned** Rust/r2r LDS node; does NOT build against this
   RoboStack. Kept for reference only. **Do not try to build it** (see below).
-- `wheel_odometry`, `motor_control`, `oled_display`, `imu_driver`, `sys_monitor`,
-  `web_control` — rclpy nodes.
+- `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32) into `/odom`+TF;
+  no longer reads GPIO.
+- `motor_control` — **retired** (PCA9685 path). The ESP32 owns `/cmd_vel`→motors;
+  not launched by `stack.sh`/`robot.launch.py`. Kept for the optional PCA9685
+  LDS-spin/aux channels only.
+- `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
+
+## ESP32 motor/encoder coprocessor (`firmware/esp32_coprocessor/`)
+- micro-ROS (PlatformIO + Arduino) over USB serial. Subscribes `/cmd_vel`
+  (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM) and publishes
+  `/wheel_ticks` (std_msgs/Int64MultiArray `[L,R]`, best-effort) from hardware PCNT
+  quadrature. Standard messages only so a stock `micro_ros_agent` bridges it.
+- Bridged by **`micro_ros_agent`** (conda pkg), started by `stack.sh` after the
+  router under `rmw_zenoh_cpp`. Serial dev = `$AGENT_DEV` (default `/dev/esp32`).
+- Build/flash from the dev PC: `cd firmware/esp32_coprocessor && pio run -t upload`.
+  Tunables (pins, diff-drive limits — keep in sync with `robot.yaml`) in
+  `include/config.h`. **Don't build the firmware on the board.**
 
 ## Build / run
 - Build: `pixi run build` (colcon, msgs + all python pkgs). There is **no
   `build-lds`/`build-all`** — the Rust node and its toolchain are intentionally gone.
 - Run the stack: **`scripts/stack.sh {up|down|restart|status}`** (run via
-  `pixi run bash scripts/stack.sh ...`). It starts router → rosbridge → web → oled
-  → imu → sys → lds in order, idempotent (pgrep-guarded), logs to `.run/*.log`.
+  `pixi run bash scripts/stack.sh ...`). It starts router → agent → rosbridge → web
+  → oled → imu → sys → odom → lds in order, idempotent (pgrep-guarded), logs to
+  `.run/*.log`. (The agent is skipped if `$AGENT_DEV` isn't plugged in.)
   Nodes are launched by their installed executables directly (not `ros2 run`) to
   keep RAM down.
 - On the board the stack **auto-starts on boot** via systemd `nano-stack.service`.

@@ -25,19 +25,16 @@ lds_driver:
     publish_rate: 10.0        # Hz cap on /scan (motor ~5 Hz; lower = decimate)
 
 # ---- Wheel encoders -> odometry (nav_msgs/Odometry on /odom + TF) -----------
+# Quadrature is now decoded on the ESP32 coprocessor (hardware PCNT) and streamed
+# as std_msgs/Int64MultiArray on /wheel_ticks; this node only integrates. Wire/
+# direction fixes live in firmware/esp32_coprocessor/include/config.h.
 wheel_odometry:
   ros__parameters:
-    gpio_chip: "/dev/gpiochip0"
-    # Quadrature A/B lines per wheel — GLOBAL gpio numbers (bank*32+pin).
-    # TODO: set these to the actual header pins you wire to (see pinmap).
-    left_pin_a: 7             # e.g. PA7
-    left_pin_b: 8             # e.g. PA8
-    right_pin_a: 198          # e.g. PG6  (avoid pins claimed in the pinmap!)
-    right_pin_b: 199          # e.g. PG7
+    ticks_topic: "wheel_ticks"  # from the ESP32 micro-ROS coprocessor
     ticks_per_rev: 1440       # encoder counts per wheel revolution (x4 quadrature)
     wheel_radius: 0.0335      # metres
     wheel_separation: 0.16    # metres between wheel contact points
-    invert_left: false
+    invert_left: false        # SBC-side fallback (normally inverted on the ESP32)
     invert_right: false
     publish_rate: 30.0        # Hz, odom/TF publish rate
     publish_tf: true
@@ -45,6 +42,9 @@ wheel_odometry:
     base_frame: "base_link"
 
 # ---- cmd_vel -> PCA9685 PWM motor driver ------------------------------------
+# RETIRED: the ESP32 coprocessor now owns /cmd_vel -> H-bridge PWM directly (see
+# firmware/esp32_coprocessor). This node is no longer launched by stack.sh; kept
+# here only for the optional PCA9685 LDS-spin/aux channels if you re-enable it.
 motor_control:
   ros__parameters:
     i2c_bus: 1                # /dev/i2c-1

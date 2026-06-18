@@ -14,7 +14,7 @@ setup(
     zip_safe=True,
     maintainer="ib",
     maintainer_email="ib.elfaramawy@gmail.com",
-    description="Quadrature wheel encoder odometry over libgpiod.",
+    description="Wheel encoder odometry from the ESP32 coprocessor (/wheel_ticks).",
     license="MIT",
     entry_points={
         "console_scripts": [

@@ -3,7 +3,7 @@
 <package format="3">
   <name>wheel_odometry</name>
   <version>0.1.0</version>
-  <description>Reads quadrature wheel encoders over libgpiod and publishes odometry + TF.</description>
+  <description>Integrates wheel encoder counts from the ESP32 coprocessor (/wheel_ticks) into odometry + TF.</description>
   <maintainer email="ib.elfaramawy@gmail.com">ib</maintainer>
   <license>MIT</license>
 
@@ -11,6 +11,7 @@
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>robot_msgs</exec_depend>
 

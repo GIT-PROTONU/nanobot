@@ -9,6 +9,14 @@
 SUBSYSTEM=="tty", ACTION=="add|change", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
   SYMLINK+="imu", GROUP="dialout", MODE="0660"
 
+# --- ESP32-WROOM motor/encoder coprocessor -> /dev/esp32 -------------------------
+# Most ESP32 DevKit boards use a CP2102 (Silicon Labs 10c4:ea60). If YOUR board
+# instead uses a CH340 (1a86:7523) it collides with the IMU above — disambiguate
+# by serial (ATTRS{serial}=="...", from `udevadm info -a /dev/ttyUSBn`) or by the
+# physical USB port (KERNELS=="...") rather than VID:PID.
+SUBSYSTEM=="tty", ACTION=="add|change", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  SYMLINK+="esp32", GROUP="dialout", MODE="0660"
+
 # --- Logitech C270 webcam: capture interface (index 0) -> /dev/camera ------------
 # (web_control auto-detects the UVC node too, but a stable name is handy.)
 SUBSYSTEM=="video4linux", ACTION=="add|change", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0825", \
@@ -19,4 +27,6 @@ SUBSYSTEM=="video4linux", ACTION=="add|change", ATTRS{idVendor}=="046d", ATTRS{i
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="7523", \
   TEST=="power/control", ATTR{power/control}="on"
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="046d", ATTR{idProduct}=="0825", \
+  TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="10c4", ATTR{idProduct}=="ea60", \
   TEST=="power/control", ATTR{power/control}="on"

@@ -15,6 +15,10 @@ set -u
 NANO="${NANO:-$HOME/Nano}"
 LOG="$NANO/.run"; mkdir -p "$LOG"
 PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/robot.yaml"
+# ESP32 motor/encoder coprocessor serial device (udev symlink preferred). The
+# micro_ros_agent bridges it into the (zenoh) graph: /cmd_vel in, /wheel_ticks out.
+AGENT_DEV="${AGENT_DEV:-/dev/esp32}"
+AGENT_BAUD="${AGENT_BAUD:-115200}"
 
 # The ROS overlay's setup scripts reference unset vars (e.g. COLCON_TRACE);
 # relax nounset just around the source so `set -u` can stay on for our logic.
@@ -39,6 +43,13 @@ do_up() {
   local own="$NANO/install"         # our colcon packages
   pgrep -f 'rmw_zenohd' >/dev/null \
     || { launch zenohd "$ros/rmw_zenoh_cpp/rmw_zenohd"; sleep 6; }
+  # micro-ROS agent for the ESP32 coprocessor. Inherits RMW_IMPLEMENTATION from
+  # the pixi env (rmw_zenoh_cpp) so it joins the same graph as everything else;
+  # must come up after the router. Skips quietly if the ESP32 isn't plugged in.
+  pgrep -f 'micro_ros_agent' >/dev/null \
+    || { [ -e "$AGENT_DEV" ] \
+           && launch agent "$ros/micro_ros_agent/micro_ros_agent serial --dev $AGENT_DEV -b $AGENT_BAUD" \
+           || echo "  agent: skipped ($AGENT_DEV not present)"; }
   pgrep -f 'rosbridge_websocket' >/dev/null \
     || launch rosbridge "$ros/rosbridge_server/rosbridge_websocket --ros-args -p port:=9090"
   pgrep -f 'web_control/lib/web_control' >/dev/null \
@@ -49,6 +60,9 @@ do_up() {
     || launch imu "$own/imu_driver/lib/imu_driver/imu_node --ros-args --params-file $PARAMS"
   pgrep -f 'sys_monitor/lib/sys_monitor' >/dev/null \
     || launch sys "$own/sys_monitor/lib/sys_monitor/monitor_node --ros-args --params-file $PARAMS"
+  # Wheel odometry: integrates /wheel_ticks from the ESP32 coprocessor into /odom.
+  pgrep -f 'wheel_odometry/lib/wheel_odometry' >/dev/null \
+    || launch odom "$own/wheel_odometry/lib/wheel_odometry/encoder_node --ros-args --params-file $PARAMS"
   # LDS: Python driver (the Rust lds_driver doesn't build against this RoboStack).
   pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
     || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
@@ -59,20 +73,23 @@ do_down() {
   # rosapi_node + ros2cli.daemon sweep up anything left by older launches or by
   # `ros2 ...` CLI probes (each spawns a ~60 MB daemon).
   for p in 'lds_driver_py/lib/lds_driver_py' \
+           'wheel_odometry/lib/wheel_odometry' \
            'sys_monitor/lib/sys_monitor' \
            'imu_driver/lib/imu_driver' \
            'oled_display/lib/oled_display' \
            'web_control/lib/web_control' \
            'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon' \
+           'micro_ros_agent' \
            'rmw_zenohd'; do
     pkill -f "$p" 2>/dev/null
   done
 }
 
 status() {
-  for s in "zenohd:rmw_zenohd" "rosbridge:rosbridge_websocket" \
+  for s in "zenohd:rmw_zenohd" "agent:micro_ros_agent" "rosbridge:rosbridge_websocket" \
            "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
            "imu:imu_driver/lib/imu_driver" "sys:sys_monitor/lib/sys_monitor" \
+           "odom:wheel_odometry/lib/wheel_odometry" \
            "lds:lds_driver_py/lib/lds_driver_py"; do
     if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi
   done
