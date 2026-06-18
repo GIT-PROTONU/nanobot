@@ -49,9 +49,6 @@
   .core .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden}
   .core .bar i{display:block;height:100%;width:0;background:var(--green);transition:width .25s}
   .core b{text-align:right;font-variant-numeric:tabular-nums}
-  .meter{height:9px;background:#21262d;border:1px solid var(--line);border-radius:4px;
-    overflow:hidden;margin:5px 0}
-  .meter i{display:block;height:100%;width:0;background:var(--green)}
   .chk{display:flex;gap:6px;align-items:center;cursor:pointer;margin-top:2px}
   .chk input{width:auto;cursor:pointer}
   #cam{display:none;width:100%;border:1px solid var(--line);border-radius:6px;
@@ -83,8 +80,10 @@
         (<b>/stream.mjpg</b>). Streams only while shown.</p>
       <h2>Mic</h2>
       <label class="chk"><input type="checkbox" id="micOn"> listen
-        <span id="micState" class="hint"></span> <b id="micPct"></b></label>
-      <div class="meter"><i id="micBar"></i></div>
+        <span id="micState" class="hint"></span></label>
+      <div class="core" style="margin-top:4px">
+        <span class="lbl">in</span><span class="bar"><i id="micBar"></i></span><b id="micPct">–</b>
+      </div>
       <p class="hint">Webcam microphone, raw PCM (<b>/audio.pcm</b>). Captures only
         while listening; bar shows the input level.</p>
       <h2>Teleop</h2>
