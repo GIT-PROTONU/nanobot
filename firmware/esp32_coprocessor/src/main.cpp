@@ -7,9 +7,10 @@
 //   pub  right_wheel_suspended std_msgs/Bool     right wheel off the ground (switch)
 //   pub  esp32_temp    std_msgs/Float32         ESP32 internal die temperature (deg C)
 //   pub  esp32_hall    std_msgs/Int32           ESP32 internal hall sensor (raw)
-//   pub  lds_rpm       std_msgs/Float32         spin-lidar speed (RPM; 0 if no data)
-//   pub  lds_hz        std_msgs/Float32         LDS valid-frame rate (Hz; 0 = no data)
-//   sub  lds_motor     std_msgs/Float32         LDS spin-motor PWM duty [0..1]
+//   pub  lds_rpm        std_msgs/Float32        spin-lidar speed (RPM; 0 if no data)
+//   pub  lds_hz         std_msgs/Float32        LDS valid-frame rate (Hz; 0 = no data)
+//   pub  lds_duty       std_msgs/Float32        LDS spin-motor PID output duty [0..1]
+//   sub  lds_target_rpm std_msgs/Float32        LDS spin-speed setpoint (RPM; PID)
 //
 // Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
 // here so the SBC is offloaded. The SBC's wheel_odometry samples wheel_ticks on
@@ -50,7 +51,7 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 rcl_subscription_t cmd_sub;
 rcl_subscription_t led_sub;
 #if LDS_MOTOR_PIN >= 0
-rcl_subscription_t lds_motor_sub;
+rcl_subscription_t lds_target_sub;
 #endif
 rcl_publisher_t    enc_pub;
 rcl_publisher_t    left_susp_pub;
@@ -61,6 +62,9 @@ rcl_publisher_t    temp_pub;
 rcl_publisher_t    hall_pub;
 rcl_publisher_t    lds_rpm_pub;
 rcl_publisher_t    lds_hz_pub;
+#if LDS_MOTOR_PIN >= 0
+rcl_publisher_t    lds_duty_pub;
+#endif
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -81,7 +85,8 @@ std_msgs__msg__Int32                hall_msg;
 std_msgs__msg__Float32              lds_rpm_msg;
 std_msgs__msg__Float32              lds_hz_msg;
 #if LDS_MOTOR_PIN >= 0
-std_msgs__msg__Float32              lds_motor_msg;
+std_msgs__msg__Float32              lds_target_msg;
+std_msgs__msg__Float32              lds_duty_msg;
 #endif
 
 // ---- shared control state ----------------------------------------------------
@@ -101,6 +106,8 @@ static void IRAM_ATTR rightEncISR() { g_right_ticks++; }
 static volatile float    g_lds_rpm    = 0.0f;   // latest valid spin-lidar speed (RPM)
 static volatile uint32_t g_lds_frames = 0;      // cumulative valid frames (for rate)
 static volatile uint32_t g_lds_last_ms = 0;     // millis() of last valid frame (staleness)
+static volatile float    g_lds_target_rpm = LDS_TARGET_RPM;  // PID setpoint
+static volatile float    g_lds_duty   = 0.0f;   // PID output duty [0..1] (published)
 
 // Minimal LDS02RR frame parser — extracts RPM only (scan data ignored). 22-byte
 // packets: 0xFA, index, speed_lo, speed_hi, 16 data, chk_lo, chk_hi. RPM = speed/64.
@@ -183,11 +190,42 @@ static void led_cb(const void *msgin) {
 }
 #endif
 
-// /lds_motor -> LDS spin-motor PWM duty [0..1] (open-loop; clamped).
+// /lds_target_rpm -> spin-speed setpoint (RPM) for the PID.
 #if LDS_MOTOR_PIN >= 0
-static void lds_motor_cb(const void *msgin) {
+static void lds_target_cb(const void *msgin) {
   const std_msgs__msg__Float32 *m = (const std_msgs__msg__Float32 *)msgin;
-  ledcWrite(CH_LDS, (uint32_t)(clampf(m->data, 0.0f, 1.0f) * PWM_MAX));
+  g_lds_target_rpm = m->data > 0.0f ? m->data : 0.0f;
+}
+
+// Spin-speed PID: drive the LDS motor PWM to hold g_lds_target_rpm, feedback = the
+// RPM parsed from the serial stream. Feedforward (Kff*target) sets the baseline so
+// the PID only trims; conditional integration gives anti-windup. While feedback is
+// stale (no frames), run open-loop on feedforward so the motor still spins up to
+// start producing data. Runs at LDS_PID_HZ from loop() (independent of the agent).
+static void ldsControl(float dt) {
+  static float integ = 0.0f, prev_err = 0.0f;
+  float target = g_lds_target_rpm;
+  if (target <= 0.0f) {                 // commanded off
+    integ = 0.0f; prev_err = 0.0f;
+    g_lds_duty = 0.0f;
+    ledcWrite(CH_LDS, 0);
+    return;
+  }
+  float ff = LDS_PID_KFF * target;
+  float duty;
+  if (millis() - g_lds_last_ms > LDS_TIMEOUT_MS) {   // no feedback -> open-loop spin-up
+    integ = 0.0f; prev_err = 0.0f;
+    duty = clampf(ff, 0.0f, 1.0f);
+  } else {
+    float err = target - g_lds_rpm;
+    float deriv = (dt > 0.0f) ? (err - prev_err) / dt : 0.0f;
+    prev_err = err;
+    float u = ff + LDS_PID_KP * err + LDS_PID_KI * integ + LDS_PID_KD * deriv;
+    duty = clampf(u, 0.0f, 1.0f);
+    if (duty == u) integ += err * dt;   // integrate only when unsaturated (anti-windup)
+  }
+  g_lds_duty = duty;
+  ledcWrite(CH_LDS, (uint32_t)(duty * PWM_MAX));
 }
 #endif
 
@@ -260,6 +298,10 @@ static void enc_cb(rcl_timer_t *timer, int64_t) {
     RCSOFTCHECK(rcl_publish(&lds_rpm_pub, &lds_rpm_msg, NULL));
     lds_hz_msg.data = hz;
     RCSOFTCHECK(rcl_publish(&lds_hz_pub, &lds_hz_msg, NULL));
+#if LDS_MOTOR_PIN >= 0
+    lds_duty_msg.data = g_lds_duty;
+    RCSOFTCHECK(rcl_publish(&lds_duty_pub, &lds_duty_msg, NULL));
+#endif
   }
 }
 
@@ -280,8 +322,8 @@ static bool createEntities() {
 #endif
 #if LDS_MOTOR_PIN >= 0
   RCCHECK(rclc_subscription_init_default(
-      &lds_motor_sub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_motor"));
+      &lds_target_sub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_target_rpm"));
 #endif
 
   // Best-effort: high-rate sensor stream, no point ACKing each sample over serial.
@@ -312,6 +354,11 @@ static bool createEntities() {
   RCCHECK(rclc_publisher_init_default(
       &lds_hz_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_hz"));
+#if LDS_MOTOR_PIN >= 0
+  RCCHECK(rclc_publisher_init_default(
+      &lds_duty_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_duty"));
+#endif
 
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
@@ -336,7 +383,7 @@ static bool createEntities() {
 #endif
 #if LDS_MOTOR_PIN >= 0
   RCCHECK(rclc_executor_add_subscription(
-      &executor, &lds_motor_sub, &lds_motor_msg, &lds_motor_cb, ON_NEW_DATA));
+      &executor, &lds_target_sub, &lds_target_msg, &lds_target_cb, ON_NEW_DATA));
 #endif
   RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
   RCCHECK(rclc_executor_add_timer(&executor, &enc_timer));
@@ -352,7 +399,7 @@ static void destroyEntities() {
   rcl_subscription_fini(&led_sub, &node);
 #endif
 #if LDS_MOTOR_PIN >= 0
-  rcl_subscription_fini(&lds_motor_sub, &node);
+  rcl_subscription_fini(&lds_target_sub, &node);
 #endif
   rcl_publisher_fini(&enc_pub, &node);
   rcl_publisher_fini(&left_susp_pub, &node);
@@ -363,6 +410,9 @@ static void destroyEntities() {
   rcl_publisher_fini(&hall_pub, &node);
   rcl_publisher_fini(&lds_rpm_pub, &node);
   rcl_publisher_fini(&lds_hz_pub, &node);
+#if LDS_MOTOR_PIN >= 0
+  rcl_publisher_fini(&lds_duty_pub, &node);
+#endif
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);
@@ -420,8 +470,7 @@ void setup() {
   Serial2.begin(LDS_BAUD, SERIAL_8N1, LDS_RX_PIN, -1);
 #if LDS_MOTOR_PIN >= 0
   ledcSetup(CH_LDS, PWM_FREQ_HZ, PWM_RES_BITS);
-  ledcAttachPin(LDS_MOTOR_PIN, CH_LDS);
-  ledcWrite(CH_LDS, (uint32_t)(LDS_MOTOR_DUTY * PWM_MAX));   // start spinning
+  ledcAttachPin(LDS_MOTOR_PIN, CH_LDS);   // duty driven by the spin-speed PID in loop()
 #endif
 
   // Int64MultiArray payload points at our static buffer (no dynamic alloc).
@@ -440,6 +489,17 @@ void loop() {
   // Always drain the LDS UART so its buffer never overflows (independent of the
   // agent link); ldsFeed() updates g_lds_rpm from valid frames.
   while (Serial2.available()) ldsFeed((uint8_t)Serial2.read());
+
+  // Spin-speed PID at LDS_PID_HZ, run here (not in an rcl timer) so the lidar keeps
+  // spinning at its setpoint even when the agent link is down.
+#if LDS_MOTOR_PIN >= 0
+  static uint32_t last_pid_ms = 0;
+  uint32_t pid_now = millis();
+  if (pid_now - last_pid_ms >= (uint32_t)(1000 / LDS_PID_HZ)) {
+    ldsControl((pid_now - last_pid_ms) / 1000.0f);
+    last_pid_ms = pid_now;
+  }
+#endif
 
   switch (state) {
     case WAITING_AGENT:

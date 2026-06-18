@@ -38,7 +38,9 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (Float32) + `/esp32_hall` (Int32) on-die telemetry. Also reads a **spin-lidar**
   (LDS02RR) on UART2 → `/lds_rpm` (Float32, RPM only — scan data ignored; 0 when the
   stream goes stale) + `/lds_hz` (Float32, valid-frame rate, 0 = not receiving), and
-  drives its spin motor open-loop via `/lds_motor` (Float32 duty 0..1). WiFi/BT kept off.
+  closed-loop-controls its spin motor: a PID (gains in `config.h`, **tune on hardware**)
+  holds `/lds_target_rpm` (Float32 setpoint) by driving the motor PWM, publishing the
+  output on `/lds_duty`. WiFi/BT kept off.
   Pins/tunables in `include/config.h` (encoders L=19 R=26, switches 18/27, motor
   STBY=17, LEFT_IN_REV=4, LDS UART2 RX=16, LDS motor PWM=21; keep diff-drive limits
   synced to `robot.yaml`).

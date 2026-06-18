@@ -61,8 +61,8 @@ the board), else the `~/uros_ws` overlay (sourced + `ros2 run`).
   magnet near the chip and the value swings.
 - **LDS** — green while frames are arriving, shows speed + frame rate (`/lds_rpm`,
   `/lds_hz`); red **"no data"** when the stream stops (RPM is zeroed, not held). The
-  **LDS spin motor** card's slider sets the motor duty (`/lds_motor`); raise it and the
-  RPM should climb.
+  **LDS spin speed** card's slider sets the **target RPM** (`/lds_target_rpm`); a PID on
+  the ESP32 holds it by driving the motor PWM (commanded duty shown, `/lds_duty`).
 - **web link** — the browser ↔ server poll is alive.
 
 The LED toggle and motor nudge exercise the host → ESP32 (subscribe) direction.

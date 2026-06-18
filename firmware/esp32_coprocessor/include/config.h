@@ -52,10 +52,20 @@
 // ---- Spin lidar (LDS02RR) ----------------------------------------------------
 // Read RPM only: the LDS data TX wire -> ESP32 UART2 RX. We parse just the speed
 // field from the packet stream (scan data ignored). The LDS spin motor is driven
-// open-loop by a PWM (LEDC) pin through its transistor/driver; the duty (and thus
-// speed) is settable live over /lds_motor (Float32 0..1) and starts at LDS_MOTOR_DUTY.
+// by a PWM (LEDC) pin through its transistor/driver.
 #define LDS_RX_PIN         16      // UART2 RX (LDS TX wire)
 #define LDS_BAUD           115200
 #define LDS_MOTOR_PIN      21      // PWM out to the LDS motor driver; -1 to disable
-#define LDS_MOTOR_DUTY     0.6f    // startup spin duty [0..1] (keep webui slider in sync)
-#define LDS_TIMEOUT_MS     300     // no valid frame within this → report rpm 0 / not receiving
+#define LDS_TIMEOUT_MS     300     // no valid frame within this → rpm 0 / not receiving
+
+// Closed-loop spin-speed control: a PID drives the motor PWM to hold a target RPM,
+// feedback = the RPM parsed from the serial stream. Set the target live over
+// /lds_target_rpm; the PID's output duty is published on /lds_duty. Feedforward
+// (Kff*target) supplies the baseline so the PID only trims the residual.
+// **Starting gains — TUNE on real hardware** (the duty→RPM curve is unknown until run).
+#define LDS_TARGET_RPM     300.0f  // default setpoint (LDS02RR nominal ~300 rpm)
+#define LDS_PID_HZ         50      // control-loop rate
+#define LDS_PID_KFF        0.0020f // feedforward duty per target RPM (~0.6 duty @ 300)
+#define LDS_PID_KP         0.0010f // duty per RPM error
+#define LDS_PID_KI         0.0015f // duty per (RPM·s)
+#define LDS_PID_KD         0.0f    // usually 0 — measured RPM is noisy

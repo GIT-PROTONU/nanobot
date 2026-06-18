@@ -22,7 +22,8 @@ single-channel and counted with lightweight GPIO interrupts.
 | pub | `esp32_hall`  | `std_msgs/Int32`            | ESP32 internal hall sensor (raw, ~1 Hz) |
 | pub | `lds_rpm`     | `std_msgs/Float32`          | spin-lidar speed (RPM, ~5 Hz; **0 when no data**, scan data ignored) |
 | pub | `lds_hz`      | `std_msgs/Float32`          | LDS valid-frame rate (Hz, ~5 Hz; `0` = not receiving) |
-| sub | `lds_motor`   | `std_msgs/Float32`          | LDS spin-motor PWM duty `[0..1]` (open-loop) |
+| pub | `lds_duty`    | `std_msgs/Float32`          | LDS spin-motor PID output duty `[0..1]` |
+| sub | `lds_target_rpm` | `std_msgs/Float32`       | LDS spin-speed setpoint (RPM) — PID drives the motor to it |
 
 End-to-end smoke test once the agent is running:
 `ros2 topic pub --once /led std_msgs/msg/Bool '{data: true}'` should light the

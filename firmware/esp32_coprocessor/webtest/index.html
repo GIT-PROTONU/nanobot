@@ -85,13 +85,13 @@
     </div>
 
     <div class="card">
-      <h2>LDS spin motor (/lds_motor)</h2>
+      <h2>LDS spin speed (/lds_target_rpm)</h2>
       <div class="big" id="ldsRpm">— <span class="mut" style="font-size:14px">rpm</span></div>
       <div class="row" style="margin-top:10px">
-        <label>duty <input type="range" id="lds" min="0" max="1" step="0.02" value="0.6"></label>
-        <span class="mut" id="ldsv">0.60</span>
+        <label>target <input type="range" id="lds" min="0" max="400" step="10" value="300"></label>
+        <span class="mut" id="ldsv">300 rpm</span>
       </div>
-      <p class="warn">PWM duty to the LDS spin motor (open-loop); starts at the firmware default.</p>
+      <p class="warn">PID holds this RPM by driving the motor PWM (duty <span id="ldsDuty">—</span>).</p>
     </div>
 
     <div class="card wide">
@@ -132,11 +132,11 @@ function arm() { document.getElementById('motorFs').disabled = !document.getElem
 const spd = document.getElementById('spd');
 spd.oninput = () => document.getElementById('spdv').textContent = (+spd.value).toFixed(2);
 
-// LDS spin-motor duty slider -> /lds_motor
+// LDS target-RPM slider -> /lds_target_rpm (PID setpoint)
 const lds = document.getElementById('lds');
 lds.oninput = () => {
-  document.getElementById('ldsv').textContent = (+lds.value).toFixed(2);
-  post('/lds_motor', {duty: +lds.value});
+  document.getElementById('ldsv').textContent = `${lds.value} rpm`;
+  post('/lds_target', {rpm: +lds.value});
 };
 
 // Hold-to-drive: repeat cmd_vel at 10 Hz so the firmware watchdog stays fed.
@@ -218,6 +218,8 @@ async function poll() {
   document.getElementById('ldsRpm').innerHTML = ldsRx
       ? `${rpm} <span class="mut" style="font-size:14px">rpm · ${hz} Hz</span>`
       : `<span class="mut" style="font-size:18px">no data</span>`;
+  document.getElementById('ldsDuty').textContent =
+      typeof s.lds_duty === 'number' ? `${(s.lds_duty * 100).toFixed(0)}%` : '—';
 
   document.getElementById('meta').textContent =
       s.info || `${s.rmw} · ${s.dev} · ${s.node ? 'ESP32 connected' : 'waiting for ESP32…'}`;

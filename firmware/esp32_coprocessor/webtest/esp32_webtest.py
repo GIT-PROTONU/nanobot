@@ -57,6 +57,7 @@ class State:
         self.hall = None            # ESP32 internal hall sensor (raw)
         self.lds_rpm = None         # spin-lidar speed (RPM; 0 when stale)
         self.lds_hz = None          # LDS valid-frame rate (Hz; 0 = not receiving)
+        self.lds_duty = None        # spin-motor PID output duty [0..1]
         self.rmw = ""
         self.dev = ""
 
@@ -75,6 +76,7 @@ class State:
                 "hall": self.hall,
                 "lds_rpm": self.lds_rpm,
                 "lds_hz": self.lds_hz,
+                "lds_duty": self.lds_duty,
                 "rmw": self.rmw,
                 "dev": self.dev,
             }
@@ -167,10 +169,10 @@ def make_handler():
             elif self.path == "/cmd_vel":
                 pub["cmd_vel"](float(data.get("lin", 0.0)), float(data.get("ang", 0.0)))
                 self._json({"ok": True})
-            elif self.path == "/lds_motor":
-                duty = float(data.get("duty", 0.0))
-                pub["lds_motor"](duty)
-                self._json({"ok": True, "duty": duty})
+            elif self.path == "/lds_target":
+                rpm = float(data.get("rpm", 0.0))
+                pub["lds_target"](rpm)
+                self._json({"ok": True, "rpm": rpm})
             else:
                 self.send_error(404)
 
@@ -222,7 +224,7 @@ def main():
 
     led_pub = node.create_publisher(Bool, "led", 10)
     cmd_pub = node.create_publisher(Twist, "cmd_vel", 10)
-    lds_motor_pub = node.create_publisher(Float32, "lds_motor", 10)
+    lds_target_pub = node.create_publisher(Float32, "lds_target_rpm", 10)
     # wheel_ticks is published best-effort by the firmware — the subscriber must
     # match or it sees nothing.
     best_effort = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -265,10 +267,15 @@ def main():
         with state.lock:
             state.lds_hz = float(msg.data)
 
+    def on_lds_duty(msg):
+        with state.lock:
+            state.lds_duty = float(msg.data)
+
     node.create_subscription(Float32, "esp32_temp", on_temp, 10)
     node.create_subscription(Int32, "esp32_hall", on_hall, 10)
     node.create_subscription(Float32, "lds_rpm", on_lds_rpm, 10)
     node.create_subscription(Float32, "lds_hz", on_lds_hz, 10)
+    node.create_subscription(Float32, "lds_duty", on_lds_duty, 10)
 
     def publish_led(on):
         led_pub.publish(Bool(data=bool(on)))
@@ -281,10 +288,10 @@ def main():
         m.angular.z = float(ang)
         cmd_pub.publish(m)
 
-    def publish_lds_motor(duty):
-        lds_motor_pub.publish(Float32(data=max(0.0, min(1.0, float(duty)))))
+    def publish_lds_target(rpm):
+        lds_target_pub.publish(Float32(data=max(0.0, float(rpm))))
 
-    pub["led"], pub["cmd_vel"], pub["lds_motor"] = publish_led, publish_cmd, publish_lds_motor
+    pub["led"], pub["cmd_vel"], pub["lds_target"] = publish_led, publish_cmd, publish_lds_target
 
     def poll_presence():
         # micro-ROS over the agent doesn't reliably register a discoverable node
