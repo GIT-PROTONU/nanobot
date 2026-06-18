@@ -1,9 +1,14 @@
 // Nano robot ESP32-WROOM motor/encoder coprocessor (micro-ROS, serial transport).
 //
-//   sub  cmd_vel     geometry_msgs/Twist       -> diff-drive mix -> H-bridge PWM
-//   pub  wheel_ticks std_msgs/Int64MultiArray  [left, right] raw cumulative counts
+//   sub  cmd_vel        geometry_msgs/Twist      -> diff-drive mix -> H-bridge PWM
+//   sub  led            std_msgs/Bool            -> onboard LED (pipeline test)
+//   pub  wheel_ticks    std_msgs/Int64MultiArray [left, right] raw cumulative counts
+//   pub  left_wheel_suspended  std_msgs/Bool     left wheel off the ground (switch)
+//   pub  right_wheel_suspended std_msgs/Bool     right wheel off the ground (switch)
+//   pub  esp32_temp    std_msgs/Float32         ESP32 internal die temperature (deg C)
+//   pub  esp32_hall    std_msgs/Int32           ESP32 internal hall sensor (raw)
 //
-// Real-time work (quadrature decode via hardware PCNT, PWM, cmd watchdog) lives
+// Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
 // here so the SBC is offloaded. The SBC's wheel_odometry samples wheel_ticks on
 // its own timer and integrates odom/TF exactly as it did from GPIO before.
 //
@@ -16,6 +21,7 @@
 //    whenever the link is down.
 #include <Arduino.h>
 #include <micro_ros_platformio.h>
+#include <esp_bt.h>
 
 #include <rcl/rcl.h>
 #include <rclc/rclc.h>
@@ -23,8 +29,9 @@
 
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/int64_multi_array.h>
-
-#include <ESP32Encoder.h>
+#include <std_msgs/msg/bool.h>
+#include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/int32.h>
 
 #include "config.h"
 
@@ -37,7 +44,14 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 
 // ---- micro-ROS entities ------------------------------------------------------
 rcl_subscription_t cmd_sub;
+rcl_subscription_t led_sub;
 rcl_publisher_t    enc_pub;
+rcl_publisher_t    left_susp_pub;
+#if RIGHT_SUSPEND_PIN >= 0
+rcl_publisher_t    right_susp_pub;
+#endif
+rcl_publisher_t    temp_pub;
+rcl_publisher_t    hall_pub;
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -46,15 +60,29 @@ rcl_allocator_t    allocator;
 rcl_node_t         node;
 
 geometry_msgs__msg__Twist           cmd_msg;
+std_msgs__msg__Bool                 led_msg;
 std_msgs__msg__Int64MultiArray      enc_msg;
 static int64_t                      enc_data[2];   // backing store for enc_msg.data
+std_msgs__msg__Bool                 left_susp_msg;
+#if RIGHT_SUSPEND_PIN >= 0
+std_msgs__msg__Bool                 right_susp_msg;
+#endif
+std_msgs__msg__Float32              temp_msg;
+std_msgs__msg__Int32                hall_msg;
 
 // ---- shared control state ----------------------------------------------------
-ESP32Encoder enc_left;
-ESP32Encoder enc_right;
-static volatile float   g_left_duty  = 0.0f;   // last commanded duty, [-1, 1]
-static volatile float   g_right_duty = 0.0f;
+// Single-channel encoders: each ISR just bumps a 32-bit counter (atomic to read
+// on the ESP32, so no locking needed). Unsigned — no direction information.
+static volatile uint32_t g_left_ticks  = 0;
+static volatile uint32_t g_right_ticks = 0;
+static volatile float    g_left_duty   = 0.0f;   // last commanded duty, [-1, 1]
+static volatile float    g_right_duty  = 0.0f;
 static volatile uint32_t g_last_cmd_ms = 0;
+
+static void IRAM_ATTR leftEncISR()  { g_left_ticks++; }
+#if RIGHT_ENC >= 0
+static void IRAM_ATTR rightEncISR() { g_right_ticks++; }
+#endif
 
 // ---- connection state machine ------------------------------------------------
 enum AgentState { WAITING_AGENT, AGENT_AVAILABLE, AGENT_CONNECTED, AGENT_DISCONNECTED };
@@ -107,6 +135,15 @@ static void cmd_cb(const void *msgin) {
   g_last_cmd_ms = millis();
 }
 
+// /led -> drive the onboard LED. Standard Bool message so a stock agent bridges
+// it; handy for an end-to-end "is the whole pipeline alive?" check.
+#if LED_PIN >= 0
+static void led_cb(const void *msgin) {
+  const std_msgs__msg__Bool *m = (const std_msgs__msg__Bool *)msgin;
+  digitalWrite(LED_PIN, m->data ? HIGH : LOW);
+}
+#endif
+
 // Control tick: apply latest command, or coast if cmd_vel went stale (watchdog).
 static void control_cb(rcl_timer_t *, int64_t) {
   if (millis() - g_last_cmd_ms > CMD_TIMEOUT_MS) {
@@ -115,14 +152,49 @@ static void control_cb(rcl_timer_t *, int64_t) {
   applyMotors(g_left_duty, g_right_duty);
 }
 
-// Publish raw cumulative encoder counts.
+// Debounce one suspension microswitch (needs a couple of stable samples to flip)
+// and publish on change, plus a ~1 s heartbeat so a late subscriber syncs. State
+// is carried in the caller's statics so each switch tracks independently.
+struct SuspendState { bool published; bool cand; uint8_t stable; uint16_t since_pub; };
+static void serviceSuspend(int pin, rcl_publisher_t *pub,
+                           std_msgs__msg__Bool *msg, SuspendState *s) {
+  bool lvl = (digitalRead(pin) == HIGH);
+  bool suspended = SUSPEND_ACTIVE_HIGH ? lvl : !lvl;
+  if (suspended == s->cand) { if (s->stable < 3) s->stable++; }
+  else                      { s->cand = suspended; s->stable = 0; }
+  s->since_pub++;
+  if ((s->stable >= 2 && s->cand != s->published) || s->since_pub >= ENC_PUBLISH_HZ) {
+    s->published = s->cand;
+    msg->data = s->published;
+    RCSOFTCHECK(rcl_publish(pub, msg, NULL));
+    s->since_pub = 0;
+  }
+}
+
+// Publish raw cumulative encoder counts, plus each suspension switch state.
 static void enc_cb(rcl_timer_t *timer, int64_t) {
   if (timer == NULL) return;
-  int64_t l = enc_left.getCount();
-  int64_t r = enc_right.getCount();
-  enc_data[0] = INVERT_LEFT_ENC  ? -l : l;
-  enc_data[1] = INVERT_RIGHT_ENC ? -r : r;
+  enc_data[0] = (int64_t)g_left_ticks;
+  enc_data[1] = (int64_t)g_right_ticks;
   RCSOFTCHECK(rcl_publish(&enc_pub, &enc_msg, NULL));
+
+  static SuspendState ls = {false, false, 0, 0xFFFF};  // force first publish
+  serviceSuspend(LEFT_SUSPEND_PIN, &left_susp_pub, &left_susp_msg, &ls);
+#if RIGHT_SUSPEND_PIN >= 0
+  static SuspendState rs = {false, false, 0, 0xFFFF};
+  serviceSuspend(RIGHT_SUSPEND_PIN, &right_susp_pub, &right_susp_msg, &rs);
+#endif
+
+  // Slow on-die telemetry at ~1 Hz (no need for 30 Hz): internal temperature
+  // and hall sensor. Both use internal sensors only — no GPIO/pin conflicts.
+  static uint16_t slow_div = ENC_PUBLISH_HZ;  // publish on the first tick
+  if (++slow_div >= ENC_PUBLISH_HZ) {
+    slow_div = 0;
+    temp_msg.data = temperatureRead();
+    RCSOFTCHECK(rcl_publish(&temp_pub, &temp_msg, NULL));
+    hall_msg.data = hallRead();
+    RCSOFTCHECK(rcl_publish(&hall_pub, &hall_msg, NULL));
+  }
 }
 
 // ---- entity lifecycle (created on connect, destroyed on disconnect) ----------
@@ -135,21 +207,54 @@ static bool createEntities() {
       &cmd_sub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel"));
 
+#if LED_PIN >= 0
+  RCCHECK(rclc_subscription_init_default(
+      &led_sub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "led"));
+#endif
+
   // Best-effort: high-rate sensor stream, no point ACKing each sample over serial.
   // The SBC subscriber must match (best_effort) or it won't see these.
   RCCHECK(rclc_publisher_init_best_effort(
       &enc_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int64MultiArray), "wheel_ticks"));
 
+  // Reliable (low-rate state): publish-on-change + heartbeat, so it must arrive.
+  RCCHECK(rclc_publisher_init_default(
+      &left_susp_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "left_wheel_suspended"));
+#if RIGHT_SUSPEND_PIN >= 0
+  RCCHECK(rclc_publisher_init_default(
+      &right_susp_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "right_wheel_suspended"));
+#endif
+
+  RCCHECK(rclc_publisher_init_default(
+      &temp_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "esp32_temp"));
+  RCCHECK(rclc_publisher_init_default(
+      &hall_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "esp32_hall"));
+
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
   RCCHECK(rclc_timer_init_default(
       &enc_timer, &support, RCL_MS_TO_NS(1000 / ENC_PUBLISH_HZ), enc_cb));
 
+  // Handles: cmd_sub + control_timer + enc_timer (+ led_sub when enabled).
+#if LED_PIN >= 0
+  const size_t num_handles = 4;
+#else
+  const size_t num_handles = 3;
+#endif
   executor = rclc_executor_get_zero_initialized_executor();
-  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, num_handles, &allocator));
   RCCHECK(rclc_executor_add_subscription(
       &executor, &cmd_sub, &cmd_msg, &cmd_cb, ON_NEW_DATA));
+#if LED_PIN >= 0
+  RCCHECK(rclc_executor_add_subscription(
+      &executor, &led_sub, &led_msg, &led_cb, ON_NEW_DATA));
+#endif
   RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
   RCCHECK(rclc_executor_add_timer(&executor, &enc_timer));
   return true;
@@ -160,7 +265,16 @@ static void destroyEntities() {
   (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_ctx, 0);
 
   rcl_subscription_fini(&cmd_sub, &node);
+#if LED_PIN >= 0
+  rcl_subscription_fini(&led_sub, &node);
+#endif
   rcl_publisher_fini(&enc_pub, &node);
+  rcl_publisher_fini(&left_susp_pub, &node);
+#if RIGHT_SUSPEND_PIN >= 0
+  rcl_publisher_fini(&right_susp_pub, &node);
+#endif
+  rcl_publisher_fini(&temp_pub, &node);
+  rcl_publisher_fini(&hall_pub, &node);
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);
@@ -170,6 +284,13 @@ static void destroyEntities() {
 
 // ---- setup / loop ------------------------------------------------------------
 void setup() {
+  // Radios are unused — the micro-ROS link is USB serial. WiFi and Bluetooth are
+  // never initialized, so the RF stays powered down (cuts current draw + RF noise
+  // near the motor/encoder wiring). We deliberately do NOT pull in <WiFi.h> just to
+  // call WIFI_OFF — it links the whole stack (~600 KB flash). Releasing the BT
+  // controller's reserved RAM back to the heap makes "BT off" explicit too.
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+
   // Serial0 (USB) is the micro-ROS transport.
   Serial.begin(115200);
   set_microros_serial_transports(Serial);
@@ -186,12 +307,24 @@ void setup() {
 #endif
   stopMotors();
 
-  // Hardware quadrature decode (PCNT). Internal pull-ups on the encoder lines.
-  ESP32Encoder::useInternalWeakPullResistors = puType::up;
-  enc_left.attachFullQuad(LEFT_ENC_A, LEFT_ENC_B);
-  enc_right.attachFullQuad(RIGHT_ENC_A, RIGHT_ENC_B);
-  enc_left.clearCount();
-  enc_right.clearCount();
+#if LED_PIN >= 0
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+#endif
+
+  // Single-channel encoders: count rising edges via GPIO interrupts (pull-ups on).
+  pinMode(LEFT_ENC, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENC), leftEncISR, RISING);
+#if RIGHT_ENC >= 0
+  pinMode(RIGHT_ENC, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_ENC), rightEncISR, RISING);
+#endif
+
+  // Wheel-suspension microswitches (read in enc_cb).
+  pinMode(LEFT_SUSPEND_PIN, INPUT_PULLUP);
+#if RIGHT_SUSPEND_PIN >= 0
+  pinMode(RIGHT_SUSPEND_PIN, INPUT_PULLUP);
+#endif
 
   // Int64MultiArray payload points at our static buffer (no dynamic alloc).
   enc_msg.data.data = enc_data;

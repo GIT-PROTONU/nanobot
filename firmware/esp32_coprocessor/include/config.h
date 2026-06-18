@@ -6,16 +6,24 @@
 // ---- Motor H-bridge (DRV8833 / TB6612-style: two PWM inputs per motor) -------
 // Forward = PWM on INx_FWD, INx_REV held low; reverse swaps them (slow-decay).
 #define LEFT_IN_FWD    25
-#define LEFT_IN_REV    26
+#define LEFT_IN_REV    16   // moved off 26 (now the right encoder); 16 = free, no special fn
 #define RIGHT_IN_FWD   32
 #define RIGHT_IN_REV   33
-#define MOTOR_STBY     27   // TB6612 STBY (HIGH=enable). -1 if your driver lacks it.
+#define MOTOR_STBY     17   // moved off 27 (now the right switch). HIGH=enable; -1 if N/A
 
-// ---- Quadrature encoders (hardware PCNT via ESP32Encoder = ~0 CPU) -----------
-#define LEFT_ENC_A     18
-#define LEFT_ENC_B     19
-#define RIGHT_ENC_A    16
-#define RIGHT_ENC_B    17
+// ---- Wheel encoders (single-channel, rising-edge count via GPIO interrupt) ----
+// One signal wire per wheel: counts rising edges only (unsigned magnitude — no
+// direction). Lines use internal pull-ups. Set a pin to -1 to disable that wheel.
+#define LEFT_ENC       19
+#define RIGHT_ENC      26
+
+// ---- Wheel-suspension microswitches ------------------------------------------
+// INPUT_PULLUP; tells whether each wheel is suspended (off the ground). Published
+// as std_msgs/Bool on /left_wheel_suspended and /right_wheel_suspended (true =
+// suspended). Set a pin to -1 to disable that side.
+#define LEFT_SUSPEND_PIN     18
+#define RIGHT_SUSPEND_PIN    27
+#define SUSPEND_ACTIVE_HIGH  true   // pin reads HIGH when suspended (flip if inverted)
 
 // ---- PWM (LEDC) --------------------------------------------------------------
 #define PWM_FREQ_HZ    20000   // 20 kHz = inaudible; freq * 2^res must be <= 80 MHz
@@ -27,12 +35,16 @@
 #define MAX_ANGULAR_SPEED  3.0f    // rad/s mapped to full PWM
 #define CMD_TIMEOUT_MS     500     // stop motors if no cmd_vel within this window
 
-// ---- Wiring sign fixes (flip if a wheel/encoder runs backwards) --------------
+// ---- Wiring sign fixes (flip if a wheel runs backwards) ----------------------
 #define INVERT_LEFT        false   // motor direction
 #define INVERT_RIGHT       false
-#define INVERT_LEFT_ENC    false   // encoder count sign
-#define INVERT_RIGHT_ENC   false
 
 // ---- Loop rates --------------------------------------------------------------
 #define CONTROL_LOOP_HZ    100     // PWM apply + watchdog
 #define ENC_PUBLISH_HZ     30      // wheel_ticks publish rate (match SBC odom rate)
+
+// ---- Built-in LED (end-to-end test of the agent->graph->firmware path) -------
+// On most ESP32-WROOM-32 dev boards the onboard LED is GPIO2. Driven by the /led
+// Bool topic (true=on). GPIO2 is a boot strapping pin but is free to drive after
+// boot. Set to -1 if your board has no usable onboard LED.
+#define LED_PIN            2

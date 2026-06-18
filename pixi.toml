@@ -26,9 +26,12 @@ ros-humble-rmw-zenoh-cpp = "*"
 ros-humble-rosbridge-suite = "*"
 # common_interfaces (sensor_msgs/nav_msgs/geometry_msgs) + tf2 ship with ros-base.
 ros-humble-tf-transformations = "*"
-# Bridges the ESP32 micro-ROS coprocessor (serial) into the graph. Runs under
-# rmw_zenoh like everything else; started by stack.sh after the router.
-ros-humble-micro-ros-agent = "*"
+# NOTE: ros-humble-micro-ros-agent is NOT listed: RoboStack no longer ships it on
+# any platform (it vanished from robostack-staging/-humble), so requiring it breaks
+# `pixi install`. The agent that bridges the ESP32 serial link now comes from the
+# Docker image microros/micro-ros-agent:humble (the webtest auto-uses it; the board
+# either keeps its previously-installed copy or runs the same image). See
+# firmware/esp32_coprocessor/webtest/.
 
 # --- colcon / C++ build tooling (for robot_msgs) ---
 colcon-common-extensions = "*"
