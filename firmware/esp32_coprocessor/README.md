@@ -16,7 +16,8 @@ single-channel and counted with lightweight GPIO interrupts.
 | sub | `cmd_vel`     | `geometry_msgs/Twist`       | diff-drive mixed → H-bridge PWM      |
 | sub | `led`         | `std_msgs/Bool`             | onboard LED (GPIO2): `true`=on — pipeline test |
 | pub | `wheel_ticks` | `std_msgs/Int64MultiArray`  | `[left, right]` cumulative raw counts (unsigned, single-channel) |
-| pub | `wheel_suspended` | `std_msgs/Bool`         | wheel off the ground (microswitch); `true`=suspended |
+| pub | `left_wheel_suspended`  | `std_msgs/Bool`   | left wheel off the ground (microswitch); `true`=suspended |
+| pub | `right_wheel_suspended` | `std_msgs/Bool`   | right wheel off the ground (microswitch); `true`=suspended |
 
 End-to-end smoke test once the agent is running:
 `ros2 topic pub --once /led std_msgs/msg/Bool '{data: true}'` should light the
@@ -31,15 +32,16 @@ H-bridge: DRV8833 / TB6612-style, two PWM inputs per motor.
 
 | signal        | GPIO | notes                                  |
 |---------------|------|----------------------------------------|
-| LEFT_IN_FWD   | 25   | LEDC PWM                               |
-| LEFT_IN_REV   | 26   | LEDC PWM                               |
-| RIGHT_IN_FWD  | 32   | LEDC PWM                               |
-| RIGHT_IN_REV  | 33   | LEDC PWM                               |
-| MOTOR_STBY    | 27   | TB6612 STBY (HIGH=enable); `-1` if N/A |
-| LEFT_ENC      | 19   | single-channel, rising-edge IRQ, pull-up |
-| RIGHT_ENC     | -1   | not wired yet; set to a GPIO to enable |
-| SUSPEND_PIN   | 18   | suspension microswitch, INPUT_PULLUP, HIGH=suspended |
-| LED_PIN       | 2    | onboard LED                            |
+| LEFT_IN_FWD       | 25   | LEDC PWM                           |
+| LEFT_IN_REV       | 16   | LEDC PWM (moved off 26)            |
+| RIGHT_IN_FWD      | 32   | LEDC PWM                           |
+| RIGHT_IN_REV      | 33   | LEDC PWM                           |
+| MOTOR_STBY        | 17   | TB6612 STBY (HIGH=enable, moved off 27); `-1` if N/A |
+| LEFT_ENC          | 19   | single-channel, rising-edge IRQ, pull-up |
+| RIGHT_ENC         | 26   | single-channel, rising-edge IRQ, pull-up |
+| LEFT_SUSPEND_PIN  | 18   | suspension microswitch, INPUT_PULLUP, HIGH=suspended |
+| RIGHT_SUSPEND_PIN | 27   | suspension microswitch, INPUT_PULLUP, HIGH=suspended |
+| LED_PIN           | 2    | onboard LED                        |
 
 UART0/USB is the micro-ROS link (115200) — don't use `Serial.print` for debug.
 Avoid flash pins 6–11; input-only 34–39 have no pull-ups (kept off the encoder/switch).

@@ -56,7 +56,8 @@
     <div class="statline">
       <div class="stat"><span class="dot" id="d-node"></span> <span>ESP32 link</span></div>
       <div class="stat"><span class="dot" id="d-ticks"></span> <span id="t-rate">wheel_ticks: — Hz</span></div>
-      <div class="stat"><span class="dot" id="d-susp"></span> <span id="t-susp">wheel: —</span></div>
+      <div class="stat"><span class="dot" id="d-suspL"></span> <span id="t-suspL">L wheel: —</span></div>
+      <div class="stat"><span class="dot" id="d-suspR"></span> <span id="t-suspR">R wheel: —</span></div>
       <div class="stat"><span class="dot off" id="d-web"></span> <span id="t-web">web link</span></div>
     </div>
   </div>
@@ -144,6 +145,13 @@ function render(s) {
 
 function dot(id, ok) { document.getElementById(id).className = 'dot ' + (ok ? 'on' : 'off'); }
 
+function wheelSusp(dotId, txtId, label, val) {
+  const d = document.getElementById(dotId), t = document.getElementById(txtId);
+  if (val === true)       { d.className = 'dot off'; t.textContent = `${label}: UP (suspended)`; }
+  else if (val === false) { d.className = 'dot on';  t.textContent = `${label}: down`; }
+  else                    { d.className = 'dot';     t.textContent = `${label}: —`; }
+}
+
 async function poll() {
   let s;
   try { s = await (await fetch('/state')).json(); dot('d-web', true);
@@ -173,10 +181,8 @@ async function poll() {
   dot('d-node', s.node);
 
   // wheel suspension: green = on the ground (ready to drive), red = up/suspended.
-  const suspDot = document.getElementById('d-susp'), suspTxt = document.getElementById('t-susp');
-  if (s.suspended === true)       { suspDot.className = 'dot off'; suspTxt.textContent = 'wheel: UP (suspended)'; }
-  else if (s.suspended === false) { suspDot.className = 'dot on';  suspTxt.textContent = 'wheel: down (on ground)'; }
-  else                            { suspDot.className = 'dot';     suspTxt.textContent = 'wheel: —'; }
+  wheelSusp('d-suspL', 't-suspL', 'L wheel', s.susp_left);
+  wheelSusp('d-suspR', 't-suspR', 'R wheel', s.susp_right);
 
   document.getElementById('meta').textContent =
       s.info || `${s.rmw} · ${s.dev} · ${s.node ? 'ESP32 connected' : 'waiting for ESP32…'}`;

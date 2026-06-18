@@ -2,8 +2,8 @@
 
 A no-CLI way to exercise the flashed **micro-ROS** firmware end to end from a
 browser: toggle the onboard LED (`/led`), watch `/wheel_ticks` stream live, see the
-wheel-suspension switch (`/wheel_suspended`), and (with an explicit safety opt-in)
-nudge the motors (`/cmd_vel`).
+per-wheel suspension switches (`/left_wheel_suspended`, `/right_wheel_suspended`),
+and (with an explicit safety opt-in) nudge the motors (`/cmd_vel`).
 
 ```
 Browser ──HTTP──▶ esp32_webtest.py (rclpy + native micro_ros_agent) ──micro-ROS──▶ ESP32
@@ -52,7 +52,8 @@ the board), else the `~/uros_ws` overlay (sourced + `ros2 run`).
   agent doesn't register a discoverable node name.
 - **wheel_ticks Hz** — live publish rate (~30 Hz). Spin the wheel and the left count
   climbs (single-channel encoder, unsigned counts).
-- **wheel** — green "down" / red "UP (suspended)" from the D18 microswitch.
+- **L/R wheel** — green "down" / red "UP (suspended)" per wheel, from the D18 (left)
+  and D27 (right) microswitches.
 - **web link** — the browser ↔ server poll is alive.
 
 The LED toggle and motor nudge exercise the host → ESP32 (subscribe) direction.

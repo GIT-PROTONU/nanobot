@@ -51,7 +51,8 @@ class State:
         self.last_rx = 0.0          # monotonic time of last wheel_ticks
         self.led = False            # last commanded LED state
         self.node_present = False   # is the esp32_coprocessor node in the graph?
-        self.suspended = None       # wheel off the ground? None until first msg
+        self.susp_left = None       # left wheel off the ground? None until first msg
+        self.susp_right = None      # right wheel off the ground?
         self.rmw = ""
         self.dev = ""
 
@@ -64,7 +65,8 @@ class State:
                 "age": age,
                 "led": self.led,
                 "node": self.node_present,
-                "suspended": self.suspended,
+                "susp_left": self.susp_left,
+                "susp_right": self.susp_right,
                 "rmw": self.rmw,
                 "dev": self.dev,
             }
@@ -222,12 +224,17 @@ def main():
 
     node.create_subscription(Int64MultiArray, "wheel_ticks", on_ticks, best_effort)
 
-    # /wheel_suspended is published reliably (state topic) — default QoS matches.
-    def on_susp(msg):
+    # {left,right}_wheel_suspended published reliably (state) — default QoS matches.
+    def on_susp_left(msg):
         with state.lock:
-            state.suspended = bool(msg.data)
+            state.susp_left = bool(msg.data)
 
-    node.create_subscription(Bool, "wheel_suspended", on_susp, 10)
+    def on_susp_right(msg):
+        with state.lock:
+            state.susp_right = bool(msg.data)
+
+    node.create_subscription(Bool, "left_wheel_suspended", on_susp_left, 10)
+    node.create_subscription(Bool, "right_wheel_suspended", on_susp_right, 10)
 
     def publish_led(on):
         led_pub.publish(Bool(data=bool(on)))

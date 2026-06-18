@@ -3,7 +3,8 @@
 //   sub  cmd_vel        geometry_msgs/Twist      -> diff-drive mix -> H-bridge PWM
 //   sub  led            std_msgs/Bool            -> onboard LED (pipeline test)
 //   pub  wheel_ticks    std_msgs/Int64MultiArray [left, right] raw cumulative counts
-//   pub  wheel_suspended std_msgs/Bool           wheel off the ground (microswitch)
+//   pub  left_wheel_suspended  std_msgs/Bool     left wheel off the ground (switch)
+//   pub  right_wheel_suspended std_msgs/Bool     right wheel off the ground (switch)
 //
 // Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
 // here so the SBC is offloaded. The SBC's wheel_odometry samples wheel_ticks on
@@ -40,7 +41,10 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 rcl_subscription_t cmd_sub;
 rcl_subscription_t led_sub;
 rcl_publisher_t    enc_pub;
-rcl_publisher_t    susp_pub;
+rcl_publisher_t    left_susp_pub;
+#if RIGHT_SUSPEND_PIN >= 0
+rcl_publisher_t    right_susp_pub;
+#endif
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -52,7 +56,10 @@ geometry_msgs__msg__Twist           cmd_msg;
 std_msgs__msg__Bool                 led_msg;
 std_msgs__msg__Int64MultiArray      enc_msg;
 static int64_t                      enc_data[2];   // backing store for enc_msg.data
-std_msgs__msg__Bool                 susp_msg;
+std_msgs__msg__Bool                 left_susp_msg;
+#if RIGHT_SUSPEND_PIN >= 0
+std_msgs__msg__Bool                 right_susp_msg;
+#endif
 
 // ---- shared control state ----------------------------------------------------
 // Single-channel encoders: each ISR just bumps a 32-bit counter (atomic to read
@@ -136,30 +143,38 @@ static void control_cb(rcl_timer_t *, int64_t) {
   applyMotors(g_left_duty, g_right_duty);
 }
 
-// Publish raw cumulative encoder counts, plus the suspension switch state.
+// Debounce one suspension microswitch (needs a couple of stable samples to flip)
+// and publish on change, plus a ~1 s heartbeat so a late subscriber syncs. State
+// is carried in the caller's statics so each switch tracks independently.
+struct SuspendState { bool published; bool cand; uint8_t stable; uint16_t since_pub; };
+static void serviceSuspend(int pin, rcl_publisher_t *pub,
+                           std_msgs__msg__Bool *msg, SuspendState *s) {
+  bool lvl = (digitalRead(pin) == HIGH);
+  bool suspended = SUSPEND_ACTIVE_HIGH ? lvl : !lvl;
+  if (suspended == s->cand) { if (s->stable < 3) s->stable++; }
+  else                      { s->cand = suspended; s->stable = 0; }
+  s->since_pub++;
+  if ((s->stable >= 2 && s->cand != s->published) || s->since_pub >= ENC_PUBLISH_HZ) {
+    s->published = s->cand;
+    msg->data = s->published;
+    RCSOFTCHECK(rcl_publish(pub, msg, NULL));
+    s->since_pub = 0;
+  }
+}
+
+// Publish raw cumulative encoder counts, plus each suspension switch state.
 static void enc_cb(rcl_timer_t *timer, int64_t) {
   if (timer == NULL) return;
   enc_data[0] = (int64_t)g_left_ticks;
   enc_data[1] = (int64_t)g_right_ticks;
   RCSOFTCHECK(rcl_publish(&enc_pub, &enc_msg, NULL));
 
-  // /wheel_suspended: debounce the microswitch (needs a couple of stable samples
-  // to flip), publish on change, plus a ~1 s heartbeat so a late subscriber syncs.
-  static bool     published = false;   // last value put on the wire
-  static bool     cand      = false;   // debounce candidate
-  static uint8_t  stable    = 0;
-  static uint16_t since_pub = 0xFFFF;  // force a publish on the first tick
-  bool lvl = (digitalRead(SUSPEND_PIN) == HIGH);
-  bool suspended = SUSPEND_ACTIVE_HIGH ? lvl : !lvl;
-  if (suspended == cand) { if (stable < 3) stable++; }
-  else                   { cand = suspended; stable = 0; }
-  since_pub++;
-  if ((stable >= 2 && cand != published) || since_pub >= ENC_PUBLISH_HZ) {
-    published = cand;
-    susp_msg.data = published;
-    RCSOFTCHECK(rcl_publish(&susp_pub, &susp_msg, NULL));
-    since_pub = 0;
-  }
+  static SuspendState ls = {false, false, 0, 0xFFFF};  // force first publish
+  serviceSuspend(LEFT_SUSPEND_PIN, &left_susp_pub, &left_susp_msg, &ls);
+#if RIGHT_SUSPEND_PIN >= 0
+  static SuspendState rs = {false, false, 0, 0xFFFF};
+  serviceSuspend(RIGHT_SUSPEND_PIN, &right_susp_pub, &right_susp_msg, &rs);
+#endif
 }
 
 // ---- entity lifecycle (created on connect, destroyed on disconnect) ----------
@@ -186,8 +201,13 @@ static bool createEntities() {
 
   // Reliable (low-rate state): publish-on-change + heartbeat, so it must arrive.
   RCCHECK(rclc_publisher_init_default(
-      &susp_pub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "wheel_suspended"));
+      &left_susp_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "left_wheel_suspended"));
+#if RIGHT_SUSPEND_PIN >= 0
+  RCCHECK(rclc_publisher_init_default(
+      &right_susp_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "right_wheel_suspended"));
+#endif
 
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
@@ -222,7 +242,10 @@ static void destroyEntities() {
   rcl_subscription_fini(&led_sub, &node);
 #endif
   rcl_publisher_fini(&enc_pub, &node);
-  rcl_publisher_fini(&susp_pub, &node);
+  rcl_publisher_fini(&left_susp_pub, &node);
+#if RIGHT_SUSPEND_PIN >= 0
+  rcl_publisher_fini(&right_susp_pub, &node);
+#endif
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);
@@ -261,8 +284,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(RIGHT_ENC), rightEncISR, RISING);
 #endif
 
-  // Wheel-suspension microswitch (read in enc_cb).
-  pinMode(SUSPEND_PIN, INPUT_PULLUP);
+  // Wheel-suspension microswitches (read in enc_cb).
+  pinMode(LEFT_SUSPEND_PIN, INPUT_PULLUP);
+#if RIGHT_SUSPEND_PIN >= 0
+  pinMode(RIGHT_SUSPEND_PIN, INPUT_PULLUP);
+#endif
 
   // Int64MultiArray payload points at our static buffer (no dynamic alloc).
   enc_msg.data.data = enc_data;

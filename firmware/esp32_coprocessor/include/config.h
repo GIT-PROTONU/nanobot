@@ -6,22 +6,23 @@
 // ---- Motor H-bridge (DRV8833 / TB6612-style: two PWM inputs per motor) -------
 // Forward = PWM on INx_FWD, INx_REV held low; reverse swaps them (slow-decay).
 #define LEFT_IN_FWD    25
-#define LEFT_IN_REV    26
+#define LEFT_IN_REV    16   // moved off 26 (now the right encoder); 16 = free, no special fn
 #define RIGHT_IN_FWD   32
 #define RIGHT_IN_REV   33
-#define MOTOR_STBY     27   // TB6612 STBY (HIGH=enable). -1 if your driver lacks it.
+#define MOTOR_STBY     17   // moved off 27 (now the right switch). HIGH=enable; -1 if N/A
 
 // ---- Wheel encoders (single-channel, rising-edge count via GPIO interrupt) ----
 // One signal wire per wheel: counts rising edges only (unsigned magnitude — no
-// direction). Lines use internal pull-ups. Only the left wheel is wired for now;
-// set RIGHT_ENC to its GPIO to enable the right wheel (its count stays 0 until).
+// direction). Lines use internal pull-ups. Set a pin to -1 to disable that wheel.
 #define LEFT_ENC       19
-#define RIGHT_ENC      -1      // not wired yet; set to a GPIO to enable
+#define RIGHT_ENC      26
 
-// ---- Wheel-suspension microswitch --------------------------------------------
-// INPUT_PULLUP; tells whether the wheel is suspended (off the ground). Published
-// as std_msgs/Bool on /wheel_suspended (true = suspended).
-#define SUSPEND_PIN          18
+// ---- Wheel-suspension microswitches ------------------------------------------
+// INPUT_PULLUP; tells whether each wheel is suspended (off the ground). Published
+// as std_msgs/Bool on /left_wheel_suspended and /right_wheel_suspended (true =
+// suspended). Set a pin to -1 to disable that side.
+#define LEFT_SUSPEND_PIN     18
+#define RIGHT_SUSPEND_PIN    27
 #define SUSPEND_ACTIVE_HIGH  true   // pin reads HIGH when suspended (flip if inverted)
 
 // ---- PWM (LEDC) --------------------------------------------------------------
