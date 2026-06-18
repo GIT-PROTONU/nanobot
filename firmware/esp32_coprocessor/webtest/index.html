@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 coprocessor — test</title>
+<style>
+  :root { --bg:#0e1116; --card:#171c24; --line:#2a3140; --fg:#e6edf3;
+          --mut:#8b97a7; --ok:#3fb950; --bad:#f85149; --acc:#2f81f7; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui,sans-serif; background:var(--bg);
+         color:var(--fg); padding:24px; max-width:760px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--mut); margin:0 0 20px; font-size:13px; }
+  .grid { display:grid; gap:16px; grid-template-columns:1fr 1fr; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:18px; }
+  .card.wide { grid-column:1 / -1; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em;
+             color:var(--mut); margin:0 0 14px; }
+  .statline { display:flex; gap:18px; flex-wrap:wrap; }
+  .stat { display:flex; align-items:center; gap:8px; font-size:13px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--mut); }
+  .dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.off { background:var(--bad); }
+  .big { font-variant-numeric:tabular-nums; font-size:34px; font-weight:600; }
+  .enc { display:flex; gap:28px; }
+  .enc .lbl { color:var(--mut); font-size:12px; text-transform:uppercase; }
+  button { font:inherit; color:var(--fg); background:#222a35; border:1px solid var(--line);
+           border-radius:8px; padding:10px 14px; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button:active { transform:translateY(1px); }
+  .ledbtn { width:100%; padding:22px; font-size:18px; font-weight:600;
+            border:1px solid var(--line); }
+  .ledbtn.on  { background:#143d1f; border-color:var(--ok); color:#7ee787; }
+  .ledbtn.off { background:#3d1517; border-color:var(--bad); color:#ff9b95; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .pad { display:grid; grid-template-columns:repeat(3,52px); grid-template-rows:repeat(3,52px);
+         gap:8px; justify-content:center; margin-top:6px; }
+  .pad button { padding:0; font-size:18px; }
+  .pad .c { grid-column:2; } .pad .l { grid-column:1; grid-row:2; }
+  .pad .s { grid-column:2; grid-row:2; } .pad .r { grid-column:3; grid-row:2; }
+  .pad .d { grid-column:2; grid-row:3; }
+  .warn { color:var(--mut); font-size:12px; margin:10px 0 0; }
+  .mut { color:var(--mut); }
+  a { color:var(--acc); }
+  fieldset:disabled { opacity:.45; }
+</style>
+</head>
+<body>
+  <h1>ESP32 coprocessor — test</h1>
+  <p class="sub" id="meta">connecting…</p>
+
+  <div class="card wide">
+    <h2>Pipeline status</h2>
+    <div class="statline">
+      <div class="stat"><span class="dot" id="d-node"></span> <span>ESP32 link</span></div>
+      <div class="stat"><span class="dot" id="d-ticks"></span> <span id="t-rate">wheel_ticks: — Hz</span></div>
+      <div class="stat"><span class="dot" id="d-susp"></span> <span id="t-susp">wheel: —</span></div>
+      <div class="stat"><span class="dot off" id="d-web"></span> <span id="t-web">web link</span></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Onboard LED (/led)</h2>
+      <button id="led" class="ledbtn off" onclick="toggleLed()">LED is OFF — tap to turn ON</button>
+      <p class="warn">Publishes <code>std_msgs/Bool</code> on <code>/led</code>.</p>
+    </div>
+
+    <div class="card">
+      <h2>Wheel ticks (/wheel_ticks)</h2>
+      <div class="enc">
+        <div><div class="lbl">left</div><div class="big" id="encL">0</div></div>
+        <div><div class="lbl">right</div><div class="big" id="encR">0</div></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button onclick="zero()">Zero display</button>
+        <span class="mut" id="encDelta">Δ 0 / 0</span>
+      </div>
+    </div>
+
+    <div class="card wide">
+      <h2>Motor nudge (/cmd_vel)</h2>
+      <fieldset id="motorFs" disabled style="border:none;padding:0;margin:0">
+        <div class="pad">
+          <button class="c" data-lin="1"  data-ang="0">▲</button>
+          <button class="l" data-lin="0"  data-ang="1">◀</button>
+          <button class="s" onclick="sendCmd(0,0)">■</button>
+          <button class="r" data-lin="0"  data-ang="-1">▶</button>
+          <button class="d" data-lin="-1" data-ang="0">▼</button>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <label>speed <input type="range" id="spd" min="0.05" max="0.4" step="0.05" value="0.15"></label>
+          <span class="mut" id="spdv">0.15</span>
+        </div>
+      </fieldset>
+      <label class="warn"><input type="checkbox" id="armed" onchange="arm()">
+        Enable motor buttons — <b>wheels off the ground</b>. Held buttons publish at 10&nbsp;Hz;
+        the firmware watchdog coasts the motors ~0.5&nbsp;s after release.</label>
+    </div>
+  </div>
+
+<script>
+let ledOn = false, base = [0, 0], lastSample = null;
+
+async function post(path, body) {
+  try { await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                          body: JSON.stringify(body)}); }
+  catch (e) { /* shown via web-link dot on next poll */ }
+}
+function toggleLed() { ledOn = !ledOn; post('/led', {on: ledOn}); render({led: ledOn}, true); }
+function sendCmd(lin, ang) { post('/cmd_vel', {lin, ang}); }
+function zero() { base = curTicks.slice(); }
+function arm() { document.getElementById('motorFs').disabled = !document.getElementById('armed').checked;
+                if (!document.getElementById('armed').checked) sendCmd(0,0); }
+
+const spd = document.getElementById('spd');
+spd.oninput = () => document.getElementById('spdv').textContent = (+spd.value).toFixed(2);
+
+// Hold-to-drive: repeat cmd_vel at 10 Hz so the firmware watchdog stays fed.
+let held = null;
+for (const b of document.querySelectorAll('.pad button[data-lin]')) {
+  const press = () => {
+    const s = +spd.value, lin = (+b.dataset.lin) * s, ang = (+b.dataset.ang) * s * 8;
+    sendCmd(lin, ang);
+    clearInterval(held); held = setInterval(() => sendCmd(lin, ang), 100);
+  };
+  const release = () => { clearInterval(held); held = null; sendCmd(0, 0); };
+  b.addEventListener('mousedown', press);  b.addEventListener('touchstart', e => {e.preventDefault(); press();});
+  b.addEventListener('mouseup', release);  b.addEventListener('mouseleave', release);
+  b.addEventListener('touchend', release);
+}
+
+let curTicks = [0, 0];
+function render(s) {
+  if ('led' in s) {
+    ledOn = s.led;
+    const el = document.getElementById('led');
+    el.className = 'ledbtn ' + (ledOn ? 'on' : 'off');
+    el.textContent = ledOn ? 'LED is ON — tap to turn OFF' : 'LED is OFF — tap to turn ON';
+  }
+}
+
+function dot(id, ok) { document.getElementById(id).className = 'dot ' + (ok ? 'on' : 'off'); }
+
+async function poll() {
+  let s;
+  try { s = await (await fetch('/state')).json(); dot('d-web', true);
+        document.getElementById('t-web').textContent = 'web link'; }
+  catch (e) { dot('d-web', false); document.getElementById('t-web').textContent = 'web link lost';
+              return; }
+
+  render(s);
+  curTicks = s.ticks;
+  document.getElementById('encL').textContent = s.ticks[0];
+  document.getElementById('encR').textContent = s.ticks[1];
+  document.getElementById('encDelta').textContent =
+      `Δ ${s.ticks[0]-base[0]} / ${s.ticks[1]-base[1]}`;
+
+  // rate from successive count samples
+  const now = performance.now();
+  let rate = 0;
+  if (lastSample) {
+    const dt = (now - lastSample.t) / 1000;
+    if (dt > 0) rate = (s.count - lastSample.count) / dt;
+  }
+  lastSample = {t: now, count: s.count};
+  const fresh = s.age != null && s.age < 1.0;
+  dot('d-ticks', fresh);
+  document.getElementById('t-rate').textContent =
+      `wheel_ticks: ${fresh ? rate.toFixed(0) : '—'} Hz`;
+  dot('d-node', s.node);
+
+  // wheel suspension: green = on the ground (ready to drive), red = up/suspended.
+  const suspDot = document.getElementById('d-susp'), suspTxt = document.getElementById('t-susp');
+  if (s.suspended === true)       { suspDot.className = 'dot off'; suspTxt.textContent = 'wheel: UP (suspended)'; }
+  else if (s.suspended === false) { suspDot.className = 'dot on';  suspTxt.textContent = 'wheel: down (on ground)'; }
+  else                            { suspDot.className = 'dot';     suspTxt.textContent = 'wheel: —'; }
+
+  document.getElementById('meta').textContent =
+      s.info || `${s.rmw} · ${s.dev} · ${s.node ? 'ESP32 connected' : 'waiting for ESP32…'}`;
+}
+setInterval(poll, 150);
+poll();
+</script>
+</body>
+</html>

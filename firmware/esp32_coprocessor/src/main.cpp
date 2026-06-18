@@ -1,9 +1,11 @@
 // Nano robot ESP32-WROOM motor/encoder coprocessor (micro-ROS, serial transport).
 //
-//   sub  cmd_vel     geometry_msgs/Twist       -> diff-drive mix -> H-bridge PWM
-//   pub  wheel_ticks std_msgs/Int64MultiArray  [left, right] raw cumulative counts
+//   sub  cmd_vel        geometry_msgs/Twist      -> diff-drive mix -> H-bridge PWM
+//   sub  led            std_msgs/Bool            -> onboard LED (pipeline test)
+//   pub  wheel_ticks    std_msgs/Int64MultiArray [left, right] raw cumulative counts
+//   pub  wheel_suspended std_msgs/Bool           wheel off the ground (microswitch)
 //
-// Real-time work (quadrature decode via hardware PCNT, PWM, cmd watchdog) lives
+// Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
 // here so the SBC is offloaded. The SBC's wheel_odometry samples wheel_ticks on
 // its own timer and integrates odom/TF exactly as it did from GPIO before.
 //
@@ -23,8 +25,7 @@
 
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/int64_multi_array.h>
-
-#include <ESP32Encoder.h>
+#include <std_msgs/msg/bool.h>
 
 #include "config.h"
 
@@ -37,7 +38,9 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 
 // ---- micro-ROS entities ------------------------------------------------------
 rcl_subscription_t cmd_sub;
+rcl_subscription_t led_sub;
 rcl_publisher_t    enc_pub;
+rcl_publisher_t    susp_pub;
 rcl_timer_t        control_timer;
 rcl_timer_t        enc_timer;
 rclc_executor_t    executor;
@@ -46,15 +49,24 @@ rcl_allocator_t    allocator;
 rcl_node_t         node;
 
 geometry_msgs__msg__Twist           cmd_msg;
+std_msgs__msg__Bool                 led_msg;
 std_msgs__msg__Int64MultiArray      enc_msg;
 static int64_t                      enc_data[2];   // backing store for enc_msg.data
+std_msgs__msg__Bool                 susp_msg;
 
 // ---- shared control state ----------------------------------------------------
-ESP32Encoder enc_left;
-ESP32Encoder enc_right;
-static volatile float   g_left_duty  = 0.0f;   // last commanded duty, [-1, 1]
-static volatile float   g_right_duty = 0.0f;
+// Single-channel encoders: each ISR just bumps a 32-bit counter (atomic to read
+// on the ESP32, so no locking needed). Unsigned — no direction information.
+static volatile uint32_t g_left_ticks  = 0;
+static volatile uint32_t g_right_ticks = 0;
+static volatile float    g_left_duty   = 0.0f;   // last commanded duty, [-1, 1]
+static volatile float    g_right_duty  = 0.0f;
 static volatile uint32_t g_last_cmd_ms = 0;
+
+static void IRAM_ATTR leftEncISR()  { g_left_ticks++; }
+#if RIGHT_ENC >= 0
+static void IRAM_ATTR rightEncISR() { g_right_ticks++; }
+#endif
 
 // ---- connection state machine ------------------------------------------------
 enum AgentState { WAITING_AGENT, AGENT_AVAILABLE, AGENT_CONNECTED, AGENT_DISCONNECTED };
@@ -107,6 +119,15 @@ static void cmd_cb(const void *msgin) {
   g_last_cmd_ms = millis();
 }
 
+// /led -> drive the onboard LED. Standard Bool message so a stock agent bridges
+// it; handy for an end-to-end "is the whole pipeline alive?" check.
+#if LED_PIN >= 0
+static void led_cb(const void *msgin) {
+  const std_msgs__msg__Bool *m = (const std_msgs__msg__Bool *)msgin;
+  digitalWrite(LED_PIN, m->data ? HIGH : LOW);
+}
+#endif
+
 // Control tick: apply latest command, or coast if cmd_vel went stale (watchdog).
 static void control_cb(rcl_timer_t *, int64_t) {
   if (millis() - g_last_cmd_ms > CMD_TIMEOUT_MS) {
@@ -115,14 +136,30 @@ static void control_cb(rcl_timer_t *, int64_t) {
   applyMotors(g_left_duty, g_right_duty);
 }
 
-// Publish raw cumulative encoder counts.
+// Publish raw cumulative encoder counts, plus the suspension switch state.
 static void enc_cb(rcl_timer_t *timer, int64_t) {
   if (timer == NULL) return;
-  int64_t l = enc_left.getCount();
-  int64_t r = enc_right.getCount();
-  enc_data[0] = INVERT_LEFT_ENC  ? -l : l;
-  enc_data[1] = INVERT_RIGHT_ENC ? -r : r;
+  enc_data[0] = (int64_t)g_left_ticks;
+  enc_data[1] = (int64_t)g_right_ticks;
   RCSOFTCHECK(rcl_publish(&enc_pub, &enc_msg, NULL));
+
+  // /wheel_suspended: debounce the microswitch (needs a couple of stable samples
+  // to flip), publish on change, plus a ~1 s heartbeat so a late subscriber syncs.
+  static bool     published = false;   // last value put on the wire
+  static bool     cand      = false;   // debounce candidate
+  static uint8_t  stable    = 0;
+  static uint16_t since_pub = 0xFFFF;  // force a publish on the first tick
+  bool lvl = (digitalRead(SUSPEND_PIN) == HIGH);
+  bool suspended = SUSPEND_ACTIVE_HIGH ? lvl : !lvl;
+  if (suspended == cand) { if (stable < 3) stable++; }
+  else                   { cand = suspended; stable = 0; }
+  since_pub++;
+  if ((stable >= 2 && cand != published) || since_pub >= ENC_PUBLISH_HZ) {
+    published = cand;
+    susp_msg.data = published;
+    RCSOFTCHECK(rcl_publish(&susp_pub, &susp_msg, NULL));
+    since_pub = 0;
+  }
 }
 
 // ---- entity lifecycle (created on connect, destroyed on disconnect) ----------
@@ -135,21 +172,42 @@ static bool createEntities() {
       &cmd_sub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel"));
 
+#if LED_PIN >= 0
+  RCCHECK(rclc_subscription_init_default(
+      &led_sub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "led"));
+#endif
+
   // Best-effort: high-rate sensor stream, no point ACKing each sample over serial.
   // The SBC subscriber must match (best_effort) or it won't see these.
   RCCHECK(rclc_publisher_init_best_effort(
       &enc_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int64MultiArray), "wheel_ticks"));
 
+  // Reliable (low-rate state): publish-on-change + heartbeat, so it must arrive.
+  RCCHECK(rclc_publisher_init_default(
+      &susp_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "wheel_suspended"));
+
   RCCHECK(rclc_timer_init_default(
       &control_timer, &support, RCL_MS_TO_NS(1000 / CONTROL_LOOP_HZ), control_cb));
   RCCHECK(rclc_timer_init_default(
       &enc_timer, &support, RCL_MS_TO_NS(1000 / ENC_PUBLISH_HZ), enc_cb));
 
+  // Handles: cmd_sub + control_timer + enc_timer (+ led_sub when enabled).
+#if LED_PIN >= 0
+  const size_t num_handles = 4;
+#else
+  const size_t num_handles = 3;
+#endif
   executor = rclc_executor_get_zero_initialized_executor();
-  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, num_handles, &allocator));
   RCCHECK(rclc_executor_add_subscription(
       &executor, &cmd_sub, &cmd_msg, &cmd_cb, ON_NEW_DATA));
+#if LED_PIN >= 0
+  RCCHECK(rclc_executor_add_subscription(
+      &executor, &led_sub, &led_msg, &led_cb, ON_NEW_DATA));
+#endif
   RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
   RCCHECK(rclc_executor_add_timer(&executor, &enc_timer));
   return true;
@@ -160,7 +218,11 @@ static void destroyEntities() {
   (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_ctx, 0);
 
   rcl_subscription_fini(&cmd_sub, &node);
+#if LED_PIN >= 0
+  rcl_subscription_fini(&led_sub, &node);
+#endif
   rcl_publisher_fini(&enc_pub, &node);
+  rcl_publisher_fini(&susp_pub, &node);
   rcl_timer_fini(&control_timer);
   rcl_timer_fini(&enc_timer);
   rclc_executor_fini(&executor);
@@ -186,12 +248,21 @@ void setup() {
 #endif
   stopMotors();
 
-  // Hardware quadrature decode (PCNT). Internal pull-ups on the encoder lines.
-  ESP32Encoder::useInternalWeakPullResistors = puType::up;
-  enc_left.attachFullQuad(LEFT_ENC_A, LEFT_ENC_B);
-  enc_right.attachFullQuad(RIGHT_ENC_A, RIGHT_ENC_B);
-  enc_left.clearCount();
-  enc_right.clearCount();
+#if LED_PIN >= 0
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+#endif
+
+  // Single-channel encoders: count rising edges via GPIO interrupts (pull-ups on).
+  pinMode(LEFT_ENC, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENC), leftEncISR, RISING);
+#if RIGHT_ENC >= 0
+  pinMode(RIGHT_ENC, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_ENC), rightEncISR, RISING);
+#endif
+
+  // Wheel-suspension microswitch (read in enc_cb).
+  pinMode(SUSPEND_PIN, INPUT_PULLUP);
 
   // Int64MultiArray payload points at our static buffer (no dynamic alloc).
   enc_msg.data.data = enc_data;
