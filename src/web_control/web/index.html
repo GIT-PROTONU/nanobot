@@ -157,7 +157,7 @@
       </div>
       <label>LDS target <span id="ldsTgtV">300</span> rpm</label>
       <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300">
-      <p class="hint">Live values from the ESP32 coprocessor (micro-ROS over USB):
+      <p class="hint">Live values from the ESP32 coprocessor (native zenoh-pico over UART):
         <b>/wheel_ticks</b>, <b>/left|right_wheel_suspended</b>, <b>/esp32_temp</b>,
         <b>/esp32_hall</b>, <b>/lds_rpm</b>, <b>/lds_hz</b>, <b>/lds_duty</b>,
         <b>/esp32_heartbeat</b>. Slider publishes <b>std_msgs/Float32</b> on
@@ -353,7 +353,7 @@ function subscribe(){
   ldsParamSrv=new ROSLIB.Service({ros,name:"/lds_driver/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
 
-  // ---- ESP32 coprocessor (micro-ROS over USB, bridged into the graph) ----
+  // ---- ESP32 coprocessor (native zenoh-pico over UART, in the rmw_zenoh graph) ----
   hbTopic=new ROSLIB.Topic({ros,name:"/esp32_heartbeat",
     messageType:"std_msgs/msg/Int32",throttle_rate:0,queue_length:1});
   hbTopic.subscribe(onHb);
