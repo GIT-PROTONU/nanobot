@@ -1,7 +1,7 @@
 // Nano ESP32-WROOM coprocessor — NATIVE ZENOH (zenoh-pico), no micro-ROS, no DDS.
 // Talks straight to the SBC's rmw_zenoh graph over a direct UART link, in rmw_zenoh's
-// exact wire format (Humble / libzenohc 1.9.0). Replaces the micro-ROS firmware in
-// ../esp32_coprocessor with the same topic contract:
+// exact wire format (Humble / libzenohc 1.9.0). Replaced the old micro-ROS firmware,
+// keeping the same topic contract:
 //
 //   sub  cmd_vel               geometry_msgs/Twist       -> diff-drive -> H-bridge PWM
 //   sub  led                   std_msgs/Bool             -> onboard LED

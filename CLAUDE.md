@@ -28,37 +28,33 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
 
-## ESP32 motor/encoder coprocessor (`firmware/esp32_coprocessor/`)
-- micro-ROS (PlatformIO + Arduino) over USB serial. Subscribes `/cmd_vel`
-  (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM) and `/led` (Bool, onboard-
-  LED pipeline test). Publishes `/wheel_ticks` (Int64MultiArray `[L,R]`, best-effort)
-  from **single-channel** rising-edge GPIO-interrupt counts (unsigned, **no
-  direction**; PCNT/quadrature was dropped), plus `/left_wheel_suspended` +
-  `/right_wheel_suspended` (Bool per-wheel off-ground microswitch) and `/esp32_temp`
-  (Float32) + `/esp32_hall` (Int32) on-die telemetry. Also reads a **spin-lidar**
-  (LDS02RR) on UART2 → `/lds_rpm` (Float32, RPM only — scan data ignored; 0 when the
-  stream goes stale) + `/lds_hz` (Float32, valid-frame rate, 0 = not receiving), and
-  closed-loop-controls its spin motor: a PID (gains in `config.h`, **tune on hardware**)
-  holds `/lds_target_rpm` (Float32 setpoint) by driving the motor PWM, publishing the
-  output on `/lds_duty`. WiFi/BT kept off.
-  Pins/tunables in `include/config.h` (encoders L=19 R=26, switches 18/27, motor
-  STBY=17, LEFT_IN_REV=4, LDS UART2 RX=16, LDS motor PWM=21; keep diff-drive limits
-  synced to `robot.yaml`).
-- **Agent built from source, not a conda pkg** — `ros-humble-micro-ros-agent` vanished
-  from RoboStack. Build once: `pixi run bash firmware/esp32_coprocessor/webtest/build_agent.sh`
-  → installs into `~/uros_ws` (uses `-DUAGENT_LOGGER_PROFILE=OFF` to dodge an fmt-12
-  build break). `stack.sh` runs it after the router; serial dev = `$AGENT_DEV`
-  (default `/dev/esp32`).
-- **CRITICAL: the agent is Fast-DDS-only** (links `librmw_fastrtps_shared_cpp`) — it
-  bridges the ESP32 onto a Fast-DDS graph regardless of `RMW_IMPLEMENTATION`, so a
-  pure `rmw_zenoh_cpp` graph **can't see its topics**. The SBC likely never actually
-  receives `/wheel_ticks` under zenoh — **unresolved** (needs Fast-DDS for the agent
-  path, or a zenoh↔DDS bridge). The dev-host browser rig `webtest/esp32_webtest.py`
-  defaults to `rmw_fastrtps_cpp` and works (toggle `/led`, watch ticks/suspension/
-  temp/hall, nudge `/cmd_vel`).
-- Build/flash from the dev PC: `cd firmware/esp32_coprocessor && pio run -t upload`
-  (pio lives in `~/pio-venv`). Tunables in `include/config.h`. **Don't build the
-  firmware on the board.**
+## ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
+- **Native zenoh-pico over a direct UART link** (PlatformIO + Arduino) — NO micro-ROS,
+  NO Fast-DDS, no agent. It joins the SBC's `rmw_zenoh` graph directly, emitting
+  rmw_zenoh's exact wire format + liveliness tokens (see the `src/main.cpp` header).
+  Subscribes `/cmd_vel` (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM), `/led`
+  (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint). Publishes
+  `/wheel_ticks` (Int64MultiArray `[L,R]`) from **single-channel** rising-edge GPIO-
+  interrupt counts (unsigned, **no direction**), `/left_wheel_suspended` +
+  `/right_wheel_suspended` (Bool per-wheel off-ground microswitch, **published on change**
+  for low latency + a 1 Hz heartbeat republish), `/esp32_temp` (Float32) + `/esp32_hall`
+  (Int32) on-die telemetry, and `/esp32_heartbeat` (Int32). Also reads a **spin-lidar**
+  (LDS02RR) → `/lds_rpm` (Float32, RPM only — scan data ignored; 0 when stale) + `/lds_hz`
+  (valid-frame rate, 0 = not receiving), and closed-loop-controls its spin motor: a PID
+  (**tune on hardware**) holds `/lds_target_rpm` by driving the motor PWM, output on
+  `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 0). WiFi/BT kept off.
+- **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
+  `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
+  flags (enables `Z_FEATURE_LINK_SERIAL`). Pins: encoders L=19 R=26, switches 18/27,
+  motor STBY=23, LEFT_IN_REV=4, **UART2 = zenoh link (TX=17, RX=16)**, LDS data on
+  GPIO35 (UART1 RX-only), LDS motor PWM=21. Keep diff-drive limits synced to `robot.yaml`.
+- **The link needs a serial-capable `zenohd`** — the conda `libzenohc` is built without
+  `transport_serial`, so stock `rmw_zenohd` can't open the UART. Build one with
+  `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; `stack.sh`
+  runs it on the board so the ESP32 (serial) and the rmw_zenoh nodes (TCP) share a graph.
+  See [[robostack-zenoh-no-serial]] and [[esp32-zenoh-pico-integration]].
+- Build/flash from the dev PC: `cd firmware/nanobot_coprocessor && pio run -t upload`
+  (pio lives in `~/pio-venv`). **Don't build the firmware on the board.**
 
 ## Build / run
 - Build: `pixi run build` (colcon, msgs + all python pkgs). There is **no

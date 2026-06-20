@@ -18,7 +18,7 @@ PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/robot.yaml"
 # ESP32 coprocessor: runs zenoh-pico over a direct UART (NO micro-ROS agent). The
 # serial-capable zenohd LISTENs on this UART so the ESP32 joins the zenoh graph
 # directly (/cmd_vel,/led,/lds_target_rpm in; /wheel_ticks,/lds_*,/esp32_* etc out).
-# Build the binary on a dev host: firmware/zenoh_pico_spike/tools/build_zenohd_serial.sh aarch64
+# Build the binary on a dev host: firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh aarch64
 ESP32_UART="${ESP32_UART:-/dev/ttyS1}"
 ESP32_BAUD="${ESP32_BAUD:-115200}"
 ZENOHD_SERIAL="${ZENOHD_SERIAL:-$NANO/bin/zenohd-serial}"

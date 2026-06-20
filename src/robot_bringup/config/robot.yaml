@@ -25,12 +25,12 @@ lds_driver:
     publish_rate: 10.0        # Hz cap on /scan (motor ~5 Hz; lower = decimate)
 
 # ---- Wheel encoders -> odometry (nav_msgs/Odometry on /odom + TF) -----------
-# Quadrature is now decoded on the ESP32 coprocessor (hardware PCNT) and streamed
-# as std_msgs/Int64MultiArray on /wheel_ticks; this node only integrates. Wire/
-# direction fixes live in firmware/esp32_coprocessor/include/config.h.
+# Wheel ticks are counted on the ESP32 coprocessor and streamed as
+# std_msgs/Int64MultiArray on /wheel_ticks; this node only integrates. Wire/
+# direction fixes live in firmware/nanobot_coprocessor/include/config.h.
 wheel_odometry:
   ros__parameters:
-    ticks_topic: "wheel_ticks"  # from the ESP32 micro-ROS coprocessor
+    ticks_topic: "wheel_ticks"  # from the ESP32 zenoh-pico coprocessor
     ticks_per_rev: 1440       # encoder counts per wheel revolution (x4 quadrature)
     wheel_radius: 0.0335      # metres
     wheel_separation: 0.16    # metres between wheel contact points
@@ -43,7 +43,7 @@ wheel_odometry:
 
 # ---- cmd_vel -> PCA9685 PWM motor driver ------------------------------------
 # RETIRED: the ESP32 coprocessor now owns /cmd_vel -> H-bridge PWM directly (see
-# firmware/esp32_coprocessor). This node is no longer launched by stack.sh; kept
+# firmware/nanobot_coprocessor). This node is no longer launched by stack.sh; kept
 # here only for the optional PCA9685 LDS-spin/aux channels if you re-enable it.
 motor_control:
   ros__parameters:
