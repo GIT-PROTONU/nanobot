@@ -66,6 +66,27 @@ motor_control:
     lds_motor_ch: -1          # -1 = disabled
     lds_motor_duty: 0.55
 
+# ---- 2D occupancy-grid SLAM (slam_nav) --------------------------------------
+# Builds a map from /scan with the pose = wheel odom translation + IMU yaw,
+# refined by a correlative scan-to-map matcher. Writes /dev/shm/nano_map.bin for
+# the web UI map panel. Stage 1 = mapping only (no motion). All sizes/RAM scale
+# with map_size_m / map_resolution: 24 m @ 0.05 m = 480x480 cells (~0.9 MB grid).
+slam_nav:
+  ros__parameters:
+    scan_topic: "scan"
+    odom_topic: "odom"
+    euler_topic: "imu/euler"       # /imu/euler vector.z = yaw in degrees
+    map_size_m: 24.0               # square map side, metres (whole-floor)
+    map_resolution: 0.05           # metres/cell
+    range_min: 0.12
+    range_max: 6.0
+    match_lin: 0.10                # scan-match search half-window (m)
+    match_ang: 0.12                # scan-match search half-window (rad)
+    match_points: 90               # scan beams used for matching (decimated)
+    min_match_score: 1.0           # reject matches with no real map overlap
+    use_imu_yaw: true              # IMU yaw delta for rotation (vs wheel odom)
+    map_write_rate: 2.0            # Hz to refresh the /dev/shm map file
+
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:
   ros__parameters:

@@ -98,7 +98,13 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define CH_LDS       4
 
 // ============================ shared cross-core state =========================
-static volatile uint32_t g_left_ticks  = 0, g_right_ticks = 0;   // encoder ISR counts
+static volatile int32_t  g_left_ticks  = 0, g_right_ticks = 0;   // encoder ISR counts (signed)
+// Single-channel encoders carry NO direction, so the ISR can't know forward/reverse.
+// We sign each tick by the last commanded wheel direction (set in cmd_cb) — the best
+// proxy available; an int8 so the ISR never touches the FPU (float math in an ESP32
+// ISR is unsafe). Without this, /odom integrates every move as forward and SLAM breaks
+// on reverse. Near-zero command holds the previous sign.
+static volatile int8_t   g_left_dir = 1, g_right_dir = 1;
 static volatile float    g_left_duty   = 0, g_right_duty   = 0;  // cmd -> motor duty
 static volatile uint32_t g_last_cmd_ms = 0;
 static volatile float    g_lds_rpm = 0, g_lds_duty = 0, g_lds_hz = 0;
@@ -109,8 +115,8 @@ static volatile int32_t  g_hall = 0;
 static volatile bool     g_susp_l = false, g_susp_r = false;
 static volatile bool     g_led = false, g_led_dirty = false;
 
-static void IRAM_ATTR leftEncISR()  { g_left_ticks++; }
-static void IRAM_ATTR rightEncISR() { g_right_ticks++; }
+static void IRAM_ATTR leftEncISR()  { g_left_ticks  += g_left_dir; }
+static void IRAM_ATTR rightEncISR() { g_right_ticks += g_right_dir; }
 
 static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
@@ -233,9 +239,12 @@ static void cmd_cb(z_loaned_sample_t* sm, void*){
   float fv = clampf((float)v, -MAX_LINEAR_SPEED,  MAX_LINEAR_SPEED);
   float fw = clampf((float)w, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED);
   float vl = fv - fw*WHEEL_SEPARATION*0.5f, vr = fv + fw*WHEEL_SEPARATION*0.5f;
-  float mx = MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f;
-  g_left_duty  = mx ? clampf(vl/mx,-1,1) : 0;
-  g_right_duty = mx ? clampf(vr/mx,-1,1) : 0;
+  static constexpr float mx = MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f;
+  g_left_duty  = clampf(vl/mx,-1,1);
+  g_right_duty = clampf(vr/mx,-1,1);
+  // sign the encoder ticks by commanded wheel direction (single-channel = no feedback)
+  if (vl >  1e-4f) g_left_dir  =  1; else if (vl < -1e-4f) g_left_dir  = -1;
+  if (vr >  1e-4f) g_right_dir =  1; else if (vr < -1e-4f) g_right_dir = -1;
   g_last_cmd_ms = millis();
 }
 static void led_cb(z_loaned_sample_t* sm, void*){
@@ -444,8 +453,8 @@ void loop(){   // Core 1: real-time control
   static uint32_t last_dbg=0;
   if (now-last_dbg >= STATUS_PRINT_MS){                     // debug-console health line
     last_dbg=now;
-    Serial.printf("[nano] ticks L=%lu R=%lu | lds rpm=%.0f hz=%.0f duty=%.2f | susp %d/%d\n",
-      (unsigned long)g_left_ticks,(unsigned long)g_right_ticks,
+    Serial.printf("[nano] ticks L=%ld R=%ld | lds rpm=%.0f hz=%.0f duty=%.2f | susp %d/%d\n",
+      (long)g_left_ticks,(long)g_right_ticks,
       g_lds_rpm, g_lds_hz, g_lds_duty, (int)g_susp_l,(int)g_susp_r);
   }
 #endif

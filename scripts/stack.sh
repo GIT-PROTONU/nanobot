@@ -12,6 +12,12 @@
 #    matches — and kills — the running shell itself (seen as plink exit 128).
 set -u
 
+# glibc gives each thread its own malloc arena (up to ~8*cores*64 MB of address space,
+# with real RSS creep). The threaded Python nodes (imu/lds/web/nav serial+HTTP readers)
+# are exactly that pattern, so cap the arenas — a cheap RSS win on the 1 GB board. Every
+# node is launched as a child of this script, so the export is inherited by all of them.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+
 NANO="${NANO:-$HOME/Nano}"
 LOG="$NANO/.run"; mkdir -p "$LOG"
 PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/robot.yaml"
@@ -87,13 +93,18 @@ PY
   # the `uart2` device-tree overlay (deploy/sbc-setup.sh) + a reboot for /dev/ttyS2 to exist.
   pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
     || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
+  # SLAM/mapping: builds an occupancy grid from /scan + /odom + /imu/euler and writes
+  # /dev/shm/nano_map.bin for the web map panel. Started last (needs scan + odom flowing).
+  pgrep -f 'slam_nav/lib/slam_nav' >/dev/null \
+    || launch nav "$own/slam_nav/lib/slam_nav/nav_node --ros-args --params-file $PARAMS"
 }
 
 do_down() {
   # Node path substrings match whether launched directly or via ros2 run/launch.
   # rosapi_node + ros2cli.daemon sweep up anything left by older launches or by
   # `ros2 ...` CLI probes (each spawns a ~60 MB daemon).
-  for p in 'lds_driver_py/lib/lds_driver_py' \
+  for p in 'slam_nav/lib/slam_nav' \
+           'lds_driver_py/lib/lds_driver_py' \
            'wheel_odometry/lib/wheel_odometry' \
            'sys_monitor/lib/sys_monitor' \
            'imu_driver/lib/imu_driver' \
@@ -110,7 +121,8 @@ status() {
            "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
            "imu:imu_driver/lib/imu_driver" "sys:sys_monitor/lib/sys_monitor" \
            "odom:wheel_odometry/lib/wheel_odometry" \
-           "lds:lds_driver_py/lib/lds_driver_py"; do
+           "lds:lds_driver_py/lib/lds_driver_py" \
+           "nav:slam_nav/lib/slam_nav"; do
     if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi
   done
 }

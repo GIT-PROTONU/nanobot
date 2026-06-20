@@ -73,6 +73,15 @@
   <main>
     <div id="wrap"><canvas id="cv"></canvas></div>
     <div id="side">
+      <h2>Map</h2>
+      <label class="chk"><input type="checkbox" id="mapOn"> show map</label>
+      <div id="mapWrap" style="display:none;background:#000;border-radius:6px;overflow:hidden">
+        <canvas id="mapcv" style="width:100%;display:block;image-rendering:pixelated"></canvas>
+      </div>
+      <p class="hint" id="mapHint" style="display:none">2D occupancy map from
+        <b>slam_nav</b> (/scan + /odom + IMU yaw, scan-to-map matched), served raw from
+        <b>/dev/shm</b> via <b>/map</b>. Polls only while shown; red marks the robot.
+        Click-to-go navigation arrives in Stage 2.</p>
       <h2>Camera</h2>
       <label class="chk"><input type="checkbox" id="camOn"> show webcam</label>
       <img id="cam" alt="">
@@ -585,6 +594,62 @@ cv.addEventListener("pointerup",()=>dragging=false);
 
 resize(); requestAnimationFrame(draw);
 connect();   // auto-connect on load
+</script>
+<script>
+// ---- SLAM map panel (Stage 1) ------------------------------------------------
+// Self-contained, pure HTTP: poll the raw occupancy map from /map (same-origin,
+// written by slam_nav to /dev/shm) and render it — no rosbridge involved. The map
+// file is a JSON metadata line, '\n', then raw int8 occupancy (-1 unknown, 0 free ..
+// 100 occupied; row 0 = origin_y). Stage 2 hooks canvas clicks -> /goal_pose.
+(function(){
+  "use strict";
+  const $=id=>document.getElementById(id);
+  const cv=$("mapcv"), ctx=cv.getContext("2d");
+  const dec=new TextDecoder();
+  let timer=null, img=null;
+
+  async function poll(){
+    try{
+      const r=await fetch("/map?t="+Date.now());
+      if(!r.ok) return;                        // 503 until the first map is written
+      const buf=new Uint8Array(await r.arrayBuffer());
+      const nl=buf.indexOf(10);                // end of the JSON header line
+      if(nl<0) return;
+      const meta=JSON.parse(dec.decode(buf.subarray(0,nl)));
+      draw(meta, buf.subarray(nl+1));
+    }catch(e){ /* transient: keep polling */ }
+  }
+
+  function draw(m, grid){
+    const w=m.w, h=m.h;
+    if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; img=ctx.createImageData(w,h); }
+    const d=img.data;
+    for(let row=0;row<h;row++){
+      const cy=h-1-row, base=row*w;            // grid row 0 = bottom -> flip for canvas
+      for(let c=0;c<w;c++){
+        let v=grid[base+c]; if(v>127) v-=256;  // byte -> signed int8
+        const o=(cy*w+c)*4;
+        const s=v<0?44:(255-Math.round(v*2.55)); // unknown grey; 0 white..100 black
+        d[o]=d[o+1]=d[o+2]=s; d[o+3]=255;
+      }
+    }
+    ctx.putImageData(img,0,0);
+    // robot pose: red dot + heading tick
+    const rx=(m.px-m.ox)/m.res, py=h-1-(m.py-m.oy)/m.res;
+    ctx.fillStyle=ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(rx,py,4,0,6.2832); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(rx,py);
+    ctx.lineTo(rx+9*Math.cos(m.pth), py-9*Math.sin(m.pth)); ctx.stroke();
+  }
+
+  $("mapOn").addEventListener("change",e=>{
+    const on=e.target.checked;
+    $("mapWrap").style.display=on?"block":"none";
+    $("mapHint").style.display=on?"block":"none";
+    if(on){ poll(); timer=setInterval(poll,500); }
+    else { clearInterval(timer); timer=null; }
+  });
+})();
 </script>
 </body>
 </html>

@@ -76,6 +76,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._stream_mjpeg()
         if path == "/audio.pcm":
             return self._stream_audio()
+        if path == "/map":
+            return self._serve_map()
         return super().do_GET()
 
     def do_POST(self):
@@ -178,6 +180,26 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             pass                       # client stopped listening
         finally:
             self._audio.remove_listener(q)
+
+    def _serve_map(self):
+        # The slam_nav node writes the live occupancy map to a RAM file (/dev/shm);
+        # we just hand the bytes over same-origin so the page's map canvas can render
+        # them. No ROS subscription / OccupancyGrid serialization in this process.
+        try:
+            with open("/dev/shm/nano_map.bin", "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_error(503, "no map yet")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, *args):      # silence per-request stderr spam
         pass

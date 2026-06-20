@@ -294,16 +294,20 @@ class ImuNode(Node):
                 self._imu_hz = 0.9 * self._imu_hz + 0.1 / dt
         self._last_pub_mono = mono
         stamp = self.get_clock().now().to_msg()
-        roll, pitch, yaw = (v * DEG2RAD for v in self.euler_deg)
-        qx, qy, qz, qw = euler_to_quat(roll, pitch, yaw)
 
-        # /imu/data — reuse the pre-built message (constants already set in __init__).
-        imu = self._imu
-        imu.header.stamp = stamp
-        imu.orientation.x, imu.orientation.y, imu.orientation.z, imu.orientation.w = qx, qy, qz, qw
-        imu.angular_velocity.x, imu.angular_velocity.y, imu.angular_velocity.z = self.gyro
-        imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z = self.acc
-        self.pub_imu.publish(imu)
+        # /imu/data — full Imu (orientation + covariances). The web UI reads /imu/web
+        # instead, and nothing else on the board consumes /imu/data by default, so only
+        # build + serialize it when something actually subscribes. On an idle/autonomous
+        # robot this skips ~50 Hz of pointless serialization (the biggest idle CPU lever).
+        if self.pub_imu.get_subscription_count() > 0:
+            roll, pitch, yaw = (v * DEG2RAD for v in self.euler_deg)
+            qx, qy, qz, qw = euler_to_quat(roll, pitch, yaw)
+            imu = self._imu               # reuse pre-built msg (constants set in __init__)
+            imu.header.stamp = stamp
+            imu.orientation.x, imu.orientation.y, imu.orientation.z, imu.orientation.w = qx, qy, qz, qw
+            imu.angular_velocity.x, imu.angular_velocity.y, imu.angular_velocity.z = self.gyro
+            imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z = self.acc
+            self.pub_imu.publish(imu)
 
         # /imu/euler — drives the web UI angle readout; its own (lower) rate.
         if self._eul_period is not None and mono >= self._next_eul:
@@ -313,13 +317,15 @@ class ImuNode(Node):
             eul.vector.x, eul.vector.y, eul.vector.z = self.euler_deg
             self.pub_eul.publish(eul)
 
-        # /imu/mag — slow-moving and unused by the UI; published at its own low rate.
-        if self._mag_period is not None and mono >= self._next_mag:
+        # /imu/mag — slow-moving and unused by the UI; published at its own low rate,
+        # and only when subscribed (nothing on the board consumes it by default).
+        if (self._mag_period is not None and mono >= self._next_mag):
             self._next_mag = mono + self._mag_period
-            mag = self._mag_msg
-            mag.header.stamp = stamp
-            mag.magnetic_field.x, mag.magnetic_field.y, mag.magnetic_field.z = self.mag
-            self.pub_mag.publish(mag)
+            if self.pub_mag.get_subscription_count() > 0:
+                mag = self._mag_msg
+                mag.header.stamp = stamp
+                mag.magnetic_field.x, mag.magnetic_field.y, mag.magnetic_field.z = self.mag
+                self.pub_mag.publish(mag)
 
         # /imu/web — the web UI's whole IMU readout in one tiny low-rate message:
         # x=|accel| (m/s^2), y=|gyro| (rad/s), z=actual /imu/data rate (Hz). Lets the

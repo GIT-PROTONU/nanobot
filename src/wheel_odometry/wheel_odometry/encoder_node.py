@@ -1,21 +1,22 @@
 """Wheel-encoder odometry from the ESP32 coprocessor.
 
-The ESP32 (micro-ROS) decodes quadrature in hardware (PCNT) and publishes raw
-cumulative counts on:
+The ESP32 (native zenoh-pico, no micro-ROS) counts single-channel rising edges on
+each wheel and publishes raw cumulative counts on:
 
     /wheel_ticks     std_msgs/Int64MultiArray   data = [left, right]
 
-This node samples those counts on its own timer and integrates a differential-
-drive model — exactly as it did when it read GPIO directly, so its outputs are
-unchanged:
+The encoders have no second channel, so direction isn't sensed in hardware; the
+firmware signs each count by the commanded wheel direction before publishing, so the
+counts are already signed (forward +, reverse -). This node samples them on its own
+timer and integrates a differential-drive model:
 
     /odom            nav_msgs/Odometry
     /joint_states    sensor_msgs/JointState   (left_wheel_joint, right_wheel_joint)
     /wheel_encoders  robot_msgs/WheelEncoders  (raw counts, for debugging)
     TF: odom -> base_link
 
-Direction sign fixes normally live on the ESP32 (config.h INVERT_*_ENC); the
-invert params here are an SBC-side fallback.
+/joint_states and /wheel_encoders are only published when something subscribes (the
+map/UI use /odom + /wheel_ticks). The invert_* params are an SBC-side sign fallback.
 """
 import math
 
@@ -161,21 +162,25 @@ class EncoderNode(Node):
             t.transform.rotation = _yaw_to_quat(self.th)
             self.tf_bc.sendTransform(t)
 
-        js = JointState()
-        js.header.stamp = stamp
-        js.name = ["left_wheel_joint", "right_wheel_joint"]
-        js.position = [l * self.m_per_tick / self.wheel_radius,
-                       r * self.m_per_tick / self.wheel_radius]
-        js.velocity = [(dl / self.wheel_radius) / dt, (dr / self.wheel_radius) / dt]
-        self.js_pub.publish(js)
+        # /joint_states + /wheel_encoders are debug/RViz aids — only build them when
+        # something subscribes (the map, OLED and web UI all use /odom + /wheel_ticks).
+        if self.js_pub.get_subscription_count() > 0:
+            js = JointState()
+            js.header.stamp = stamp
+            js.name = ["left_wheel_joint", "right_wheel_joint"]
+            js.position = [l * self.m_per_tick / self.wheel_radius,
+                           r * self.m_per_tick / self.wheel_radius]
+            js.velocity = [(dl / self.wheel_radius) / dt, (dr / self.wheel_radius) / dt]
+            self.js_pub.publish(js)
 
-        enc = WheelEncoders()
-        enc.header.stamp = stamp
-        enc.left_ticks = int(l)
-        enc.right_ticks = int(r)
-        enc.left_velocity = (dl / self.wheel_radius) / dt
-        enc.right_velocity = (dr / self.wheel_radius) / dt
-        self.enc_pub.publish(enc)
+        if self.enc_pub.get_subscription_count() > 0:
+            enc = WheelEncoders()
+            enc.header.stamp = stamp
+            enc.left_ticks = int(l)
+            enc.right_ticks = int(r)
+            enc.left_velocity = (dl / self.wheel_radius) / dt
+            enc.right_velocity = (dr / self.wheel_radius) / dt
+            self.enc_pub.publish(enc)
 
 
 def main():

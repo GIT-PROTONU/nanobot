@@ -35,7 +35,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   Subscribes `/cmd_vel` (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM), `/led`
   (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint). Publishes
   `/wheel_ticks` (Int64MultiArray `[L,R]`) from **single-channel** rising-edge GPIO-
-  interrupt counts (unsigned, **no direction**), `/left_wheel_suspended` +
+  interrupt counts (**signed by commanded direction** — the encoders have no 2nd channel,
+  so the ISR signs each tick by the last `/cmd_vel` wheel direction), `/left_wheel_suspended` +
   `/right_wheel_suspended` (Bool per-wheel off-ground microswitch, **published on change**
   for low latency + a 1 Hz heartbeat republish), `/esp32_temp` (Float32) + `/esp32_hall`
   (Int32) on-die telemetry, and `/esp32_heartbeat` (Int32). Also reads a **spin-lidar**
