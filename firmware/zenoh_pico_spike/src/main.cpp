@@ -269,10 +269,17 @@ static void zenohTask(void*){
     uint32_t now = millis();
 
     uint8_t buf[40];
-    if (now - t_ticks >= 33){                                // wheel_ticks + suspension @~30 Hz
+    if (now - t_ticks >= 33){                                // wheel_ticks @~30 Hz
       t_ticks = now;
       zpub_put(P_ticks, buf, cdr_i64arr2(buf,(int64_t)g_left_ticks,(int64_t)g_right_ticks));
     }
+    // suspension: publish immediately on change (every ~2 ms loop), so the web UI
+    // tracks a wheel lifting/dropping with no lag; the 1 Hz block below republishes
+    // for late-joining subscribers.
+    static bool pub_l=false, pub_r=false, susp_init=false;
+    if (!susp_init || g_susp_l!=pub_l){ pub_l=g_susp_l; zpub_put(P_suspL,buf,cdr_bool(buf,pub_l)); }
+    if (!susp_init || g_susp_r!=pub_r){ pub_r=g_susp_r; zpub_put(P_suspR,buf,cdr_bool(buf,pub_r)); }
+    susp_init=true;
 #if LDS_ENABLED
     if (now - t_lds >= 200){                                 // lds @5 Hz
       t_lds = now;
@@ -284,7 +291,7 @@ static void zenohTask(void*){
 #else
     (void)t_lds;
 #endif
-    if (now - t_slow >= 1000){                               // temp/hall/heartbeat/suspension @1 Hz
+    if (now - t_slow >= 1000){                               // temp/hall/heartbeat @1 Hz + suspension republish
       t_slow = now;
       static int32_t hb=0;
       zpub_put(P_temp, buf, cdr_f32(buf, g_temp));
