@@ -22,6 +22,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Quaternion, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
@@ -91,10 +92,21 @@ class EncoderNode(Node):
         self.create_subscription(
             Int64MultiArray, ticks_topic, self._on_ticks, ticks_qos)
 
-        self.create_timer(1.0 / rate, self._publish)
+        self.publish_rate = max(1.0, float(rate))
+        self._timer = self.create_timer(1.0 / self.publish_rate, self._publish)
+        # let the web UI slider retune the odom/TF rate live via set_parameters
+        self.add_on_set_parameters_callback(self._on_params)
         self.get_logger().info(
             f"wheel_odometry up: integrating {ticks_topic} "
-            f"({self.ticks_per_rev} ticks/rev) at {rate:.0f} Hz")
+            f"({self.ticks_per_rev} ticks/rev) at {self.publish_rate:.0f} Hz")
+
+    def _on_params(self, params):
+        for p in params:
+            if p.name == "publish_rate":
+                self.publish_rate = max(1.0, float(p.value))
+                self.destroy_timer(self._timer)
+                self._timer = self.create_timer(1.0 / self.publish_rate, self._publish)
+        return SetParametersResult(successful=True)
 
     def _on_ticks(self, msg: Int64MultiArray):
         if len(msg.data) < 2:

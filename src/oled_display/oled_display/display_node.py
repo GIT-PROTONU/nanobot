@@ -5,7 +5,7 @@
     line 3: hostname + IP        (so you can find the web UI without a screen)
     line 4: pose  x / y / theta   (from /odom)
     line 5: speed v / w           (from /odom twist)
-    line 6: LDS scan rate (Hz)    (from /scan timestamps)
+    line 6: LDS scan rate (Hz)    (from the ESP32's /lds_hz Float32)
 
 Only the lines that fit the panel height are drawn (rows are ROW_PX tall), so the
 clock and custom text stay visible while lower lines drop off on short panels.
@@ -21,8 +21,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 
 try:
     from luma.core.interface.serial import i2c
@@ -71,7 +70,6 @@ class DisplayNode(Node):
         self.pose = (0.0, 0.0, 0.0)
         self.speed = (0.0, 0.0)
         self.scan_hz = 0.0
-        self._last_scan = None
         self.text = ""                       # custom message from the web UI
 
         # Cache host/IP so the render loop never does name resolution per frame.
@@ -100,7 +98,7 @@ class DisplayNode(Node):
             self.get_logger().error(f"luma.oled unavailable: {_LUMA_ERR}")
 
         self.create_subscription(Odometry, "odom", self._on_odom, 10)
-        self.create_subscription(LaserScan, "scan", self._on_scan, 10)
+        self.create_subscription(Float32, "lds_hz", self._on_lds_hz, 10)
         self.create_subscription(String, "oled_text", self._on_text, 10)
         self.create_timer(1.0 / g("refresh_rate").value, self._render)
 
@@ -114,13 +112,10 @@ class DisplayNode(Node):
         self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
         self.speed = (msg.twist.twist.linear.x, msg.twist.twist.angular.z)
 
-    def _on_scan(self, msg: LaserScan):
-        now = self.get_clock().now()
-        if self._last_scan is not None:
-            dt = (now - self._last_scan).nanoseconds * 1e-9
-            if dt > 0:
-                self.scan_hz = 0.8 * self.scan_hz + 0.2 / dt
-        self._last_scan = now
+    def _on_lds_hz(self, msg: Float32):
+        # Lightweight valid-frame rate from the ESP32 (a single Float32) instead of
+        # deserializing the full /scan LaserScan array 10x/sec just to time it.
+        self.scan_hz = msg.data
 
     def _cached_ip(self) -> str:
         now = time.monotonic()

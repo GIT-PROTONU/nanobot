@@ -37,7 +37,7 @@ wheel_odometry:
     wheel_separation: 0.16    # metres between wheel contact points
     invert_left: false        # SBC-side fallback (normally inverted on the ESP32)
     invert_right: false
-    publish_rate: 30.0        # Hz, odom/TF publish rate
+    publish_rate: 15.0        # Hz, odom/TF publish rate (retunable live via web UI slider)
     publish_tf: true
     odom_frame: "odom"
     base_frame: "base_link"
@@ -73,7 +73,7 @@ oled_display:
     i2c_address: 0x3C         # SSD1306 default
     width: 128
     height: 64
-    refresh_rate: 2.0         # Hz
+    refresh_rate: 1.0         # Hz (clock shows HH:MM:SS; 1 Hz keeps seconds live)
     show_ip: true             # show the wlan/eth IP so you can find the web UI
 
 # ---- BWT901CL 9-axis IMU (WitMotion, USB-serial via CH340) ------------------

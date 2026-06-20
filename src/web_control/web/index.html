@@ -162,6 +162,16 @@
         <b>/esp32_hall</b>, <b>/lds_rpm</b>, <b>/lds_hz</b>, <b>/lds_duty</b>,
         <b>/esp32_heartbeat</b>. Slider publishes <b>std_msgs/Float32</b> on
         <b>/lds_target_rpm</b> (PID spin-speed setpoint).</p>
+      <h2>Odometry</h2>
+      <div class="imu">
+        <span>x</span><b id="odoX">–</b>
+        <span>y</span><b id="odoY">–</b>
+        <span>θ</span><b id="odoTh">–</b>
+      </div>
+      <label>Publish rate <span id="odoRateV">15</span> Hz</label>
+      <input id="odoRate" type="range" min="1" max="50" step="1" value="15">
+      <p class="hint"><b>/odom</b> + TF from <b>wheel_odometry</b>. Slider retunes the
+        node publish rate live (lower = less SBC CPU).</p>
       <h2>View</h2>
       <label>Max range <input id="maxr" type="number" value="6" step="0.5" style="width:70px"> m</label>
       <p class="hint">Drive with the pad or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> /
@@ -193,7 +203,7 @@ let scanCount=0, lastHzT=performance.now(), scanHz=0;
 // ---- ROS state ----
 let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null,
     imuTopic=null, eulTopic=null, sysTopic=null,
-    imuParamSrv=null, ldsParamSrv=null, connected=false;
+    imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
 // ESP32 coprocessor topics
 let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
     hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
@@ -218,6 +228,8 @@ $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
 $("imuRate").onchange=()=>setNodeRate(imuParamSrv,Number($("imuRate").value));
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
 $("ldsRate").onchange=()=>setNodeRate(ldsParamSrv,Number($("ldsRate").value));
+$("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
+$("odoRate").onchange=()=>setNodeRate(odoParamSrv,Number($("odoRate").value));
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>{ if(ldsTgtTopic)
@@ -351,6 +363,8 @@ function subscribe(){
   imuParamSrv=new ROSLIB.Service({ros,name:"/imu_driver/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
   ldsParamSrv=new ROSLIB.Service({ros,name:"/lds_driver/set_parameters",
+    serviceType:"rcl_interfaces/srv/SetParameters"});
+  odoParamSrv=new ROSLIB.Service({ros,name:"/wheel_odometry/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
 
   // ---- ESP32 coprocessor (native zenoh-pico over UART, in the rmw_zenoh graph) ----
@@ -493,6 +507,8 @@ function onOdom(msg){
   const yaw=Math.atan2(2*(q.w*q.z),1-2*(q.z*q.z));
   $("px").textContent=p.x.toFixed(2); $("py").textContent=p.y.toFixed(2);
   $("pth").textContent=(yaw*180/Math.PI).toFixed(0);
+  $("odoX").textContent=p.x.toFixed(2)+" m"; $("odoY").textContent=p.y.toFixed(2)+" m";
+  $("odoTh").textContent=(yaw*180/Math.PI).toFixed(0)+"°";
 }
 
 // ---- teleop ----
