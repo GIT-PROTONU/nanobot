@@ -120,8 +120,9 @@
       </div>
       <label>Publish rate <span id="imuRateV">50</span> Hz</label>
       <input id="imuRate" type="range" min="1" max="100" step="1" value="50">
-      <p class="hint">BWT901CL on <b>/imu/data</b> + <b>/imu/euler</b>. Angles °,
-        accel m/s², gyro °/s. Slider retunes the node publish rate live.</p>
+      <p class="hint">BWT901CL. Readout from the light <b>/imu/web</b> + <b>/imu/euler</b>
+        summaries; <b>/imu/data</b> stays 50 Hz for ROS. Angles °, accel m/s², gyro °/s.
+        Slider retunes the node publish rate live.</p>
       <h2>System</h2>
       <div class="imu">
         <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
@@ -207,7 +208,6 @@ let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null,
 // ESP32 coprocessor topics
 let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
     hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
-let imuCount=0, imuHzT=performance.now();   // /imu/data rate measurement
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -350,8 +350,9 @@ function subscribe(){
   odomTopic.subscribe(onOdom);
   cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
   textTopic=new ROSLIB.Topic({ros,name:"/oled_text",messageType:"std_msgs/msg/String"});
-  // no throttle here so the measured rate reflects the node's real publish rate
-  imuTopic=new ROSLIB.Topic({ros,name:"/imu/data",messageType:"sensor_msgs/msg/Imu",
+  // /imu/web is a tiny summary (|accel|,|gyro|,actual /imu/data Hz) the node emits at
+  // ~15 Hz, so we don't make rosbridge bridge the full 50 Hz /imu/data just for a readout.
+  imuTopic=new ROSLIB.Topic({ros,name:"/imu/web",messageType:"geometry_msgs/msg/Vector3Stamped",
     throttle_rate:0,queue_length:1});
   imuTopic.subscribe(onImu);
   eulTopic=new ROSLIB.Topic({ros,name:"/imu/euler",messageType:"geometry_msgs/msg/Vector3Stamped",
@@ -428,13 +429,10 @@ setInterval(()=>{
 },1000);
 
 function onImu(msg){
-  const a=msg.linear_acceleration, g=msg.angular_velocity;
-  $("imuA").textContent=Math.hypot(a.x,a.y,a.z).toFixed(2);
-  $("imuG").textContent=(Math.hypot(g.x,g.y,g.z)*180/Math.PI).toFixed(1);
-  imuCount++;
-  const now=performance.now();
-  if(now-imuHzT>=1000){ $("imuHz").textContent=(imuCount*1000/(now-imuHzT)).toFixed(0)+" Hz";
-    imuCount=0; imuHzT=now; }
+  // /imu/web Vector3Stamped: x=|accel| m/s^2, y=|gyro| rad/s, z=actual /imu/data Hz
+  $("imuA").textContent=msg.vector.x.toFixed(2);
+  $("imuG").textContent=(msg.vector.y*180/Math.PI).toFixed(1);
+  $("imuHz").textContent=msg.vector.z.toFixed(0)+" Hz";
 }
 function onEul(msg){
   $("imuR").textContent=msg.vector.x.toFixed(1)+"°";

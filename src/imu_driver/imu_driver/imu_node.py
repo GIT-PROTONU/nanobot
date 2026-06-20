@@ -81,6 +81,7 @@ class ImuNode(Node):
             ("publish_rate", 50.0),
             ("euler_rate", 25.0),       # /imu/euler only drives the web angle readout
             ("mag_rate", 10.0),         # /imu/mag is slow-moving + unused by the UI
+            ("web_rate", 15.0),         # /imu/web (accel|/|gyro| summary for the UI)
             ("output_rate_hz", 0),      # device stream rate; 0 = auto-follow publish
         ])
         g = self.get_parameter
@@ -97,9 +98,17 @@ class ImuNode(Node):
         self._eul_period = (1.0 / self.euler_rate) if self.euler_rate > 0 else None
         self.mag_rate = max(0.0, float(g("mag_rate").value))
         self._mag_period = (1.0 / self.mag_rate) if self.mag_rate > 0 else None
+        # /imu/web is a tiny Vector3Stamped (|accel|, |gyro|, actual /imu/data Hz) that
+        # feeds the web readout, so rosbridge bridges THIS low-rate summary instead of
+        # deserializing the full 50 Hz Imu (covariances and all) just for two numbers.
+        self.web_rate = max(0.0, float(g("web_rate").value))
+        self._web_period = (1.0 / self.web_rate) if self.web_rate > 0 else None
         self._next_pub = 0.0
         self._next_eul = 0.0
         self._next_mag = 0.0
+        self._next_web = 0.0
+        self._imu_hz = 0.0             # measured /imu/data publish rate (EMA)
+        self._last_pub_mono = None
         self._dev_hz = 0                # last rate actually programmed into device
         self._need_reconfig = threading.Event()
         # let the web UI slider retune the rate live via /imu_driver/set_parameters
@@ -108,6 +117,7 @@ class ImuNode(Node):
         self.pub_imu = self.create_publisher(Imu, "imu/data", 10)
         self.pub_mag = self.create_publisher(MagneticField, "imu/mag", 10)
         self.pub_eul = self.create_publisher(Vector3Stamped, "imu/euler", 10)
+        self.pub_web = self.create_publisher(Vector3Stamped, "imu/web", 10)
 
         # Pre-allocate the messages and set every constant field once; the hot path
         # only mutates the live values + stamp and re-publishes. Avoids building
@@ -124,6 +134,8 @@ class ImuNode(Node):
         self._mag_msg.header.frame_id = self.frame_id
         self._eul_msg = Vector3Stamped()
         self._eul_msg.header.frame_id = self.frame_id
+        self._web_msg = Vector3Stamped()
+        self._web_msg.header.frame_id = self.frame_id
 
         # Latest decoded values, filled in frame-type order each cycle.
         self.acc = (0.0, 0.0, 0.0)
@@ -182,6 +194,9 @@ class ImuNode(Node):
             elif p.name == "mag_rate":
                 self.mag_rate = max(0.0, float(p.value))
                 self._mag_period = (1.0 / self.mag_rate) if self.mag_rate > 0 else None
+            elif p.name == "web_rate":
+                self.web_rate = max(0.0, float(p.value))
+                self._web_period = (1.0 / self.web_rate) if self.web_rate > 0 else None
             elif p.name == "output_rate_hz":
                 self.force_rate = int(p.value)
                 self._need_reconfig.set()
@@ -271,6 +286,13 @@ class ImuNode(Node):
         # exception here would kill the reader thread and silence the IMU).
         if self._stop.is_set() or not rclpy.ok():
             return
+        # Track the real /imu/data publish rate (this method runs once per published
+        # frame) so the UI can show it without subscribing to the 50 Hz topic itself.
+        if self._last_pub_mono is not None:
+            dt = mono - self._last_pub_mono
+            if dt > 0:
+                self._imu_hz = 0.9 * self._imu_hz + 0.1 / dt
+        self._last_pub_mono = mono
         stamp = self.get_clock().now().to_msg()
         roll, pitch, yaw = (v * DEG2RAD for v in self.euler_deg)
         qx, qy, qz, qw = euler_to_quat(roll, pitch, yaw)
@@ -298,6 +320,20 @@ class ImuNode(Node):
             mag.header.stamp = stamp
             mag.magnetic_field.x, mag.magnetic_field.y, mag.magnetic_field.z = self.mag
             self.pub_mag.publish(mag)
+
+        # /imu/web — the web UI's whole IMU readout in one tiny low-rate message:
+        # x=|accel| (m/s^2), y=|gyro| (rad/s), z=actual /imu/data rate (Hz). Lets the
+        # browser drop its 50 Hz /imu/data subscription, cutting rosbridge's load.
+        if self._web_period is not None and mono >= self._next_web:
+            self._next_web = mono + self._web_period
+            ax, ay, az = self.acc
+            gx, gy, gz = self.gyro
+            web = self._web_msg
+            web.header.stamp = stamp
+            web.vector.x = math.sqrt(ax * ax + ay * ay + az * az)
+            web.vector.y = math.sqrt(gx * gx + gy * gy + gz * gz)
+            web.vector.z = self._imu_hz
+            self.pub_web.publish(web)
 
     def destroy_node(self):
         self._stop.set()

@@ -86,6 +86,8 @@ imu_driver:
                               # follows this (so lowering it cuts parse CPU too).
     euler_rate: 25.0          # Hz; /imu/euler only feeds the web angle display
     mag_rate: 10.0            # Hz; /imu/mag is slow-moving + unused by the UI
+    web_rate: 15.0            # Hz; /imu/web (|accel|,|gyro|,rate) summary for the UI so
+                              # the browser need not subscribe to the full 50 Hz /imu/data
     output_rate_hz: 0         # 0 = device streams at publish_rate; >0 pins it
 
 # ---- Board health monitor -> diagnostic_msgs/DiagnosticArray on /diagnostics -
