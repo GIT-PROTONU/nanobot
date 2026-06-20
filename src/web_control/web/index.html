@@ -142,6 +142,26 @@
       <input id="ldsRate" type="range" min="1" max="10" step="1" value="10">
       <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider caps
         (decimates) it lower.</p>
+      <h2>Coprocessor (ESP32)</h2>
+      <div class="imu">
+        <span>link</span><b id="espHb">–</b>
+        <span>ticks L/R</span><b id="espTicks">–</b>
+        <span>tick rate</span><b id="espTickHz">–</b>
+        <span>L wheel</span><b id="espSuspL">–</b>
+        <span>R wheel</span><b id="espSuspR">–</b>
+        <span>temp</span><b id="espTemp">–</b>
+        <span>hall</span><b id="espHall">–</b>
+        <span>LDS spin</span><b id="espLdsRpm">–</b>
+        <span>LDS frames</span><b id="espLdsHz">–</b>
+        <span>LDS duty</span><b id="espLdsDuty">–</b>
+      </div>
+      <label>LDS target <span id="ldsTgtV">300</span> rpm</label>
+      <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300">
+      <p class="hint">Live values from the ESP32 coprocessor (micro-ROS over USB):
+        <b>/wheel_ticks</b>, <b>/left|right_wheel_suspended</b>, <b>/esp32_temp</b>,
+        <b>/esp32_hall</b>, <b>/lds_rpm</b>, <b>/lds_hz</b>, <b>/lds_duty</b>,
+        <b>/esp32_heartbeat</b>. Slider publishes <b>std_msgs/Float32</b> on
+        <b>/lds_target_rpm</b> (PID spin-speed setpoint).</p>
       <h2>View</h2>
       <label>Max range <input id="maxr" type="number" value="6" step="0.5" style="width:70px"> m</label>
       <p class="hint">Drive with the pad or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> /
@@ -174,6 +194,9 @@ let scanCount=0, lastHzT=performance.now(), scanHz=0;
 let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null,
     imuTopic=null, eulTopic=null, sysTopic=null,
     imuParamSrv=null, ldsParamSrv=null, connected=false;
+// ESP32 coprocessor topics
+let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
+    hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
 let imuCount=0, imuHzT=performance.now();   // /imu/data rate measurement
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
@@ -195,6 +218,10 @@ $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
 $("imuRate").onchange=()=>setNodeRate(imuParamSrv,Number($("imuRate").value));
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
 $("ldsRate").onchange=()=>setNodeRate(ldsParamSrv,Number($("ldsRate").value));
+// LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
+$("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
+$("ldsTgt").onchange=()=>{ if(ldsTgtTopic)
+  ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); };
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
 // server). Toggling off drops the connection so the camera stops (ref-counted).
@@ -325,7 +352,66 @@ function subscribe(){
     serviceType:"rcl_interfaces/srv/SetParameters"});
   ldsParamSrv=new ROSLIB.Service({ros,name:"/lds_driver/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
+
+  // ---- ESP32 coprocessor (micro-ROS over USB, bridged into the graph) ----
+  hbTopic=new ROSLIB.Topic({ros,name:"/esp32_heartbeat",
+    messageType:"std_msgs/msg/Int32",throttle_rate:0,queue_length:1});
+  hbTopic.subscribe(onHb);
+  ticksTopic=new ROSLIB.Topic({ros,name:"/wheel_ticks",
+    messageType:"std_msgs/msg/Int64MultiArray",throttle_rate:100,queue_length:1});
+  ticksTopic.subscribe(onTicks);
+  suspLTopic=new ROSLIB.Topic({ros,name:"/left_wheel_suspended",
+    messageType:"std_msgs/msg/Bool",queue_length:1});
+  suspLTopic.subscribe(m=>suspTxt("espSuspL",m.data));
+  suspRTopic=new ROSLIB.Topic({ros,name:"/right_wheel_suspended",
+    messageType:"std_msgs/msg/Bool",queue_length:1});
+  suspRTopic.subscribe(m=>suspTxt("espSuspR",m.data));
+  tempTopic=new ROSLIB.Topic({ros,name:"/esp32_temp",
+    messageType:"std_msgs/msg/Float32",queue_length:1});
+  tempTopic.subscribe(m=>$("espTemp").textContent=m.data.toFixed(1)+"°C");
+  hallTopic=new ROSLIB.Topic({ros,name:"/esp32_hall",
+    messageType:"std_msgs/msg/Int32",queue_length:1});
+  hallTopic.subscribe(m=>$("espHall").textContent=m.data);
+  ldsRpmTopic=new ROSLIB.Topic({ros,name:"/lds_rpm",
+    messageType:"std_msgs/msg/Float32",queue_length:1});
+  ldsRpmTopic.subscribe(m=>$("espLdsRpm").textContent=m.data.toFixed(0)+" rpm");
+  ldsHzTopic=new ROSLIB.Topic({ros,name:"/lds_hz",
+    messageType:"std_msgs/msg/Float32",queue_length:1});
+  ldsHzTopic.subscribe(m=>$("espLdsHz").textContent=m.data.toFixed(1)+" Hz");
+  ldsDutyTopic=new ROSLIB.Topic({ros,name:"/lds_duty",
+    messageType:"std_msgs/msg/Float32",queue_length:1});
+  ldsDutyTopic.subscribe(m=>$("espLdsDuty").textContent=(m.data*100).toFixed(0)+"%");
+  ldsTgtTopic=new ROSLIB.Topic({ros,name:"/lds_target_rpm",messageType:"std_msgs/msg/Float32"});
 }
+
+// ---- ESP32 coprocessor handlers ----
+let espTickCount=0, espTickHzT=performance.now(), lastHb=null, lastHbT=0;
+function onHb(msg){ lastHb=msg.data; lastHbT=performance.now(); }
+function onTicks(msg){
+  const d=msg.data||[];
+  $("espTicks").textContent = d.length>=2 ? `${d[0]} / ${d[1]}` : "–";
+  espTickCount++;
+  const now=performance.now();
+  if(now-espTickHzT>=1000){
+    $("espTickHz").textContent=(espTickCount*1000/(now-espTickHzT)).toFixed(0)+" Hz";
+    espTickCount=0; espTickHzT=now;
+  }
+}
+// suspension: green = on the ground (ready to drive), amber = up/suspended.
+function suspTxt(id,val){
+  const el=$(id);
+  if(val===true){ el.textContent="UP (suspended)"; el.style.color="var(--amber)"; }
+  else if(val===false){ el.textContent="down"; el.style.color="var(--green)"; }
+  else { el.textContent="–"; el.style.color=""; }
+}
+// Heartbeat liveness: the counter ticks ~1 Hz; if it stops advancing the link is down.
+setInterval(()=>{
+  const el=$("espHb");
+  if(lastHb==null){ el.textContent="–"; el.style.color=""; return; }
+  const alive=(performance.now()-lastHbT)<2500;
+  el.textContent = alive ? `alive (#${lastHb})` : "lost";
+  el.style.color = alive ? "var(--green)" : "var(--red)";
+},1000);
 
 function onImu(msg){
   const a=msg.linear_acceleration, g=msg.angular_velocity;

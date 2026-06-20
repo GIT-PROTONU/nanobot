@@ -10,6 +10,7 @@
 //   pub  lds_rpm        std_msgs/Float32        spin-lidar speed (RPM; 0 if no data)
 //   pub  lds_hz         std_msgs/Float32        LDS valid-frame rate (Hz; 0 = no data)
 //   pub  lds_duty       std_msgs/Float32        LDS spin-motor PID output duty [0..1]
+//   pub  esp32_heartbeat std_msgs/Int32         link-alive counter, +1 every ~1 s
 //   sub  lds_target_rpm std_msgs/Float32        LDS spin-speed setpoint (RPM; PID)
 //
 // Real-time work (single-channel encoder edge-counting, PWM, cmd watchdog) lives
@@ -60,6 +61,7 @@ rcl_publisher_t    right_susp_pub;
 #endif
 rcl_publisher_t    temp_pub;
 rcl_publisher_t    hall_pub;
+rcl_publisher_t    heartbeat_pub;
 rcl_publisher_t    lds_rpm_pub;
 rcl_publisher_t    lds_hz_pub;
 #if LDS_MOTOR_PIN >= 0
@@ -82,6 +84,7 @@ std_msgs__msg__Bool                 right_susp_msg;
 #endif
 std_msgs__msg__Float32              temp_msg;
 std_msgs__msg__Int32                hall_msg;
+std_msgs__msg__Int32                heartbeat_msg;
 std_msgs__msg__Float32              lds_rpm_msg;
 std_msgs__msg__Float32              lds_hz_msg;
 #if LDS_MOTOR_PIN >= 0
@@ -279,6 +282,11 @@ static void enc_cb(rcl_timer_t *timer, int64_t) {
     RCSOFTCHECK(rcl_publish(&temp_pub, &temp_msg, NULL));
     hall_msg.data = hallRead();
     RCSOFTCHECK(rcl_publish(&hall_pub, &hall_msg, NULL));
+    // Link heartbeat: a counter that just ticks up ~1 Hz. The SBC/web watches it
+    // increment to confirm the whole USB->agent->graph path is alive (a frozen or
+    // missing value = link down), independent of any sensor actually changing.
+    heartbeat_msg.data++;
+    RCSOFTCHECK(rcl_publish(&heartbeat_pub, &heartbeat_msg, NULL));
   }
 
   // Spin-lidar at ~5 Hz: report RPM (0 if the stream went stale so a powered-down LDS
@@ -349,6 +357,9 @@ static bool createEntities() {
       &hall_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "esp32_hall"));
   RCCHECK(rclc_publisher_init_default(
+      &heartbeat_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "esp32_heartbeat"));
+  RCCHECK(rclc_publisher_init_default(
       &lds_rpm_pub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "lds_rpm"));
   RCCHECK(rclc_publisher_init_default(
@@ -408,6 +419,7 @@ static void destroyEntities() {
 #endif
   rcl_publisher_fini(&temp_pub, &node);
   rcl_publisher_fini(&hall_pub, &node);
+  rcl_publisher_fini(&heartbeat_pub, &node);
   rcl_publisher_fini(&lds_rpm_pub, &node);
   rcl_publisher_fini(&lds_hz_pub, &node);
 #if LDS_MOTOR_PIN >= 0

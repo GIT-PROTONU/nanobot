@@ -1,0 +1,4 @@
+.pio/
+zenohd-x86_64
+zenohd-aarch64
+*.txt

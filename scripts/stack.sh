@@ -15,10 +15,13 @@ set -u
 NANO="${NANO:-$HOME/Nano}"
 LOG="$NANO/.run"; mkdir -p "$LOG"
 PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/robot.yaml"
-# ESP32 motor/encoder coprocessor serial device (udev symlink preferred). The
-# micro_ros_agent bridges it into the (zenoh) graph: /cmd_vel in, /wheel_ticks out.
-AGENT_DEV="${AGENT_DEV:-/dev/esp32}"
-AGENT_BAUD="${AGENT_BAUD:-115200}"
+# ESP32 coprocessor: runs zenoh-pico over a direct UART (NO micro-ROS agent). The
+# serial-capable zenohd LISTENs on this UART so the ESP32 joins the zenoh graph
+# directly (/cmd_vel,/led,/lds_target_rpm in; /wheel_ticks,/lds_*,/esp32_* etc out).
+# Build the binary on a dev host: firmware/zenoh_pico_spike/tools/build_zenohd_serial.sh aarch64
+ESP32_UART="${ESP32_UART:-/dev/ttyS1}"
+ESP32_BAUD="${ESP32_BAUD:-115200}"
+ZENOHD_SERIAL="${ZENOHD_SERIAL:-$NANO/bin/zenohd-serial}"
 
 # The ROS overlay's setup scripts reference unset vars (e.g. COLCON_TRACE);
 # relax nounset just around the source so `set -u` can stay on for our logic.
@@ -41,15 +44,30 @@ do_up() {
   # topics and never enumerates, so it isn't needed (~65 MB more).
   local ros="$CONDA_PREFIX/lib"     # ROS package libexec dirs in the pixi env
   local own="$NANO/install"         # our colcon packages
-  pgrep -f 'rmw_zenohd' >/dev/null \
-    || { launch zenohd "$ros/rmw_zenoh_cpp/rmw_zenohd"; sleep 6; }
-  # micro-ROS agent for the ESP32 coprocessor. Inherits RMW_IMPLEMENTATION from
-  # the pixi env (rmw_zenoh_cpp) so it joins the same graph as everything else;
-  # must come up after the router. Skips quietly if the ESP32 isn't plugged in.
-  pgrep -f 'micro_ros_agent' >/dev/null \
-    || { [ -e "$AGENT_DEV" ] \
-           && launch agent "$ros/micro_ros_agent/micro_ros_agent serial --dev $AGENT_DEV -b $AGENT_BAUD" \
-           || echo "  agent: skipped ($AGENT_DEV not present)"; }
+  # ROUTER: the serial-capable zenohd (built with --features transport_serial; the
+  # conda libzenohc has NO serial support). It LISTENs on TCP for the rmw_zenoh stack
+  # AND on the ESP32's UART, so the ESP32 (running zenoh-pico, NO micro-ROS agent, NO
+  # DDS) joins the graph directly. Replaces conda rmw_zenohd + micro_ros_agent.
+  #
+  # It MUST run with rmw_zenoh's own ROUTER config (not zenohd defaults): the default
+  # routing lets the ROS peers gossip into a direct mesh that bypasses delivery of the
+  # ESP32 (a zenoh CLIENT) data to them. We generate that config + add the serial listen
+  # endpoint, and set exit_on_failure:false so a transient serial desync can't kill the
+  # router. (The ESP32 firmware also disables its LDS UART so it can keep the zenoh
+  # serial link fed under the rmw config's tighter transport timings.)
+  local rcfg="$LOG/router_serial.json5"
+  python - "$rcfg" "$ESP32_UART" "$ESP32_BAUD" <<'PY'
+import sys, os
+out, uart, baud = sys.argv[1], sys.argv[2], sys.argv[3]
+src = f"{os.environ['CONDA_PREFIX']}/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_ROUTER_CONFIG.json5"
+t = open(src).read()
+old = '    endpoints: [\n      "tcp/[::]:7447"\n    ],'
+new = f'    endpoints: [\n      "tcp/[::]:7447",\n      "serial/{uart}#baudrate={baud}"\n    ],'
+assert t.count(old) == 1, "router config listen-endpoints block not found as expected"
+open(out, "w").write(t.replace(old, new).replace("exit_on_failure: true", "exit_on_failure: false"))
+PY
+  pgrep -x 'zenohd-serial' >/dev/null \
+    || { launch zenohd "$ZENOHD_SERIAL -c $rcfg"; sleep 6; }
   pgrep -f 'rosbridge_websocket' >/dev/null \
     || launch rosbridge "$ros/rosbridge_server/rosbridge_websocket --ros-args -p port:=9090"
   pgrep -f 'web_control/lib/web_control' >/dev/null \
@@ -63,9 +81,13 @@ do_up() {
   # Wheel odometry: integrates /wheel_ticks from the ESP32 coprocessor into /odom.
   pgrep -f 'wheel_odometry/lib/wheel_odometry' >/dev/null \
     || launch odom "$own/wheel_odometry/lib/wheel_odometry/encoder_node --ros-args --params-file $PARAMS"
-  # LDS: Python driver (the Rust lds_driver doesn't build against this RoboStack).
-  pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
-    || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
+  # LDS scan driver: DISABLED — /dev/ttyS1 is now the ESP32 zenoh link (above), so the
+  # SBC can't read the LDS scan there. The ESP32 still owns the LDS spin PID and
+  # publishes /lds_rpm,/lds_hz,/lds_duty over zenoh. To restore /scan, wire the LDS
+  # data line to a free SBC UART and set LDS_PORT, then re-enable this:
+  #   pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
+  #     || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
+  :
 }
 
 do_down() {
@@ -78,15 +100,14 @@ do_down() {
            'imu_driver/lib/imu_driver' \
            'oled_display/lib/oled_display' \
            'web_control/lib/web_control' \
-           'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon' \
-           'micro_ros_agent' \
-           'rmw_zenohd'; do
+           'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon'; do
     pkill -f "$p" 2>/dev/null
   done
+  pkill -x 'zenohd-serial' 2>/dev/null   # router holds the ESP32 UART; kill by exact name
 }
 
 status() {
-  for s in "zenohd:rmw_zenohd" "agent:micro_ros_agent" "rosbridge:rosbridge_websocket" \
+  for s in "zenohd:zenohd-serial" "rosbridge:rosbridge_websocket" \
            "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
            "imu:imu_driver/lib/imu_driver" "sys:sys_monitor/lib/sys_monitor" \
            "odom:wheel_odometry/lib/wheel_odometry" \
