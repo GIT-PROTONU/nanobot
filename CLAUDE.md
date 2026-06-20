@@ -42,12 +42,13 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (LDS02RR) → `/lds_rpm` (Float32, RPM only — scan data ignored; 0 when stale) + `/lds_hz`
   (valid-frame rate, 0 = not receiving), and closed-loop-controls its spin motor: a PID
   (**tune on hardware**) holds `/lds_target_rpm` by driving the motor PWM, output on
-  `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 0). WiFi/BT kept off.
+  `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 1; UART1 is drained once
+  per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins: encoders L=19 R=26, switches 18/27,
-  motor STBY=23, LEFT_IN_REV=4, **UART2 = zenoh link (TX=17, RX=16)**, LDS data on
-  GPIO35 (UART1 RX-only), LDS motor PWM=21. Keep diff-drive limits synced to `robot.yaml`.
+  motor STBY=23, LEFT_IN_REV=4, **UART2 = zenoh link (TX=17, RX=16)**, **LDS data on GPIO14
+  (UART1 RX; TX=GPIO13 unused)**, LDS motor PWM=21. Keep diff-drive limits synced to `robot.yaml`.
 - **The link needs a serial-capable `zenohd`** — the conda `libzenohc` is built without
   `transport_serial`, so stock `rmw_zenohd` can't open the UART. Build one with
   `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; `stack.sh`

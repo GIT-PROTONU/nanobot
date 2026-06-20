@@ -18,12 +18,12 @@ set -euo pipefail
 USER_NAME="${SUDO_USER:-ibster}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-echo "== 1/4  Device-tree overlays (I2C0/1/2, UART1 for the LDS, ALL USB hosts) =="
+echo "== 1/4  Device-tree overlays (I2C0/1/2, UART1=ESP32 link, UART2=LDS scan, ALL USB hosts) =="
 ENV=/boot/armbianEnv.txt
 # usbhost0..3 = all four H5 host controllers (USB-A + header ports). The OTG/micro-
 # USB port (usb@1c19000) is already dr_mode=host in the base DT. Enabling every host
 # means a device works from whichever port you plug it into.
-NEED="usbhost0 usbhost1 usbhost2 usbhost3 i2c0 i2c1 i2c2 uart1"
+NEED="usbhost0 usbhost1 usbhost2 usbhost3 i2c0 i2c1 i2c2 uart1 uart2"
 cp -n "$ENV" "$ENV.nano.bak" 2>/dev/null || true
 if grep -q '^overlays=' "$ENV"; then
   cur=" $(sed -n 's/^overlays=//p' "$ENV") "

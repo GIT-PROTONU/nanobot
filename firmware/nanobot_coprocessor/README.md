@@ -41,7 +41,8 @@ tools/build_zenohd_serial.sh aarch64   # -> ./zenohd-aarch64 (board)
 pio run -t upload          # flash over USB/UART0
 pio device monitor         # debug console (115200 on the CP2102 port)
 ```
-Tunables (pins, PID gains, diff-drive limits) live in `include/config.h`.
+Tunables (pins, PID gains, diff-drive limits) are inline `#define`s at the top of
+`src/main.cpp` (there is no `include/config.h`).
 
 ## Wiring (UART2 link via host USB-serial / FTDI adapter, 3.3V logic)
 | FTDI | ESP32 |

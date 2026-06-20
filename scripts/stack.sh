@@ -81,13 +81,12 @@ PY
   # Wheel odometry: integrates /wheel_ticks from the ESP32 coprocessor into /odom.
   pgrep -f 'wheel_odometry/lib/wheel_odometry' >/dev/null \
     || launch odom "$own/wheel_odometry/lib/wheel_odometry/encoder_node --ros-args --params-file $PARAMS"
-  # LDS scan driver: DISABLED — /dev/ttyS1 is now the ESP32 zenoh link (above), so the
-  # SBC can't read the LDS scan there. The ESP32 still owns the LDS spin PID and
-  # publishes /lds_rpm,/lds_hz,/lds_duty over zenoh. To restore /scan, wire the LDS
-  # data line to a free SBC UART and set LDS_PORT, then re-enable this:
-  #   pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
-  #     || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
-  :
+  # LDS scan driver: reads the LDS data line on /dev/ttyS2 (UART2, set in robot.yaml) and
+  # publishes /scan. ttyS1 is the ESP32 zenoh link, so the LDS data wire fans out to BOTH
+  # the ESP32 (UART1 RX=GPIO14, RPM->spin PID) and the SBC's UART2 (full scan). UART2 needs
+  # the `uart2` device-tree overlay (deploy/sbc-setup.sh) + a reboot for /dev/ttyS2 to exist.
+  pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
+    || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
 }
 
 do_down() {

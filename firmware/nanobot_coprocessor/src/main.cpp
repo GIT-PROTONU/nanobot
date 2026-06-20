@@ -16,15 +16,26 @@
 // LINK: ESP32 UART2 (TX=GPIO17, RX=GPIO16) <-> SBC UART1 (/dev/ttyS1). The serial-
 // capable zenohd LISTENs there + on TCP for the rest of the rmw_zenoh stack.
 //
-// MULTICORE: Core 0 runs the ZENOH task (sole owner of the session/serial: zp_read +
-// keepalive + all publishes + sub callbacks). Core 1 runs the Arduino loop() = REAL-
-// TIME CONTROL (motors, cmd watchdog, LDS PID, sensor sampling). They share state via
-// volatiles (32-bit aligned reads/writes are atomic on the ESP32). Only Core 0 ever
-// touches the zenoh session — concurrent serial writes corrupt frames (lease timeout).
+// MULTICORE: zenohTask (publishes + sub callbacks) is pinned to Core 0. zenoh-pico's read
+// + lease tasks use plain xTaskCreate (no affinity) so they float, but run at HIGH priority
+// (configMAX_PRIORITIES/2 = 12) — far above the Arduino loop() (loopTask = prio 1). Core 1
+// runs loop() = REAL-TIME CONTROL (motors, cmd watchdog, LDS UART1 read + PID, sensors).
+//
+// Why the SBC zenoh link ALWAYS wins over the LDS:
+// (1) the zenoh read/lease tasks (prio 12) preempt the LDS/control loop (prio 1)
+// wherever they're scheduled; (2) the UART2 RX ISR lives on Core 0 (z_open runs here) while
+// the UART1/LDS RX ISR lives on Core 1 (Serial1.begin runs in setup on Core 1), so the two
+// UARTs never contend for the same core's interrupt time. (Pinning the zenoh tasks onto
+// Core 0 was tried and REVERTED: it starved the prio-5 zenohTask's publisher declarations,
+// so the board connected but never announced its topics.)
+//
+// State is shared via volatiles (32-bit aligned reads/writes are atomic on the ESP32).
+// Only Core 0 ever touches the zenoh session — concurrent serial writes corrupt frames.
 //
 // Three hard-won zenoh-pico notes (see README): use the "serial/UART_2" device locator
-// (the pin form skips the link handshake), the begin()-explicit-pins patch, and single-
-// thread mode (Z_FEATURE_MULTI_THREAD=0).
+// (the pin form skips the link handshake), the begin()-explicit-pins patch, and multi-
+// thread mode (Z_FEATURE_MULTI_THREAD=1) — the blocking serial RX needs its own read
+// task while the lease task + our publishes do TX (serialized by Z_FEATURE_BATCH_TX_MUTEX).
 #include <Arduino.h>
 #include <zenoh-pico.h>
 #include <string.h>
@@ -44,7 +55,11 @@
 #define RIGHT_SUSPEND_PIN 27
 #define SUSPEND_ACTIVE_HIGH true
 #define LED_PIN        2
-#define LDS_RX_PIN    35      // was 16 (now UART2 RX); LDS data wire -> GPIO35 (UART1 RX)
+// LDS data link = UART1 (Serial1). UART1's default pins (9/10) are the SPI flash, but the
+// peripheral routes through the GPIO matrix, so RX is remapped to GPIO14 (TX=GPIO13 stays
+// free — the LDS02RR only streams, we never transmit to it). 25/4 were rejected: they're
+// the left-motor PWM. UART2 stays the SBC zenoh link, UART0 the debug console.
+#define LDS_RX_PIN    14      // UART1 RX (was 35)
 #define LDS_MOTOR_PIN 21
 
 #define PWM_FREQ_HZ   20000
@@ -67,10 +82,14 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define LDS_PID_KI     0.0015f
 #define LDS_PID_KD     0.0f
 
-// LDS DISABLED: its UART1 read (Serial1) is an extra serial peripheral that can steal
-// CPU/interrupt time from the zenoh serial link. Set to 1 to re-enable the spin-lidar
-// RPM read + PID + lds_rpm/lds_hz/lds_duty pubs + lds_target_rpm sub. All code kept.
-#define LDS_ENABLED  0
+// LDS spin-lidar. We only want the current RPM to close the spin PID, so UART1 is drained
+// once per PID tick (not every loop) — see loop(). Enabling adds a 2nd active UART; if the
+// zenoh link (UART2) turns flaky under load, set back to 0 (all code stays compiled out).
+#define LDS_ENABLED  1
+
+// Periodic one-line health summary on the debug console (UART0 — separate from the zenoh
+// UART2 link). Lets you watch the LDS + control stay live under load; 0 disables it.
+#define STATUS_PRINT_MS 3000
 
 #define CH_LEFT_FWD  0
 #define CH_LEFT_REV  1
@@ -149,7 +168,26 @@ static void declare_lv(const char* topic, const char* type, int eid){
 struct ZPub { z_owned_publisher_t p; int64_t seq; uint8_t gid[16]; };
 static ZPub P_ticks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb;
 
-static void zpub_declare(ZPub& zp, const char* keyexpr, uint8_t tag){
+// Single source of truth for every publisher: topic/type, the attachment GID tag
+// (last GID byte, unique per publisher) and the liveliness entity id (lv_eid, also
+// unique). The declare loop and the liveliness loop both walk this, so the two can't
+// drift. These wire identities are PROVEN-GOOD against the live graph — don't renumber.
+struct PubDef { ZPub* zp; const char* topic; const char* type; uint8_t gid_tag; int lv_eid; bool lds_only; };
+static const PubDef PUBS[] = {
+  { &P_ticks, "wheel_ticks",           T_I64A, 1, 1, false },
+  { &P_suspL, "left_wheel_suspended",  T_BOOL, 2, 2, false },
+  { &P_suspR, "right_wheel_suspended", T_BOOL, 3, 3, false },
+  { &P_temp,  "esp32_temp",            T_F32,  4, 4, false },
+  { &P_hall,  "esp32_hall",            T_I32,  5, 5, false },
+  { &P_hb,    "esp32_heartbeat",       T_I32,  9, 6, false },
+  { &P_rpm,   "lds_rpm",               T_F32,  6, 7, true  },
+  { &P_hz,    "lds_hz",                T_F32,  7, 8, true  },
+  { &P_duty,  "lds_duty",              T_F32,  8, 9, true  },
+};
+
+static void zpub_declare(ZPub& zp, const char* topic, const char* type, uint8_t tag){
+  char keyexpr[160];
+  snprintf(keyexpr, sizeof(keyexpr), DOMAIN "/%s/%s/TypeHashNotSupported", topic, type);
   z_view_keyexpr_t ke; z_view_keyexpr_from_str_unchecked(&ke, keyexpr);
   z_declare_publisher(z_session_loan(&s), &zp.p, z_view_keyexpr_loan(&ke), NULL);
   zp.seq = 0;
@@ -181,8 +219,12 @@ static size_t sample_bytes(const z_loaned_sample_t* sm, uint8_t* out, size_t cap
   return n;
 }
 
-// --- subscription callbacks (run on Core 0 during zp_read) ---
+// --- subscription callbacks (run in the zenoh-pico read task: prio 12, floats cores) ---
 static void cmd_cb(z_loaned_sample_t* sm, void*){
+  // one-shot: report which core the read task is on (informational; it floats but at prio
+  // 12 it always preempts the LDS/control loop). Prints when the first cmd_vel arrives.
+  static bool core_printed=false;
+  if (!core_printed){ core_printed=true; Serial.printf("[nano] zenoh rx task on core %d\n", xPortGetCoreID()); }
   uint8_t b[64]; size_t n = sample_bytes(sm, b, sizeof(b));
   if (n < 52) return;                       // hdr(4) + 6*f64(48); align from body start
   double v, w;
@@ -214,17 +256,8 @@ static bool zenohConnect(){
   zp_start_read_task(z_session_loan_mut(&s), NULL);
   zp_start_lease_task(z_session_loan_mut(&s), NULL);
 
-  zpub_declare(P_ticks,KE("wheel_ticks",T_I64A),1);
-  zpub_declare(P_suspL,KE("left_wheel_suspended",T_BOOL),2);
-  zpub_declare(P_suspR,KE("right_wheel_suspended",T_BOOL),3);
-  zpub_declare(P_temp, KE("esp32_temp",T_F32),4);
-  zpub_declare(P_hall, KE("esp32_hall",T_I32),5);
-#if LDS_ENABLED
-  zpub_declare(P_rpm,  KE("lds_rpm",T_F32),6);
-  zpub_declare(P_hz,   KE("lds_hz",T_F32),7);
-  zpub_declare(P_duty, KE("lds_duty",T_F32),8);
-#endif
-  zpub_declare(P_hb,   KE("esp32_heartbeat",T_I32),9);
+  for (auto& d : PUBS)
+    if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
   static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt;   // kept alive (static)
   z_owned_closure_sample_t cl;
@@ -238,17 +271,9 @@ static bool zenohConnect(){
 
   // Publisher liveliness tokens -> ESP32 shows up as a graph participant so rmw_zenoh
   // subscribers reliably receive its data. eid must be unique per entity.
-  declare_lv("wheel_ticks",T_I64A,1);
-  declare_lv("left_wheel_suspended",T_BOOL,2);
-  declare_lv("right_wheel_suspended",T_BOOL,3);
-  declare_lv("esp32_temp",T_F32,4);
-  declare_lv("esp32_hall",T_I32,5);
-  declare_lv("esp32_heartbeat",T_I32,6);
-#if LDS_ENABLED
-  declare_lv("lds_rpm",T_F32,7);
-  declare_lv("lds_hz",T_F32,8);
-  declare_lv("lds_duty",T_F32,9);
-#endif
+  for (auto& d : PUBS)
+    if (!d.lds_only || LDS_ENABLED) declare_lv(d.topic, d.type, d.lv_eid);
+
 #if LDS_ENABLED
   z_view_keyexpr_from_str_unchecked(&ke, KE("lds_target_rpm",T_F32));
   z_closure_sample(&cl, ldstgt_cb, NULL, NULL);
@@ -262,6 +287,7 @@ static bool zenohConnect(){
 // Publishing runs here on Core 0. RX + keepalive are handled by the zenoh-pico read/
 // lease tasks; we only PUT (TX-mutex-serialized against them), so nothing blocks.
 static void zenohTask(void*){
+  Serial.printf("[nano] zenoh task pinned to core %d\n", xPortGetCoreID());
   for(;;){
     if (!ready){ ready = zenohConnect(); if (!ready){ delay(1000); continue; } }
 
@@ -360,26 +386,34 @@ void setup(){
   pinMode(LEFT_SUSPEND_PIN,INPUT_PULLUP); pinMode(RIGHT_SUSPEND_PIN,INPUT_PULLUP);
 
 #if LDS_ENABLED
-  // LDS data on UART1 remapped to GPIO35 (RX-only); UART2 is the zenoh link.
+  // LDS data on UART1 RX=GPIO14 (RX-only; UART2 is the zenoh link). Roomy RX buffer so a
+  // burst of scan frames survives between PID ticks — we drain it only at the PID rate.
+  Serial1.setRxBufferSize(1024);
   Serial1.begin(LDS_BAUD, SERIAL_8N1, LDS_RX_PIN, -1);
   ledcSetup(CH_LDS,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LDS_MOTOR_PIN,CH_LDS);
+  Serial.printf("[nano] LDS on UART1 RX=%d, spin PID @%d Hz\n", LDS_RX_PIN, LDS_PID_HZ);
 #endif
 
+  g_temp = temperatureRead(); g_hall = hallRead();   // seed telemetry so first pub isn't 0
   g_last_cmd_ms = millis();
-  // Zenoh session owns Core 0; control loop() runs on Core 1.
+  // zenohTask pinned to Core 0; setup()/loop() (this code, + the LDS) run on Core 1. The
+  // LDS can't starve the link: zenoh's read/lease tasks are prio 12 vs this loop's prio 1,
+  // and the UART2 (zenoh) and UART1 (LDS) RX ISRs sit on Core 0 and Core 1 respectively.
+  Serial.printf("[nano] control loop runs on core %d\n", xPortGetCoreID());
   xTaskCreatePinnedToCore(zenohTask, "zenoh", 16384, NULL, 5, NULL, 0);
 }
 
 void loop(){   // Core 1: real-time control
-#if LDS_ENABLED
-  while (Serial1.available()) ldsFeed((uint8_t)Serial1.read());
-#endif
-
-  static uint32_t last_pid=0, last_ctl=0, last_sens=0;
+  static uint32_t last_pid=0, last_ctl=0, last_sens=0, last_slow=0;
   uint32_t now = millis();
 
 #if LDS_ENABLED
-  if (now-last_pid >= (uint32_t)(1000/LDS_PID_HZ)){ ldsControl((now-last_pid)/1000.0f); last_pid=now; }
+  if (now-last_pid >= (uint32_t)(1000/LDS_PID_HZ)){    // spin PID @50 Hz
+    // Drain UART1 here, not every loop: every frame carries the current RPM, so flushing
+    // the buffer right before the PID gives the freshest speed and skips idle polling.
+    while (Serial1.available()) ldsFeed((uint8_t)Serial1.read());
+    ldsControl((now-last_pid)/1000.0f); last_pid=now;
+  }
 #else
   (void)last_pid;
 #endif
@@ -389,13 +423,11 @@ void loop(){   // Core 1: real-time control
     if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){ g_left_duty=0; g_right_duty=0; }
     applyMotors(g_left_duty, g_right_duty);
   }
-  if (now-last_sens >= 100){                                // sensors @10 Hz
+  if (now-last_sens >= 100){                                // suspension debounce + LED @10 Hz
     last_sens=now;
     static bool cl=false,cr=false; static uint8_t sl=0,sr=0;
     g_susp_l = debounceSusp(LEFT_SUSPEND_PIN, cl, sl, g_susp_l);
     g_susp_r = debounceSusp(RIGHT_SUSPEND_PIN,cr, sr, g_susp_r);
-    g_temp = temperatureRead();
-    g_hall = hallRead();
     if (g_led_dirty){ digitalWrite(LED_PIN, g_led?HIGH:LOW); g_led_dirty=false; }
 #if LDS_ENABLED
     // compute LDS frame-rate (Hz)
@@ -403,5 +435,19 @@ void loop(){   // Core 1: real-time control
     uint32_t f=g_lds_frames; g_lds_hz = (lm && now>lm)?(f-lf)*1000.0f/(now-lm):0; lf=f; lm=now;
 #endif
   }
+  if (now-last_slow >= 1000){                               // die telemetry @1 Hz (its pub rate)
+    last_slow=now;
+    g_temp = temperatureRead();
+    g_hall = hallRead();
+  }
+#if STATUS_PRINT_MS
+  static uint32_t last_dbg=0;
+  if (now-last_dbg >= STATUS_PRINT_MS){                     // debug-console health line
+    last_dbg=now;
+    Serial.printf("[nano] ticks L=%lu R=%lu | lds rpm=%.0f hz=%.0f duty=%.2f | susp %d/%d\n",
+      (unsigned long)g_left_ticks,(unsigned long)g_right_ticks,
+      g_lds_rpm, g_lds_hz, g_lds_duty, (int)g_susp_l,(int)g_susp_r);
+  }
+#endif
   delay(1);
 }

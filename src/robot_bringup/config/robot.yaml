@@ -15,7 +15,8 @@
 # ---- Rust LDS node (sensor_msgs/LaserScan on /scan) -------------------------
 lds_driver:
   ros__parameters:
-    port: "/dev/ttyS1"        # LDS02RR data UART on UART1/PG6-PG7 (@115200)
+    port: "/dev/ttyS2"        # LDS02RR data UART on UART2/PA0-PA1 (@115200). ttyS1 is the
+                              # ESP32 zenoh link now; needs the `uart2` overlay (sbc-setup.sh).
     baud: 115200
     frame_id: "laser"
     clockwise: true           # LDS02RR spins CW; node converts to ROS CCW frame
