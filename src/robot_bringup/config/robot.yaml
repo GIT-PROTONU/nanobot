@@ -86,6 +86,20 @@ slam_nav:
     min_match_score: 1.0           # reject matches with no real map overlap
     use_imu_yaw: true              # IMU yaw delta for rotation (vs wheel odom)
     map_write_rate: 2.0            # Hz to refresh the /dev/shm map file
+    # --- navigation (click-to-go) ---
+    enable_motion: false           # SAFETY: false = plan + show path but DON'T drive.
+                                   # Flip live from the web UI "enable motion" toggle.
+    robot_radius: 0.16             # obstacle inflation for the planner (m)
+    plan_downsample: 4             # plan on a 1/N grid (CPU/RAM); 4 = 0.20 m cells
+    allow_unknown: true            # let the global plan cross unmapped cells
+    control_rate: 10.0             # Hz pursuit/controller loop
+    replan_period: 1.0             # s between global replans while a goal is active
+    max_lin: 0.15                  # m/s pursuit speed cap (start gentle)
+    max_ang: 1.0                   # rad/s turn-rate cap
+    lookahead: 0.30                # m pure-pursuit lookahead
+    goal_tol: 0.12                 # m: within this of the goal = arrived
+    stop_distance: 0.25            # m: obstacle this close ahead = stop + replan
+    front_angle: 0.6               # rad: half-width of the reactive front cone
 
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:

@@ -76,12 +76,17 @@
       <h2>Map</h2>
       <label class="chk"><input type="checkbox" id="mapOn"> show map</label>
       <div id="mapWrap" style="display:none;background:#000;border-radius:6px;overflow:hidden">
-        <canvas id="mapcv" style="width:100%;display:block;image-rendering:pixelated"></canvas>
+        <canvas id="mapcv" style="width:100%;display:block;image-rendering:pixelated;cursor:crosshair"></canvas>
+      </div>
+      <div id="mapCtl" style="display:none;gap:6px;margin-top:6px;grid-template-columns:1fr 1fr">
+        <label class="chk"><input type="checkbox" id="mapMotion"> enable motion</label>
+        <button id="mapStop" class="danger">■ Stop</button>
       </div>
       <p class="hint" id="mapHint" style="display:none">2D occupancy map from
         <b>slam_nav</b> (/scan + /odom + IMU yaw, scan-to-map matched), served raw from
-        <b>/dev/shm</b> via <b>/map</b>. Polls only while shown; red marks the robot.
-        Click-to-go navigation arrives in Stage 2.</p>
+        <b>/dev/shm</b> via <b>/map</b>. Polls only while shown. <b>Click the map to set a
+        goal</b> — the green path is the plan (<b>/plan</b>). It only drives when
+        <b>enable motion</b> is on (else it just plans). Red = robot, yellow = goal.</p>
       <h2>Camera</h2>
       <label class="chk"><input type="checkbox" id="camOn"> show webcam</label>
       <img id="cam" alt="">
@@ -217,6 +222,8 @@ let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null,
 // ESP32 coprocessor topics
 let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
     hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
+// slam_nav view+plan state (read by the map panel script below)
+let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -239,6 +246,21 @@ $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
 $("ldsRate").onchange=()=>setNodeRate(ldsParamSrv,Number($("ldsRate").value));
 $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
 $("odoRate").onchange=()=>setNodeRate(odoParamSrv,Number($("odoRate").value));
+// publish a navigation goal in the map frame; slam_nav plans a path toward it.
+function mapSetGoal(wx,wy){
+  if(!goalTopic) return;
+  goalTopic.publish(new ROSLIB.Message({header:{frame_id:"map"},
+    pose:{position:{x:wx,y:wy,z:0},orientation:{x:0,y:0,z:0,w:1}}}));
+  mapGoal=[wx,wy];
+}
+// flip slam_nav enable_motion live (rcl_interfaces SetParameters; type 1 = bool).
+function setNavMotion(on){
+  if(!navMotionSrv) return;
+  navMotionSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name:"enable_motion",
+    value:{type:1,bool_value:on,integer_value:0,double_value:0,string_value:"",
+      byte_array_value:[],bool_array_value:[],integer_array_value:[],
+      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
+}
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>{ if(ldsTgtTopic)
@@ -406,6 +428,13 @@ function subscribe(){
     messageType:"std_msgs/msg/Float32",queue_length:1});
   ldsDutyTopic.subscribe(m=>$("espLdsDuty").textContent=(m.data*100).toFixed(0)+"%");
   ldsTgtTopic=new ROSLIB.Topic({ros,name:"/lds_target_rpm",messageType:"std_msgs/msg/Float32"});
+  // slam_nav: click-to-go goal, the planned path overlay, and the motion toggle.
+  goalTopic=new ROSLIB.Topic({ros,name:"/goal_pose",messageType:"geometry_msgs/msg/PoseStamped"});
+  navMotionSrv=new ROSLIB.Service({ros,name:"/slam_nav/set_parameters",
+    serviceType:"rcl_interfaces/srv/SetParameters"});
+  planTopic=new ROSLIB.Topic({ros,name:"/plan",messageType:"nav_msgs/msg/Path",
+    throttle_rate:200,queue_length:1});
+  planTopic.subscribe(m=>{ mapPlan=(m.poses||[]).map(p=>[p.pose.position.x,p.pose.position.y]); });
 }
 
 // ---- ESP32 coprocessor handlers ----
@@ -606,7 +635,7 @@ connect();   // auto-connect on load
   const $=id=>document.getElementById(id);
   const cv=$("mapcv"), ctx=cv.getContext("2d");
   const dec=new TextDecoder();
-  let timer=null, img=null;
+  let timer=null, img=null, lastMeta=null;
 
   async function poll(){
     try{
@@ -634,20 +663,51 @@ connect();   // auto-connect on load
       }
     }
     ctx.putImageData(img,0,0);
+    lastMeta=m;
+    const W2P=(x,y)=>[(x-m.ox)/m.res, h-1-(y-m.oy)/m.res];  // world -> canvas px
+    // planned path (green polyline)
+    if(mapPlan && mapPlan.length>1){
+      ctx.strokeStyle="#34c759"; ctx.lineWidth=2; ctx.beginPath();
+      mapPlan.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+      ctx.stroke();
+    }
+    // goal marker (yellow ring)
+    if(mapGoal){
+      const [gx,gy]=W2P(mapGoal[0],mapGoal[1]);
+      ctx.strokeStyle="#ffd60a"; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(gx,gy,5,0,6.2832); ctx.stroke();
+    }
     // robot pose: red dot + heading tick
-    const rx=(m.px-m.ox)/m.res, py=h-1-(m.py-m.oy)/m.res;
+    const [rx,ry]=W2P(m.px,m.py);
     ctx.fillStyle=ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.arc(rx,py,4,0,6.2832); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(rx,py);
-    ctx.lineTo(rx+9*Math.cos(m.pth), py-9*Math.sin(m.pth)); ctx.stroke();
+    ctx.beginPath(); ctx.arc(rx,ry,4,0,6.2832); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(rx,ry);
+    ctx.lineTo(rx+9*Math.cos(m.pth), ry-9*Math.sin(m.pth)); ctx.stroke();
   }
 
   $("mapOn").addEventListener("change",e=>{
     const on=e.target.checked;
     $("mapWrap").style.display=on?"block":"none";
+    $("mapCtl").style.display=on?"grid":"none";
     $("mapHint").style.display=on?"block":"none";
     if(on){ poll(); timer=setInterval(poll,500); }
     else { clearInterval(timer); timer=null; }
+  });
+
+  // click the map -> goal in world metres (account for CSS scaling + the y-flip)
+  cv.addEventListener("click",e=>{
+    if(!lastMeta) return;
+    const rect=cv.getBoundingClientRect();
+    const cx=(e.clientX-rect.left)*cv.width/rect.width;
+    const cy=(e.clientY-rect.top)*cv.height/rect.height;
+    const m=lastMeta;
+    mapSetGoal(m.ox+cx*m.res, m.oy+(cv.height-1-cy)*m.res);
+  });
+  $("mapMotion").addEventListener("change",e=>setNavMotion(e.target.checked));
+  $("mapStop").addEventListener("click",()=>{
+    $("mapMotion").checked=false; setNavMotion(false);
+    if(cmdTopic) cmdTopic.publish(new ROSLIB.Message(
+      {linear:{x:0,y:0,z:0},angular:{x:0,y:0,z:0}}));   // belt-and-braces halt
   });
 })();
 </script>

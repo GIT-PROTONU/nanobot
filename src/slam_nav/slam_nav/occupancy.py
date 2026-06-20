@@ -127,3 +127,104 @@ class GridMap:
         out = (p * 100.0).astype(np.int8)
         out[~self.seen] = -1
         return out
+
+    # --- global planner (Stage 2) -------------------------------------------
+    OBST_L = 0.62        # log-odds threshold counted as an obstacle (~P>0.65)
+
+    @staticmethod
+    def _nearest_free(blocked, c, r, m, maxrad=6):
+        """Nearest non-blocked coarse cell to (c, r) in a small spiral (cols, rows)."""
+        if 0 <= r < m and 0 <= c < m and not blocked[r, c]:
+            return c, r
+        for rad in range(1, maxrad + 1):
+            for dr in range(-rad, rad + 1):
+                for dc in range(-rad, rad + 1):
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < m and 0 <= cc < m and not blocked[rr, cc]:
+                        return cc, rr
+        return None, None
+
+    @staticmethod
+    def _simplify(path):
+        """Drop collinear waypoints so the follower gets corners, not every cell."""
+        if len(path) < 3:
+            return path
+        out = [path[0]]
+        for i in range(1, len(path) - 1):
+            ax, ay = path[i][0] - out[-1][0], path[i][1] - out[-1][1]
+            bx, by = path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]
+            if abs(ax * by - ay * bx) > 1e-6:      # turn here -> keep it
+                out.append(path[i])
+        out.append(path[-1])
+        return out
+
+    def plan(self, start, goal, radius_m=0.16, downsample=4, allow_unknown=True,
+             max_iter=1000):
+        """Plan a path from `start` to `goal` (world m) over a *downsampled* copy of the
+        grid (keeps CPU/RAM tiny: 24 m @ 5 cm / ds=4 -> 120x120 cells). Obstacles are
+        inflated by the robot radius; a vectorised wavefront from the goal gives a
+        distance field, then we descend it from the start. Returns world waypoints or
+        None if unreachable. Cheap enough to re-run ~1 Hz."""
+        ds = max(1, int(downsample))
+        m = self.n // ds
+        res_c = self.res * ds
+        k = m * ds
+        occ_c = (self.log[:k, :k] > self.OBST_L).reshape(m, ds, m, ds).any(axis=(1, 3))
+        seen_c = self.seen[:k, :k].reshape(m, ds, m, ds).any(axis=(1, 3))
+
+        # inflate obstacles by the robot radius (L1 / diamond dilation, a few passes)
+        blocked = occ_c.copy()
+        for _ in range(max(1, int(round(radius_m / res_c)))):
+            b = blocked.copy()
+            b[1:, :] |= blocked[:-1, :]; b[:-1, :] |= blocked[1:, :]
+            b[:, 1:] |= blocked[:, :-1]; b[:, :-1] |= blocked[:, 1:]
+            blocked = b
+        if not allow_unknown:
+            blocked |= ~seen_c
+
+        def w2c(x, y):
+            return (int((x - self.origin) / res_c), int((y - self.origin) / res_c))
+
+        sc, sr = w2c(*start)
+        gc, gr = w2c(*goal)
+        if not (0 <= sc < m and 0 <= sr < m and 0 <= gc < m and 0 <= gr < m):
+            return None
+        gc, gr = self._nearest_free(blocked, gc, gr, m)     # snap goal off any wall
+        sc, sr = self._nearest_free(blocked, sc, sr, m)     # snap start out of inflation
+        if gc is None or sc is None:
+            return None
+
+        BIG = np.float32(1e9)
+        dist = np.full((m, m), BIG, dtype=np.float32)
+        dist[gr, gc] = 0.0
+        for _ in range(max_iter):
+            nb = np.full((m, m), BIG, dtype=np.float32)
+            nb[1:, :] = np.minimum(nb[1:, :], dist[:-1, :])
+            nb[:-1, :] = np.minimum(nb[:-1, :], dist[1:, :])
+            nb[:, 1:] = np.minimum(nb[:, 1:], dist[:, :-1])
+            nb[:, :-1] = np.minimum(nb[:, :-1], dist[:, 1:])
+            cand = nb + 1.0
+            cand[blocked] = BIG
+            cand[gr, gc] = 0.0
+            newd = np.minimum(dist, cand)
+            if np.array_equal(newd, dist):       # wavefront filled all reachable cells
+                break
+            dist = newd
+        if dist[sr, sc] >= BIG:
+            return None                          # goal not reachable from start
+
+        # descend the distance field start -> goal (greedy 4-neighbour steepest)
+        path, r, c, limit = [], sr, sc, m * m
+        for _ in range(limit):
+            path.append((self.origin + (c + 0.5) * res_c, self.origin + (r + 0.5) * res_c))
+            if r == gr and c == gc:
+                break
+            best, nr, nc = dist[r, c], r, c
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < m and 0 <= cc < m and dist[rr, cc] < best:
+                    best, nr, nc = dist[rr, cc], rr, cc
+            if (nr, nc) == (r, c):
+                break
+            r, c = nr, nc
+        return self._simplify(path)

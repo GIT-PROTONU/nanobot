@@ -7,6 +7,10 @@
 /install/
 /log/
 
+# PlatformIO build cache (firmware) — incl. the abandoned esp32_coprocessor leftovers
+.pio/
+firmware/esp32_coprocessor/
+
 # rust
 src/lds_driver/target/
 **/*.rs.bk

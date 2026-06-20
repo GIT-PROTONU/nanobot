@@ -22,8 +22,9 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from geometry_msgs.msg import PoseStamped, Vector3Stamped
-from nav_msgs.msg import Odometry
+from rcl_interfaces.msg import SetParametersResult
+from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 
 from .occupancy import GridMap
@@ -52,6 +53,19 @@ class NavNode(Node):
             ("min_match_score", 1.0),    # below this, keep the prior (no good overlap)
             ("use_imu_yaw", True),       # IMU yaw delta for rotation (else wheel odom)
             ("map_write_rate", 2.0),     # Hz to (re)write the /dev/shm map file
+            # --- navigation (Stages 2/3) ---
+            ("enable_motion", False),    # SAFETY: when false, plan+show path but DON'T drive
+            ("robot_radius", 0.16),      # obstacle inflation for the planner (m)
+            ("plan_downsample", 4),      # plan on a 1/N grid (CPU/RAM); 4 -> 0.20 m cells
+            ("allow_unknown", True),     # let the global plan cross unmapped cells
+            ("control_rate", 10.0),      # Hz controller / pursuit loop
+            ("replan_period", 1.0),      # s between global replans while a goal is active
+            ("max_lin", 0.15),           # m/s pure-pursuit speed cap
+            ("max_ang", 1.0),            # rad/s turn rate cap
+            ("lookahead", 0.30),         # m pure-pursuit lookahead
+            ("goal_tol", 0.12),          # m: within this of the goal = arrived
+            ("stop_distance", 0.25),     # m: obstacle closer than this ahead = stop+replan
+            ("front_angle", 0.6),        # rad: half-width of the reactive front cone
         ])
         g = self.get_parameter
         self.grid = GridMap(
@@ -64,6 +78,19 @@ class NavNode(Node):
         self.use_imu = bool(g("use_imu_yaw").value)
         self._write_period = 1.0 / max(0.2, float(g("map_write_rate").value))
 
+        # navigation params
+        self.enable_motion = bool(g("enable_motion").value)
+        self.robot_radius = float(g("robot_radius").value)
+        self.plan_downsample = int(g("plan_downsample").value)
+        self.allow_unknown = bool(g("allow_unknown").value)
+        self.replan_period = float(g("replan_period").value)
+        self.max_lin = float(g("max_lin").value)
+        self.max_ang = float(g("max_ang").value)
+        self.lookahead = float(g("lookahead").value)
+        self.goal_tol = float(g("goal_tol").value)
+        self.stop_distance = float(g("stop_distance").value)
+        self.front_angle = float(g("front_angle").value)
+
         # SLAM pose in the map frame.
         self.px = self.py = self.pth = 0.0
         self._have_map = False
@@ -74,15 +101,41 @@ class NavNode(Node):
         self._prev_imu = None
         self._last_write = 0.0
 
+        # navigation state (all callbacks + the control timer run on the one spin
+        # thread, so plain attributes are safe — no locks needed).
+        self._goal = None            # (x, y) world, or None
+        self._path = []              # [(x, y)] world waypoints
+        self._last_scan = None       # (angles, ranges) for the reactive layer
+        self._next_replan = 0.0
+
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
+        self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
+        self.path_pub = self.create_publisher(Path, "plan", 5)
         self.create_subscription(Odometry, g("odom_topic").value, self._on_odom, 20)
         self.create_subscription(Vector3Stamped, g("euler_topic").value, self._on_euler, 10)
         self.create_subscription(
             LaserScan, g("scan_topic").value, self._on_scan, qos_profile_sensor_data)
+        self.create_subscription(PoseStamped, "goal_pose", self._on_goal, 5)
+        self.create_timer(1.0 / max(1.0, float(g("control_rate").value)), self._control)
+        self.add_on_set_parameters_callback(self._on_params)
 
         self.get_logger().info(
             f"slam_nav up: {self.grid.n}x{self.grid.n} grid @ {self.grid.res:.3f} m "
-            f"({self.grid.n * self.grid.res:.1f} m square), match {self.match_pts} pts")
+            f"({self.grid.n * self.grid.res:.1f} m square), match {self.match_pts} pts; "
+            f"motion {'ENABLED' if self.enable_motion else 'disabled (view/plan only)'}")
+
+    def _on_params(self, params):
+        # let the web UI flip enable_motion / retune speeds live via set_parameters
+        for p in params:
+            if p.name == "enable_motion":
+                self.enable_motion = bool(p.value)
+                if not self.enable_motion:
+                    self._send(0.0, 0.0)     # drop to a stop the moment it's disabled
+            elif p.name == "max_lin":
+                self.max_lin = float(p.value)
+            elif p.name == "max_ang":
+                self.max_ang = float(p.value)
+        return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
     def _on_odom(self, msg):
@@ -100,6 +153,7 @@ class NavNode(Node):
         if n == 0:
             return
         angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
+        self._last_scan = (angles, ranges)        # for the reactive front-stop layer
 
         if not self._have_map:
             # Seed: drop the first scan straight in at the origin and prime trackers.
@@ -160,6 +214,89 @@ class NavNode(Node):
         ps.pose.orientation.z = math.sin(self.pth * 0.5)
         ps.pose.orientation.w = math.cos(self.pth * 0.5)
         self.pose_pub.publish(ps)
+
+    # --- navigation (Stages 2/3) --------------------------------------------
+    def _on_goal(self, msg):
+        self._goal = (msg.pose.position.x, msg.pose.position.y)
+        self._next_replan = 0.0                  # plan immediately on the next tick
+        self.get_logger().info(f"goal set: ({self._goal[0]:.2f}, {self._goal[1]:.2f})")
+
+    def _control(self):
+        if self._goal is None or not self._have_map:
+            return
+        now = time.monotonic()
+        if now >= self._next_replan:
+            self._next_replan = now + self.replan_period
+            path = self.grid.plan(
+                (self.px, self.py), self._goal, radius_m=self.robot_radius,
+                downsample=self.plan_downsample, allow_unknown=self.allow_unknown)
+            self._path = path or []
+            self._publish_path()                 # always publish so the UI shows the plan
+            if not self._path:
+                self.get_logger().warning("no path to goal", throttle_duration_sec=3.0)
+
+        gx, gy = self._goal
+        if math.hypot(gx - self.px, gy - self.py) < self.goal_tol:
+            self.get_logger().info("goal reached")
+            self._goal, self._path = None, []
+            self._publish_path()
+            self._send(0.0, 0.0)
+            return
+
+        # reactive safety: an obstacle in the forward cone -> stop and replan around it
+        if self._front_blocked():
+            self._send(0.0, 0.0)
+            self._next_replan = min(self._next_replan, now + 0.2)
+            return
+
+        v, w = self._pursuit()
+        self._send(v, w)
+
+    def _front_blocked(self):
+        if self._last_scan is None:
+            return False
+        ang, rng = self._last_scan
+        fwd = np.abs(np.arctan2(np.sin(ang), np.cos(ang))) < self.front_angle
+        r = rng[fwd]
+        r = r[np.isfinite(r) & (r > 0.05)]
+        return r.size > 0 and float(r.min()) < self.stop_distance
+
+    def _pursuit(self):
+        if not self._path:
+            return 0.0, 0.0
+        # lookahead target = first waypoint at least `lookahead` away (else the last)
+        tx, ty = self._path[-1]
+        for (x, y) in self._path:
+            if math.hypot(x - self.px, y - self.py) >= self.lookahead:
+                tx, ty = x, y
+                break
+        err = _wrap(math.atan2(ty - self.py, tx - self.px) - self.pth)
+        dgoal = math.hypot(self._goal[0] - self.px, self._goal[1] - self.py)
+        v = 0.0 if abs(err) > 0.6 else self.max_lin    # rotate in place if facing away
+        v = min(v, self.max_lin * max(0.25, dgoal / 0.5))   # ease off near the goal
+        w = max(-self.max_ang, min(self.max_ang, 1.5 * err))
+        return v, w
+
+    def _send(self, v, w):
+        if not self.enable_motion:               # view/plan-only mode: never drive
+            return
+        t = Twist()
+        t.linear.x = float(v)
+        t.angular.z = float(w)
+        self.cmd_pub.publish(t)
+
+    def _publish_path(self):
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = "map"
+        for (x, y) in self._path:
+            ps = PoseStamped()
+            ps.header.frame_id = "map"
+            ps.pose.position.x = float(x)
+            ps.pose.position.y = float(y)
+            ps.pose.orientation.w = 1.0
+            path.poses.append(ps)
+        self.path_pub.publish(path)
 
     def _write_map(self):
         occ = self.grid.occupancy_int8()
