@@ -1,0 +1,6 @@
+- [Project overview](project-overview.md) — Nano robot: NanoPi NEO Plus2 + ROS 2 Humble (pixi/RoboStack, rmw_zenoh), mixed Python/Rust, rosbridge web UI
+- [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
+- [Deployment state](deployment-state.md) — live board at 192.168.178.141, plink/pscp access, web UI running, what's left
+- [ESP32 coprocessor](esp32-coprocessor.md) — native zenoh-pico (not micro-ROS) coprocessor in firmware/nanobot_coprocessor; single-channel encoders signed by commanded dir
+- [slam_nav](slam-nav.md) — custom super-light 2D SLAM + planned click-to-go nav (branch slam); Stage 1 done in repo, stages 2-3 pending
+- [ESP32 tooling setup](esp32-tooling-setup.md) — RESUME AFTER REBOOT: native Windows can't build micro-ROS; moving to WSL2+usbipd for build/flash/test
