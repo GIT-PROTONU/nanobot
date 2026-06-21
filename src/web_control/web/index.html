@@ -75,8 +75,9 @@
     <div id="side">
       <h2>Map</h2>
       <label class="chk"><input type="checkbox" id="mapOn"> show map</label>
-      <div id="mapWrap" style="display:none;background:#000;border-radius:6px;overflow:hidden">
-        <canvas id="mapcv" style="width:100%;display:block;image-rendering:pixelated;cursor:crosshair"></canvas>
+      <div id="mapWrap" style="display:none;background:#000;border-radius:6px;overflow:hidden;position:relative;min-height:64px">
+        <canvas id="mapcv" style="width:100%;display:block;image-rendering:pixelated"></canvas>
+        <div id="mapWait" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9aa;font-size:13px;text-align:center;padding:10px">waiting for map… is the lidar spinning?<br>(set <b>LDS&nbsp;target</b> &gt; 0 rpm below)</div>
       </div>
       <div id="mapCtl" style="display:none;gap:6px;margin-top:6px;grid-template-columns:1fr 1fr">
         <label class="chk"><input type="checkbox" id="mapMotion"> enable motion</label>
@@ -664,6 +665,8 @@ connect();   // auto-connect on load
     }
     ctx.putImageData(img,0,0);
     lastMeta=m;
+    $("mapWait").style.display="none";    // got a real frame: drop the placeholder
+    cv.style.cursor="crosshair";          // ...and arm click-to-go only now
     const W2P=(x,y)=>[(x-m.ox)/m.res, h-1-(y-m.oy)/m.res];  // world -> canvas px
     // planned path (green polyline)
     if(mapPlan && mapPlan.length>1){
@@ -690,8 +693,10 @@ connect();   // auto-connect on load
     $("mapWrap").style.display=on?"block":"none";
     $("mapCtl").style.display=on?"grid":"none";
     $("mapHint").style.display=on?"block":"none";
-    if(on){ poll(); timer=setInterval(poll,500); }
-    else { clearInterval(timer); timer=null; }
+    if(on){
+      $("mapWait").style.display="flex"; cv.style.cursor="default"; // until a frame lands
+      poll(); timer=setInterval(poll,500);
+    } else { clearInterval(timer); timer=null; }
   });
 
   // click the map -> goal in world metres (account for CSS scaling + the y-flip)
