@@ -58,10 +58,7 @@ final confirmation was still pending at end of session.
   `web_control` serves `/scan.bin`; the page polls it (~12.5 Hz, skips unchanged seq) and
   draws — same lidar view + point-count + scan-Hz readouts, zero rosbridge LaserScan
   builds. Same pattern as `/map`. /scan still publishes for slam_nav.
-- **Process merge for RAM:** new `sensor_hub` package runs imu+sys+odom+lds in ONE process
-  (SingleThreadedExecutor); saves ~100+ MB vs four interpreters. Node names/topics/params/
-  services unchanged (per-name param loading from one --params-file works). Trade-off: no
-  independent crash/restart; serial drivers self-heal on their own threads. Web shows IMU
-  connectivity via /imu/web staleness (red "lost"), so a device drop is still visible.
-  `stack.sh` launches one `sensors` entry; `do_down` keeps the old per-node patterns to
-  sweep pre-merge stragglers. See [[single-webui-from-sbc]].
+
+NB: this note is on the **`separate-sensor-nodes`** branch (sensor nodes = 4 processes).
+`main` additionally merges imu+sys+odom+lds into one `sensor_hub` process (~100+ MB RAM
+saved); revert to this branch to undo only that merge. See [[single-webui-from-sbc]].

@@ -29,10 +29,6 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   not launched by `stack.sh`/`robot.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
-- `sensor_hub` — **runs `imu_driver` + `sys_monitor` + `wheel_odometry` + `lds_driver_py`
-  in ONE process** (one executor) to save ~100+ MB RAM on the 1 GB board. Same node
-  names/topics/params/services — purely an packaging change. `stack.sh` launches this
-  instead of those four separately. Trade-off: they no longer crash/restart independently.
 
 ## ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
 - **Native zenoh-pico over a direct UART link** (PlatformIO + Arduino) — NO micro-ROS,
@@ -72,10 +68,11 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   `build-lds`/`build-all`** — the Rust node and its toolchain are intentionally gone.
 - Run the stack: **`scripts/stack.sh {up|down|restart|status}`** (run via
   `pixi run bash scripts/stack.sh ...`). It starts router → agent → rosbridge → web
-  → oled → **sensors** (one `sensor_hub` process = imu+sys+odom+lds) → nav in order,
-  idempotent (pgrep-guarded), logs to `.run/*.log`. `down`/`restart` SIGTERM→wait→SIGKILL
-  and verify (also sweeps pre-merge per-node stragglers). (The agent is skipped if
-  `$AGENT_DEV` isn't plugged in.)
+  → oled → imu → sys → odom → lds → nav in order, idempotent (pgrep-guarded), logs to
+  `.run/*.log`. `down`/`restart` SIGTERM→wait→SIGKILL and verify. (The agent is skipped
+  if `$AGENT_DEV` isn't plugged in.)
+  > NB: this is the **`separate-sensor-nodes`** fallback branch — the sensor nodes run as
+  > four separate processes. `main` merges them into one `sensor_hub` process to save RAM.
   Nodes are launched by their installed executables directly (not `ros2 run`) to
   keep RAM down.
 - On the board the stack **auto-starts on boot** via systemd `nano-stack.service`.
