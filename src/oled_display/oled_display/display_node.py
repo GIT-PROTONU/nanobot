@@ -39,8 +39,11 @@ Subscribe-only and best-effort: if the panel or luma isn't present the node stil
 runs and just logs once, so the rest of the stack is unaffected.
 """
 import math
+import os
 import random
+import signal
 import socket
+import threading
 import time
 
 import rclpy
@@ -61,6 +64,10 @@ except Exception as exc:  # pragma: no cover - hardware lib
 IP_REFRESH_S = 30.0    # re-resolve the outbound IP at most this often
 TEMP_REFRESH_S = 2.0   # re-read the SBC thermal zone at most this often
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"  # cpu-thermal (millidegrees)
+# The web UI writes "restart" / "shutdown" here just before it stops the stack, so the
+# OLED node (stopped via SIGTERM) knows which end-screen to show. /dev/shm is tmpfs the
+# stack user can write and is cleared on reboot.
+ACTION_FILE = "/dev/shm/nano_oled_action"
 
 # Staleness windows: a source is "alive" only if it arrived within this many
 # seconds. Generous enough to ride out one missed message at each topic's rate.
@@ -139,6 +146,8 @@ class DisplayNode(Node):
         self._frame = 0                 # free-running frame counter (stress mood)
         self._next_smile = now          # happy: next recurring crescent "smile" beat
         self._smile_until = 0.0         # happy: crescent shown until this time
+        self._off = False               # panel has been powered off (shutdown)
+        self._sys = ""                  # "restart"/"shutdown" once a system action starts
 
         self.device = None
         self.font = None
@@ -162,6 +171,7 @@ class DisplayNode(Node):
         self.create_subscription(Float32, "lds_hz", self._on_lds_hz, 10)
         self.create_subscription(String, "oled_text", self._on_text, 10)
         self.create_subscription(String, "oled_face", self._on_face, 10)
+        self.create_subscription(String, "oled_system", self._on_system, 10)
 
         # Dashboard ticks slowly; the face has its own faster timer that stays
         # cancelled (no wakeups) until a mood is selected.
@@ -202,6 +212,20 @@ class DisplayNode(Node):
         elif not new and was_face:        # back to dashboard: stop the face timer
             self._face_timer.cancel()
         self.get_logger().info(f"OLED mode: {self.face_mood or 'dashboard'}")
+
+    def _on_system(self, msg: String):
+        """Web UI sends 'restart'/'shutdown' the instant the button is clicked, so the
+        end-screen appears immediately (well before the stack teardown's SIGTERM)."""
+        s = msg.data.strip().lower()
+        if s not in ("restart", "shutdown") or self._sys:
+            return
+        self._sys = s
+        try:
+            self._face_timer.cancel()       # freeze normal rendering on the end-screen
+        except Exception:
+            pass
+        if self.device:
+            (self._restart_screen if s == "restart" else self._shutdown_screen)()
 
     def _on_esp_beat(self, _msg: Int32):
         self.esp_at = time.monotonic()
@@ -253,7 +277,7 @@ class DisplayNode(Node):
         draw.text((48, y), value, font=self.font, fill=255)
 
     def _dashboard_tick(self):
-        if not self.device or self.face_mood:    # face mode owns the screen
+        if not self.device or self.face_mood or self._sys:   # face/system screen owns it
             return
         now = time.monotonic()
         esp_up = (now - self.esp_at) < ESP_TIMEOUT_S
@@ -405,7 +429,7 @@ class DisplayNode(Node):
         draw.ellipse((bx - 9, by - 9, bx + 9, by + 9), outline=255)
 
     def _face_tick(self):
-        if not self.device or not self.face_mood:
+        if not self.device or not self.face_mood or self._sys:
             return
         now = time.monotonic()
         self._anim_update(now)
@@ -446,8 +470,80 @@ class DisplayNode(Node):
                 self._happy_eye(draw, lcx, cy, px, py, smiling)
                 self._happy_eye(draw, rcx, cy, px, py, smiling)
 
+    # ---- shutdown ----
+    def _shutdown_screen(self):
+        """A centred 'Shutting down' screen with a power glyph (shown on stop)."""
+        if not self.device:
+            return
+        W, H = self.width, self.height
+        with canvas(self.device) as draw:
+            cx, gy, r = W // 2, H // 2 - 12, 8
+            draw.arc((cx - r, gy - r, cx + r, gy + r), 300, 240, fill=255)  # ring, gap at top
+            draw.line((cx, gy - r - 1, cx, gy + 2), fill=255)               # power bar
+            msg = "Shutting down"
+            draw.text(((W - self._text_w(msg)) // 2, gy + r + 4), msg, font=self.font, fill=255)
+
+    def _restart_screen(self):
+        """A centred 'Restarting' screen with a circular-arrow glyph (shown on a
+        stack restart). The panel is left on — the relaunched node redraws over it."""
+        if not self.device:
+            return
+        W, H = self.width, self.height
+        cx, gy, r = W // 2, H // 2 - 12, 8
+        with canvas(self.device) as draw:
+            draw.arc((cx - r, gy - r, cx + r, gy + r), 70, 360, fill=255)   # ~open ring
+            ax = cx + int(r * math.cos(math.radians(70)))                   # arrowhead at the gap
+            ay = gy + int(r * math.sin(math.radians(70)))
+            draw.polygon([(ax - 3, ay - 1), (ax + 3, ay - 1), (ax, ay + 4)], fill=255)
+            msg = "Restarting"
+            draw.text(((W - self._text_w(msg)) // 2, gy + r + 4), msg, font=self.font, fill=255)
+
+    def _power_off_panel(self):
+        """Blank the framebuffer and turn the SSD1306 off (display-off, 0xAE) so the
+        panel goes dark instead of holding its last frame after the board halts."""
+        if not self.device or self._off:
+            return
+        self._off = True
+        try:
+            self.device.clear()
+            if hasattr(self.device, "hide"):
+                self.device.hide()
+        except Exception:
+            pass
+
+    def shutdown_sequence(self):
+        """On stop (SIGTERM from stack.sh down / systemd poweroff, or Ctrl-C): show an
+        end-screen. For a restart, leave "Restarting" up (no power-off, so no race with
+        the incoming node); otherwise show "Shutting down" and turn the panel off."""
+        if not self.device or self._off:
+            return
+        try:
+            self._face_timer.cancel()       # stop the animation owning the panel
+        except Exception:
+            pass
+        # Prefer the live signal from the web UI (/oled_system); fall back to the hint
+        # file (e.g. CLI stop with no topic). Default to a safe shutdown.
+        action = self._sys
+        if not action:
+            try:
+                with open(ACTION_FILE) as f:
+                    action = f.read().strip()
+            except Exception:
+                pass
+        try:
+            os.remove(ACTION_FILE)
+        except Exception:
+            pass
+        if action == "restart":
+            self._restart_screen()          # idempotent; relaunched node redraws over it
+        else:
+            self._shutdown_screen()         # idempotent; already up if the topic arrived
+            time.sleep(1.2)                 # leave it readable during the rest of shutdown
+            self._power_off_panel()
+
     def destroy_node(self):
-        if self.device:
+        # If we didn't already power the panel off (e.g. an unclean stop), blank it.
+        if self.device and not self._off:
             try:
                 self.device.clear()
             except Exception:
@@ -458,11 +554,18 @@ class DisplayNode(Node):
 def main():
     rclpy.init()
     node = DisplayNode()
+    # SIGTERM is how stack.sh down / systemd poweroff stop us; trip a flag and let the
+    # main thread run the shutdown sequence (drawing from a signal handler could re-enter
+    # a mid-flight I2C flush).
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     try:
-        rclpy.spin(node)
+        while rclpy.ok() and not stop.is_set():
+            rclpy.spin_once(node, timeout_sec=0.2)
     except KeyboardInterrupt:
         pass
     finally:
+        node.shutdown_sequence()
         node.destroy_node()
         rclpy.shutdown()
 

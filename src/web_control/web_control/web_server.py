@@ -85,15 +85,27 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if path == "/system/restart":
             # Restart the whole ROS stack. Detached + new session so it survives
             # do_down killing this very web server, then do_up brings it back.
+            self._set_oled_action("restart")   # tells the OLED to show "Restarting"
             self._run_detached(
                 'cd "$HOME/Nano" && "$HOME/.pixi/bin/pixi" run bash scripts/stack.sh restart')
             self._respond(200, "restarting stack")
         elif path == "/system/shutdown":
             # Power off the SBC (needs the scoped NOPASSWD sudo rule for systemctl).
+            self._set_oled_action("shutdown")  # tells the OLED to show "Shutting down" + go dark
             self._run_detached("sudo -n /usr/bin/systemctl poweroff")
             self._respond(200, "shutting down")
         else:
             self.send_error(404)
+
+    @staticmethod
+    def _set_oled_action(action):
+        # Hint the OLED node (read in its SIGTERM shutdown sequence) which end-screen to
+        # show. Written synchronously here so it exists before the (delayed) stop runs.
+        try:
+            with open("/dev/shm/nano_oled_action", "w") as f:
+                f.write(action)
+        except Exception:
+            pass
 
     @staticmethod
     def _run_detached(cmd):

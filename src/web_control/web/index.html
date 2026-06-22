@@ -237,7 +237,7 @@ let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
 
 // ---- ROS state ----
-let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null, faceTopic=null,
+let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null, faceTopic=null, systemTopic=null,
     imuTopic=null, eulTopic=null, sysTopic=null,
     imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
 // ESP32 coprocessor topics
@@ -373,11 +373,13 @@ $("micOn").addEventListener("change",e=>{ e.target.checked ? micStart() : micSto
 // Power controls -> POST to the web server (same origin). Both are confirmed.
 $("btnReset").onclick=()=>{
   if(!confirm("Restart the whole ROS stack? The page will reconnect in a few seconds.")) return;
+  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"restart"}));  // OLED switches now
   fetch("/system/restart",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
 $("btnShutdown").onclick=()=>{
   if(!confirm("SHUT DOWN the SBC?\nIt powers off completely — you must turn it back on by hand.")) return;
+  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"shutdown"}));  // OLED switches now
   fetch("/system/shutdown",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
@@ -406,6 +408,7 @@ function subscribe(){
   cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
   textTopic=new ROSLIB.Topic({ros,name:"/oled_text",messageType:"std_msgs/msg/String"});
   faceTopic=new ROSLIB.Topic({ros,name:"/oled_face",messageType:"std_msgs/msg/String"});
+  systemTopic=new ROSLIB.Topic({ros,name:"/oled_system",messageType:"std_msgs/msg/String"});
   // /imu/web is a tiny summary (|accel|,|gyro|,actual /imu/data Hz) the node emits at
   // ~15 Hz, so we don't make rosbridge bridge the full 50 Hz /imu/data just for a readout.
   imuTopic=new ROSLIB.Topic({ros,name:"/imu/web",messageType:"geometry_msgs/msg/Vector3Stamped",
