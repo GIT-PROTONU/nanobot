@@ -114,6 +114,19 @@ slam_nav:
     trail_max: 400                 # breadcrumb ring-buffer length (where it's been); 0 = off
     stuck_timeout: 0.0             # s of commanded-but-no-motion before aborting goal; 0 = off
     stuck_eps: 0.04                # m: movement below this counts as "not moving"
+    # --- pick-up awareness + lost-robot relocalization (autonomy) ---
+    pickup_pause: true             # both off-ground switches -> halt + freeze SLAM while carried
+    pickup_face: "focused"         # OLED mood shown while lifted ("" = leave the OLED alone)
+    relocalize: true               # auto-recover the pose when scans stop matching the map
+    recover_patience: 5            # consecutive unmatched scans before declaring "lost"
+    recover_min_beams: 40          # need this many in-range beams to trust a "mismatch"
+    recover_exit_score: 4.0        # scan-match score that ends recovery (relocalized)
+    recover_lin: 0.5               # recovery search half-window (m) around the prior
+    recover_ang: 1.0               # recovery search half-window (rad)
+    recover_half: 6                # recovery candidates per axis (2*half+1)
+    recover_refine: 3              # recovery coarse-to-fine passes
+    recover_spin: 0.6              # rad/s in-place spin while relocalizing (needs enable_motion)
+    recover_timeout: 12.0          # s before giving up the active relocalize search
 
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:

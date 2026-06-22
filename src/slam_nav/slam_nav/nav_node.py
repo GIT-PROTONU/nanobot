@@ -27,7 +27,7 @@ from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 from .occupancy import GridMap
 
@@ -76,6 +76,19 @@ class NavNode(Node):
             ("trail_max", 400),          # breadcrumb ring-buffer length; 0 = off
             ("stuck_timeout", 0.0),      # s commanded-but-not-moving before abort; 0 = off
             ("stuck_eps", 0.04),         # m: movement below this counts as "not moving"
+            # --- pick-up awareness + lost-robot relocalization (Tier-1 autonomy) ---
+            ("pickup_pause", True),       # both wheels off-ground -> halt + freeze SLAM
+            ("pickup_face", "focused"),   # OLED mood while lifted ("" = don't touch the OLED)
+            ("relocalize", True),         # auto-recover localization when the scan stops matching
+            ("recover_patience", 5),      # consecutive unmatched scans before declaring "lost"
+            ("recover_min_beams", 40),    # need this many in-range beams to trust a "mismatch"
+            ("recover_exit_score", 4.0),  # match score that ends recovery (= relocalized)
+            ("recover_lin", 0.5),         # recovery scan-match search half-window (m)
+            ("recover_ang", 1.0),         # recovery scan-match search half-window (rad)
+            ("recover_half", 6),          # recovery candidates per axis (2*half+1)
+            ("recover_refine", 3),        # recovery coarse-to-fine passes
+            ("recover_spin", 0.6),        # rad/s in-place spin while relocalizing (needs motion)
+            ("recover_timeout", 12.0),    # s before giving up the active relocalize search
         ])
         g = self.get_parameter
         self.grid = GridMap(
@@ -110,6 +123,20 @@ class NavNode(Node):
         self.stuck_timeout = float(g("stuck_timeout").value)
         self.stuck_eps = float(g("stuck_eps").value)
 
+        # pick-up awareness + lost-robot relocalization
+        self.pickup_pause = bool(g("pickup_pause").value)
+        self.pickup_face = str(g("pickup_face").value)
+        self.relocalize = bool(g("relocalize").value)
+        self.recover_patience = int(g("recover_patience").value)
+        self.recover_min_beams = int(g("recover_min_beams").value)
+        self.recover_exit_score = float(g("recover_exit_score").value)
+        self.recover_lin = float(g("recover_lin").value)
+        self.recover_ang = float(g("recover_ang").value)
+        self.recover_half = int(g("recover_half").value)
+        self.recover_refine = int(g("recover_refine").value)
+        self.recover_spin = float(g("recover_spin").value)
+        self.recover_timeout = float(g("recover_timeout").value)
+
         # SLAM pose in the map frame.
         self.px = self.py = self.pth = 0.0
         self.home = (0.0, 0.0)       # where the robot booted = map origin; "go home" target
@@ -136,6 +163,12 @@ class NavNode(Node):
         # stuck detector
         self._stuck_ref = None       # (x, y) pose when the current move started
         self._stuck_since = 0.0
+        # pick-up + relocalization state
+        self._susp_l = self._susp_r = False   # per-wheel off-ground switches (from the ESP)
+        self._picked_up = False
+        self._recovering = False     # actively re-searching for the pose (lost / set down)
+        self._recover_until = 0.0
+        self._lost_count = 0         # consecutive scans the match has failed
 
         # Optionally reload a previously-saved map (relocalize into it from the origin).
         if self.map_store and self.grid.load(self.map_store):
@@ -145,6 +178,7 @@ class NavNode(Node):
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.path_pub = self.create_publisher(Path, "plan", 5)
+        self.face_pub = self.create_publisher(String, "oled_face", 10)   # pick-up reaction
         self.create_subscription(Odometry, g("odom_topic").value, self._on_odom, 20)
         self.create_subscription(Vector3Stamped, g("euler_topic").value, self._on_euler, 10)
         self.create_subscription(
@@ -152,6 +186,9 @@ class NavNode(Node):
         self.create_subscription(PoseStamped, "goal_pose", self._on_goal, 5)
         self.create_subscription(Bool, "go_home", self._on_go_home, 5)
         self.create_subscription(Bool, "save_map", self._on_save_map, 5)
+        # per-wheel off-ground switches from the ESP32 (pick-up detection)
+        self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
+        self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
         self.create_timer(1.0 / max(1.0, float(g("control_rate").value)), self._control)
         self.add_on_set_parameters_callback(self._on_params)
 
@@ -178,6 +215,12 @@ class NavNode(Node):
                     self._goal_is_frontier = False
             elif p.name == "stuck_timeout":
                 self.stuck_timeout = float(p.value)
+            elif p.name == "relocalize":
+                self.relocalize = bool(p.value)
+                if not self.relocalize:
+                    self._recovering = False
+            elif p.name == "pickup_pause":
+                self.pickup_pause = bool(p.value)
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
@@ -188,6 +231,12 @@ class NavNode(Node):
 
     def _on_euler(self, msg):
         self._imu_yaw = math.radians(msg.vector.z)   # /imu/euler vector.z = yaw (deg)
+
+    def _on_susp_l(self, msg):
+        self._susp_l = bool(msg.data)
+
+    def _on_susp_r(self, msg):
+        self._susp_r = bool(msg.data)
 
     # --- the SLAM step (per scan) -------------------------------------------
     def _on_scan(self, msg):
@@ -206,6 +255,16 @@ class NavNode(Node):
             self._write_map()
             return
 
+        # Pick-up freeze: while lifted off the ground, scans are garbage (being carried),
+        # so don't predict / match / integrate. Just keep the web map status fresh so it's
+        # visibly "picked up"; relocalization is armed for set-down (see _control).
+        if self._picked_up:
+            now = time.monotonic()
+            if now - self._last_write >= self._write_period:
+                self._last_write = now
+                self._write_map()
+            return
+
         px, py, pth = self._predict(self.px, self.py, self.pth)
 
         # Refine against the map with a decimated set of valid beams.
@@ -214,7 +273,23 @@ class NavNode(Node):
         if len(vr) > self.match_pts:
             idx = np.linspace(0, len(vr) - 1, self.match_pts).astype(int)
             va, vr = va[idx], vr[idx]
-        if len(vr) > 10:
+
+        if self._recovering:
+            # Lost / kidnapped: search a much WIDER window around the prior (and the control
+            # loop spins us in place to vary the geometry) until a strong match snaps back.
+            if len(vr) > 10:
+                cand = self.grid.match((px, py, pth), va, vr, lin=self.recover_lin,
+                                       ang=self.recover_ang, half=self.recover_half,
+                                       refine=self.recover_refine)
+                score = self.grid.score(cand, va, vr)
+                self._last_score = score
+                if score >= self.min_score:
+                    px, py, pth = cand                 # keep snapping toward the map
+                if score >= self.recover_exit_score:
+                    self._recovering = False
+                    self._lost_count = 0
+                    self.get_logger().info(f"relocalized (score {score:.1f})")
+        elif len(vr) > 10:
             cand = self.grid.match((px, py, pth), va, vr,
                                    lin=self.match_lin, ang=self.match_ang)
             # Reject a match with no real overlap (e.g. wide-open space) — trust the prior.
@@ -222,9 +297,21 @@ class NavNode(Node):
             self._last_score = score
             if score >= self.min_score:
                 px, py, pth = cand
+                self._lost_count = 0
+            elif self.relocalize and len(vr) >= self.recover_min_beams:
+                # plenty of structure in view but it doesn't match the map -> we're drifting
+                self._lost_count += 1
+                if self._lost_count >= self.recover_patience:
+                    self._recovering = True
+                    self._recover_until = time.monotonic() + self.recover_timeout
+                    self.get_logger().warning(
+                        f"localization lost (score {score:.1f}) — relocalizing")
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
-        self.grid.integrate((self.px, self.py, self.pth), angles, ranges)
+        # Don't fold the scan into the map while the pose is uncertain (recovering) — a
+        # wrong pose would smear obstacles across the map.
+        if not self._recovering:
+            self.grid.integrate((self.px, self.py, self.pth), angles, ranges)
         self._publish_pose()
 
         # breadcrumb trail: append only when the robot has actually moved a bit (keeps the
@@ -303,6 +390,22 @@ class NavNode(Node):
         if not self._have_map:
             return
         now = time.monotonic()
+
+        # Pick-up + relocalization take priority over navigation.
+        self._update_pickup(now)
+        if self._picked_up:
+            self._send(0.0, 0.0)                       # halt while lifted
+            return
+        if self._recovering:
+            if now > self._recover_until:
+                self._recovering = False               # give up the active search...
+                self._lost_count = 0                   # ...and run on the best estimate
+                self._send(0.0, 0.0)
+                self.get_logger().warning("relocalize timed out; using best estimate")
+            else:
+                self._send(0.0, self.recover_spin)     # slow in-place spin (only if motion on)
+            return
+
         # auto-explore: when there's no goal, periodically adopt the nearest reachable
         # frontier as one (only drives if enable_motion; otherwise just shows the plan).
         if self._goal is None:
@@ -343,6 +446,34 @@ class NavNode(Node):
             self._publish_path()
             return
         self._send(v, w)
+
+    def _update_pickup(self, now):
+        """Detect lift/drop from the per-wheel off-ground switches. BOTH wheels off the
+        ground = picked up -> halt + freeze SLAM (the freeze itself is in _on_scan). On
+        set-down, arm relocalization so the robot re-finds itself instead of driving on a
+        stale pose."""
+        picked = self.pickup_pause and self._susp_l and self._susp_r
+        if picked == self._picked_up:
+            return
+        self._picked_up = picked
+        if picked:
+            self._send(0.0, 0.0)
+            self._set_face(self.pickup_face)
+            self.get_logger().info("picked up — pausing SLAM")
+        else:
+            self._set_face("")                         # back to the normal dashboard
+            if self.relocalize:
+                self._recovering = True
+                self._recover_until = now + self.recover_timeout
+                self._lost_count = 0
+            self.get_logger().info("set down — relocalizing")
+
+    def _set_face(self, mood):
+        """Drive the OLED face (an alert stare while carried). Skipped entirely when
+        pickup_face is empty, so it never fights the web UI's own face control."""
+        if not self.pickup_face:
+            return
+        self.face_pub.publish(String(data=mood))
 
     def _explore_step(self):
         """Adopt the nearest *reachable* frontier as the goal (auto-exploration). Tries the
@@ -434,6 +565,9 @@ class NavNode(Node):
         seen_frac, free_m2, _occ_m2 = self.grid.coverage()
         mode = ("explore" if self._goal_is_frontier else
                 "goal" if self._goal is not None else "idle")
+        loc = ("picked up" if self._picked_up else
+               "relocalizing" if self._recovering else
+               "lost" if self._lost_count else "ok")
         meta = {
             "w": self.grid.n, "h": self.grid.n, "res": self.grid.res,
             "ox": self.grid.origin, "oy": self.grid.origin,
@@ -443,7 +577,7 @@ class NavNode(Node):
             "seen": round(seen_frac, 3),                     # fraction of grid observed
             "free_m2": round(free_m2, 1),                    # mapped free area
             "score": round(self._last_score, 1),             # scan-match quality
-            "mode": mode, "motion": self.enable_motion,
+            "mode": mode, "loc": loc, "motion": self.enable_motion,
             "trail": list(self._trail) if self._trail else [],
         }
         header = (json.dumps(meta) + "\n").encode()

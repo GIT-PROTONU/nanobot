@@ -777,10 +777,11 @@ connect();   // auto-connect on load
     // telemetry line (coverage + localization health + mode)
     if(m.seen!==undefined){
       const q = m.score>=8?"good":(m.score>=2?"ok":"weak");
+      const loc = m.loc && m.loc!=="ok" ? ` · ⚠ ${m.loc}` : "";
       $("mapStats").textContent =
         `mode: ${m.mode||"—"} · explored ${(m.seen*100).toFixed(0)}% `
         + `(${(m.free_m2||0).toFixed(1)} m² free) · match ${q} (${(m.score||0).toFixed(0)})`
-        + ` · motion ${m.motion?"ON":"off"}`;
+        + ` · motion ${m.motion?"ON":"off"}${loc}`;
     }
   }
 
