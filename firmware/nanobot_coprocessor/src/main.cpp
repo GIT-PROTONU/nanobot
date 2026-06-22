@@ -38,6 +38,7 @@
 // task while the lease task + our publishes do TX (serialized by Z_FEATURE_BATCH_TX_MUTEX).
 #include <Arduino.h>
 #include <zenoh-pico.h>
+#include <esp_system.h>   // esp_restart() — link-connect watchdog (see LINK_CONNECT_DEADLINE_MS)
 #include <string.h>
 #include <math.h>
 
@@ -90,6 +91,16 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // Periodic one-line health summary on the debug console (UART0 — separate from the zenoh
 // UART2 link). Lets you watch the LDS + control stay live under load; 0 disables it.
 #define STATUS_PRINT_MS 3000
+
+// Link-connect watchdog. The ESP boots in ~1 s but the SBC takes ~30-60 s to bring up the
+// serial zenohd. If the ESP boots first, its repeated failed serial handshakes leave the
+// link in a state that an in-process z_open() retry won't re-sync — historically the only
+// cure was a manual ESP power-cycle (a fresh boot sends a clean InitSyn the now-listening
+// router accepts). So: if we haven't reached `ready` within this deadline of boot, reboot
+// ourselves. A reboot == the manual power-cycle, and (running on Core 1) it also recovers a
+// z_open() that wedged on Core 0. Tunable: shorter = faster auto-recovery once the SBC is up,
+// but more wasted reboots while the SBC is still booting. 0 disables the watchdog.
+#define LINK_CONNECT_DEADLINE_MS 40000
 
 #define CH_LEFT_FWD  0
 #define CH_LEFT_REV  1
@@ -157,7 +168,8 @@ static size_t cdr_i64arr2(uint8_t* b, int64_t a, int64_t bb){
 #define NODE_NAME "nano_esp32"
 
 static z_owned_session_t s;
-static bool ready = false;
+static volatile bool ready = false;       // written Core 0 (zenohTask), read Core 1 (loop watchdog)
+static volatile uint32_t g_boot_ms = 0;   // millis() at boot — link-connect watchdog reference
 // rmw_zenoh liveliness token = makes a publisher visible in the ROS graph. Format:
 // @ros2_lv/<domain>/<zid>/<nid>/<eid>/MP/%/%/<node>/%<topic>/<type>/<typehash>/<qos>
 static z_owned_liveliness_token_t g_lv[10]; static int g_lv_n = 0;
@@ -405,6 +417,7 @@ void setup(){
 
   g_temp = temperatureRead(); g_hall = hallRead();   // seed telemetry so first pub isn't 0
   g_last_cmd_ms = millis();
+  g_boot_ms = millis();                              // link-connect watchdog reference (see loop())
   // zenohTask pinned to Core 0; setup()/loop() (this code, + the LDS) run on Core 1. The
   // LDS can't starve the link: zenoh's read/lease tasks are prio 12 vs this loop's prio 1,
   // and the UART2 (zenoh) and UART1 (LDS) RX ISRs sit on Core 0 and Core 1 respectively.
@@ -415,6 +428,18 @@ void setup(){
 void loop(){   // Core 1: real-time control
   static uint32_t last_pid=0, last_ctl=0, last_sens=0, last_slow=0;
   uint32_t now = millis();
+
+#if LINK_CONNECT_DEADLINE_MS
+  // Link-connect watchdog: never came up within the deadline → reboot and re-handshake the
+  // (by now likely-listening) router, instead of waiting for a manual power-cycle. Only fires
+  // while still unconnected; once `ready`, we never reboot from here. Runs on Core 1 so it
+  // also rescues a z_open() that wedged the zenohTask on Core 0.
+  if (!ready && (now - g_boot_ms) > LINK_CONNECT_DEADLINE_MS){
+    Serial.println("[nano] link not up within deadline — esp_restart() to re-handshake router");
+    Serial.flush();
+    esp_restart();
+  }
+#endif
 
 #if LDS_ENABLED
   if (now-last_pid >= (uint32_t)(1000/LDS_PID_HZ)){    // spin PID @50 Hz
