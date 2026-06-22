@@ -96,6 +96,8 @@ class GridMap:
         v = self._valid(ranges, self.rmin, self.rmax)
         a = (angles + pth)[v]
         rr = ranges[v]
+        if rr.size == 0:
+            return
         cos, sin = np.cos(a), np.sin(a)
 
         # occupied endpoints (np.add.at handles repeated cells correctly)
@@ -104,17 +106,17 @@ class GridMap:
         np.add.at(self.log, (er[m], ec[m]), L_OCC)
         self.seen[er[m], ec[m]] = True
 
-        # free space: sample each ray at the grid pitch up to just shy of the hit
-        fx, fy = [], []
-        for k in range(len(rr)):
-            steps = int(rr[k] / self.res)
-            if steps <= 1:
-                continue
-            t = np.arange(0, steps - 1) * self.res    # stop one cell before the hit
-            fx.append(px + t * cos[k])
-            fy.append(py + t * sin[k])
-        if fx:
-            fc, fr = self.w2g(np.concatenate(fx), np.concatenate(fy))
+        # free space: sample each ray at the grid pitch from the robot up to one cell shy of
+        # the hit. Vectorised over ALL beams at once — no per-beam Python loop. Each beam
+        # contributes `per[b]` samples; we build the ragged step indices (0..per-1 per beam)
+        # with a repeat/cumsum trick, so we only ever allocate exactly the kept samples.
+        per = np.maximum(0, (rr / self.res).astype(np.int32) - 1)   # samples per beam
+        total = int(per.sum())
+        if total:
+            bi = np.repeat(np.arange(rr.size), per)                 # beam index per sample
+            si = np.arange(total) - np.repeat(np.cumsum(per) - per, per)   # 0..per[b]-1
+            tt = si * self.res                                      # distance along the ray (f64)
+            fc, fr = self.w2g(px + tt * cos[bi], py + tt * sin[bi])
             mf = self._inb(fc, fr)
             np.add.at(self.log, (fr[mf], fc[mf]), -L_FREE)
             self.seen[fr[mf], fc[mf]] = True
