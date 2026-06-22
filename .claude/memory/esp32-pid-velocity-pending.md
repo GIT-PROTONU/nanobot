@@ -35,5 +35,18 @@ ratio) and wheel radius, to map `/cmd_vel` (m/s) ↔ tick-rate setpoints.
 integration + output clamp, reset integrator on cmd timeout / agent disconnect, add a
 feedforward term and a `/wheel_vel` publisher for live tuning, gains in `config.h`.
 
-**Why this matters:** waiting on the user to pick the direction strategy and supply
-CPR + wheel radius. See [[micro-ros-agent-source-build]].
+**UPDATE (2026-06-22): the wheel PID is now IMPLEMENTED in firmware, gated OFF by default
+(`#define WHEEL_PID_ENABLED 0`).** Per-wheel feedforward+PI(+D) with conditional integration
++ integral clamp, runs at `WHEEL_PID_HZ` (50) inside the Core-1 control loop, measures
+velocity from `g_left/right_ticks` deltas over dt, output → `g_left/right_duty` (applyMotors
+unchanged @100 Hz). `cmd_cb` stores per-wheel target m/s (`g_left/right_tgt`) when enabled,
+else keeps the old open-loop duty path. Uses `WHEEL_RADIUS 0.0335` + `TICKS_PER_REV 1440`
+(both copied from robot.yaml — the firmware doesn't read the yaml). `WHEEL_KFF = 1/full-scale`
+so KP=KI=KD=0 reproduces today's open-loop behavior (safe baseline). No `/wheel_vel` topic
+(would mean touching the proven publisher wire-identity table) — instead measured vel is on
+the **UART0 debug console** via STATUS_PRINT for tuning. **To use: set WHEEL_PID_ENABLED 1,
+flash, then tune KP/KI on hardware.** Still blind on reverse-through-zero/stall/slip (option
+(2), 2nd quadrature channel, remains the only fix). Not yet flashed/tuned as of this note.
+
+**Why this matters:** the scaffolding is in; the remaining work is on-hardware tuning (and
+deciding whether the single-channel blind spots are acceptable). See [[esp32-zenoh-pico-integration]].

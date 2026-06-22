@@ -74,6 +74,26 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define INVERT_LEFT  false
 #define INVERT_RIGHT false
 
+// ---- closed-loop wheel velocity PID (OPTIONAL; OFF by default) ----------------
+// Holds each wheel's commanded linear speed (m/s) via a per-wheel PID on encoder-tick
+// velocity, replacing the open-loop duty = speed/full-scale map. DISABLED by default:
+// an untuned PID can drive erratically, and the feedback is single-channel (blind on
+// reverse-through-zero / stall / slip / being pushed — see [[esp32-pid-velocity-pending]]).
+// To use: set =1, then tune KP/KI ON HARDWARE (watch wheel vel on the debug console). With
+// KP=KI=KD=0 the feedforward alone reproduces today's open-loop behavior — a safe baseline.
+#define WHEEL_PID_ENABLED 0
+#define WHEEL_RADIUS      0.0335f   // m  (matches robot.yaml wheel_odometry.wheel_radius)
+#define TICKS_PER_REV     1440.0f   // counts/wheel-rev as the ESP emits them (matches odom)
+#define WHEEL_PID_HZ      50        // PID rate; longer window than the 100 Hz loop => less tick-quantization noise
+// Full-scale wheel speed at duty=1; KFF = 1/that maps a target m/s straight to the
+// open-loop duty, so feedforward-only == today's behavior.
+#define WHEEL_KFF   (1.0f/(MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f))
+#define WHEEL_KP    0.0f            // <- tune up first
+#define WHEEL_KI    0.0f            // <- then add a little to kill steady-state error
+#define WHEEL_KD    0.0f
+#define WHEEL_INTEG_MAX 1.0f        // anti-windup: integral clamp (duty units)
+static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RADIUS);
+
 #define LDS_BAUD       115200
 #define LDS_TIMEOUT_MS 300
 #define LDS_TARGET_RPM 300.0f
@@ -102,6 +122,16 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // but more wasted reboots while the SBC is still booting. 0 disables the watchdog.
 #define LINK_CONNECT_DEADLINE_MS 40000
 
+// Runtime link-liveness watchdog. The connect watchdog above only fires while UNconnected;
+// it can't catch the router (zenohd) restarting AFTER a good connect — over a raw UART the
+// session never notices the peer vanished (our writes just succeed into the void), so we'd
+// keep publishing to nobody until a manual reset. Fix: the always-on SBC web_control node
+// publishes /esp32_ping at 1 Hz; we subscribe, and if we're `ready` but no ping has arrived
+// for this long, esp_restart() to re-handshake. FAILS SAFE: the timer only arms after the
+// FIRST ping is seen, so if pings never come (topic mismatch / feature off) we never reboot
+// from here. 0 disables. Keep > the 1 Hz ping period with margin.
+#define LINK_RX_TIMEOUT_MS 8000
+
 #define CH_LEFT_FWD  0
 #define CH_LEFT_REV  1
 #define CH_RIGHT_FWD 2
@@ -117,6 +147,8 @@ static volatile int32_t  g_left_ticks  = 0, g_right_ticks = 0;   // encoder ISR 
 // on reverse. Near-zero command holds the previous sign.
 static volatile int8_t   g_left_dir = 1, g_right_dir = 1;
 static volatile float    g_left_duty   = 0, g_right_duty   = 0;  // cmd -> motor duty
+static volatile float    g_left_tgt    = 0, g_right_tgt    = 0;  // per-wheel target speed (m/s), PID input
+static volatile float    g_left_vel    = 0, g_right_vel    = 0;  // measured wheel speed (m/s), debug/tuning
 static volatile uint32_t g_last_cmd_ms = 0;
 static volatile float    g_lds_rpm = 0, g_lds_duty = 0, g_lds_hz = 0;
 static volatile uint32_t g_lds_frames = 0, g_lds_last_ms = 0;
@@ -125,6 +157,8 @@ static volatile float    g_temp = 0;
 static volatile int32_t  g_hall = 0;
 static volatile bool     g_susp_l = false, g_susp_r = false;
 static volatile bool     g_led = false, g_led_dirty = false;
+static volatile uint32_t g_last_ping_ms = 0;   // last /esp32_ping rx (runtime liveness watchdog)
+static volatile bool     g_ping_seen = false;  // arm the runtime watchdog only after 1st ping
 
 static void IRAM_ATTR leftEncISR()  { g_left_ticks  += g_left_dir; }
 static void IRAM_ATTR rightEncISR() { g_right_ticks += g_right_dir; }
@@ -251,9 +285,13 @@ static void cmd_cb(z_loaned_sample_t* sm, void*){
   float fv = clampf((float)v, -MAX_LINEAR_SPEED,  MAX_LINEAR_SPEED);
   float fw = clampf((float)w, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED);
   float vl = fv - fw*WHEEL_SEPARATION*0.5f, vr = fv + fw*WHEEL_SEPARATION*0.5f;
+#if WHEEL_PID_ENABLED
+  g_left_tgt = vl; g_right_tgt = vr;            // the control loop's PID turns these into duty
+#else
   static constexpr float mx = MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f;
   g_left_duty  = clampf(vl/mx,-1,1);
   g_right_duty = clampf(vr/mx,-1,1);
+#endif
   // sign the encoder ticks by commanded wheel direction (single-channel = no feedback)
   if (vl >  1e-4f) g_left_dir  =  1; else if (vl < -1e-4f) g_left_dir  = -1;
   if (vr >  1e-4f) g_right_dir =  1; else if (vr < -1e-4f) g_right_dir = -1;
@@ -265,6 +303,10 @@ static void led_cb(z_loaned_sample_t* sm, void*){
 static void ldstgt_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_lds_target = f>0?f:0; }
 }
+#if LINK_RX_TIMEOUT_MS
+// /esp32_ping (Int32) from the SBC web_control node — payload ignored; arrival = link alive.
+static void ping_cb(z_loaned_sample_t*, void*){ g_last_ping_ms = millis(); g_ping_seen = true; }
+#endif
 
 static bool zenohConnect(){
   z_owned_config_t cfg; z_config_default(&cfg);
@@ -289,6 +331,13 @@ static bool zenohConnect(){
   z_view_keyexpr_from_str_unchecked(&ke, KE("led",T_BOOL));
   z_closure_sample(&cl, led_cb, NULL, NULL);
   z_declare_subscriber(z_session_loan(&s), &sub_led, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+#if LINK_RX_TIMEOUT_MS
+  static z_owned_subscriber_t sub_ping;
+  z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
+  z_closure_sample(&cl, ping_cb, NULL, NULL);
+  z_declare_subscriber(z_session_loan(&s), &sub_ping, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  g_last_ping_ms = millis(); g_ping_seen = false;   // (re)arm fresh on each (re)connect
+#endif
 
   // Publisher liveliness tokens -> ESP32 shows up as a graph participant so rmw_zenoh
   // subscribers reliably receive its data. eid must be unique per entity.
@@ -385,6 +434,20 @@ static void ldsControl(float dt){
   }
   g_lds_duty=duty; ledcWrite(CH_LDS,(uint32_t)(duty*PWM_MAX));
 }
+#if WHEEL_PID_ENABLED
+// Per-wheel velocity PID: feedforward + PI(+D) with conditional integration + clamp.
+struct WPid { float integ, prev; };
+static float wheelPid(WPid& st, float tgt, float meas, float dt){
+  float err = tgt - meas;
+  float deriv = dt>0 ? (err - st.prev)/dt : 0; st.prev = err;
+  float u = WHEEL_KFF*tgt + WHEEL_KP*err + WHEEL_KI*st.integ + WHEEL_KD*deriv;
+  float duty = clampf(u,-1,1);
+  if (duty == u)   // integrate only when not saturated (anti-windup), then clamp the integral
+    st.integ = clampf(st.integ + err*dt, -WHEEL_INTEG_MAX, WHEEL_INTEG_MAX);
+  return duty;
+}
+#endif
+
 static bool debounceSusp(int pin, bool& cand, uint8_t& stable, bool cur){
   bool lvl = digitalRead(pin)==HIGH, susp = SUSPEND_ACTIVE_HIGH?lvl:!lvl;
   if (susp==cand){ if(stable<3) stable++; } else { cand=susp; stable=0; }
@@ -440,6 +503,15 @@ void loop(){   // Core 1: real-time control
     esp_restart();
   }
 #endif
+#if LINK_RX_TIMEOUT_MS
+  // Runtime liveness: connected + had pings + they stopped => the router/SBC restarted under
+  // us (serial can't detect peer-gone). Reboot to re-handshake. Armed only after 1st ping.
+  if (ready && g_ping_seen && (now - g_last_ping_ms) > LINK_RX_TIMEOUT_MS){
+    Serial.println("[nano] /esp32_ping stopped — esp_restart() to re-join the graph");
+    Serial.flush();
+    esp_restart();
+  }
+#endif
 
 #if LDS_ENABLED
   if (now-last_pid >= (uint32_t)(1000/LDS_PID_HZ)){    // spin PID @50 Hz
@@ -450,6 +522,23 @@ void loop(){   // Core 1: real-time control
   }
 #else
   (void)last_pid;
+#endif
+
+#if WHEEL_PID_ENABLED
+  static uint32_t last_wpid=0; static int32_t wp_l=0, wp_r=0; static WPid wpid_l{0,0}, wpid_r{0,0};
+  if (now-last_wpid >= (uint32_t)(1000/WHEEL_PID_HZ)){     // wheel velocity PID @WHEEL_PID_HZ
+    float dt=(now-last_wpid)/1000.0f; last_wpid=now;
+    int32_t l=g_left_ticks, r=g_right_ticks;               // atomic 32-bit reads
+    g_left_vel  = (l-wp_l)/TICKS_PER_METER/dt; wp_l=l;
+    g_right_vel = (r-wp_r)/TICKS_PER_METER/dt; wp_r=r;
+    if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){               // cmd stale: stop + reset integrators
+      wpid_l.integ=wpid_l.prev=0; wpid_r.integ=wpid_r.prev=0;
+      g_left_duty=0; g_right_duty=0;
+    } else {
+      g_left_duty  = wheelPid(wpid_l, g_left_tgt,  g_left_vel,  dt);
+      g_right_duty = wheelPid(wpid_r, g_right_tgt, g_right_vel, dt);
+    }
+  }
 #endif
 
   if (now-last_ctl >= 10){                                  // motors + watchdog @100 Hz
@@ -481,6 +570,10 @@ void loop(){   // Core 1: real-time control
     Serial.printf("[nano] ticks L=%ld R=%ld | lds rpm=%.0f hz=%.0f duty=%.2f | susp %d/%d\n",
       (long)g_left_ticks,(long)g_right_ticks,
       g_lds_rpm, g_lds_hz, g_lds_duty, (int)g_susp_l,(int)g_susp_r);
+#if WHEEL_PID_ENABLED
+    Serial.printf("[nano] wheel vel L=%.3f R=%.3f m/s | tgt L=%.3f R=%.3f | duty L=%.2f R=%.2f\n",
+      g_left_vel, g_right_vel, g_left_tgt, g_right_tgt, g_left_duty, g_right_duty);
+#endif
   }
 #endif
   delay(1);

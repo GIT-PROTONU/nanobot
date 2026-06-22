@@ -287,8 +287,13 @@ const setNavMotion=on=>setNavBool("enable_motion",on);
 const setNavExplore=on=>setNavBool("auto_explore",on);
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
-$("ldsTgt").onchange=()=>{ if(ldsTgtTopic)
-  ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); };
+$("ldsTgt").onchange=()=>publishLdsTgt();
+function publishLdsTgt(){ if(ldsTgtTopic)
+  ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); }
+// On (re)connect, push the slider's current value once so the robot's spin setpoint
+// matches the UI without a manual drag (the firmware boots at 300 rpm; this keeps the
+// shown value authoritative even if it differs).
+function syncLdsTgt(){ publishLdsTgt(); }
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
 // server). Toggling off drops the connection so the camera stops (ref-counted).
@@ -386,7 +391,7 @@ $("btnShutdown").onclick=()=>{
 
 function connect(){
   ros=new ROSLIB.Ros({url:`ws://${$("host").value}`});
-  ros.on("connection",()=>{connected=true;setConn(true);subscribe();});
+  ros.on("connection",()=>{connected=true;setConn(true);subscribe();syncLdsTgt();});
   ros.on("close",()=>{connected=false;setConn(false);});
   ros.on("error",()=>{setConn(false);});
 }

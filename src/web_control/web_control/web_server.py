@@ -19,6 +19,7 @@ import threading
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
+from std_msgs.msg import Int32
 
 from .mjpeg_camera import CameraStream
 from .mic_audio import AudioStream
@@ -55,6 +56,19 @@ class WebServerNode(Node):
         self._thread.start()
         self.get_logger().info(
             f"control page at http://0.0.0.0:{port}  (serving {web_dir})")
+
+        # Liveness ping for the ESP32 coprocessor. The ESP joins the zenoh graph over a raw
+        # UART that can't detect the peer vanishing, so if the router/SBC restarts it would
+        # keep publishing into the void until a manual reset. This always-on 1 Hz heartbeat
+        # lets the firmware reboot itself when the pings stop (see LINK_RX_TIMEOUT_MS in
+        # firmware/nanobot_coprocessor/src/main.cpp). Independent of any browser being open.
+        self._ping_pub = self.create_publisher(Int32, "esp32_ping", 10)
+        self._ping_seq = 0
+        self.create_timer(1.0, self._publish_ping)
+
+    def _publish_ping(self):
+        self._ping_seq = (self._ping_seq + 1) & 0x7FFFFFFF
+        self._ping_pub.publish(Int32(data=self._ping_seq))
 
     def destroy_node(self):
         try:

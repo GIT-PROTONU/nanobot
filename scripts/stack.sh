@@ -99,21 +99,49 @@ PY
     || launch nav "$own/slam_nav/lib/slam_nav/nav_node --ros-args --params-file $PARAMS"
 }
 
+# Node path substrings match whether launched directly or via ros2 run/launch.
+# rosapi_node + ros2cli.daemon sweep up anything left by older launches or by
+# `ros2 ...` CLI probes (each spawns a ~60 MB daemon).
+NODE_PATS=(
+  'slam_nav/lib/slam_nav'
+  'lds_driver_py/lib/lds_driver_py'
+  'wheel_odometry/lib/wheel_odometry'
+  'sys_monitor/lib/sys_monitor'
+  'imu_driver/lib/imu_driver'
+  'oled_display/lib/oled_display'
+  'web_control/lib/web_control'
+  'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon'
+)
+
+# true while ANY managed process is still alive (nodes by -f pattern, router by exact name)
+any_alive() {
+  local p
+  for p in "${NODE_PATS[@]}"; do pgrep -f "$p" >/dev/null && return 0; done
+  pgrep -x 'zenohd-serial' >/dev/null && return 0
+  return 1
+}
+
 do_down() {
-  # Node path substrings match whether launched directly or via ros2 run/launch.
-  # rosapi_node + ros2cli.daemon sweep up anything left by older launches or by
-  # `ros2 ...` CLI probes (each spawns a ~60 MB daemon).
-  for p in 'slam_nav/lib/slam_nav' \
-           'lds_driver_py/lib/lds_driver_py' \
-           'wheel_odometry/lib/wheel_odometry' \
-           'sys_monitor/lib/sys_monitor' \
-           'imu_driver/lib/imu_driver' \
-           'oled_display/lib/oled_display' \
-           'web_control/lib/web_control' \
-           'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon'; do
-    pkill -f "$p" 2>/dev/null
+  # The old version sent ONE SIGTERM then slept a fixed 1-2 s. A node slow to exit
+  # survived, and then do_up's pgrep guard saw it still running and SKIPPED relaunch —
+  # leaving a stale process holding the port / serving old code (the "change didn't
+  # take" foot-gun in CLAUDE.md). Now: SIGTERM all, WAIT for actual exit, then SIGKILL
+  # any straggler and verify.
+  local p
+  for p in "${NODE_PATS[@]}"; do pkill -f "$p" 2>/dev/null; done
+  pkill -x 'zenohd-serial' 2>/dev/null    # router holds the ESP32 UART; kill by exact name
+
+  # Poll up to ~6 s, returning as soon as everything is gone.
+  local i
+  for i in $(seq 1 30); do any_alive || break; sleep 0.2; done
+
+  # SIGKILL whatever ignored SIGTERM, then report anything still standing.
+  for p in "${NODE_PATS[@]}"; do
+    pgrep -f "$p" >/dev/null && { echo "  forcing kill: $p"; pkill -9 -f "$p" 2>/dev/null; }
   done
-  pkill -x 'zenohd-serial' 2>/dev/null   # router holds the ESP32 UART; kill by exact name
+  pgrep -x 'zenohd-serial' >/dev/null && { echo "  forcing kill: zenohd-serial"; pkill -9 -x 'zenohd-serial' 2>/dev/null; }
+  sleep 0.3
+  any_alive && echo "  WARNING: a managed process is still alive after SIGKILL"
 }
 
 status() {
@@ -129,8 +157,8 @@ status() {
 
 case "${1:-status}" in
   up)      echo "stack up…";      do_up;   sleep 5; status ;;
-  down)    echo "stack down…";    do_down; sleep 1; status ;;
-  restart) echo "stack restart…"; do_down; sleep 2; do_up; sleep 5; status ;;
+  down)    echo "stack down…";    do_down; status ;;          # do_down now blocks until gone
+  restart) echo "stack restart…"; do_down; do_up; sleep 5; status ;;
   status)  status ;;
   *) echo "usage: $0 {up|down|restart|status}"; exit 2 ;;
 esac
