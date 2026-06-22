@@ -80,19 +80,14 @@ PY
     || launch web "$own/web_control/lib/web_control/web_server --ros-args -p web_port:=8080 -p rosbridge_port:=9090"
   pgrep -f 'oled_display/lib/oled_display' >/dev/null \
     || launch oled "$own/oled_display/lib/oled_display/display_node --ros-args --params-file $PARAMS"
-  pgrep -f 'imu_driver/lib/imu_driver' >/dev/null \
-    || launch imu "$own/imu_driver/lib/imu_driver/imu_node --ros-args --params-file $PARAMS"
-  pgrep -f 'sys_monitor/lib/sys_monitor' >/dev/null \
-    || launch sys "$own/sys_monitor/lib/sys_monitor/monitor_node --ros-args --params-file $PARAMS"
-  # Wheel odometry: integrates /wheel_ticks from the ESP32 coprocessor into /odom.
-  pgrep -f 'wheel_odometry/lib/wheel_odometry' >/dev/null \
-    || launch odom "$own/wheel_odometry/lib/wheel_odometry/encoder_node --ros-args --params-file $PARAMS"
-  # LDS scan driver: reads the LDS data line on /dev/ttyS2 (UART2, set in robot.yaml) and
-  # publishes /scan. ttyS1 is the ESP32 zenoh link, so the LDS data wire fans out to BOTH
-  # the ESP32 (UART1 RX=GPIO14, RPM->spin PID) and the SBC's UART2 (full scan). UART2 needs
-  # the `uart2` device-tree overlay (deploy/sbc-setup.sh) + a reboot for /dev/ttyS2 to exist.
-  pgrep -f 'lds_driver_py/lib/lds_driver_py' >/dev/null \
-    || launch lds "$own/lds_driver_py/lib/lds_driver_py/lds_node --ros-args --params-file $PARAMS"
+  # Sensor hub: imu_driver + sys_monitor + wheel_odometry + lds_driver_py in ONE process
+  # (one executor) to save ~100+ MB of RAM vs four separate interpreters on the 1 GB board.
+  # Same node names/topics/params, so /odom, /diagnostics, /scan, /imu/*, the live-retune
+  # services and the LDS scan blob (/dev/shm) are all unchanged. The LDS data wire fans out
+  # to the ESP32 (UART1 RX=GPIO14, RPM->spin PID) AND the SBC's UART2 (/dev/ttyS2, full
+  # scan); UART2 needs the `uart2` overlay (deploy/sbc-setup.sh) + a reboot to exist.
+  pgrep -f 'sensor_hub/lib/sensor_hub' >/dev/null \
+    || launch sensors "$own/sensor_hub/lib/sensor_hub/sensor_hub --ros-args --params-file $PARAMS"
   # SLAM/mapping: builds an occupancy grid from /scan + /odom + /imu/euler and writes
   # /dev/shm/nano_map.bin for the web map panel. Started last (needs scan + odom flowing).
   pgrep -f 'slam_nav/lib/slam_nav' >/dev/null \
@@ -102,8 +97,11 @@ PY
 # Node path substrings match whether launched directly or via ros2 run/launch.
 # rosapi_node + ros2cli.daemon sweep up anything left by older launches or by
 # `ros2 ...` CLI probes (each spawns a ~60 MB daemon).
+# sensor_hub now hosts imu/sys/odom/lds in one process, but the old per-node patterns are
+# kept here too so `down`/`restart` also sweeps up stragglers from a pre-merge deploy.
 NODE_PATS=(
   'slam_nav/lib/slam_nav'
+  'sensor_hub/lib/sensor_hub'
   'lds_driver_py/lib/lds_driver_py'
   'wheel_odometry/lib/wheel_odometry'
   'sys_monitor/lib/sys_monitor'
@@ -147,9 +145,7 @@ do_down() {
 status() {
   for s in "zenohd:zenohd-serial" "rosbridge:rosbridge_websocket" \
            "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
-           "imu:imu_driver/lib/imu_driver" "sys:sys_monitor/lib/sys_monitor" \
-           "odom:wheel_odometry/lib/wheel_odometry" \
-           "lds:lds_driver_py/lib/lds_driver_py" \
+           "sensors:sensor_hub/lib/sensor_hub" \
            "nav:slam_nav/lib/slam_nav"; do
     if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi
   done

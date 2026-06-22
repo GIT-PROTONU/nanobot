@@ -92,6 +92,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._stream_audio()
         if path == "/map":
             return self._serve_map()
+        if path == "/scan.bin":
+            return self._serve_scan()
         return super().do_GET()
 
     def do_POST(self):
@@ -211,11 +213,20 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # The slam_nav node writes the live occupancy map to a RAM file (/dev/shm);
         # we just hand the bytes over same-origin so the page's map canvas can render
         # them. No ROS subscription / OccupancyGrid serialization in this process.
+        self._serve_shm("/dev/shm/nano_map.bin", "no map yet")
+
+    def _serve_scan(self):
+        # The lidar driver writes each scan as a compact blob to /dev/shm (JSON header +
+        # raw float32 ranges); the page polls it here instead of bridging the heavy
+        # /scan LaserScan over rosbridge. Same idea as the map — keeps rosbridge light.
+        self._serve_shm("/dev/shm/nano_scan.bin", "no scan yet")
+
+    def _serve_shm(self, path, missing_msg):
         try:
-            with open("/dev/shm/nano_map.bin", "rb") as f:
+            with open(path, "rb") as f:
                 data = f.read()
         except OSError:
-            self.send_error(503, "no map yet")
+            self.send_error(503, missing_msg)
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")

@@ -51,3 +51,17 @@ Status (2026-06-20): oled, odom (30->15), and the /imu/web decoupling are deploy
 committed (oled/odom f93e51a, imu ccd7139). The full rosbridge drop from the IMU change
 needs the browser reloaded onto the new page (so nothing holds /imu/data open) — that
 final confirmation was still pending at end of session.
+
+**Update (2026-06-22) — two more rate-preserving wins (not yet deployed/verified):**
+- **/scan moved off rosbridge** (the heaviest bridged msg, 360 floats). `lds_driver_py`
+  now writes a compact blob to `/dev/shm/nano_scan.bin` (JSON header + raw float32 ranges);
+  `web_control` serves `/scan.bin`; the page polls it (~12.5 Hz, skips unchanged seq) and
+  draws — same lidar view + point-count + scan-Hz readouts, zero rosbridge LaserScan
+  builds. Same pattern as `/map`. /scan still publishes for slam_nav.
+- **Process merge for RAM:** new `sensor_hub` package runs imu+sys+odom+lds in ONE process
+  (SingleThreadedExecutor); saves ~100+ MB vs four interpreters. Node names/topics/params/
+  services unchanged (per-name param loading from one --params-file works). Trade-off: no
+  independent crash/restart; serial drivers self-heal on their own threads. Web shows IMU
+  connectivity via /imu/web staleness (red "lost"), so a device drop is still visible.
+  `stack.sh` launches one `sensors` entry; `do_down` keeps the old per-node patterns to
+  sweep pre-merge stragglers. See [[single-webui-from-sbc]].

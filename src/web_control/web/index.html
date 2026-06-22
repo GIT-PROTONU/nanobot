@@ -237,7 +237,7 @@ let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
 
 // ---- ROS state ----
-let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null, faceTopic=null, systemTopic=null,
+let ros=null, odomTopic=null, cmdTopic=null, textTopic=null, faceTopic=null, systemTopic=null,
     imuTopic=null, eulTopic=null, sysTopic=null,
     imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
 // ESP32 coprocessor topics
@@ -404,9 +404,9 @@ function setConn(ok){
 }
 
 function subscribe(){
-  scanTopic=new ROSLIB.Topic({ros,name:"/scan",messageType:"sensor_msgs/msg/LaserScan",
-    throttle_rate:50,queue_length:1,compression:"cbor"});
-  scanTopic.subscribe(onScan);
+  // NB: /scan is NOT bridged here — it's the heaviest message (360 floats) and
+  // dominated rosbridge CPU. The lidar driver writes a compact blob to /dev/shm and we
+  // poll it over HTTP (see pollScan below), same update rate, no rosbridge cost.
   odomTopic=new ROSLIB.Topic({ros,name:"/odom",messageType:"nav_msgs/msg/Odometry",
     throttle_rate:100,queue_length:1});
   odomTopic.subscribe(onOdom);
@@ -501,12 +501,21 @@ setInterval(()=>{
   el.style.color = alive ? "var(--green)" : "var(--red)";
 },1000);
 
+let lastImuT=0;
 function onImu(msg){
   // /imu/web Vector3Stamped: x=|accel| m/s^2, y=|gyro| rad/s, z=actual /imu/data Hz
+  lastImuT=performance.now();
   $("imuA").textContent=msg.vector.x.toFixed(2);
   $("imuG").textContent=(msg.vector.y*180/Math.PI).toFixed(1);
-  $("imuHz").textContent=msg.vector.z.toFixed(0)+" Hz";
+  const el=$("imuHz"); el.textContent=msg.vector.z.toFixed(0)+" Hz"; el.style.color="";
 }
+// IMU connectivity: /imu/web streams ~15 Hz whenever the IMU is up. If it stops (USB
+// unplugged, or the driver lost the port) the rate readout goes red "lost" — so even
+// with the sensor nodes merged into one process you can still see the IMU drop out.
+setInterval(()=>{
+  if(lastImuT && performance.now()-lastImuT<2000) return;   // fresh: onImu owns the text
+  const el=$("imuHz"); el.textContent="lost"; el.style.color="var(--red)";
+},1000);
 function onEul(msg){
   $("imuR").textContent=msg.vector.x.toFixed(1)+"°";
   $("imuP").textContent=msg.vector.y.toFixed(1)+"°";
@@ -575,21 +584,38 @@ function sendFace(){
 $("faceOn").addEventListener("change",sendFace);
 $("faceMood").addEventListener("change",()=>{ if($("faceOn").checked) sendFace(); });
 
-function onScan(msg){
-  const pts=[], maxr=Number($("maxr").value)||1e9;
-  const a0=msg.angle_min, da=msg.angle_increment;
-  for(let i=0;i<msg.ranges.length;i++){
-    const r=msg.ranges[i];
-    if(!isFinite(r)||r<=0||r>maxr) continue;
-    const a=a0+i*da;
-    pts.push({x:r*Math.cos(a), y:r*Math.sin(a)});
-  }
-  frame=pts; $("pts").textContent=pts.length; $("ldsPts").textContent=pts.length;
-  scanCount++;
-  const now=performance.now();
-  if(now-lastHzT>=1000){ scanHz=scanCount*1000/(now-lastHzT); scanCount=0; lastHzT=now;
-    $("hz").textContent=scanHz.toFixed(1); $("ldsHz").textContent=scanHz.toFixed(1)+" Hz"; }
+// ---- lidar scan over HTTP (same-origin /dev/shm), not rosbridge ----
+// /scan.bin = a JSON header line ({seq,amin,ainc,n}), '\n', then n raw float32 ranges
+// (inf = no hit). The driver rewrites it per scan; we poll a touch faster and skip
+// unchanged seqs, so the canvas + point count + scan-Hz readouts are identical to the
+// old rosbridge path, minus the LaserScan deserialization that dominated rosbridge CPU.
+let lastScanSeq=-1;
+const scanDec=new TextDecoder();
+async function pollScan(){
+  try{
+    const r=await fetch("/scan.bin?t="+Date.now());
+    if(!r.ok) return;                          // 503 until the first scan is written
+    const buf=new Uint8Array(await r.arrayBuffer());
+    const nl=buf.indexOf(10); if(nl<0) return;
+    const h=JSON.parse(scanDec.decode(buf.subarray(0,nl)));
+    if(h.seq===lastScanSeq) return;            // no new scan since the last poll
+    lastScanSeq=h.seq;
+    const dv=new DataView(buf.buffer, buf.byteOffset+nl+1);
+    const maxr=Number($("maxr").value)||1e9, pts=[];
+    for(let i=0;i<h.n;i++){
+      const rng=dv.getFloat32(i*4,true);
+      if(!isFinite(rng)||rng<=0||rng>maxr) continue;
+      const a=h.amin+i*h.ainc;
+      pts.push({x:rng*Math.cos(a), y:rng*Math.sin(a)});
+    }
+    frame=pts; $("pts").textContent=pts.length; $("ldsPts").textContent=pts.length;
+    scanCount++;
+    const now=performance.now();
+    if(now-lastHzT>=1000){ scanHz=scanCount*1000/(now-lastHzT); scanCount=0; lastHzT=now;
+      $("hz").textContent=scanHz.toFixed(1); $("ldsHz").textContent=scanHz.toFixed(1)+" Hz"; }
+  }catch(e){ /* transient: keep polling */ }
 }
+setInterval(pollScan,80);    // ~12.5 Hz poll; the file updates at the scan rate (~5-10 Hz)
 function onOdom(msg){
   const p=msg.pose.pose.position, q=msg.pose.pose.orientation;
   const yaw=Math.atan2(2*(q.w*q.z),1-2*(q.z*q.z));

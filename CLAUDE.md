@@ -19,7 +19,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - `robot_msgs` — custom interfaces (ament_cmake).
 - `robot_bringup` — launch files + **the single config `config/robot.yaml`** (all
   ports/pins/rates live here).
-- `lds_driver_py` — **the LDS driver in use** (rclpy, publishes `/scan`).
+- `lds_driver_py` — **the LDS driver in use** (rclpy, publishes `/scan`; also writes a
+  compact scan blob to `/dev/shm/nano_scan.bin` for the web UI — see `web_control` below).
 - `lds_driver` — **abandoned** Rust/r2r LDS node; does NOT build against this
   RoboStack. Kept for reference only. **Do not try to build it** (see below).
 - `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32) into `/odom`+TF;
@@ -28,6 +29,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   not launched by `stack.sh`/`robot.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
+- `sensor_hub` — **runs `imu_driver` + `sys_monitor` + `wheel_odometry` + `lds_driver_py`
+  in ONE process** (one executor) to save ~100+ MB RAM on the 1 GB board. Same node
+  names/topics/params/services — purely an packaging change. `stack.sh` launches this
+  instead of those four separately. Trade-off: they no longer crash/restart independently.
 
 ## ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
 - **Native zenoh-pico over a direct UART link** (PlatformIO + Arduino) — NO micro-ROS,
@@ -67,8 +72,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   `build-lds`/`build-all`** — the Rust node and its toolchain are intentionally gone.
 - Run the stack: **`scripts/stack.sh {up|down|restart|status}`** (run via
   `pixi run bash scripts/stack.sh ...`). It starts router → agent → rosbridge → web
-  → oled → imu → sys → odom → lds in order, idempotent (pgrep-guarded), logs to
-  `.run/*.log`. (The agent is skipped if `$AGENT_DEV` isn't plugged in.)
+  → oled → **sensors** (one `sensor_hub` process = imu+sys+odom+lds) → nav in order,
+  idempotent (pgrep-guarded), logs to `.run/*.log`. `down`/`restart` SIGTERM→wait→SIGKILL
+  and verify (also sweeps pre-merge per-node stragglers). (The agent is skipped if
+  `$AGENT_DEV` isn't plugged in.)
   Nodes are launched by their installed executables directly (not `ros2 run`) to
   keep RAM down.
 - On the board the stack **auto-starts on boot** via systemd `nano-stack.service`.
@@ -90,6 +97,12 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   mic as raw PCM via `arecord` (`mic_audio.py`). Both are ref-counted (only run
   while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
   (browsers don't stream an HTTP/1.0 body to `fetch`).
+- **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
+  Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
+  so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`
+  (occupancy grid, written by `slam_nav`) and `/scan.bin` (compact lidar blob = JSON
+  header + raw float32 ranges, written by `lds_driver_py`). The page polls these like
+  files; `/scan` is **not** bridged. Also publishes `/esp32_ping` @1 Hz (ESP liveness).
 - Tune live: `imu_driver`/`lds_driver_py` expose `publish_rate` as a settable param;
   the web UI sliders call `/<node>/set_parameters` over rosbridge. The IMU's device
   stream rate auto-follows `publish_rate` (`output_rate_hz: 0`).

@@ -13,7 +13,10 @@ checksum over the first 20 bytes is compared to bytes 20..21.
 Publishes one sensor_msgs/LaserScan per revolution on /scan. Node name is
 "lds_driver" so it reads the existing `lds_driver:` block in robot.yaml.
 """
+import array
+import json
 import math
+import os
 import threading
 import time
 
@@ -35,6 +38,11 @@ CMD = 0xFA
 IDX_LO = 0xA0
 BAD_MASK = 0xC0      # invalid (0x80) | low-signal (0x40)
 RAYS = 360
+# Compact scan blob for the web UI: a JSON header line, '\n', then the raw float32
+# ranges. The browser polls this same-origin (served by web_control from /dev/shm) and
+# draws it directly — so /scan (the heaviest message) no longer has to be bridged over
+# rosbridge just to show the lidar. Mirrors how slam_nav serves the occupancy map.
+SCAN_FILE = "/dev/shm/nano_scan.bin"
 
 
 class LdsParser:
@@ -113,6 +121,7 @@ class LdsNode(Node):
         self.add_on_set_parameters_callback(self._on_params)
 
         self.pub = self.create_publisher(LaserScan, "scan", qos_profile_sensor_data)
+        self._scan_seq = 0
         self.parser = LdsParser()
         self.ser = None
         self._stop = threading.Event()
@@ -183,6 +192,23 @@ class LdsNode(Node):
         msg.ranges = ranges
         msg.intensities = intensities
         self.pub.publish(msg)
+        self._write_scan_blob(msg.angle_min, msg.angle_increment, ranges)
+
+    def _write_scan_blob(self, amin, ainc, ranges):
+        """Dump the scan to /dev/shm for the web UI (see SCAN_FILE). Atomic via .tmp +
+        rename so a polling reader never sees a torn file. inf (no-hit) packs as float32
+        inf, which the browser treats as 'no point'."""
+        self._scan_seq += 1
+        header = json.dumps({"seq": self._scan_seq, "amin": amin,
+                             "ainc": ainc, "n": len(ranges)}).encode() + b"\n"
+        tmp = SCAN_FILE + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(header)
+                f.write(array.array("f", ranges).tobytes())
+            os.replace(tmp, SCAN_FILE)
+        except OSError:
+            pass
 
     def destroy_node(self):
         self._stop.set()
