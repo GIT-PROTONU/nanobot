@@ -100,6 +100,20 @@ slam_nav:
     goal_tol: 0.12                 # m: within this of the goal = arrived
     stop_distance: 0.25            # m: obstacle this close ahead = stop + replan
     front_angle: 0.6               # rad: half-width of the reactive front cone
+    # --- extras (each independently toggleable; behaviour-changers default OFF for
+    #     easy/safe testing — flip them on one at a time) ---
+    map_store: ""                  # persist the map here (.npz). "" = disabled. To enable,
+                                   # set an absolute path e.g. "/home/ibster/nano_map.npz";
+                                   # it auto-loads on boot + saves on the /slam_nav/save_map
+                                   # button. (Don't use /dev/shm — that's RAM, lost on reboot.)
+    autosave_period: 0.0           # s between background map autosaves; 0 = off (manual only)
+    auto_explore: false            # autonomously drive to map frontiers when idle.
+                                   # Still needs enable_motion to actually move; with motion
+                                   # off it just shows where it *would* explore.
+    explore_period: 4.0            # s between frontier picks while exploring
+    trail_max: 400                 # breadcrumb ring-buffer length (where it's been); 0 = off
+    stuck_timeout: 0.0             # s of commanded-but-no-motion before aborting goal; 0 = off
+    stuck_eps: 0.04                # m: movement below this counts as "not moving"
 
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:

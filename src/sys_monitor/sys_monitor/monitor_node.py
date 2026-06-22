@@ -5,12 +5,15 @@ churn, negligible cost on the 1 GB H5.
 A single DiagnosticStatus named "system" carries KeyValue fields:
     cpu_percent, cpu_cores (per-core busy%, "12,4,6,8"), load1,
     mem_used_mb, mem_total_mb, mem_percent,
-    cpu_temp_c, gpu_temp_c, disk_percent, uptime_s
+    cpu_temp_c, gpu_temp_c, disk_percent, uptime_s,
+    wifi_iface, wifi_ssid, wifi_signal_dbm, wifi_quality_pct
 and a level (OK/WARN) flagged when temp/mem/disk cross soft thresholds. The web
 UI renders these in a System panel.
 """
 import os
 import socket
+import subprocess
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -55,6 +58,8 @@ class MonitorNode(Node):
         self.host = socket.gethostname()
         self.zones = _thermal_zones()
         self._prev = self._cpu_times()      # (idle, total) for delta-based CPU%
+        self._ssid = ""                     # cached; refreshed at most every 5 s (subprocess)
+        self._ssid_at = -1e9
         self.create_timer(1.0 / rate, self._tick)
         self.get_logger().info(
             f"sys_monitor publishing /diagnostics at {rate} Hz "
@@ -91,6 +96,42 @@ class MonitorNode(Node):
         raw = _read(self.zones.get(zone_type, "")).strip()
         return int(raw) / 1000.0 if raw else float("nan")
 
+    @staticmethod
+    def _wifi_link():
+        """(iface, quality, signal_dbm) from /proc/net/wireless — a pure read, no tools.
+        Returns ('', nan, nan) when no wireless link is up."""
+        for line in _read("/proc/net/wireless").splitlines():
+            name, sep, rest = line.partition(":")
+            if not sep or name.strip() in ("Inter-| sta", "face | tus"):
+                continue                      # skip the two header rows
+            f = rest.split()
+            if len(f) >= 3:
+                try:
+                    return name.strip(), float(f[1].rstrip(".")), float(f[2].rstrip("."))
+                except ValueError:
+                    return name.strip(), float("nan"), float("nan")
+        return "", float("nan"), float("nan")
+
+    def _wifi_ssid(self, iface, now):
+        """SSID of `iface`, cached for 5 s (the only subprocess here; ~ms, 0.2 Hz)."""
+        if iface and now - self._ssid_at > 5.0:
+            self._ssid_at = now
+            self._ssid = ""
+            for cmd in (["iwgetid", "-r", iface], ["iw", "dev", iface, "link"]):
+                try:
+                    out = subprocess.run(cmd, capture_output=True, text=True,
+                                         timeout=1.0).stdout
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                if cmd[0] == "iwgetid" and out.strip():
+                    self._ssid = out.strip(); break
+                for ln in out.splitlines():
+                    if ln.strip().startswith("SSID:"):
+                        self._ssid = ln.split("SSID:", 1)[1].strip(); break
+                if self._ssid:
+                    break
+        return self._ssid if iface else ""
+
     def _tick(self):
         # memory
         mem = {}
@@ -121,6 +162,11 @@ class MonitorNode(Node):
         gpu_t = self._temp("gpu-thermal")
         uptime = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
 
+        # WiFi: signal/quality (pure /proc read) + SSID (cached subprocess, 0.2 Hz)
+        wifi_if, wifi_q, wifi_dbm = self._wifi_link()
+        wifi_ssid = self._wifi_ssid(wifi_if, time.monotonic())
+        wifi_pct = max(0.0, min(100.0, wifi_q / 70.0 * 100.0)) if wifi_q == wifi_q else float("nan")
+
         fields = {
             "cpu_percent": f"{cpu_pct:.1f}",
             "cpu_cores": ",".join(cores),     # per-core busy%, core order
@@ -132,6 +178,10 @@ class MonitorNode(Node):
             "gpu_temp_c": f"{gpu_t:.1f}",
             "disk_percent": f"{disk_pct:.0f}",
             "uptime_s": f"{uptime:.0f}",
+            "wifi_iface": wifi_if,
+            "wifi_ssid": wifi_ssid,
+            "wifi_signal_dbm": "" if wifi_dbm != wifi_dbm else f"{wifi_dbm:.0f}",
+            "wifi_quality_pct": "" if wifi_pct != wifi_pct else f"{wifi_pct:.0f}",
         }
 
         warn = (cpu_t == cpu_t and cpu_t >= TEMP_WARN_C) \

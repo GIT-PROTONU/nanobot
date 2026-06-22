@@ -82,12 +82,18 @@
       <div id="mapCtl" style="display:none;gap:6px;margin-top:6px;grid-template-columns:1fr 1fr">
         <label class="chk"><input type="checkbox" id="mapMotion"> enable motion</label>
         <button id="mapStop" class="danger">■ Stop</button>
+        <label class="chk"><input type="checkbox" id="mapExplore"> auto-explore</label>
+        <button id="mapHome">⌂ Go home</button>
+        <button id="mapSave">💾 Save map</button>
       </div>
+      <div id="mapStats" class="hint" style="display:none;margin-top:4px"></div>
       <p class="hint" id="mapHint" style="display:none">2D occupancy map from
         <b>slam_nav</b> (/scan + /odom + IMU yaw, scan-to-map matched), served raw from
         <b>/dev/shm</b> via <b>/map</b>. Polls only while shown. <b>Click the map to set a
         goal</b> — the green path is the plan (<b>/plan</b>). It only drives when
-        <b>enable motion</b> is on (else it just plans). Red = robot, yellow = goal.</p>
+        <b>enable motion</b> is on (else it just plans). Red = robot, yellow = goal,
+        cyan = where it's been, ⌂ = home. <b>Auto-explore</b> drives to unmapped frontiers;
+        <b>Save map</b> persists it (needs <code>map_store</code> set).</p>
       <h2>Camera</h2>
       <label class="chk"><input type="checkbox" id="camOn"> show webcam</label>
       <img id="cam" alt="">
@@ -146,9 +152,11 @@
         <span>mem</span><b id="sysMem">–</b>
         <span>temp</span><b id="sysTemp">–</b>
         <span>disk</span><b id="sysDisk">–</b>
+        <span>wifi</span><b id="sysWifi">–</b>
         <span>uptime</span><b id="sysUp">–</b>
       </div>
-      <p class="hint">Board health from <b>/diagnostics</b> (sys_monitor), 1 Hz.</p>
+      <p class="hint">Board health from <b>/diagnostics</b> (sys_monitor), 1 Hz.
+        <b>wifi</b> = SSID + signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
       <h2>LDS</h2>
       <div class="imu">
         <span>rate</span><b id="ldsHz">–</b>
@@ -225,6 +233,7 @@ let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=n
     hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
 // slam_nav view+plan state (read by the map panel script below)
 let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
+let homeTopic=null, saveTopic=null;
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -254,14 +263,16 @@ function mapSetGoal(wx,wy){
     pose:{position:{x:wx,y:wy,z:0},orientation:{x:0,y:0,z:0,w:1}}}));
   mapGoal=[wx,wy];
 }
-// flip slam_nav enable_motion live (rcl_interfaces SetParameters; type 1 = bool).
-function setNavMotion(on){
+// flip a slam_nav bool param live (rcl_interfaces SetParameters; type 1 = bool).
+function setNavBool(name,on){
   if(!navMotionSrv) return;
-  navMotionSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name:"enable_motion",
+  navMotionSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name,
     value:{type:1,bool_value:on,integer_value:0,double_value:0,string_value:"",
       byte_array_value:[],bool_array_value:[],integer_array_value:[],
       double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
 }
+const setNavMotion=on=>setNavBool("enable_motion",on);
+const setNavExplore=on=>setNavBool("auto_explore",on);
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>{ if(ldsTgtTopic)
@@ -431,6 +442,8 @@ function subscribe(){
   ldsTgtTopic=new ROSLIB.Topic({ros,name:"/lds_target_rpm",messageType:"std_msgs/msg/Float32"});
   // slam_nav: click-to-go goal, the planned path overlay, and the motion toggle.
   goalTopic=new ROSLIB.Topic({ros,name:"/goal_pose",messageType:"geometry_msgs/msg/PoseStamped"});
+  homeTopic=new ROSLIB.Topic({ros,name:"/slam_nav/go_home",messageType:"std_msgs/msg/Bool"});
+  saveTopic=new ROSLIB.Topic({ros,name:"/slam_nav/save_map",messageType:"std_msgs/msg/Bool"});
   navMotionSrv=new ROSLIB.Service({ros,name:"/slam_nav/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
   planTopic=new ROSLIB.Topic({ros,name:"/plan",messageType:"nav_msgs/msg/Path",
@@ -514,6 +527,15 @@ function onDiag(msg){
   $("sysUp").textContent=fmtUptime(Number(kv.uptime_s||0));
   $("sysTemp").style.color = Number(kv.cpu_temp_c)>=75 ? "var(--red)" : "";
   $("sysMem").style.color  = Number(kv.mem_percent)>=90 ? "var(--amber)" : "";
+  // WiFi: "SSID  -54dBm (78%)", colour-coded by signal so you can spot a weak link.
+  const w=$("sysWifi"), dbm=kv.wifi_signal_dbm;
+  if(!kv.wifi_iface){ w.textContent="—"; w.style.color=""; }
+  else{
+    const ssid=kv.wifi_ssid||kv.wifi_iface;
+    w.textContent = dbm ? `${ssid}  ${dbm}dBm${kv.wifi_quality_pct?` (${kv.wifi_quality_pct}%)`:""}` : ssid;
+    const d=Number(dbm);
+    w.style.color = !dbm ? "" : d>=-60 ? "var(--green)" : d>=-75 ? "var(--amber)" : "var(--red)";
+  }
 }
 
 // ---- OLED text ----
@@ -668,11 +690,22 @@ connect();   // auto-connect on load
     $("mapWait").style.display="none";    // got a real frame: drop the placeholder
     cv.style.cursor="crosshair";          // ...and arm click-to-go only now
     const W2P=(x,y)=>[(x-m.ox)/m.res, h-1-(y-m.oy)/m.res];  // world -> canvas px
+    // breadcrumb trail (cyan polyline) — where the robot has been
+    if(m.trail && m.trail.length>1){
+      ctx.strokeStyle="#22d3ee"; ctx.lineWidth=1; ctx.globalAlpha=0.7; ctx.beginPath();
+      m.trail.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+      ctx.stroke(); ctx.globalAlpha=1;
+    }
     // planned path (green polyline)
     if(mapPlan && mapPlan.length>1){
       ctx.strokeStyle="#34c759"; ctx.lineWidth=2; ctx.beginPath();
       mapPlan.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
       ctx.stroke();
+    }
+    // home marker (origin) — small magenta square
+    if(m.hx!==undefined){
+      const [hx,hy]=W2P(m.hx,m.hy);
+      ctx.strokeStyle="#c084fc"; ctx.lineWidth=2; ctx.strokeRect(hx-4,hy-4,8,8);
     }
     // goal marker (yellow ring)
     if(mapGoal){
@@ -686,12 +719,21 @@ connect();   // auto-connect on load
     ctx.beginPath(); ctx.arc(rx,ry,4,0,6.2832); ctx.fill();
     ctx.beginPath(); ctx.moveTo(rx,ry);
     ctx.lineTo(rx+9*Math.cos(m.pth), ry-9*Math.sin(m.pth)); ctx.stroke();
+    // telemetry line (coverage + localization health + mode)
+    if(m.seen!==undefined){
+      const q = m.score>=8?"good":(m.score>=2?"ok":"weak");
+      $("mapStats").textContent =
+        `mode: ${m.mode||"—"} · explored ${(m.seen*100).toFixed(0)}% `
+        + `(${(m.free_m2||0).toFixed(1)} m² free) · match ${q} (${(m.score||0).toFixed(0)})`
+        + ` · motion ${m.motion?"ON":"off"}`;
+    }
   }
 
   $("mapOn").addEventListener("change",e=>{
     const on=e.target.checked;
     $("mapWrap").style.display=on?"block":"none";
     $("mapCtl").style.display=on?"grid":"none";
+    $("mapStats").style.display=on?"block":"none";
     $("mapHint").style.display=on?"block":"none";
     if(on){
       $("mapWait").style.display="flex"; cv.style.cursor="default"; // until a frame lands
@@ -709,8 +751,12 @@ connect();   // auto-connect on load
     mapSetGoal(m.ox+cx*m.res, m.oy+(cv.height-1-cy)*m.res);
   });
   $("mapMotion").addEventListener("change",e=>setNavMotion(e.target.checked));
+  $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));
+  $("mapHome").addEventListener("click",()=>{ if(homeTopic) homeTopic.publish(new ROSLIB.Message({data:true})); });
+  $("mapSave").addEventListener("click",()=>{ if(saveTopic) saveTopic.publish(new ROSLIB.Message({data:true})); });
   $("mapStop").addEventListener("click",()=>{
     $("mapMotion").checked=false; setNavMotion(false);
+    $("mapExplore").checked=false; setNavExplore(false);   // also halt auto-exploration
     if(cmdTopic) cmdTopic.publish(new ROSLIB.Message(
       {linear:{x:0,y:0,z:0},angular:{x:0,y:0,z:0}}));   // belt-and-braces halt
   });

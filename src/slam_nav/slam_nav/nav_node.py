@@ -13,6 +13,7 @@ Map file format (atomic via os.replace): one JSON metadata line, '\n', then the 
 int8 occupancy bytes (row-major, row 0 = origin_y). The browser parses the header and
 draws the rest straight into an ImageData.
 """
+import collections
 import json
 import math
 import os
@@ -26,6 +27,7 @@ from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool
 
 from .occupancy import GridMap
 
@@ -66,6 +68,14 @@ class NavNode(Node):
             ("goal_tol", 0.12),          # m: within this of the goal = arrived
             ("stop_distance", 0.25),     # m: obstacle closer than this ahead = stop+replan
             ("front_angle", 0.6),        # rad: half-width of the reactive front cone
+            # --- extras (all independently toggleable; the heavy ones default OFF) ---
+            ("map_store", ""),           # path to persist the map (.npz). "" = disabled.
+            ("autosave_period", 0.0),    # s between background map autosaves; 0 = off
+            ("auto_explore", False),     # drive to frontiers when idle (needs enable_motion)
+            ("explore_period", 4.0),     # s between frontier picks while exploring
+            ("trail_max", 400),          # breadcrumb ring-buffer length; 0 = off
+            ("stuck_timeout", 0.0),      # s commanded-but-not-moving before abort; 0 = off
+            ("stuck_eps", 0.04),         # m: movement below this counts as "not moving"
         ])
         g = self.get_parameter
         self.grid = GridMap(
@@ -91,8 +101,18 @@ class NavNode(Node):
         self.stop_distance = float(g("stop_distance").value)
         self.front_angle = float(g("front_angle").value)
 
+        # extras
+        self.map_store = str(g("map_store").value)
+        self._autosave_period = float(g("autosave_period").value)
+        self.auto_explore = bool(g("auto_explore").value)
+        self.explore_period = float(g("explore_period").value)
+        self._trail_max = int(g("trail_max").value)
+        self.stuck_timeout = float(g("stuck_timeout").value)
+        self.stuck_eps = float(g("stuck_eps").value)
+
         # SLAM pose in the map frame.
         self.px = self.py = self.pth = 0.0
+        self.home = (0.0, 0.0)       # where the robot booted = map origin; "go home" target
         self._have_map = False
         # Motion-prior trackers (last odom pose + last IMU yaw consumed by a scan).
         self._odom = None
@@ -104,9 +124,23 @@ class NavNode(Node):
         # navigation state (all callbacks + the control timer run on the one spin
         # thread, so plain attributes are safe — no locks needed).
         self._goal = None            # (x, y) world, or None
+        self._goal_is_frontier = False  # current goal came from auto-explore
         self._path = []              # [(x, y)] world waypoints
         self._last_scan = None       # (angles, ranges) for the reactive layer
         self._next_replan = 0.0
+        self._next_explore = 0.0
+        self._next_autosave = 0.0
+        self._last_score = 0.0       # last accepted scan-match score (localization health)
+        self._trail = (collections.deque(maxlen=self._trail_max)
+                       if self._trail_max > 0 else None)
+        # stuck detector
+        self._stuck_ref = None       # (x, y) pose when the current move started
+        self._stuck_since = 0.0
+
+        # Optionally reload a previously-saved map (relocalize into it from the origin).
+        if self.map_store and self.grid.load(self.map_store):
+            self._have_map = True
+            self.get_logger().info(f"loaded saved map from {self.map_store}")
 
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
@@ -116,6 +150,8 @@ class NavNode(Node):
         self.create_subscription(
             LaserScan, g("scan_topic").value, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, "goal_pose", self._on_goal, 5)
+        self.create_subscription(Bool, "go_home", self._on_go_home, 5)
+        self.create_subscription(Bool, "save_map", self._on_save_map, 5)
         self.create_timer(1.0 / max(1.0, float(g("control_rate").value)), self._control)
         self.add_on_set_parameters_callback(self._on_params)
 
@@ -135,6 +171,13 @@ class NavNode(Node):
                 self.max_lin = float(p.value)
             elif p.name == "max_ang":
                 self.max_ang = float(p.value)
+            elif p.name == "auto_explore":
+                self.auto_explore = bool(p.value)
+                if not self.auto_explore and self._goal_is_frontier:
+                    self._goal, self._path = None, []   # drop the exploration goal
+                    self._goal_is_frontier = False
+            elif p.name == "stuck_timeout":
+                self.stuck_timeout = float(p.value)
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
@@ -175,17 +218,29 @@ class NavNode(Node):
             cand = self.grid.match((px, py, pth), va, vr,
                                    lin=self.match_lin, ang=self.match_ang)
             # Reject a match with no real overlap (e.g. wide-open space) — trust the prior.
-            if self.grid.score(cand, va, vr) >= self.min_score:
+            score = self.grid.score(cand, va, vr)
+            self._last_score = score
+            if score >= self.min_score:
                 px, py, pth = cand
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
         self.grid.integrate((self.px, self.py, self.pth), angles, ranges)
         self._publish_pose()
 
+        # breadcrumb trail: append only when the robot has actually moved a bit (keeps the
+        # ring buffer meaningful and the JSON header small).
+        if self._trail is not None and (
+                not self._trail or math.hypot(self.px - self._trail[-1][0],
+                                              self.py - self._trail[-1][1]) > 0.05):
+            self._trail.append((round(self.px, 2), round(self.py, 2)))
+
         now = time.monotonic()
         if now - self._last_write >= self._write_period:
             self._last_write = now
             self._write_map()
+        if self._autosave_period > 0 and self.map_store and now >= self._next_autosave:
+            self._next_autosave = now + self._autosave_period
+            self._save_map_file(quiet=True)
 
     def _predict(self, px, py, pth):
         """Apply the odom/IMU motion since the last scan as the scan-match prior."""
@@ -218,13 +273,45 @@ class NavNode(Node):
     # --- navigation (Stages 2/3) --------------------------------------------
     def _on_goal(self, msg):
         self._goal = (msg.pose.position.x, msg.pose.position.y)
+        self._goal_is_frontier = False           # a human/explicit goal wins over exploring
         self._next_replan = 0.0                  # plan immediately on the next tick
         self.get_logger().info(f"goal set: ({self._goal[0]:.2f}, {self._goal[1]:.2f})")
 
+    def _on_go_home(self, _msg):
+        """Return-to-origin: target the pose the robot booted at (map (0,0))."""
+        self._goal = self.home
+        self._goal_is_frontier = False
+        self._next_replan = 0.0
+        self.get_logger().info("go home: heading to map origin")
+
+    def _on_save_map(self, _msg):
+        self._save_map_file()
+
+    def _save_map_file(self, quiet=False):
+        if not self.map_store:
+            if not quiet:
+                self.get_logger().warning("save_map ignored: map_store param is empty")
+            return
+        try:
+            self.grid.save(self.map_store)
+            if not quiet:
+                self.get_logger().info(f"map saved to {self.map_store}")
+        except OSError as exc:
+            self.get_logger().warning(f"map save failed: {exc}", throttle_duration_sec=10.0)
+
     def _control(self):
-        if self._goal is None or not self._have_map:
+        if not self._have_map:
             return
         now = time.monotonic()
+        # auto-explore: when there's no goal, periodically adopt the nearest reachable
+        # frontier as one (only drives if enable_motion; otherwise just shows the plan).
+        if self._goal is None:
+            if self.auto_explore and now >= self._next_explore:
+                self._next_explore = now + self.explore_period
+                self._explore_step()
+            if self._goal is None:
+                return
+
         if now >= self._next_replan:
             self._next_replan = now + self.replan_period
             path = self.grid.plan(
@@ -238,7 +325,7 @@ class NavNode(Node):
         gx, gy = self._goal
         if math.hypot(gx - self.px, gy - self.py) < self.goal_tol:
             self.get_logger().info("goal reached")
-            self._goal, self._path = None, []
+            self._goal, self._path, self._goal_is_frontier = None, [], False
             self._publish_path()
             self._send(0.0, 0.0)
             return
@@ -250,7 +337,51 @@ class NavNode(Node):
             return
 
         v, w = self._pursuit()
+        if self._check_stuck(now, v):
+            self._send(0.0, 0.0)
+            self._goal, self._path, self._goal_is_frontier = None, [], False
+            self._publish_path()
+            return
         self._send(v, w)
+
+    def _explore_step(self):
+        """Adopt the nearest *reachable* frontier as the goal (auto-exploration). Tries the
+        nearest-first candidate list and keeps the first one the planner can actually reach,
+        so a frontier tucked behind a wall is skipped rather than stalling exploration."""
+        for fx, fy in self.grid.frontiers((self.px, self.py), radius_m=self.robot_radius,
+                                          downsample=self.plan_downsample):
+            path = self.grid.plan((self.px, self.py), (fx, fy), radius_m=self.robot_radius,
+                                  downsample=self.plan_downsample,
+                                  allow_unknown=self.allow_unknown)
+            if path:
+                self._goal, self._path, self._goal_is_frontier = (fx, fy), path, True
+                self._next_replan = time.monotonic() + self.replan_period
+                self._publish_path()
+                self.get_logger().info(f"explore: frontier ({fx:.2f}, {fy:.2f})",
+                                       throttle_duration_sec=2.0)
+                return
+        self.get_logger().info("explore: no reachable frontier (map complete?)",
+                               throttle_duration_sec=10.0)
+
+    def _check_stuck(self, now, v):
+        """True if we've been commanding forward motion but the pose hasn't advanced for
+        `stuck_timeout` s — a cheap watchdog for a wedged wheel / unsensed collision."""
+        if self.stuck_timeout <= 0 or not self.enable_motion or v <= 0.02:
+            self._stuck_ref = None
+            return False
+        if self._stuck_ref is None:
+            self._stuck_ref, self._stuck_since = (self.px, self.py), now
+            return False
+        if math.hypot(self.px - self._stuck_ref[0],
+                      self.py - self._stuck_ref[1]) > self.stuck_eps:
+            self._stuck_ref, self._stuck_since = (self.px, self.py), now   # made progress
+            return False
+        if now - self._stuck_since > self.stuck_timeout:
+            self.get_logger().warning("stuck: commanded motion but pose not advancing — "
+                                      "aborting goal")
+            self._stuck_ref = None
+            return True
+        return False
 
     def _front_blocked(self):
         if self._last_scan is None:
@@ -300,10 +431,20 @@ class NavNode(Node):
 
     def _write_map(self):
         occ = self.grid.occupancy_int8()
+        seen_frac, free_m2, _occ_m2 = self.grid.coverage()
+        mode = ("explore" if self._goal_is_frontier else
+                "goal" if self._goal is not None else "idle")
         meta = {
             "w": self.grid.n, "h": self.grid.n, "res": self.grid.res,
             "ox": self.grid.origin, "oy": self.grid.origin,
             "px": self.px, "py": self.py, "pth": self.pth,
+            # --- telemetry the web map panel renders (all cheap to compute) ---
+            "hx": self.home[0], "hy": self.home[1],          # home marker
+            "seen": round(seen_frac, 3),                     # fraction of grid observed
+            "free_m2": round(free_m2, 1),                    # mapped free area
+            "score": round(self._last_score, 1),             # scan-match quality
+            "mode": mode, "motion": self.enable_motion,
+            "trail": list(self._trail) if self._trail else [],
         }
         header = (json.dumps(meta) + "\n").encode()
         tmp = MAP_FILE + ".tmp"

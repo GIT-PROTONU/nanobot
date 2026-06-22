@@ -10,6 +10,8 @@ Memory: one float32 grid + one bool 'seen' mask. At 24 m / 5 cm that's 480x480 =
 ~0.9 MB + 0.23 MB. CPU: integration is O(hit cells); matching is a small coarse-to-fine
 search over a subsampled scan (caller decimates), vectorised per candidate angle.
 """
+import os
+
 import numpy as np
 
 # Inverse-sensor-model log-odds increments, and the clamp that bounds how "certain"
@@ -128,6 +130,43 @@ class GridMap:
         out[~self.seen] = -1
         return out
 
+    def coverage(self):
+        """(seen_fraction, free_m2, occ_m2) — cheap mapping telemetry (two boolean sums
+        over the grid). Cheap enough to call at the map-write rate."""
+        seen = int(self.seen.sum())
+        free = int(((self.log < 0.0) & self.seen).sum())
+        occ = int(((self.log > 0.0) & self.seen).sum())
+        cell_a = self.res * self.res
+        return seen / float(self.n * self.n), free * cell_a, occ * cell_a
+
+    # --- persistence ---------------------------------------------------------
+    def save(self, path):
+        """Persist the grid (log-odds + seen) compressed. A mostly-empty floor map is a
+        few tens of KB — the uniform regions zlib-compress hard. Atomic via a .tmp + rename
+        so a reader (or a crash mid-write) never sees a torn file."""
+        tmp = path + ".tmp"
+        np.savez_compressed(tmp, log=self.log, seen=self.seen,
+                            n=np.int32(self.n), res=np.float32(self.res))
+        # np.savez appends .npz to a str path; normalise then rename onto the target.
+        os.replace(tmp + ".npz" if not tmp.endswith(".npz") else tmp, path)
+
+    def load(self, path):
+        """Load a grid written by save(). Returns True on success; False if the file is
+        missing/corrupt or its geometry (size/res) doesn't match this map (never load a
+        mismatched grid — the indices wouldn't line up)."""
+        try:
+            z = np.load(path, allow_pickle=False)
+        except (OSError, ValueError, EOFError):
+            return False
+        try:
+            if int(z["n"]) != self.n or abs(float(z["res"]) - self.res) > 1e-9:
+                return False
+            self.log = np.ascontiguousarray(z["log"], dtype=np.float32)
+            self.seen = np.ascontiguousarray(z["seen"], dtype=bool)
+        except (KeyError, ValueError):
+            return False
+        return True
+
     # --- global planner (Stage 2) -------------------------------------------
     OBST_L = 0.62        # log-odds threshold counted as an obstacle (~P>0.65)
 
@@ -158,13 +197,10 @@ class GridMap:
         out.append(path[-1])
         return out
 
-    def plan(self, start, goal, radius_m=0.16, downsample=4, allow_unknown=True,
-             max_iter=1000):
-        """Plan a path from `start` to `goal` (world m) over a *downsampled* copy of the
-        grid (keeps CPU/RAM tiny: 24 m @ 5 cm / ds=4 -> 120x120 cells). Obstacles are
-        inflated by the robot radius; a vectorised wavefront from the goal gives a
-        distance field, then we descend it from the start. Returns world waypoints or
-        None if unreachable. Cheap enough to re-run ~1 Hz."""
+    def _coarse(self, downsample, radius_m, allow_unknown):
+        """Build the downsampled obstacle grid shared by plan() and frontiers(): coarse
+        occupied/seen masks + a robot-radius-inflated `blocked` mask. Returns
+        (blocked, seen_c, m, res_c)."""
         ds = max(1, int(downsample))
         m = self.n // ds
         res_c = self.res * ds
@@ -181,6 +217,39 @@ class GridMap:
             blocked = b
         if not allow_unknown:
             blocked |= ~seen_c
+        return blocked, seen_c, m, res_c
+
+    def frontiers(self, start, radius_m=0.16, downsample=4, k=8):
+        """Nearest-first list of up to `k` *frontier* points (world m): free coarse cells
+        that border still-unknown space — the classic autonomous-exploration target ("go
+        map the edge of what you know"). Vectorised on the same coarse grid as the planner,
+        so it's a handful of boolean ops on the 120x120 grid. Caller plans to the first
+        reachable one. Returns [] when the map is fully explored / no frontier exists."""
+        blocked, seen_c, m, res_c = self._coarse(downsample, radius_m, True)
+        free = seen_c & ~blocked
+        unknown = ~seen_c
+        fr = np.zeros_like(free)                      # free cell 4-adjacent to unknown
+        fr[1:, :]  |= free[1:, :]  & unknown[:-1, :]
+        fr[:-1, :] |= free[:-1, :] & unknown[1:, :]
+        fr[:, 1:]  |= free[:, 1:]  & unknown[:, :-1]
+        fr[:, :-1] |= free[:, :-1] & unknown[:, 1:]
+        if not fr.any():
+            return []
+        sc = int((start[0] - self.origin) / res_c)
+        sr = int((start[1] - self.origin) / res_c)
+        rs, cs = np.nonzero(fr)
+        order = np.argsort((rs - sr) ** 2 + (cs - sc) ** 2)[:max(1, int(k))]
+        return [(self.origin + (cs[i] + 0.5) * res_c, self.origin + (rs[i] + 0.5) * res_c)
+                for i in order]
+
+    def plan(self, start, goal, radius_m=0.16, downsample=4, allow_unknown=True,
+             max_iter=1000):
+        """Plan a path from `start` to `goal` (world m) over a *downsampled* copy of the
+        grid (keeps CPU/RAM tiny: 24 m @ 5 cm / ds=4 -> 120x120 cells). Obstacles are
+        inflated by the robot radius; a vectorised wavefront from the goal gives a
+        distance field, then we descend it from the start. Returns world waypoints or
+        None if unreachable. Cheap enough to re-run ~1 Hz."""
+        blocked, seen_c, m, res_c = self._coarse(downsample, radius_m, allow_unknown)
 
         def w2c(x, y):
             return (int((x - self.origin) / res_c), int((y - self.origin) / res_c))
