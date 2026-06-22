@@ -1,6 +1,17 @@
 - [Project overview](project-overview.md) — Nano robot: NanoPi NEO Plus2 + ROS 2 Humble (pixi/RoboStack, rmw_zenoh), mixed Python/Rust, rosbridge web UI
+- [Memory in git](memory-in-git.md) — user ALWAYS wants memory committed to git; ~/.claude memory dir is symlinked to repo .claude/memory; commit memory changes
 - [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
-- [Deployment state](deployment-state.md) — live board at 192.168.178.141, plink/pscp access, web UI running, what's left
+- [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy from Ubuntu via ssh/scp (plink/pscp refs are stale); web UI + stack auto-start
+- [Dev host is Ubuntu](dev-host-is-ubuntu.md) — native Ubuntu 24.04 now; repo Windows/WSL/COM-port docs are stale; deploy via ssh/scp (SSH_ASKPASS, no sshpass)
+- [Pin / bus map](pin-bus-map.md) — current SBC bus/port + ESP32 GPIO assignments; LDS=ttyS2, ESP32 link=ttyS1, OLED=i2c-0; canonical doc = nanopi-neo-plus2-pinmap.md
 - [ESP32 coprocessor](esp32-coprocessor.md) — native zenoh-pico (not micro-ROS) coprocessor in firmware/nanobot_coprocessor; single-channel encoders signed by commanded dir
-- [slam_nav](slam-nav.md) — custom super-light 2D SLAM + planned click-to-go nav (branch slam); Stage 1 done in repo, stages 2-3 pending
-- [ESP32 tooling setup](esp32-tooling-setup.md) — RESUME AFTER REBOOT: native Windows can't build micro-ROS; moving to WSL2+usbipd for build/flash/test
+- [ESP32 zenoh-pico integration](esp32-zenoh-pico-integration.md) — ESP32 runs zenoh-pico over direct UART (no agent/DDS); fix was liveliness tokens; LDS dual-read (ESP32 RPM UART1/GPIO14 + SBC scan UART2/ttyS2); do NOT pin zenoh-pico tasks to Core 0
+- [RoboStack zenoh has no serial](robostack-zenoh-no-serial.md) — conda libzenohc built without transport_serial; needs a custom serial-capable zenohd for the ESP32 link
+- [ESP32 build+flash on dev PC](esp32-build-flash-on-dev-pc.md) — both building and flashing stay on the dev PC; don't propose SBC-side build or flash
+- [ESP32 flash setup (Ubuntu)](esp32-flash-setup-ubuntu.md) — PlatformIO venv + penv symlink; ESP32 = CP2102 /dev/ttyUSB0
+- [ESP32 WHEEL PID still pending](esp32-pid-velocity-pending.md) — wheel velocity PID unbuilt (blocked: single-channel encoders = no direction). The LDS spin-speed PID is separate & already done.
+- [slam_nav](slam-nav.md) — custom super-light 2D SLAM + click-to-go nav; was branch slam, now all merged into main (slam branch deleted 2026-06-22)
+- [SLAM map empty = lidar not spinning](slam-map-empty-lidar-spin.md) — slam_nav writes /map only on /scan; firmware auto-spins lidar on boot; rpm/hz=0 usually means lidar unpowered, not a bug
+- [OLED display perf + face mode](oled-display-perf.md) — SSD1306 is I2C-bus-bound (flush=79% wait/21% CPU); i2c-0 raised to 400kHz; CPU∝flush count not bus speed; animated-eyes moods + shutdown/restart screens via /oled_face + /oled_system
+- [SBC CPU profile](sbc-cpu-profile.md) — ~50% CPU is mostly rosbridge while the web UI is open; CBOR=bandwidth-not-CPU; real win = don't bridge heavy topics (/imu/web summary)
+- [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
