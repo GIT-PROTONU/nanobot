@@ -55,6 +55,30 @@ Example: `PG13 = 192 + 13 = 205`; `PL10 = 352 + 10 = 362`.
 
 ---
 
+## Current project usage (Nano robot)
+
+How these buses/pins are actually wired on this build (source of truth:
+`src/robot_bringup/config/robot.yaml`, `firmware/nanobot_coprocessor/src/main.cpp`,
+`deploy/sbc-setup.sh`):
+
+| Bus / port | SoC pins | Used for |
+|---|---|---|
+| **i2c-0** | PA11/PA12 | **SSD1306 OLED** @0x3c — clock raised to **400 kHz** via user overlay `i2c0-400k` |
+| **i2c-1** | PA18/PA19 | PCA9685 @0x40 — **retired/unused** (ESP32 owns motors) |
+| **i2c-2** | PE12/PE13 | enabled, spare |
+| **ttyS1** (UART1) | PG6/PG7 | **ESP32 zenoh-pico link** (serial). On-board **Bluetooth disabled** to free these pins |
+| **ttyS2** (UART2) | PA0/PA1 | **LDS02RR scan** data @115200 (`lds_driver_py` → `/scan`) |
+| USB | — | BWT901CL **IMU** (`/dev/imu`, CH340), Logitech **C270** webcam+mic (`/dev/camera`) |
+
+ESP32-side GPIO (the coprocessor, not the H5): encoders L=19/R=26, off-ground
+switches L=18/R=27, motor STBY=23, H-bridge IN L=25/4 R=32/33, LED=2, UART2 link
+TX=17/RX=16, LDS data RX=GPIO14 (TX=13 unused), LDS spin-motor PWM=21.
+
+Actual `armbianEnv.txt`: `overlays=analog-codec i2c0 i2c1 i2c2 uart1 uart2 usbhost0
+usbhost1 usbhost2 usbhost3` + `user_overlays=i2c0-400k` (the 400 kHz OLED bus).
+
+---
+
 ## Special-function GPIOs (claimed lines)
 
 From `/sys/kernel/debug/gpio`:

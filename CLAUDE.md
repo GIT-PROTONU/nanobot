@@ -9,7 +9,8 @@ running **Armbian**, with **ROS 2 Humble** installed as conda packages via
 (chosen for low RAM; needs `rmw_zenohd` running). The web UI is **rosbridge + a
 static HTML page** (`web_control`), not Foxglove.
 
-Hardware: Roborock **LDS02RR** lidar (UART1 `/dev/ttyS1`), single-channel **wheel
+Hardware: Roborock **LDS02RR** lidar (scan on **UART2 `/dev/ttyS2`**; RPM also read by
+the ESP32), single-channel **wheel
 encoders** + **motors** (now via an **ESP32-WROOM coprocessor**, see below),
 **PCA9685** PWM (I2C, now unused by the stack), **SSD1306** OLED (I2C), **BWT901CL**
 IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
@@ -47,9 +48,12 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
-  flags (enables `Z_FEATURE_LINK_SERIAL`). Pins: encoders L=19 R=26, switches 18/27,
-  motor STBY=23, LEFT_IN_REV=4, **UART2 = zenoh link (TX=17, RX=16)**, **LDS data on GPIO14
-  (UART1 RX; TX=GPIO13 unused)**, LDS motor PWM=21. Keep diff-drive limits synced to `robot.yaml`.
+  flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=26,
+  off-ground switches L=18 R=27, motor STBY=23, H-bridge IN L=25/4 R=32/33 (fwd/rev),
+  onboard LED=2, **UART2 = zenoh link (TX=17, RX=16) → SBC `/dev/ttyS1`**, **LDS data on
+  UART1 RX=GPIO14 (TX=GPIO13 unused)**, LDS spin-motor PWM=21. (SBC side: ESP32 link on
+  `/dev/ttyS1`/UART1-PG6/PG7, LDS scan on `/dev/ttyS2`/UART2-PA0/PA1, OLED on
+  `/dev/i2c-0`/PA11-PA12 @400kHz.) Keep diff-drive limits synced to `robot.yaml`.
 - **The link needs a serial-capable `zenohd`** — the conda `libzenohc` is built without
   `transport_serial`, so stock `rmw_zenohd` can't open the UART. Build one with
   `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; `stack.sh`

@@ -8,12 +8,15 @@ default FastDDS to keep RAM/discovery cost low on the 1 GB board.
 
 Hardware:
 
-| Peripheral | Bus | Node | Topic |
+| Peripheral | Bus / port | Node | Topic |
 |---|---|---|---|
-| Roborock **LDS02RR** lidar | UART (`/dev/ttyS1`) | `lds_driver_py` (Python) | `/scan` |
-| Wheel **encoders** (quadrature ×2) | GPIO (`/dev/gpiochip0`) | `wheel_odometry` | `/odom`, `/joint_states`, `/wheel_encoders`, TF |
-| **PCA9685** PWM (motor driver) | I2C (`/dev/i2c-1`) | `motor_control` | sub `/cmd_vel` |
-| **SSD1306** OLED | I2C (`/dev/i2c-1`) | `oled_display` | sub `/odom`, `/scan` |
+| Roborock **LDS02RR** lidar (scan) | UART2 (`/dev/ttyS2`, PA0/PA1) | `lds_driver_py` (Python) | `/scan` |
+| **ESP32-WROOM** coprocessor (motors + encoders + lidar RPM/spin) | UART1 (`/dev/ttyS1`, PG6/PG7 — zenoh-pico link) | firmware | sub `/cmd_vel`; pub `/wheel_ticks`, `/lds_rpm`, `/lds_hz`, `/esp32_*` |
+| Wheel **encoders** (single-channel ×2) + **motors** | ESP32 GPIO (see firmware pinout) | `wheel_odometry` (`/wheel_ticks`→`/odom`) | `/odom`, TF |
+| **SSD1306** OLED | I2C0 (`/dev/i2c-0`, PA11/PA12 @400 kHz) | `oled_display` | sub `/oled_text`, `/oled_face` |
+| **BWT901CL** IMU | USB-serial (`/dev/imu`, CH340) | `imu_driver` | `/imu/data`, `/imu/web` |
+| **Logitech C270** webcam + mic | USB | `web_control` | `/stream.mjpg`, `/audio.pcm` |
+| **PCA9685** PWM | I2C1 (`/dev/i2c-1`, 0x40) | — (retired; ESP32 owns motors) | — |
 | Web control + map | — | `web_control` + rosbridge | browser |
 
 ## Architecture
@@ -27,8 +30,8 @@ robot_msgs        custom interfaces (WheelEncoders, MotorCommand)         [ament
 robot_bringup     launch files + the single config/robot.yaml             [ament_python]
 lds_driver_py     serial LDS02RR -> /scan                                 [rclpy]
 lds_driver        abandoned Rust/r2r LDS node (doesn't build; kept for ref) [Rust / r2r]
-wheel_odometry    GPIO encoders -> /odom + TF                             [rclpy]
-motor_control     /cmd_vel -> PCA9685 PWM                                 [rclpy]
+wheel_odometry    /wheel_ticks (from ESP32) -> /odom + TF                 [rclpy]
+motor_control     retired (ESP32 owns /cmd_vel->motors; PCA9685 aux only) [rclpy]
 oled_display      status dashboard -> SSD1306                             [rclpy]
 web_control       rosbridge websocket + static control/visualiser page   [rclpy]
 ```
@@ -59,14 +62,16 @@ Easiest: `sudo armbian-config` → *System → Hardware*, enable **i2c1**, **uar
 then reboot. Or edit `/boot/armbianEnv.txt`:
 
 ```
-overlays=i2c1 uart2
+overlays=i2c0 i2c1 i2c2 uart1 uart2 usbhost0 usbhost1 usbhost2 usbhost3
+user_overlays=i2c0-400k
 ```
+(`deploy/sbc-setup.sh` writes exactly this — `i2c0-400k` raises the OLED bus to 400 kHz.)
 
 Verify after reboot:
 
 ```bash
-ls /dev/i2c-1 /dev/ttyS2 /dev/gpiochip0
-i2cdetect -y 1          # expect 0x40 (PCA9685) and 0x3C (SSD1306)
+ls /dev/i2c-0 /dev/ttyS1 /dev/ttyS2 /dev/gpiochip0   # OLED bus, ESP32 link, LDS, GPIO
+pixi run python scripts/i2c_scan.py                  # expect 0x3C SSD1306 on i2c-0
 ```
 
 Add your user to the `i2c`, `dialout`, and `gpio` groups so the nodes can open the
@@ -154,10 +159,11 @@ RAM, 7 GB rootfs. Notes specific to this image:
   (overlay_prefix is `sun50i-h5`), then reboot → `/dev/i2c-0/1/2`. The stock image has
   **no `i2c` group**, so non-root access is granted via a udev rule — install
   `deploy/udev/90-i2c.rules` (uses the `dialout` group, which the default user is in).
-- **UARTs** `/dev/ttyS0–7` are present without overlays (`ttyS2` is free for the LDS;
-  `ttyS0` is the console).
-- Scan the bus with `pixi run python scripts/i2c_scan.py` (expect `0x40` PCA9685,
-  `0x3c` SSD1306 on bus 1).
+- **UARTs**: `ttyS2` (PA0/PA1) is the **LDS scan** data line and `ttyS1` (PG6/PG7,
+  normally on-board Bluetooth — now disabled) is the **ESP32 zenoh-pico link**; both need
+  their overlays (`uart1`/`uart2`). `ttyS0` is the serial console.
+- Scan the bus with `pixi run python scripts/i2c_scan.py` (expect `0x3c` SSD1306 on
+  **bus 0** (i2c-0); `0x40` PCA9685 on bus 1 if still wired).
 - The build needs CMake **3.x** (not 4) plus Ninja + explicit Python hints — handled by
   `scripts/build.sh` / `pixi.toml`; see that script's header for the why.
 
