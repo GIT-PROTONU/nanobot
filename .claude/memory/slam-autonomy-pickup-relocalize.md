@@ -35,3 +35,16 @@ it handles bumps / slips / lift-and-replace-near-here, not "carried to another r
 live in `robot.yaml` slam_nav block; `relocalize` + `pickup_pause` are live-settable. NOT yet
 hardware-verified. The `separate-sensor-nodes` fallback branch does NOT have these (main only).
 See [[slam-nav]], [[esp32-coprocessor]].
+
+**Calibration self-test (2026-06-23, same nav_node).** Trigger: publish `/selftest` Bool true
+(web button "🔧 Self-test" in the map panel; **requires enable_motion**). Scripted drive
+preempts nav in `_control`: still → forward `TEST_DIST` → back → in-place spin `TEST_TURNS`.
+Checks: IMU at rest (|accel|≈9.81, gyro≈0, /imu/web alive); encoders both count + & balanced
+forward (raw `/wheel_ticks`, dead/imbalance detection) and go negative on reverse; spin
+cross-checks **IMU yaw vs wheel-odom yaw vs commanded** (wrapped accumulation) and suggests a
+`wheel_separation` scale factor on mismatch. Report → log + `/selftest_result` String (shown
+in the web `mapTestOut` panel) + OLED title. Lazy-subscribes `/wheel_ticks` + `/imu/web` only
+during the run (destroyed after) to avoid steady CPU. Aborts on pick-up or motion-off. Tunables
+= `TEST_*` module constants in nav_node.py. NB: web `/selftest` topics are UNprefixed (match the
+node's relative names) — unlike the pre-existing `/slam_nav/go_home` buttons which look mismatched
+against the node's relative `go_home` sub (latent, not touched).

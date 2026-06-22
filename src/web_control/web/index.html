@@ -85,8 +85,10 @@
         <label class="chk"><input type="checkbox" id="mapExplore"> auto-explore</label>
         <button id="mapHome">⌂ Go home</button>
         <button id="mapSave">💾 Save map</button>
+        <button id="mapTest">🔧 Self-test</button>
       </div>
       <div id="mapStats" class="hint" style="display:none;margin-top:4px"></div>
+      <pre id="mapTestOut" class="hint" style="display:none;white-space:pre-wrap;margin-top:4px;font-size:11px;line-height:1.4"></pre>
       <p class="hint" id="mapHint" style="display:none">2D occupancy map from
         <b>slam_nav</b> (/scan + /odom + IMU yaw, scan-to-map matched), served raw from
         <b>/dev/shm</b> via <b>/map</b>. Polls only while shown. <b>Click the map to set a
@@ -245,7 +247,7 @@ let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=n
     hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
 // slam_nav view+plan state (read by the map panel script below)
 let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
-let homeTopic=null, saveTopic=null;
+let homeTopic=null, saveTopic=null, testTopic=null, testResTopic=null;
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -465,6 +467,11 @@ function subscribe(){
   goalTopic=new ROSLIB.Topic({ros,name:"/goal_pose",messageType:"geometry_msgs/msg/PoseStamped"});
   homeTopic=new ROSLIB.Topic({ros,name:"/slam_nav/go_home",messageType:"std_msgs/msg/Bool"});
   saveTopic=new ROSLIB.Topic({ros,name:"/slam_nav/save_map",messageType:"std_msgs/msg/Bool"});
+  // calibration self-test: trigger on /selftest (Bool), read the report on /selftest_result
+  testTopic=new ROSLIB.Topic({ros,name:"/selftest",messageType:"std_msgs/msg/Bool"});
+  testResTopic=new ROSLIB.Topic({ros,name:"/selftest_result",
+    messageType:"std_msgs/msg/String",throttle_rate:0,queue_length:1});
+  testResTopic.subscribe(m=>{ const el=$("mapTestOut"); el.style.display="block"; el.textContent=m.data; });
   navMotionSrv=new ROSLIB.Service({ros,name:"/slam_nav/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
   planTopic=new ROSLIB.Topic({ros,name:"/plan",messageType:"nav_msgs/msg/Path",
@@ -810,6 +817,12 @@ connect();   // auto-connect on load
   $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));
   $("mapHome").addEventListener("click",()=>{ if(homeTopic) homeTopic.publish(new ROSLIB.Message({data:true})); });
   $("mapSave").addEventListener("click",()=>{ if(saveTopic) saveTopic.publish(new ROSLIB.Message({data:true})); });
+  $("mapTest").addEventListener("click",()=>{
+    if(!$("mapMotion").checked){ alert("Enable motion first — the self-test drives the robot."); return; }
+    if(!confirm("Run the calibration self-test?\nThe robot will drive forward, back, then spin in place.")) return;
+    const el=$("mapTestOut"); el.style.display="block"; el.textContent="running self-test…";
+    if(testTopic) testTopic.publish(new ROSLIB.Message({data:true}));
+  });
   $("mapStop").addEventListener("click",()=>{
     $("mapMotion").checked=false; setNavMotion(false);
     $("mapExplore").checked=false; setNavExplore(false);   // also halt auto-exploration

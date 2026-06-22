@@ -27,11 +27,18 @@ from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, Int64MultiArray
 
 from .occupancy import GridMap
 
 MAP_FILE = "/dev/shm/nano_map.bin"
+
+# --- self-test / calibration sequence (drives known motions to check IMU + encoders) ---
+TEST_LIN = 0.12      # m/s forward/back speed (capped by max_lin)
+TEST_ANG = 0.6       # rad/s in-place spin speed (capped by max_ang)
+TEST_DIST = 0.35     # m to drive forward, then back
+TEST_TURNS = 1.0     # full in-place rotations for the IMU-vs-odom cross-check
+TEST_SETTLE = 1.2    # s to settle between motion legs
 
 
 def _wrap(a):
@@ -169,6 +176,15 @@ class NavNode(Node):
         self._recovering = False     # actively re-searching for the pose (lost / set down)
         self._recover_until = 0.0
         self._lost_count = 0         # consecutive scans the match has failed
+        # self-test / calibration state
+        self._test_active = False
+        self._test_seq = []
+        self._test_phase = 0
+        self._test_phase_t0 = 0.0
+        self._test_entered = False
+        self._ticks = None           # latest raw /wheel_ticks [L,R] (lazy sub, test only)
+        self._imu_accel = self._imu_gyro = self._imu_hz = 0.0
+        self._ticks_sub = self._imuweb_sub = None
 
         # Optionally reload a previously-saved map (relocalize into it from the origin).
         if self.map_store and self.grid.load(self.map_store):
@@ -179,6 +195,8 @@ class NavNode(Node):
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.path_pub = self.create_publisher(Path, "plan", 5)
         self.face_pub = self.create_publisher(String, "oled_face", 10)   # pick-up reaction
+        self.text_pub = self.create_publisher(String, "oled_text", 10)   # self-test status -> OLED
+        self.test_pub = self.create_publisher(String, "selftest_result", 1)
         self.create_subscription(Odometry, g("odom_topic").value, self._on_odom, 20)
         self.create_subscription(Vector3Stamped, g("euler_topic").value, self._on_euler, 10)
         self.create_subscription(
@@ -189,6 +207,7 @@ class NavNode(Node):
         # per-wheel off-ground switches from the ESP32 (pick-up detection)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
+        self.create_subscription(Bool, "selftest", self._on_selftest, 1)  # calibration drive
         self.create_timer(1.0 / max(1.0, float(g("control_rate").value)), self._control)
         self.add_on_set_parameters_callback(self._on_params)
 
@@ -237,6 +256,19 @@ class NavNode(Node):
 
     def _on_susp_r(self, msg):
         self._susp_r = bool(msg.data)
+
+    def _on_selftest(self, msg):
+        if msg.data:
+            self._start_selftest()
+
+    def _on_ticks(self, msg):       # raw cumulative encoder counts [L, R] (test only)
+        if len(msg.data) >= 2:
+            self._ticks = (int(msg.data[0]), int(msg.data[1]))
+
+    def _on_imuweb(self, msg):      # /imu/web: x=|accel|, y=|gyro|, z=measured /imu/data Hz
+        self._imu_accel = float(msg.vector.x)
+        self._imu_gyro = float(msg.vector.y)
+        self._imu_hz = float(msg.vector.z)
 
     # --- the SLAM step (per scan) -------------------------------------------
     def _on_scan(self, msg):
@@ -298,7 +330,8 @@ class NavNode(Node):
             if score >= self.min_score:
                 px, py, pth = cand
                 self._lost_count = 0
-            elif self.relocalize and len(vr) >= self.recover_min_beams:
+            elif (self.relocalize and not self._test_active
+                  and len(vr) >= self.recover_min_beams):
                 # plenty of structure in view but it doesn't match the map -> we're drifting
                 self._lost_count += 1
                 if self._lost_count >= self.recover_patience:
@@ -391,10 +424,18 @@ class NavNode(Node):
             return
         now = time.monotonic()
 
-        # Pick-up + relocalization take priority over navigation.
+        # Pick-up + self-test + relocalization take priority over navigation.
         self._update_pickup(now)
         if self._picked_up:
+            if self._test_active:
+                self._abort_selftest("picked up")
             self._send(0.0, 0.0)                       # halt while lifted
+            return
+        if self._test_active:
+            if not self.enable_motion:
+                self._abort_selftest("motion disabled")
+            else:
+                self._test_step(now)
             return
         if self._recovering:
             if now > self._recover_until:
@@ -474,6 +515,181 @@ class NavNode(Node):
         if not self.pickup_face:
             return
         self.face_pub.publish(String(data=mood))
+
+    # --- self-test / calibration (drive known motions, cross-check IMU vs encoders) ----
+    def _start_selftest(self):
+        """Kick off a scripted drive (forward, back, spin) that measures what the IMU and
+        encoders report vs what was commanded. Needs enable_motion ON (it deliberately
+        moves). Subscribes raw /wheel_ticks + /imu/web only for the duration."""
+        if self._test_active:
+            return
+        if not self.enable_motion:
+            self._publish_test("self-test aborted: enable motion first (safety)")
+            self.get_logger().warning("self-test: enable motion first")
+            return
+        lin = min(TEST_LIN, self.max_lin)
+        ang = min(TEST_ANG, self.max_ang)
+        fwd = TEST_DIST / lin if lin > 0 else 2.0
+        rot = TEST_TURNS * 2.0 * math.pi / ang if ang > 0 else 6.0
+        self._test_seq = [
+            ("still",   TEST_SETTLE, 0.0,  0.0),   # IMU at rest: gravity + zero-gyro check
+            ("forward", fwd,         lin,  0.0),   # encoders: both count +, balanced; odom dist
+            ("settle",  TEST_SETTLE, 0.0,  0.0),
+            ("back",    fwd,        -lin,  0.0),   # encoders: signs go negative on reverse
+            ("settle",  TEST_SETTLE, 0.0,  0.0),
+            ("rotate",  rot,         0.0,  ang),   # IMU yaw vs odom yaw vs commanded
+            ("done",    0.4,         0.0,  0.0),
+        ]
+        self._test_ang, self._test_rot_dur = ang, rot
+        self._test_phase, self._test_entered = 0, False
+        self._test_phase_t0 = time.monotonic()
+        self._test_report, self._test_warn, self._test_fail = [], 0, 0
+        self._m_fwd = (0, 0)
+        self._recovering = False        # don't let recovery fight the test
+        self._lost_count = 0
+        self._ticks = None
+        self._ticks_sub = self.create_subscription(
+            Int64MultiArray, "wheel_ticks", self._on_ticks, 10)
+        self._imuweb_sub = self.create_subscription(
+            Vector3Stamped, "imu/web", self._on_imuweb, 10)
+        self._test_active = True
+        self._set_face("focused")
+        self._oled("Self-test...")
+        self.get_logger().info("self-test: started (forward/back + in-place spin)")
+
+    def _snapshot(self):
+        od = self._odom or (0.0, 0.0, 0.0)
+        tk = self._ticks or (0, 0)
+        yaw = self._imu_yaw if self._imu_yaw is not None else 0.0
+        return {"yaw": yaw, "x": od[0], "y": od[1], "L": tk[0], "R": tk[1]}
+
+    def _accum_rotation(self):
+        """Sum wrapped per-tick yaw deltas during the spin so a full turn isn't lost to the
+        +/-pi wrap — for both the IMU and the wheel-odometry heading."""
+        if self._imu_yaw is None or self._odom is None:
+            return
+        iy, oy = self._imu_yaw, self._odom[2]
+        if self._rot_prev is None:
+            self._rot_prev = (iy, oy)
+            return
+        piy, poy = self._rot_prev
+        self._rot_imu += _wrap(iy - piy)
+        self._rot_odom += _wrap(oy - poy)
+        self._rot_prev = (iy, oy)
+
+    def _test_step(self, now):
+        seq = self._test_seq
+        if self._test_phase >= len(seq):
+            self._finish_selftest()
+            return
+        name, dur, v, w = seq[self._test_phase]
+        if not self._test_entered:                  # entering this phase: snapshot baseline
+            self._test_entered = True
+            self._snap = self._snapshot()
+            self._rot_imu = self._rot_odom = 0.0
+            self._rot_prev = None
+        if name == "rotate":
+            self._accum_rotation()
+        if now - self._test_phase_t0 < dur:
+            self._send(v, w)
+            return
+        self._send(0.0, 0.0)                         # leg done: measure + advance
+        self._measure(name)
+        self._test_phase += 1
+        self._test_phase_t0 = now
+        self._test_entered = False
+
+    def _measure(self, name):
+        cur = self._snapshot()
+        s = self._snap
+        R = self._test_report
+        if name == "still":
+            a, g, hz = self._imu_accel, self._imu_gyro, self._imu_hz
+            if hz <= 0:
+                R.append("IMU: not publishing (/imu/web silent) -> FAIL")
+                self._test_fail += 1
+            else:
+                bad = []
+                if not (9.0 <= a <= 10.6):
+                    bad.append("accel != ~9.81"); self._test_warn += 1
+                if g > 0.08:
+                    bad.append("gyro != ~0"); self._test_warn += 1
+                R.append(f"IMU still: |a|={a:.2f} m/s2, |w|={g:.3f} rad/s, {hz:.0f} Hz -> "
+                         + (", ".join(bad) if bad else "OK"))
+        elif name == "forward":
+            dist = math.hypot(cur["x"] - s["x"], cur["y"] - s["y"])
+            dL, dR = cur["L"] - s["L"], cur["R"] - s["R"]
+            self._m_fwd = (dL, dR)
+            line = f"FWD: odom {dist:.2f} m (cmd ~{TEST_DIST:.2f}); ticks L={dL:+d} R={dR:+d}"
+            if dL == 0 or dR == 0:
+                line += " -> ENCODER DEAD / no tick data"; self._test_fail += 1
+            elif dL < 0 or dR < 0:
+                line += " -> SIGN WRONG (forward should be +)"; self._test_warn += 1
+            else:
+                bal = dR / dL
+                if 0.7 <= bal <= 1.4:
+                    line += f" -> OK (R/L={bal:.2f})"
+                else:
+                    line += f" -> WHEEL IMBALANCE (R/L={bal:.2f})"; self._test_warn += 1
+            R.append(line)
+        elif name == "back":
+            dL, dR = cur["L"] - s["L"], cur["R"] - s["R"]
+            line = f"REV: ticks L={dL:+d} R={dR:+d}"
+            if dL >= 0 or dR >= 0:
+                line += " -> SIGN WRONG (reverse should be -)"; self._test_warn += 1
+            else:
+                fL = self._m_fwd[0]
+                sym = abs(dL) / fL if fL else 0.0
+                line += f" -> direction OK (|rev/fwd|={sym:.2f})"
+            R.append(line)
+        elif name == "rotate":
+            imu_d = math.degrees(self._rot_imu)
+            odo_d = math.degrees(self._rot_odom)
+            cmd_d = math.degrees(self._test_ang * self._test_rot_dur)
+            line = f"SPIN: cmd {cmd_d:+.0f}deg, IMU {imu_d:+.0f}, odom {odo_d:+.0f}"
+            if abs(imu_d) < 0.4 * abs(cmd_d):
+                line += " -> IMU YAW NOT TRACKING"; self._test_fail += 1
+            elif abs(odo_d) > 5.0:
+                ratio = imu_d / odo_d
+                if 0.85 <= ratio <= 1.18:
+                    line += f" -> OK (IMU/odom={ratio:.2f})"
+                else:
+                    line += (f" -> MISMATCH (IMU/odom={ratio:.2f}; "
+                             f"set wheel_separation*{ratio:.2f} to match IMU)")
+                    self._test_warn += 1
+            R.append(line)
+        # "settle" / "done" legs: nothing to measure
+
+    def _finish_selftest(self):
+        self._send(0.0, 0.0)
+        self._test_active = False
+        self._test_entered = False
+        for sub in (self._ticks_sub, self._imuweb_sub):
+            if sub is not None:
+                self.destroy_subscription(sub)
+        self._ticks_sub = self._imuweb_sub = None
+        verdict = "FAIL" if self._test_fail else ("WARN" if self._test_warn else "PASS")
+        self._test_report.append(
+            f"=== {verdict} (fail {self._test_fail}, warn {self._test_warn}) ===")
+        for ln in self._test_report:
+            self.get_logger().info("selftest: " + ln)
+        self._publish_test("\n".join(self._test_report))
+        self._oled(f"Self-test: {verdict}")
+        self._set_face("")
+
+    def _abort_selftest(self, reason):
+        if not self._test_active:
+            return
+        self._send(0.0, 0.0)
+        self._test_report.append(f"ABORTED: {reason}")
+        self._test_fail += 1
+        self._finish_selftest()
+
+    def _publish_test(self, text):
+        self.test_pub.publish(String(data=text))
+
+    def _oled(self, text):
+        self.text_pub.publish(String(data=text))
 
     def _explore_step(self):
         """Adopt the nearest *reachable* frontier as the goal (auto-exploration). Tries the
