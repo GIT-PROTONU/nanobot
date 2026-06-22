@@ -56,6 +56,7 @@ class DisplayNode(Node):
             ("i2c_bus", 1), ("i2c_address", 0x3C),
             ("width", 128), ("height", 64),
             ("refresh_rate", 2.0), ("show_ip", True),
+            ("rotate", 0),     # screen rotation in 90° steps; 2 = 180° (upside-down mount)
         ])
         g = self.get_parameter
         self.show_ip = g("show_ip").value
@@ -83,7 +84,8 @@ class DisplayNode(Node):
             try:
                 serial = i2c(port=g("i2c_bus").value, address=g("i2c_address").value)
                 self.device = ssd1306(serial, width=g("width").value,
-                                      height=g("height").value)
+                                      height=g("height").value,
+                                      rotate=int(g("rotate").value) % 4)
                 self.font = ImageFont.load_default()
                 try:
                     self.cols = max(1, int(self.width // (self.font.getlength("0") or 6)))

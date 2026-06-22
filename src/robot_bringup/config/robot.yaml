@@ -124,6 +124,7 @@ oled_display:
     height: 64
     refresh_rate: 1.0         # Hz (clock shows HH:MM:SS; 1 Hz keeps seconds live)
     show_ip: true             # show the wlan/eth IP so you can find the web UI
+    rotate: 2                 # 90° steps; 2 = 180° — panel is mounted upside-down
 
 # ---- BWT901CL 9-axis IMU (WitMotion, USB-serial via CH340) ------------------
 imu_driver:
