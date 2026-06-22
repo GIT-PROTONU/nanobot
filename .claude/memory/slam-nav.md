@@ -25,6 +25,22 @@ there avoiding obstacles. Built on branch **`slam`** (pushed 2026-06-21), 3 stag
   live-togglable via /slam_nav/set_parameters). UI: "enable motion" toggle + Stop button.
   All three stages pushed to branch `slam` 2026-06-21; NONE hardware-verified yet.
 
+**Extras added 2026-06-22 (uncommitted on branch slam, not hardware-verified):** all cheap,
+each independently toggleable, behaviour-changers default OFF for safe testing. (1) **Map
+persistence** — `GridMap.save/load` (np.savez_compressed, atomic; geometry-checked); param
+`map_store` (""=off) auto-loads on boot + `/slam_nav/save_map` Bool topic; `autosave_period`
+(0=off). (2) **Auto-explore** — `GridMap.frontiers()` (free cell bordering unknown, nearest-
+first on the coarse grid; refactored shared `_coarse()` helper out of plan()); param
+`auto_explore` (off), drives to nearest reachable frontier when idle (still needs enable_motion).
+(3) **Return-to-home** — `/slam_nav/go_home` Bool → goal=map origin. (4) **Breadcrumb trail** —
+`trail_max` ring buffer in /dev/shm header. (5) **Coverage+health telemetry** in map header
+(seen %, free m², scan-match score, mode). (6) **Stuck watchdog** — `stuck_timeout` (0=off).
+Web UI: auto-explore/go-home/save-map controls, trail(cyan)/home(magenta) overlays, stats line.
+**WiFi telemetry** added to sys_monitor (separate from slam): `wifi_iface/ssid/signal_dbm/
+quality_pct` from /proc/net/wireless (pure read) + SSID via cached `iwgetid`/`iw` subprocess
+(5 s); web System panel shows "SSID -56dBm (78%)" colour-coded. occupancy.py extras unit-tested
+on the dev host (save/load round-trip, coverage, frontiers, plan post-refactor).
+
 **Full static review done 2026-06-21 (HEAD `e7cca93`):** no bugs found. Verified package
 wiring (setup.py console_script `nav_node` ↔ stack.sh launch/down/status; robot.yaml keys ↔
 declare_parameters ↔ web UI service calls), occupancy.py match() broadcast indexing + plan()
