@@ -41,6 +41,15 @@ quality_pct` from /proc/net/wireless (pure read) + SSID via cached `iwgetid`/`iw
 (5 s); web System panel shows "SSID -56dBm (78%)" colour-coded. occupancy.py extras unit-tested
 on the dev host (save/load round-trip, coverage, frontiers, plan post-refactor).
 
+**Perf (2026-06-22):** `integrate()` free-space raycast vectorized — per-beam Python loop
+replaced by a repeat/cumsum ragged-index pass; bit-identical output, ~1.5x faster on x86
+(~2-3x expected on the A53). This was the per-scan CPU hot spot. Considered the Roborock-style
+tricks (submaps, 2/4-bit cell packing, pose-graph pruning, static/dynamic split) and chose NOT
+to: our whole grid is ~0.9 MB (480² f32) on a ~970 MB board, so per-node Python overhead — not
+the map array — dominates RAM; bit-packing would *slow* numpy. We already avoid the gmapping
+particle-filter RAM blowup (single-pose correlative scan-to-map matcher). Real remaining gaps if
+ever needed: bounded/sparse grid (only if map grows much larger) + true loop closure (drift).
+
 **Full static review done 2026-06-21 (HEAD `e7cca93`):** no bugs found. Verified package
 wiring (setup.py console_script `nav_node` ↔ stack.sh launch/down/status; robot.yaml keys ↔
 declare_parameters ↔ web UI service calls), occupancy.py match() broadcast indexing + plan()
