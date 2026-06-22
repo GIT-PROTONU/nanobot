@@ -129,7 +129,19 @@
         <button id="oledSend" class="primary">Send to OLED</button>
       </label>
       <p class="hint">Publishes <b>std_msgs/String</b> on <b>/oled_text</b>; the OLED
-        shows it under the clock. Up to ~21 chars fit. <kbd>Enter</kbd> sends.</p>
+        shows it as the title. Up to ~21 chars fit. <kbd>Enter</kbd> sends.</p>
+      <label><input id="faceOn" type="checkbox"> Face / eye animation</label>
+      <label>Mood
+        <select id="faceMood">
+          <option value="happy">Happy</option>
+          <option value="angry">Angry</option>
+          <option value="focused">Focused</option>
+          <option value="stress">Stress test (max load)</option>
+        </select>
+      </label>
+      <p class="hint">Publishes the mood on <b>/oled_face</b> (empty = dashboard). The
+        eyes blink &amp; glance at random so it never looks like a loop; frames are
+        only sent on change, so idle eyes cost ~no CPU.</p>
       <h2>IMU</h2>
       <div class="imu">
         <span>roll</span><b id="imuR">–</b>
@@ -156,7 +168,7 @@
         <span>uptime</span><b id="sysUp">–</b>
       </div>
       <p class="hint">Board health from <b>/diagnostics</b> (sys_monitor), 1 Hz.
-        <b>wifi</b> = SSID + signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
+        <b>wifi</b> = signal strength (green ≥ −60 dBm, amber ≥ −75, red below).</p>
       <h2>LDS</h2>
       <div class="imu">
         <span>rate</span><b id="ldsHz">–</b>
@@ -225,7 +237,7 @@ let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
 
 // ---- ROS state ----
-let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null,
+let ros=null, scanTopic=null, odomTopic=null, cmdTopic=null, textTopic=null, faceTopic=null,
     imuTopic=null, eulTopic=null, sysTopic=null,
     imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
 // ESP32 coprocessor topics
@@ -393,6 +405,7 @@ function subscribe(){
   odomTopic.subscribe(onOdom);
   cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
   textTopic=new ROSLIB.Topic({ros,name:"/oled_text",messageType:"std_msgs/msg/String"});
+  faceTopic=new ROSLIB.Topic({ros,name:"/oled_face",messageType:"std_msgs/msg/String"});
   // /imu/web is a tiny summary (|accel|,|gyro|,actual /imu/data Hz) the node emits at
   // ~15 Hz, so we don't make rosbridge bridge the full 50 Hz /imu/data just for a readout.
   imuTopic=new ROSLIB.Topic({ros,name:"/imu/web",messageType:"geometry_msgs/msg/Vector3Stamped",
@@ -527,14 +540,13 @@ function onDiag(msg){
   $("sysUp").textContent=fmtUptime(Number(kv.uptime_s||0));
   $("sysTemp").style.color = Number(kv.cpu_temp_c)>=75 ? "var(--red)" : "";
   $("sysMem").style.color  = Number(kv.mem_percent)>=90 ? "var(--amber)" : "";
-  // WiFi: "SSID  -54dBm (78%)", colour-coded by signal so you can spot a weak link.
+  // WiFi: signal strength only ("-54dBm (78%)"), colour-coded so you can spot a weak link.
   const w=$("sysWifi"), dbm=kv.wifi_signal_dbm;
-  if(!kv.wifi_iface){ w.textContent="—"; w.style.color=""; }
+  if(!kv.wifi_iface || !dbm){ w.textContent="—"; w.style.color=""; }
   else{
-    const ssid=kv.wifi_ssid||kv.wifi_iface;
-    w.textContent = dbm ? `${ssid}  ${dbm}dBm${kv.wifi_quality_pct?` (${kv.wifi_quality_pct}%)`:""}` : ssid;
+    w.textContent = `${dbm}dBm${kv.wifi_quality_pct?` (${kv.wifi_quality_pct}%)`:""}`;
     const d=Number(dbm);
-    w.style.color = !dbm ? "" : d>=-60 ? "var(--green)" : d>=-75 ? "var(--amber)" : "var(--red)";
+    w.style.color = d>=-60 ? "var(--green)" : d>=-75 ? "var(--amber)" : "var(--red)";
   }
 }
 
@@ -545,6 +557,15 @@ function sendOled(){
 }
 $("oledSend").onclick=sendOled;
 $("oledText").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();sendOled();} });
+
+// ---- OLED face / mood ---- empty string = dashboard, else the selected mood.
+function sendFace(){
+  if(!faceTopic){ return; }
+  const mood=$("faceOn").checked ? $("faceMood").value : "";
+  faceTopic.publish(new ROSLIB.Message({data:mood}));
+}
+$("faceOn").addEventListener("change",sendFace);
+$("faceMood").addEventListener("change",()=>{ if($("faceOn").checked) sendFace(); });
 
 function onScan(msg){
   const pts=[], maxr=Number($("maxr").value)||1e9;

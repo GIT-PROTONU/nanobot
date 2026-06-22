@@ -35,6 +35,31 @@ fi
 grep -q '^overlay_prefix=' "$ENV" || echo 'overlay_prefix=sun50i-h5' >> "$ENV"
 grep '^overlays=' "$ENV"
 
+# Raise the OLED's I2C bus (i2c-0 = /soc/i2c@1c2ac00) from the 100 kHz default to
+# 400 kHz: full-frame SSD1306 flushes drop from ~103 ms to ~38 ms (~9.7 -> ~26 fps),
+# which is what makes the animated-eyes face mode smooth. The OLED is the only device
+# on bus 0, so this affects nothing else. Done as a *user* overlay (loaded after the
+# stock i2c0 overlay) so a kernel/DT update doesn't clobber it.
+mkdir -p /boot/overlay-user
+cat > /tmp/i2c0-400k.dts <<'DTS'
+/dts-v1/;
+/plugin/;
+/ {
+    compatible = "allwinner,sun50i-h5";
+    fragment@0 {
+        target-path = "/soc/i2c@1c2ac00";
+        __overlay__ { clock-frequency = <400000>; };
+    };
+};
+DTS
+dtc -I dts -O dtb -o /boot/overlay-user/i2c0-400k.dtbo /tmp/i2c0-400k.dts 2>/dev/null
+if grep -q '^user_overlays=' "$ENV"; then
+  grep -q 'i2c0-400k' "$ENV" || sed -i 's/^user_overlays=.*/& i2c0-400k/' "$ENV"
+else
+  echo 'user_overlays=i2c0-400k' >> "$ENV"
+fi
+grep '^user_overlays=' "$ENV"
+
 echo "== 2/4  udev: non-root I2C access + port-independent USB device names =="
 install -m 0644 "$HERE/udev/90-i2c.rules" /etc/udev/rules.d/90-i2c.rules
 install -m 0644 "$HERE/udev/95-nano-usb.rules" /etc/udev/rules.d/95-nano-usb.rules
