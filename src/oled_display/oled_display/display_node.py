@@ -77,7 +77,6 @@ KNOWN_MOODS = ("happy", "angry", "focused", "stress")
 EYE_DX = 37            # eye centre offset from screen centre (px)
 EYE_W = 20             # eye half-width (px)
 EYE_H = 26             # eye half-height when fully open (px)
-EYE_PAD = 2            # widest decoration overhang past EYE_W (the angry brow)
 
 
 def _primary_ip() -> str:
@@ -138,6 +137,8 @@ class DisplayNode(Node):
         self._next_gaze = now
         self._face_sig = None           # last drawn face signature (dirty-check)
         self._frame = 0                 # free-running frame counter (stress mood)
+        self._next_smile = now          # happy: next recurring crescent "smile" beat
+        self._smile_until = 0.0         # happy: crescent shown until this time
 
         self.device = None
         self.font = None
@@ -193,7 +194,9 @@ class DisplayNode(Node):
             self._next_blink = now + random.uniform(1.5, 3.5)
             self._gxf = self._gyf = self._gtx = self._gty = 0.0
             self._gx = self._gy = 0
-            self._next_gaze = now + random.uniform(1.8, 4.5)
+            self._next_gaze = now + random.uniform(1.0, 2.5)
+            self._next_smile = now + random.uniform(2.0, 5.0)
+            self._smile_until = 0.0
             self._face_sig = None
             self._face_timer.reset()
         elif not new and was_face:        # back to dashboard: stop the face timer
@@ -302,8 +305,8 @@ class DisplayNode(Node):
                     self._next_blink = now + random.uniform(5.0, 9.0)
                     self._double = False
                 else:
-                    self._next_blink = now + random.uniform(2.5, 6.0)
-                    self._double = random.random() < 0.25
+                    self._next_blink = now + random.uniform(2.0, 5.0)
+                    self._double = random.random() < 0.3
             else:
                 self._open = abs(1.0 - 2.0 * p)
         elif now >= self._next_blink:
@@ -313,15 +316,22 @@ class DisplayNode(Node):
             self._open = 1.0
 
         # Gaze: pick a new target now and then (biased to centre), ease toward it.
-        # "focused" stares — its glances are smaller and rarer than other moods.
+        # All moods use this to dart the *pupils* within fixed eye-whites (see
+        # _face_tick); it settles between glances so the dirty-check keeps idle
+        # frames free. "focused" retargets fastest (active scanning).
         if now >= self._next_gaze:
-            amp = 0.3 if self.face_mood == "focused" else 1.0
-            if random.random() < (0.7 if self.face_mood == "focused" else 0.45):
+            if random.random() < 0.35:
                 self._gtx, self._gty = 0.0, 0.0
             else:
-                self._gtx = random.uniform(-3.0, 3.0) * amp
-                self._gty = random.uniform(-3.0, 3.0) * amp
-            self._next_gaze = now + random.uniform(1.8, 4.5)
+                self._gtx = random.uniform(-3.0, 3.0)
+                self._gty = random.uniform(-3.0, 3.0)
+            lo, hi = (0.6, 1.8) if self.face_mood == "focused" else (1.0, 3.0)
+            self._next_gaze = now + random.uniform(lo, hi)
+
+        # Happy: a recurring crescent "smile" beat keeps it lively between glances.
+        if self.face_mood == "happy" and now >= self._next_smile:
+            self._smile_until = now + 0.45
+            self._next_smile = now + random.uniform(3.0, 7.0)
         k = min(1.0, dt * 6.0)
         self._gxf += (self._gtx - self._gxf) * k
         self._gyf += (self._gty - self._gyf) * k
@@ -332,39 +342,53 @@ class DisplayNode(Node):
         self._gx = int(round(self._gxf))
         self._gy = int(round(self._gyf))
 
-    def _happy_eye(self, draw, cx, cy):
-        """Happy eye: an upward crescent (^_^); a blink flattens it to a line."""
-        if self._open < 0.3:
-            draw.line((cx - EYE_W, cy, cx + EYE_W, cy), fill=255)
-            return
-        top, bot = cy - 16, cy + 10
-        draw.ellipse((cx - EYE_W, top, cx + EYE_W, bot), fill=255)
-        draw.ellipse((cx - EYE_W, top + 8, cx + EYE_W, bot + 8), fill=0)  # cut -> upward crescent
+    def _pupil(self, draw, cx, cy, eh, px, py, pw, ph, sparkle=False):
+        """Dark pupil that darts to offset (px, py), clamped to stay inside the
+        eye-white (half-extents EYE_W x eh). Optional white glint for cuteness."""
+        mx, my = max(0, EYE_W - pw - 2), max(0, eh - ph - 2)
+        pcx = cx + max(-mx, min(mx, px))
+        pcy = cy + max(-my, min(my, py))
+        draw.ellipse((pcx - pw, pcy - ph, pcx + pw, pcy + ph), fill=0)
+        if sparkle:
+            draw.ellipse((pcx - pw + 1, pcy - ph + 1, pcx - pw + 4, pcy - ph + 4), fill=255)
 
-    def _angry_eye(self, draw, cx, cy, inner):
-        """Angry eye: a tall oval with a slanted brow cut deepest on the *inner*
-        side (toward the nose), giving the classic \\ / scowl. `inner` is +1 for
-        the left eye (inner edge to the right), -1 for the right eye."""
+    def _happy_eye(self, draw, cx, cy, px, py, smiling):
+        """Happy eye: big round white + a sparkly pupil that looks around; folds to
+        an upward crescent (^_^) on the recurring smile beat or a blink."""
+        if smiling or self._open < 0.3:
+            top, bot = cy - 16, cy + 10
+            draw.ellipse((cx - EYE_W, top, cx + EYE_W, bot), fill=255)
+            draw.ellipse((cx - EYE_W, top + 8, cx + EYE_W, bot + 8), fill=0)  # upward crescent
+            return
+        eh = max(2, int(EYE_H * self._open))
+        draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
+        self._pupil(draw, cx, cy, eh, px, py, 7, 9, sparkle=True)
+
+    def _angry_eye(self, draw, cx, cy, inner, px, py):
+        """Angry eye: a tall white with a darting pupil and a slanted brow cut
+        deepest on the *inner* side (toward the nose) for the classic \\ / scowl.
+        `inner` is +1 for the left eye (inner edge to the right), -1 for the right."""
         eh = max(2, int(EYE_H * self._open))
         if self._open < 0.25:
             draw.line((cx - EYE_W, cy, cx + EYE_W, cy), fill=255)
             return
         draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
-        x_in = cx + inner * (EYE_W + 2)       # inner edge (deep cut)
-        x_out = cx - inner * (EYE_W + 2)       # outer edge (shallow cut)
-        brow = int(eh * 1.1)
+        self._pupil(draw, cx, cy, eh, px, py, 6, 7)       # harsh, no glint
+        x_in = cx + inner * (EYE_W + 2)        # inner edge (deep cut)
+        x_out = cx - inner * (EYE_W + 2)        # outer edge (shallow cut)
+        brow = int(eh * 1.1)                    # drawn last -> brow sits over the pupil
         draw.polygon([(x_out, cy - eh - 3), (x_in, cy - eh - 3),
                       (x_in, cy - eh + brow), (x_out, cy - eh + 3)], fill=0)
 
-    def _focused_eye(self, draw, cx, cy):
-        """Focused eye: a narrowed (squinted) oval with a dark central pupil for
-        an intent stare."""
+    def _focused_eye(self, draw, cx, cy, px, py):
+        """Focused eye: a narrowed (squinted) white with a dark pupil that darts
+        around inside it for an intent, scanning look."""
         if self._open < 0.25:
             draw.line((cx - EYE_W, cy, cx + EYE_W, cy), fill=255)
             return
         eh = max(3, int(EYE_H * 0.6 * self._open))
         draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
-        draw.ellipse((cx - 5, cy - eh + 3, cx + 5, cy + eh - 3), fill=0)   # pupil
+        self._pupil(draw, cx, cy, eh, px, py, 5, max(2, eh - 3))
 
     def _stress(self, draw):
         """Worst-case animation: a full-screen pattern that changes every single
@@ -395,29 +419,32 @@ class DisplayNode(Node):
                 self._stress(draw)
             return
 
-        # Dirty-check: only redraw/flush when the picture actually changes, so
-        # open, settled eyes cost nothing.
-        sig = (self.face_mood, int(round(self._open * 8)), self._gx, self._gy)
+        # All moods: eye-whites stay fixed at the base position and the gaze drives
+        # the *pupils* (amplified, 1px steps off the eased float so they slide
+        # smoothly). Whites never move, so nothing can clip at the sides.
+        cy = H // 2
+        lcx, rcx = W // 2 - EYE_DX, W // 2 + EYE_DX
+        px = int(round(self._gxf * 3.0))
+        py = int(round(self._gyf * 2.5))
+        openq = int(round(self._open * 8))
+        smiling = self.face_mood == "happy" and now < self._smile_until
+
+        # Dirty-check: only redraw/flush when the picture actually changes.
+        sig = (self.face_mood, openq, px, py, smiling)
         if sig == self._face_sig:
             return
         self._face_sig = sig
 
-        cy = H // 2 + self._gy
-        # Clamp the horizontal glance so the outermost eye pixel (incl. the brow
-        # overhang) can never fall outside [0, W-1] — no clipping at the sides.
-        gx_lim = (W - 1 - W // 2 - EYE_DX) - EYE_W - EYE_PAD
-        gx = max(-gx_lim, min(gx_lim, self._gx))
-        lcx, rcx = W // 2 - EYE_DX + gx, W // 2 + EYE_DX + gx
         with canvas(self.device) as draw:
             if self.face_mood == "angry":
-                self._angry_eye(draw, lcx, cy, +1)
-                self._angry_eye(draw, rcx, cy, -1)
+                self._angry_eye(draw, lcx, cy, +1, px, py)
+                self._angry_eye(draw, rcx, cy, -1, px, py)
             elif self.face_mood == "focused":
-                self._focused_eye(draw, lcx, cy)
-                self._focused_eye(draw, rcx, cy)
+                self._focused_eye(draw, lcx, cy, px, py)
+                self._focused_eye(draw, rcx, cy, px, py)
             else:                                  # happy
-                self._happy_eye(draw, lcx, cy)
-                self._happy_eye(draw, rcx, cy)
+                self._happy_eye(draw, lcx, cy, px, py, smiling)
+                self._happy_eye(draw, rcx, cy, px, py, smiling)
 
     def destroy_node(self):
         if self.device:
