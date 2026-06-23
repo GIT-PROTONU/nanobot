@@ -153,11 +153,11 @@
         <span>|gyro|</span><b id="imuG">–</b>
         <span>rate</span><b id="imuHz">–</b>
       </div>
-      <label>Publish rate <span id="imuRateV">50</span> Hz</label>
-      <input id="imuRate" type="range" min="1" max="100" step="1" value="50">
+      <label>Publish rate <span id="imuRateV">100</span> Hz</label>
+      <input id="imuRate" type="range" min="1" max="200" step="1" value="100">
       <p class="hint">BWT901CL. Readout from the light <b>/imu/web</b> + <b>/imu/euler</b>
-        summaries; <b>/imu/data</b> stays 50 Hz for ROS. Angles °, accel m/s², gyro °/s.
-        Slider retunes the node publish rate live.</p>
+        summaries. Slider retunes the <b>/imu/data</b> publish rate live (default 100 Hz,
+        max 200); the device stream rate auto-follows. Angles °, accel m/s², gyro °/s.</p>
       <h2>System</h2>
       <div class="imu">
         <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
@@ -219,10 +219,12 @@
       <h2>Power</h2>
       <div style="display:grid;gap:6px">
         <button id="btnReset">↻ Reset stack</button>
+        <button id="btnReboot" class="danger">⟳ Restart SBC</button>
         <button id="btnShutdown" class="danger">⏻ Shutdown SBC</button>
       </div>
       <p class="hint">Reset restarts the ROS stack (the page reconnects in a few
-        seconds). Shutdown powers off the whole board — you then power it back on
+        seconds). Restart SBC reboots the whole board — the page reconnects once it
+        boots back up. Shutdown powers off the board — you then power it back on
         by hand.</p>
     </div>
   </main>
@@ -382,6 +384,12 @@ $("btnReset").onclick=()=>{
   if(!confirm("Restart the whole ROS stack? The page will reconnect in a few seconds.")) return;
   if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"restart"}));  // OLED switches now
   fetch("/system/restart",{method:"POST"}).catch(()=>{});
+  setConn(false);
+};
+$("btnReboot").onclick=()=>{
+  if(!confirm("REBOOT the SBC?\nThe whole board restarts — the page reconnects once it boots back up.")) return;
+  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"reboot"}));   // OLED switches now
+  fetch("/system/reboot",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
 $("btnShutdown").onclick=()=>{

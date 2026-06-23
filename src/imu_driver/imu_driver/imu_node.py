@@ -78,7 +78,7 @@ class ImuNode(Node):
             ("port", "/dev/imu"),
             ("baud", 115200),
             ("frame_id", "imu_link"),
-            ("publish_rate", 50.0),
+            ("publish_rate", 100.0),
             ("euler_rate", 25.0),       # /imu/euler only drives the web angle readout
             ("mag_rate", 10.0),         # /imu/mag is slow-moving + unused by the UI
             ("web_rate", 15.0),         # /imu/web (accel|/|gyro| summary for the UI)
@@ -107,8 +107,9 @@ class ImuNode(Node):
         self._next_eul = 0.0
         self._next_mag = 0.0
         self._next_web = 0.0
-        self._imu_hz = 0.0             # measured /imu/data publish rate (EMA)
-        self._last_pub_mono = None
+        self._imu_hz = 0.0             # measured /imu/data publish rate (windowed avg)
+        self._rate_t0 = None           # current measurement window start (monotonic)
+        self._rate_n = 0               # publishes counted in the current window
         self._dev_hz = 0                # last rate actually programmed into device
         self._need_reconfig = threading.Event()
         # let the web UI slider retune the rate live via /imu_driver/set_parameters
@@ -274,9 +275,15 @@ class ImuNode(Node):
             self.mag = (float(a), float(b), float(c))
         elif t == T_ANGLE:
             self.euler_deg = (a * ANG_SCALE, b * ANG_SCALE, c * ANG_SCALE)
-            # angle is the cycle's anchor frame; publish a coherent set, throttled
+            # angle is the cycle's anchor frame -> publish a coherent set. The device
+            # stream auto-follows publish_rate, so when it's already at/below our target
+            # we publish EVERY angle frame. The wall-clock gate is only for the in-between
+            # case (e.g. publish 30 Hz off a 50 Hz stream); applying it when dev<=publish
+            # would drop frames that arrive bunched in one batched read (two frames share
+            # ~one timestamp -> the 2nd is gated out), which capped the effective rate at
+            # roughly half the requested one (ask 100 -> get ~60).
             now = time.monotonic()
-            if now >= self._next_pub:
+            if self._dev_hz <= self.publish_rate or now >= self._next_pub:
                 self._next_pub = now + self._pub_period
                 self._publish(now)
 
@@ -287,12 +294,19 @@ class ImuNode(Node):
         if self._stop.is_set() or not rclpy.ok():
             return
         # Track the real /imu/data publish rate (this method runs once per published
-        # frame) so the UI can show it without subscribing to the 50 Hz topic itself.
-        if self._last_pub_mono is not None:
-            dt = mono - self._last_pub_mono
-            if dt > 0:
-                self._imu_hz = 0.9 * self._imu_hz + 0.1 / dt
-        self._last_pub_mono = mono
+        # frame) so the UI can show it without subscribing to the topic itself. Count
+        # publishes over a sliding window rather than a per-sample 1/dt EMA: angle
+        # frames arrive bunched in one batched serial read (several publishes a few
+        # microseconds apart, then a gap), so an instantaneous-dt estimate spikes to
+        # many times the true rate (a 200 Hz stream read as ~800 Hz).
+        if self._rate_t0 is None:
+            self._rate_t0 = mono
+        self._rate_n += 1
+        win = mono - self._rate_t0
+        if win >= 0.5:
+            self._imu_hz = self._rate_n / win
+            self._rate_t0 = mono
+            self._rate_n = 0
         stamp = self.get_clock().now().to_msg()
 
         # /imu/data — full Imu (orientation + covariances). The web UI reads /imu/web

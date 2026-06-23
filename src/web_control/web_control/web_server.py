@@ -101,10 +101,15 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if path == "/system/restart":
             # Restart the whole ROS stack. Detached + new session so it survives
             # do_down killing this very web server, then do_up brings it back.
-            self._set_oled_action("restart")   # tells the OLED to show "Restarting"
+            self._set_oled_action("restart")   # tells the OLED to show "Restarting stack"
             self._run_detached(
                 'cd "$HOME/Nano" && "$HOME/.pixi/bin/pixi" run bash scripts/stack.sh restart')
             self._respond(200, "restarting stack")
+        elif path == "/system/reboot":
+            # Reboot the whole SBC (needs the scoped NOPASSWD sudo rule for systemctl).
+            self._set_oled_action("reboot")    # tells the OLED to show "Restarting"
+            self._run_detached("sudo -n /usr/bin/systemctl reboot")
+            self._respond(200, "rebooting")
         elif path == "/system/shutdown":
             # Power off the SBC (needs the scoped NOPASSWD sudo rule for systemctl).
             self._set_oled_action("shutdown")  # tells the OLED to show "Shutting down" + go dark

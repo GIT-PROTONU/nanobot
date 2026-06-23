@@ -214,10 +214,11 @@ class DisplayNode(Node):
         self.get_logger().info(f"OLED mode: {self.face_mood or 'dashboard'}")
 
     def _on_system(self, msg: String):
-        """Web UI sends 'restart'/'shutdown' the instant the button is clicked, so the
-        end-screen appears immediately (well before the stack teardown's SIGTERM)."""
+        """Web UI sends 'restart' (ROS stack) / 'reboot' (whole SBC) / 'shutdown' the
+        instant the button is clicked, so the end-screen appears immediately (well before
+        the stack teardown's SIGTERM)."""
         s = msg.data.strip().lower()
-        if s not in ("restart", "shutdown") or self._sys:
+        if s not in ("restart", "reboot", "shutdown") or self._sys:
             return
         self._sys = s
         try:
@@ -225,7 +226,10 @@ class DisplayNode(Node):
         except Exception:
             pass
         if self.device:
-            (self._restart_screen if s == "restart" else self._shutdown_screen)()
+            if s == "shutdown":
+                self._shutdown_screen()
+            else:                           # 'restart' = stack only, 'reboot' = whole board
+                self._restart_screen("Restarting stack" if s == "restart" else "Restarting")
 
     def _on_esp_beat(self, _msg: Int32):
         self.esp_at = time.monotonic()
@@ -483,9 +487,11 @@ class DisplayNode(Node):
             msg = "Shutting down"
             draw.text(((W - self._text_w(msg)) // 2, gy + r + 4), msg, font=self.font, fill=255)
 
-    def _restart_screen(self):
-        """A centred 'Restarting' screen with a circular-arrow glyph (shown on a
-        stack restart). The panel is left on — the relaunched node redraws over it."""
+    def _restart_screen(self, msg="Restarting"):
+        """A centred circular-arrow glyph screen. Used for both a stack restart
+        ('Restarting stack') and a full SBC reboot ('Restarting'). The panel is left
+        on — for a stack restart the relaunched node redraws over it; for a reboot it
+        simply holds until the board power-cycles."""
         if not self.device:
             return
         W, H = self.width, self.height
@@ -495,7 +501,6 @@ class DisplayNode(Node):
             ax = cx + int(r * math.cos(math.radians(70)))                   # arrowhead at the gap
             ay = gy + int(r * math.sin(math.radians(70)))
             draw.polygon([(ax - 3, ay - 1), (ax + 3, ay - 1), (ax, ay + 4)], fill=255)
-            msg = "Restarting"
             draw.text(((W - self._text_w(msg)) // 2, gy + r + 4), msg, font=self.font, fill=255)
 
     def _power_off_panel(self):
@@ -534,8 +539,10 @@ class DisplayNode(Node):
             os.remove(ACTION_FILE)
         except Exception:
             pass
-        if action == "restart":
-            self._restart_screen()          # idempotent; relaunched node redraws over it
+        if action in ("restart", "reboot"):
+            # leave the glyph up (no power-off): a stack restart's relaunched node
+            # redraws over it; a reboot holds it until the board power-cycles.
+            self._restart_screen("Restarting stack" if action == "restart" else "Restarting")
         else:
             self._shutdown_screen()         # idempotent; already up if the topic arrived
             time.sleep(1.2)                 # leave it readable during the rest of shutdown
