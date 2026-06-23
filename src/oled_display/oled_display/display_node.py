@@ -6,9 +6,9 @@ DASHBOARD (default) — a compact status panel:
     │ NANOBOT              12:34:56  │  header bar (inverted): brand + clock
     │ 192.168.178.141          47C   │  primary IP  +  SBC CPU temp (right)
     │ ───────────────────────────── │
-    │ ESP  ●  39C                    │  ● filled = online / ○ hollow = offline
-    │ IMU  ●  50Hz                   │  data rate when running, else "off"
-    │ LDS  ○  off                    │
+    │ ESP  ●  39C          CPU 1.4   │  left col: subsystems (● online/○ off);
+    │ IMU  ●  50Hz         RAM 61%   │  right col: SBC vitals (temp/load/RAM%)
+    │ LDS  ○  off                    │  CPU = 1-min load avg, RAM = used %
     └───────────────────────────────┘
 
 FACE — cute animated robot eyes that blink and glance around, used to express a
@@ -34,6 +34,8 @@ Data sources (all lightweight — no heavy message is deserialized per frame):
     /oled_text       (String)         → optional brand override (web UI textbox)
     /oled_face       (String)         → mood name / "" for dashboard (web UI)
     /sys/class/thermal/thermal_zone0/temp → SBC CPU temp (cached file read)
+    /proc/loadavg                     → SBC 1-min load average (cached file read)
+    /proc/meminfo                     → SBC RAM used % (cached file read)
 
 Subscribe-only and best-effort: if the panel or luma isn't present the node still
 runs and just logs once, so the rest of the stack is unaffected.
@@ -63,7 +65,9 @@ except Exception as exc:  # pragma: no cover - hardware lib
 
 IP_REFRESH_S = 30.0    # re-resolve the outbound IP at most this often
 TEMP_REFRESH_S = 2.0   # re-read the SBC thermal zone at most this often
+SYS_REFRESH_S = 2.0    # re-read load average + RAM at most this often
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"  # cpu-thermal (millidegrees)
+MEMINFO_PATH = "/proc/meminfo"                          # RAM totals (kB)
 # The web UI writes "restart" / "shutdown" here just before it stops the stack, so the
 # OLED node (stopped via SIGTERM) knows which end-screen to show. /dev/shm is tmpfs the
 # stack user can write and is cleared on reboot.
@@ -130,6 +134,9 @@ class DisplayNode(Node):
         self._ip_due = 0.0
         self._sbc = float("nan")
         self._sbc_due = 0.0
+        self._load = float("nan")        # SBC 1-min load average
+        self._mem_pct = float("nan")     # SBC RAM used %
+        self._sys_due = 0.0
 
         # Face animation state (see _anim_update / _draw_face).
         now = time.monotonic()
@@ -265,6 +272,31 @@ class DisplayNode(Node):
                 self._sbc = float("nan")
         return self._sbc
 
+    def _cached_sys(self):
+        """(1-min load average, RAM used %) — cheap throttled /proc reads so the
+        render loop never recomputes per frame."""
+        now = time.monotonic()
+        if now >= self._sys_due:
+            self._sys_due = now + SYS_REFRESH_S
+            try:
+                self._load = os.getloadavg()[0]
+            except Exception:
+                self._load = float("nan")
+            try:
+                tot = avail = 0
+                with open(MEMINFO_PATH) as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            tot = int(line.split()[1])
+                        elif line.startswith("MemAvailable:"):
+                            avail = int(line.split()[1])
+                        if tot and avail:
+                            break
+                self._mem_pct = 100.0 * (tot - avail) / tot if tot else float("nan")
+            except Exception:
+                self._mem_pct = float("nan")
+        return self._load, self._mem_pct
+
     def _text_w(self, s: str) -> int:
         try:
             return int(self.font.getlength(s))
@@ -307,11 +339,20 @@ class DisplayNode(Node):
 
             draw.line((0, 25, W - 1, 25), fill=255)
 
-            # Subsystem status rows.
+            # Subsystem status rows (left column).
             self._row(draw, 28, "ESP", esp_up,
                       f"{self.esp_temp:.0f}C" if esp_up and self.esp_temp == self.esp_temp else "off")
             self._row(draw, 40, "IMU", imu_up, f"{self.imu_hz:.0f}Hz" if imu_up else "off")
             self._row(draw, 52, "LDS", lds_up, f"{self.lds_hz:.1f}Hz" if lds_up else "off")
+
+            # SBC vitals (right column, below the temp): 1-min load + RAM used %.
+            load, mem_pct = self._cached_sys()
+            if load == load:                     # not NaN
+                s = f"CPU {load:.1f}"
+                draw.text((W - 2 - self._text_w(s), 28), s, font=self.font, fill=255)
+            if mem_pct == mem_pct:
+                s = f"RAM {mem_pct:.0f}%"
+                draw.text((W - 2 - self._text_w(s), 40), s, font=self.font, fill=255)
 
     # ---- face / mood animation ----
     def _anim_update(self, now):
