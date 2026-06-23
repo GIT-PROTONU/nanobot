@@ -12,6 +12,7 @@
 - [ESP32 WHEEL PID still pending](esp32-pid-velocity-pending.md) — wheel velocity PID unbuilt (blocked: single-channel encoders = no direction). The LDS spin-speed PID is separate & already done.
 - [slam_nav](slam-nav.md) — custom super-light 2D SLAM + click-to-go nav; was branch slam, now all merged into main (slam branch deleted 2026-06-22)
 - [SLAM map empty = lidar not spinning](slam-map-empty-lidar-spin.md) — slam_nav writes /map only on /scan; firmware auto-spins lidar on boot; rpm/hz=0 usually means lidar unpowered, not a bug
+- [LDS scan path is SBC-direct](lds-scan-path-sbc-direct.md) — web UI points come ONLY from SBC reading ttyS2/PA1; ESP reads RPM only & never relays scan; "ESP sees data but no points" = SBC RX wiring (prove with raw `cat /dev/ttyS2`)
 - [SLAM autonomy: pick-up + relocalize](slam-autonomy-pickup-relocalize.md) — pick-up freeze via off-ground switches + lost-robot self-recovery (wide scan-match + spin); LOCAL recovery only (~0.5m), not global kidnap; main only
 - [OLED display perf + face mode](oled-display-perf.md) — SSD1306 is I2C-bus-bound (flush=79% wait/21% CPU); i2c-0 raised to 400kHz; CPU∝flush count not bus speed; animated-eyes moods + shutdown/restart screens via /oled_face + /oled_system
 - [SBC CPU profile](sbc-cpu-profile.md) — ~50% CPU is mostly rosbridge while the web UI is open; CBOR=bandwidth-not-CPU; real win = don't bridge heavy topics (/imu/web summary)
