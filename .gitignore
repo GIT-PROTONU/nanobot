@@ -23,3 +23,7 @@ __pycache__/
 # editor
 .vscode/
 .idea/
+
+# local SBC credentials (never commit)
+.nano-deploy.env
+.nano-askpass.sh

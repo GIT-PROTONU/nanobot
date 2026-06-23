@@ -2,7 +2,7 @@
 - [Memory in git](memory-in-git.md) — user ALWAYS wants memory committed to git; ~/.claude memory dir is symlinked to repo .claude/memory; commit memory changes
 - [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
 - [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy from Ubuntu via ssh/scp (plink/pscp refs are stale); web UI + stack auto-start
-- [Dev host is Ubuntu](dev-host-is-ubuntu.md) — native Ubuntu 24.04 now; repo Windows/WSL/COM-port docs are stale; deploy via ssh/scp (SSH_ASKPASS, no sshpass)
+- [Dev host is Ubuntu](dev-host-is-ubuntu.md) — native Ubuntu 24.04 now; repo Windows/WSL/COM-port docs are stale; passwordless `ssh nano`/`scp nano:` alias (RSA host-key forced; creds git-ignored in .nano-deploy.env)
 - [Pin / bus map](pin-bus-map.md) — current SBC bus/port + ESP32 GPIO assignments; LDS=ttyS2, ESP32 link=ttyS1, OLED=i2c-0; canonical doc = nanopi-neo-plus2-pinmap.md
 - [ESP32 coprocessor](esp32-coprocessor.md) — native zenoh-pico (not micro-ROS) coprocessor in firmware/nanobot_coprocessor; single-channel encoders signed by commanded dir
 - [ESP32 zenoh-pico integration](esp32-zenoh-pico-integration.md) — ESP32 runs zenoh-pico over direct UART (no agent/DDS); fix was liveliness tokens; LDS dual-read (ESP32 RPM UART1/GPIO14 + SBC scan UART2/ttyS2); do NOT pin zenoh-pico tasks to Core 0

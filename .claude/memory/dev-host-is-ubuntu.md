@@ -22,10 +22,18 @@ plain `ssh`/`scp` instead. Board: **`ibster@192.168.178.141`** (the `NANO_HOST` 
 home `~/Nano`, build/run via `~/.pixi/bin/pixi run`. `ibster` has **password sudo** (no
 NOPASSWD) — pipe with `echo <pw> | sudo -S …`.
 
-`sshpass` is NOT installed; for non-interactive auth use OpenSSH's askpass (no install):
-write the password to a `chmod 700` temp file, then
-`SSH_ASKPASS=<file> SSH_ASKPASS_REQUIRE=force setsid -w ssh …` (delete the file after,
-never commit it). Network commands need the Bash sandbox disabled.
+**SSH access is now KEY-BASED — use the `nano` alias (set up 2026-06-23):** just
+`ssh nano '…'` and `scp … nano:…`. The dev host's `~/.ssh/id_ed25519` is installed in the
+board's `authorized_keys`, so it's **passwordless**; `~/.ssh/config` Host `nano` sets
+`User ibster` + `HostName 192.168.178.141`. **The board's ed25519 HOST key fails signature
+verification** (`ssh_dispatch_run_fatal: incorrect signature`) — the config forces
+`HostKeyAlgorithms rsa-sha2-512,rsa-sha2-256` so SSH uses the board's RSA host key instead
+(don't waste time debugging "incorrect signature"; it's just the ed25519 host key). The
+password is kept **locally, git-ignored** in `.nano-deploy.env` (+ `.nano-askpass.sh`
+SSH_ASKPASS fallback) at the repo root for `deploy.sh`-style env use — NEVER commit it and
+never put it in memory. Network commands need the Bash sandbox disabled. (Legacy fallback
+if the key is ever gone: `SSH_ASKPASS=.nano-askpass.sh SSH_ASKPASS_REQUIRE=force setsid -w
+ssh -o HostKeyAlgorithms=rsa-sha2-512 ibster@192.168.178.141 …`.)
 
 Manual deploy recipe that worked (June 2026, LDS→ttyS2 change): `scp -r src scripts deploy
 ibster@…:~/Nano/` → `pixi run colcon build --symlink-install --packages-select <pkgs>` →
