@@ -65,3 +65,27 @@ final confirmation was still pending at end of session.
   connectivity via /imu/web staleness (red "lost"), so a device drop is still visible.
   `stack.sh` launches one `sensors` entry; `do_down` keeps the old per-node patterns to
   sweep pre-merge stragglers. See [[single-webui-from-sbc]].
+
+**Update (2026-06-23) — IDLE baseline profiled (web UI CLOSED), per-process AND per-thread.**
+Prior profiling focused on the UI-open rosbridge cost; this is the always-on 24/7 cost that
+runs regardless of the browser. Idle total ≈ **83% of one core** (of 400% = 4 cores):
+- **sensor_hub ~40%** → per-thread: main executor **28%** (odom 15 Hz + TF + /wheel_ticks
+  ingest + sys_monitor), **IMU serial-parse thread 8.8%**, zenoh rx/tx ~3%. (LDS reader
+  thread was ~0 — lidar low/idle data that sample.)
+- **nav (slam) ~26%** → ~all main-thread per-scan match+integrate. The planner was idle
+  (no goal), so this is pure SLAM, not navigation.
+- **OLED ~11%** → **10.4% on the MAIN thread, and it is NOT rendering.** Benchmarked on the
+  board: full dashboard PIL render = **8 ms**, luma monochrome frame-pack = **9.7 ms** (a
+  pure-Python triple loop; np.packbits does the same in 0.56 ms = 17×), I2C flush is mostly
+  *wait*. Render+pack+flush ≈ only ~2.3% at 1 Hz. The other ~8% is **deserializing
+  /imu/web (15 Hz) + /lds_hz + esp topics over zenoh just to repaint once a second** — same
+  "every subscriber deserializes in-process" tax as above, [[esp32-zenoh-pico-integration]].
+- zenohd ~5% (router, inherent).
+
+Decisive new fact: **nothing in the stack subscribes to /imu/data** (grep-confirmed: nav
+uses /imu/euler, web uses /imu/web). Yet the BWT901CL device is pinned to stream 100 Hz, so
+the parser chews ~400 frames/s (accel+gyro+angle+mag) for a topic with **zero consumers**.
+Profiler scripts (per-process + per-thread /proc utime+stime samplers, and the luma/render
+micro-benchmarks) were one-off in /tmp on the board; re-derive from this note if needed.
+The actionable reduction plan from this session is in [[cpu-reduction-plan]] (user will
+decide scope later — nothing implemented yet).

@@ -6,10 +6,10 @@ DASHBOARD (default) — a compact status panel:
     │ NANOBOT              12:34:56  │  header bar (inverted): brand + clock
     │ 192.168.178.141          47C   │  primary IP  +  SBC CPU temp (right)
     │ ───────────────────────────── │
-    │ ESP  ●  39C          CPU 1.4   │  left col: subsystems (● online/○ off);
-    │ IMU  ●  50Hz         RAM 61%   │  right col: SBC vitals (temp/load/RAM%)
-    │ LDS  ○  off                    │  CPU = 1-min load avg, RAM = used %
-    └───────────────────────────────┘
+    │ ESP  ●  39C          CPU 23%   │  left col: subsystems (● online/○ off);
+    │ IMU  ●  50Hz         RAM 61%   │  right col: SBC vitals (temp/CPU%/RAM%)
+    │ LDS  ○  off                    │  CPU = busy %, RAM = used % (web UI's
+    └───────────────────────────────┘  cpu_percent / mem_percent)
 
 FACE — cute animated robot eyes that blink and glance around, used to express a
 mood. Enabled from the web UI by publishing a mood name on /oled_face (empty
@@ -34,7 +34,7 @@ Data sources (all lightweight — no heavy message is deserialized per frame):
     /oled_text       (String)         → optional brand override (web UI textbox)
     /oled_face       (String)         → mood name / "" for dashboard (web UI)
     /sys/class/thermal/thermal_zone0/temp → SBC CPU temp (cached file read)
-    /proc/loadavg                     → SBC 1-min load average (cached file read)
+    /proc/stat                        → SBC CPU busy % (delta-sampled file read)
     /proc/meminfo                     → SBC RAM used % (cached file read)
 
 Subscribe-only and best-effort: if the panel or luma isn't present the node still
@@ -65,9 +65,10 @@ except Exception as exc:  # pragma: no cover - hardware lib
 
 IP_REFRESH_S = 30.0    # re-resolve the outbound IP at most this often
 TEMP_REFRESH_S = 2.0   # re-read the SBC thermal zone at most this often
-SYS_REFRESH_S = 2.0    # re-read load average + RAM at most this often
+SYS_REFRESH_S = 2.0    # re-sample CPU% + RAM at most this often (also the CPU% window)
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"  # cpu-thermal (millidegrees)
 MEMINFO_PATH = "/proc/meminfo"                          # RAM totals (kB)
+STAT_PATH = "/proc/stat"                                # cpu jiffies for busy %
 # The web UI writes "restart" / "shutdown" here just before it stops the stack, so the
 # OLED node (stopped via SIGTERM) knows which end-screen to show. /dev/shm is tmpfs the
 # stack user can write and is cleared on reboot.
@@ -134,7 +135,8 @@ class DisplayNode(Node):
         self._ip_due = 0.0
         self._sbc = float("nan")
         self._sbc_due = 0.0
-        self._load = float("nan")        # SBC 1-min load average
+        self._cpu_pct = float("nan")     # SBC CPU busy % (delta-sampled)
+        self._cpu_prev = None            # last (idle, total) jiffies for the delta
         self._mem_pct = float("nan")     # SBC RAM used %
         self._sys_due = 0.0
 
@@ -273,15 +275,23 @@ class DisplayNode(Node):
         return self._sbc
 
     def _cached_sys(self):
-        """(1-min load average, RAM used %) — cheap throttled /proc reads so the
-        render loop never recomputes per frame."""
+        """(CPU busy %, RAM used %) — cheap throttled /proc reads so the render loop
+        never recomputes per frame. CPU% is delta-sampled over SYS_REFRESH_S from the
+        aggregate /proc/stat line, matching the web UI's cpu_percent."""
         now = time.monotonic()
         if now >= self._sys_due:
             self._sys_due = now + SYS_REFRESH_S
             try:
-                self._load = os.getloadavg()[0]
+                with open(STAT_PATH) as f:
+                    parts = [int(x) for x in f.readline().split()[1:]]
+                idle = parts[3] + (parts[4] if len(parts) > 4 else 0)  # idle + iowait
+                total = sum(parts)
+                if self._cpu_prev is not None:
+                    di, dt = idle - self._cpu_prev[0], total - self._cpu_prev[1]
+                    self._cpu_pct = 100.0 * (1.0 - di / dt) if dt > 0 else float("nan")
+                self._cpu_prev = (idle, total)
             except Exception:
-                self._load = float("nan")
+                self._cpu_pct = float("nan")
             try:
                 tot = avail = 0
                 with open(MEMINFO_PATH) as f:
@@ -295,7 +305,7 @@ class DisplayNode(Node):
                 self._mem_pct = 100.0 * (tot - avail) / tot if tot else float("nan")
             except Exception:
                 self._mem_pct = float("nan")
-        return self._load, self._mem_pct
+        return self._cpu_pct, self._mem_pct
 
     def _text_w(self, s: str) -> int:
         try:
@@ -345,14 +355,15 @@ class DisplayNode(Node):
             self._row(draw, 40, "IMU", imu_up, f"{self.imu_hz:.0f}Hz" if imu_up else "off")
             self._row(draw, 52, "LDS", lds_up, f"{self.lds_hz:.1f}Hz" if lds_up else "off")
 
-            # SBC vitals (right column, below the temp): 1-min load + RAM used %.
-            load, mem_pct = self._cached_sys()
-            if load == load:                     # not NaN
-                s = f"CPU {load:.1f}"
-                draw.text((W - 2 - self._text_w(s), 28), s, font=self.font, fill=255)
-            if mem_pct == mem_pct:
-                s = f"RAM {mem_pct:.0f}%"
-                draw.text((W - 2 - self._text_w(s), 40), s, font=self.font, fill=255)
+            # SBC vitals (right column, below the temp): CPU busy % + RAM used %.
+            # Right-aligned with a 3px margin and an x>=0 clamp so a wide value
+            # (e.g. "CPU 100%") can never run off the right edge.
+            cpu_pct, mem_pct = self._cached_sys()
+            for y, val in ((28, cpu_pct), (40, mem_pct)):
+                if val != val:               # NaN -> not ready yet
+                    continue
+                s = f"{'CPU' if y == 28 else 'RAM'} {val:.0f}%"
+                draw.text((max(0, W - 3 - self._text_w(s)), y), s, font=self.font, fill=255)
 
     # ---- face / mood animation ----
     def _anim_update(self, now):

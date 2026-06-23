@@ -15,5 +15,6 @@
 - [LDS scan path is SBC-direct](lds-scan-path-sbc-direct.md) — web UI points come ONLY from SBC reading ttyS2/PA1; ESP reads RPM only & never relays scan; "ESP sees data but no points" = SBC RX wiring (prove with raw `cat /dev/ttyS2`)
 - [SLAM autonomy: pick-up + relocalize](slam-autonomy-pickup-relocalize.md) — pick-up freeze via off-ground switches + lost-robot self-recovery (wide scan-match + spin); LOCAL recovery only (~0.5m), not global kidnap; main only
 - [OLED display perf + face mode](oled-display-perf.md) — SSD1306 is I2C-bus-bound (flush=79% wait/21% CPU); i2c-0 raised to 400kHz; CPU∝flush count not bus speed; animated-eyes moods + shutdown/restart screens via /oled_face + /oled_system
-- [SBC CPU profile](sbc-cpu-profile.md) — ~50% CPU is mostly rosbridge while the web UI is open; CBOR=bandwidth-not-CPU; real win = don't bridge heavy topics (/imu/web summary)
+- [SBC CPU profile](sbc-cpu-profile.md) — ~50% CPU is mostly rosbridge while the web UI is open; CBOR=bandwidth-not-CPU; real win = don't bridge heavy topics (/imu/web summary); 2026-06-23 adds the web-CLOSED idle baseline (~83% of 1 core) per-process+per-thread
+- [CPU reduction plan](cpu-reduction-plan.md) — 3-tier idle-CPU plan (IMU device auto-rate / SLAM skip-when-stationary / OLED de-chatter), all keep sensor rates+function; nothing built yet, user to pick scope
 - [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
