@@ -19,3 +19,9 @@ whenever the ESP32 is powered. The web "LDS target" slider publishes `/lds_targe
 published on page load). `/lds_rpm` and `/lds_hz` = 0 means the lidar is producing no
 frames → almost always the **lidar is unpowered/disconnected** (e.g. robot on the bench),
 not a software bug. See [[esp32-zenoh-pico-integration]].
+
+**Confirmed instance (2026-06-23):** an LDS "no scan / no points" outage traced to a
+**faulty USB power supply** — purely a power fault, not wiring/driver/UART. The SBC
+UART2 (`/dev/ttyS2`) tested perfect by RX↔TX loopback (5/5 frames echoed @115200) the
+same day, ruling out the port. Swapping the power supply fixed it. So: check power
+(supply + the LDS's own rail) before suspecting [[lds-scan-path-sbc-direct]] wiring.

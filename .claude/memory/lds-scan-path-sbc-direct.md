@@ -33,6 +33,15 @@ logs `LDS open on /dev/ttyS2 @115200`; `stty` 115200 — yet raw read = 0 bytes.
 cause is physical on PA1: TX/RX swap (landed on PA0/UART2-TX), missing common ground to
 the SBC, or the SBC branch of the TX split is open.
 
+**Port-health proof — RX↔TX loopback (2026-06-23):** to test the UART itself, bridge
+the LDS's RX and TX pins, stop `sensor_hub` (it holds `/dev/ttyS2`; killing it was
+needed for *exclusive* access — a concurrent test gives **false negatives** because
+the live driver eats the looped-back bytes), then write+read frames on the port. 5/5
+echoed byte-for-byte @115200 = port fully healthy. That day the LDS outage turned out
+to be a **faulty USB power supply**, NOT the UART or wiring — see
+[[slam-map-empty-lidar-spin]]. So order of checks: power → loopback the port → then
+PA1 wiring. Run the test from a script FILE by path (same self-kill gotcha as above).
+
 Doc gotcha: `nanopi-neo-plus2-pinmap.md` lists UART2's base as `1c2dc00` — a **typo**;
 the live `/dev/ttyS2` is `1c28800.serial` = UART2 (PA0/PA1). See [[pin-bus-map]],
 [[slam-map-empty-lidar-spin]] (the other branch: RPM/Hz=0 = lidar unpowered), and
