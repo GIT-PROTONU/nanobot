@@ -97,6 +97,26 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   mic as raw PCM via `arecord` (`mic_audio.py`). Both are ref-counted (only run
   while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
   (browsers don't stream an HTTP/1.0 body to `fetch`).
+- **Text-to-speech** (`tts.py`): `POST /tts {text,voice?}` synthesises with
+  `pico2wave` (SVOX Pico, **English + German only** — install via
+  `deploy/install-picotts.sh`) to a `/dev/shm` WAV, plays it with `aplay`, and
+  publishes the words one at a time on **`/oled_word`** timed to the clip duration
+  (Pico emits no word marks, so timing is length-weighted). `oled_display` shows
+  each word big+centred as it's spoken ("karaoke"); `""` returns to the dashboard.
+  Both binaries run **only while speaking** (zero idle cost). The web "Speak" box
+  reuses the old OLED-text field; it no longer publishes `/oled_text` (that brand
+  override still works if published manually). Off rosbridge on purpose (HTTP POST).
+  - **Voice/volume/speed/pitch** are tuned in the UI and applied as Pico's inline
+    `<volume>/<speed>/<pitch>` level markup (no ALSA-mixer dep). They + the stats
+    announcer are **persisted** to `~/.local/state/nanobot/tts.json` (override with
+    the `tts_settings_path` param) and reloaded on node start, so they survive a
+    reboot. `GET/POST /tts/config` read/update them; the page restores its controls
+    from `GET /tts/config` on load.
+  - **Spoken system stats**: a server-side 1 Hz tick (`_announce_tick`) speaks
+    CPU%/RAM%/CPU-temp every `announce_interval` s when `announce` is on — it lives
+    in the node, so it **keeps running after every browser closes** and resumes after
+    a reboot. `POST /tts/announce` says it once now. CPU/RAM/temp come from the same
+    cheap `/proc` + thermal reads the OLED uses; phrasing follows the selected voice.
 - **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
   Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
   so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`

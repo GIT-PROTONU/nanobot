@@ -33,6 +33,8 @@ Data sources (all lightweight — no heavy message is deserialized per frame):
     /lds_hz          (Float32)        → LDS valid-frame rate (0/stale = offline)
     /oled_text       (String)         → optional brand override (web UI textbox)
     /oled_face       (String)         → mood name / "" for dashboard (web UI)
+    /oled_word       (String)         → one TTS word at a time, shown big+centred while
+                                        speaking; "" returns to the dashboard (web_control)
     /sys/class/thermal/thermal_zone0/temp → SBC CPU temp (cached file read)
     /proc/stat                        → SBC CPU busy % (delta-sampled file read)
     /proc/meminfo                     → SBC RAM used % (cached file read)
@@ -57,7 +59,7 @@ try:
     from luma.core.interface.serial import i2c
     from luma.core.render import canvas
     from luma.oled.device import ssd1306
-    from PIL import ImageFont
+    from PIL import Image, ImageDraw, ImageFont
     HAVE_LUMA = True
 except Exception as exc:  # pragma: no cover - hardware lib
     HAVE_LUMA = False
@@ -123,6 +125,7 @@ class DisplayNode(Node):
         # *_at fields are monotonic arrival times used to decide liveness.
         self.text = ""                  # optional brand override from the web UI
         self.face_mood = ""             # "" = dashboard; else a mood name
+        self.speak_word = ""            # current TTS word (karaoke); "" = not speaking
         self.esp_temp = float("nan")
         self.esp_at = -1e9
         self.imu_hz = 0.0
@@ -180,6 +183,7 @@ class DisplayNode(Node):
         self.create_subscription(Float32, "lds_hz", self._on_lds_hz, 10)
         self.create_subscription(String, "oled_text", self._on_text, 10)
         self.create_subscription(String, "oled_face", self._on_face, 10)
+        self.create_subscription(String, "oled_word", self._on_word, 10)
         self.create_subscription(String, "oled_system", self._on_system, 10)
 
         # Dashboard ticks slowly; the face has its own faster timer that stays
@@ -221,6 +225,25 @@ class DisplayNode(Node):
         elif not new and was_face:        # back to dashboard: stop the face timer
             self._face_timer.cancel()
         self.get_logger().info(f"OLED mode: {self.face_mood or 'dashboard'}")
+
+    def _on_word(self, msg: String):
+        """TTS karaoke: web_control streams one word at a time as it's spoken. A word
+        takes over the panel (big + centred); the empty string ends speech and hands
+        the panel back to the face (if a mood is up) or the dashboard. Drawn inline
+        here — words arrive at speech rate, so this stays in sync with the audio."""
+        if self._sys:                       # a shutdown/restart screen owns the panel
+            return
+        word = msg.data.strip()
+        if word:
+            self.speak_word = word
+            self._draw_word(word)
+        elif self.speak_word:
+            self.speak_word = ""
+            if self.face_mood:              # resume the face cleanly on the next tick
+                self._anim_t = time.monotonic()
+                self._face_sig = None
+            else:
+                self._dashboard_tick()      # redraw the dashboard immediately
 
     def _on_system(self, msg: String):
         """Web UI sends 'restart' (ROS stack) / 'reboot' (whole SBC) / 'shutdown' the
@@ -323,8 +346,8 @@ class DisplayNode(Node):
         draw.text((48, y), value, font=self.font, fill=255)
 
     def _dashboard_tick(self):
-        if not self.device or self.face_mood or self._sys:   # face/system screen owns it
-            return
+        if not self.device or self.face_mood or self.speak_word or self._sys:
+            return                                           # face/speech/system owns it
         now = time.monotonic()
         esp_up = (now - self.esp_at) < ESP_TIMEOUT_S
         imu_up = (now - self.imu_at) < IMU_TIMEOUT_S
@@ -364,6 +387,30 @@ class DisplayNode(Node):
                     continue
                 s = f"{'CPU' if y == 28 else 'RAM'} {val:.0f}%"
                 draw.text((max(0, W - 3 - self._text_w(s)), y), s, font=self.font, fill=255)
+
+    # ---- TTS karaoke (one word, big + centred) ----
+    def _draw_word(self, word):
+        """Render a single word as large as it'll fit, centred on the panel. The
+        default luma font is tiny, so we draw the word once at 1x then nearest-scale
+        it up (integer, mode '1') — no TTF file needed, so it costs no extra disk."""
+        if not self.device:
+            return
+        W, H = self.width, self.height
+        try:
+            x0, y0, x1, y1 = self.font.getbbox(word)
+        except Exception:
+            x0, y0, x1, y1 = 0, 0, self._text_w(word), 8
+        tw, th = max(1, x1 - x0), max(1, y1 - y0)
+        # Largest integer scale that fits with a small margin (cap so short words
+        # don't pixelate into illegibility). Falls back to 1 for a very long word.
+        scale = max(1, min((W - 4) // tw, (H - 8) // th, 6))
+        glyph = Image.new("1", (tw, th), 0)
+        ImageDraw.Draw(glyph).text((-x0, -y0), word, font=self.font, fill=1)
+        if scale > 1:
+            glyph = glyph.resize((tw * scale, th * scale), Image.NEAREST)
+        gw, gh = glyph.size
+        with canvas(self.device) as draw:
+            draw.bitmap(((W - gw) // 2, (H - gh) // 2), glyph, fill=255)
 
     # ---- face / mood animation ----
     def _anim_update(self, now):
@@ -485,7 +532,7 @@ class DisplayNode(Node):
         draw.ellipse((bx - 9, by - 9, bx + 9, by + 9), outline=255)
 
     def _face_tick(self):
-        if not self.device or not self.face_mood or self._sys:
+        if not self.device or not self.face_mood or self.speak_word or self._sys:
             return
         now = time.monotonic()
         self._anim_update(now)

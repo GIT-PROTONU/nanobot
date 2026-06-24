@@ -13,7 +13,8 @@ Hardware:
 | Roborock **LDS02RR** lidar (scan) | UART2 (`/dev/ttyS2`, PA0/PA1) | `lds_driver_py` (Python) | `/scan` |
 | **ESP32-WROOM** coprocessor (motors + encoders + lidar RPM/spin) | UART1 (`/dev/ttyS1`, PG6/PG7 — zenoh-pico link) | firmware | sub `/cmd_vel`; pub `/wheel_ticks`, `/lds_rpm`, `/lds_hz`, `/esp32_*` |
 | Wheel **encoders** (single-channel ×2) + **motors** | ESP32 GPIO (see firmware pinout) | `wheel_odometry` (`/wheel_ticks`→`/odom`) | `/odom`, TF |
-| **SSD1306** OLED | I2C0 (`/dev/i2c-0`, PA11/PA12 @400 kHz) | `oled_display` | sub `/oled_text`, `/oled_face` |
+| **SSD1306** OLED | I2C0 (`/dev/i2c-0`, PA11/PA12 @400 kHz) | `oled_display` | sub `/oled_face`, `/oled_word` |
+| **Speaker** (text-to-speech) | USB/analog audio out (`aplay`) | `web_control` (`pico2wave`) | `POST /tts`; pub `/oled_word` |
 | **BWT901CL** IMU | USB-serial (`/dev/imu`, CH340) | `imu_driver` | `/imu/data`, `/imu/web` |
 | **Logitech C270** webcam + mic | USB | `web_control` | `/stream.mjpg`, `/audio.pcm` |
 | **PCA9685** PWM | I2C1 (`/dev/i2c-1`, 0x40) | — (retired; ESP32 owns motors) | — |
@@ -99,6 +100,27 @@ pixi run build        # colcon build (msgs + all python pkgs)
 > like the rest). The old Rust `lds_driver` is abandoned — it doesn't build against
 > this RoboStack Humble, and its toolchain is intentionally **not** in `pixi.toml`
 > (it cost ~1.6 GB). The source is kept under `src/lds_driver/` for reference only.
+
+## 3b. (Optional) Text-to-speech
+
+The web UI's **Speak** box reads a line aloud (English/German) and karaokes the
+words onto the OLED. It needs `pico2wave` (SVOX Pico). Install it — English +
+German voices only — once on the board:
+
+```bash
+sudo bash deploy/install-picotts.sh
+```
+
+**Audio out — the SBC's internal H5 analog codec:** enable + un-mute it (it boots
+muted) and make it the default ALSA device:
+
+```bash
+sudo bash deploy/enable-h5-audio.sh     # reboot once if it says the codec isn't up yet
+```
+
+Then `web_control: tts_device` can stay `""`. (For a USB speaker instead, skip that
+script and set `tts_device` to the USB card — find it with `aplay -l`.) Skip TTS
+entirely and everything else still runs — it just reports "unavailable".
 
 ## 4. Run
 

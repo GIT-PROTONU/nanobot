@@ -18,3 +18,4 @@
 - [SBC CPU profile](sbc-cpu-profile.md) — ~50% CPU is mostly rosbridge while the web UI is open; CBOR=bandwidth-not-CPU; real win = don't bridge heavy topics (/imu/web summary); 2026-06-23 adds the web-CLOSED idle baseline (~83% of 1 core) per-process+per-thread
 - [CPU reduction plan](cpu-reduction-plan.md) — 3-tier idle-CPU plan (IMU device auto-rate / SLAM skip-when-stationary / OLED de-chatter), all keep sensor rates+function; nothing built yet, user to pick scope
 - [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
+- [TTS / speech](tts-speech.md) — robot speaks (en/de) via pico2wave in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh)

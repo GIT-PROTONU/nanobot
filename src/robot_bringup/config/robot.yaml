@@ -163,3 +163,16 @@ web_control:
   ros__parameters:
     web_port: 8080            # http://<robot-ip>:8080
     rosbridge_port: 9090      # websocket roslib connects to
+    # Text-to-speech (English + German only). The web page POSTs /tts; the server
+    # synthesises with pico2wave (install via deploy/install-picotts.sh), plays it
+    # through aplay, and streams the words to the OLED (/oled_word) as they're said.
+    tts_enabled: true
+    tts_pico_bin: "pico2wave"  # resolved from PATH; set an absolute path to override
+    tts_device: ""             # aplay -D device; "" = ALSA default. Using the SBC's
+                               # internal H5 analog codec: run deploy/enable-h5-audio.sh
+                               # (sets it as the default + un-mutes it), then "" works.
+                               # Or target it explicitly: "plughw:CARD=audiocodec".
+    tts_default_voice: "en-US" # seeds the voice on first boot (before any UI change)
+    # Live voice/volume/speed/pitch + the stats-announcer are tuned from the web UI
+    # and persisted here so they survive a reboot. "" = ~/.local/state/nanobot/tts.json.
+    tts_settings_path: ""

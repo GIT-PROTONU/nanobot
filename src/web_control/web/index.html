@@ -125,13 +125,37 @@
       <input id="lin" type="range" min="0.05" max="0.4" step="0.01" value="0.25">
       <label>Max angular <span id="angv">1.5</span> rad/s</label>
       <input id="ang" type="range" min="0.2" max="3.0" step="0.1" value="1.5">
-      <h2>OLED</h2>
+      <h2>Speech</h2>
       <label style="flex-direction:column;align-items:stretch;gap:6px">
-        <input id="oledText" type="text" maxlength="21" placeholder="text for the screen…">
-        <button id="oledSend" class="primary">Send to OLED</button>
+        <input id="oledText" type="text" maxlength="300" placeholder="text to speak…">
+        <select id="ttsVoice">
+          <option value="en-US">English (US)</option>
+          <option value="en-GB">English (UK)</option>
+          <option value="de-DE">German</option>
+        </select>
+        <div style="display:flex;gap:6px">
+          <button id="oledSend" class="primary" style="flex:1">Speak</button>
+          <button id="ttsStop">Stop</button>
+        </div>
       </label>
-      <p class="hint">Publishes <b>std_msgs/String</b> on <b>/oled_text</b>; the OLED
-        shows it as the title. Up to ~21 chars fit. <kbd>Enter</kbd> sends.</p>
+      <label>Volume <span id="ttsVolV">100</span>%</label>
+      <input id="ttsVol" type="range" min="0" max="100" step="5" value="100">
+      <label>Speed <span id="ttsSpeedV">100</span>%</label>
+      <input id="ttsSpeed" type="range" min="50" max="200" step="5" value="100">
+      <label>Pitch <span id="ttsPitchV">100</span>%</label>
+      <input id="ttsPitch" type="range" min="50" max="200" step="5" value="100">
+      <p class="hint">Speaks the text aloud (SVOX Pico TTS) and karaokes it onto the
+        OLED — each word shows as it's said, so a long line doesn't need to fit the
+        small screen. Voice = English / German; all settings persist across a reboot.
+        <b>Volume</b> trims the synthesis (100% = cleanest, no clipping) — for overall
+        <i>loudness</i> use the speaker's hardware mixer. <kbd>Enter</kbd> speaks.</p>
+      <label><input id="announceOn" type="checkbox"> Speak system stats every
+        <input id="announceInterval" type="number" min="5" max="3600" step="5" value="30"
+          style="width:5em"> s</label>
+      <button id="announceSay">Say stats now</button>
+      <p class="hint">Announces CPU&nbsp;%, RAM&nbsp;% and CPU temperature on a timer.
+        Runs in the robot (web_control), so it <b>keeps going after you close this
+        page</b> and survives a reboot. Uses the selected voice/volume/speed/pitch.</p>
       <label><input id="faceOn" type="checkbox"> Face / eye animation</label>
       <label>Mood
         <select id="faceMood">
@@ -241,7 +265,7 @@ let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
 
 // ---- ROS state ----
-let ros=null, odomTopic=null, cmdTopic=null, textTopic=null, faceTopic=null, systemTopic=null,
+let ros=null, odomTopic=null, cmdTopic=null, faceTopic=null, systemTopic=null,
     imuTopic=null, eulTopic=null, sysTopic=null,
     imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
 // ESP32 coprocessor topics
@@ -421,7 +445,7 @@ function subscribe(){
     throttle_rate:100,queue_length:1});
   odomTopic.subscribe(onOdom);
   cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
-  textTopic=new ROSLIB.Topic({ros,name:"/oled_text",messageType:"std_msgs/msg/String"});
+  // (TTS/speech goes over HTTP POST /tts, not rosbridge — see sendOled.)
   faceTopic=new ROSLIB.Topic({ros,name:"/oled_face",messageType:"std_msgs/msg/String"});
   systemTopic=new ROSLIB.Topic({ros,name:"/oled_system",messageType:"std_msgs/msg/String"});
   // /imu/web is a tiny summary (|accel|,|gyro|,actual /imu/data Hz) the node emits at
@@ -582,13 +606,52 @@ function onDiag(msg){
   }
 }
 
-// ---- OLED text ----
+// ---- Speech (TTS) ---- POSTs to web_control, which speaks via pico2wave and
+// streams the words to the OLED (/oled_word). Not over rosbridge — keeps the bridge
+// light and lets the server own the audio + word timing in one place. Voice/volume/
+// speed/pitch + the stats-announcer are persisted server-side (survive a reboot),
+// so the page just mirrors them: GET them on load, POST /tts/config on change.
 function sendOled(){
-  if(!textTopic){ return; }
-  textTopic.publish(new ROSLIB.Message({data:$("oledText").value}));
+  const text=$("oledText").value.trim();
+  if(!text) return;
+  fetch("/tts",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({voice:$("ttsVoice").value,text})}).catch(()=>{});
 }
 $("oledSend").onclick=sendOled;
+$("ttsStop").onclick=()=>fetch("/tts/stop",{method:"POST"}).catch(()=>{});
 $("oledText").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();sendOled();} });
+
+function saveTts(patch){
+  fetch("/tts/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(patch)}).catch(()=>{});
+}
+// Live label on drag (input); persist only on release/commit (change) to avoid spam.
+function bindSlider(id,labelId,key){
+  const el=$(id), lab=$(labelId);
+  el.addEventListener("input",()=>{ lab.textContent=el.value; });
+  el.addEventListener("change",()=>saveTts({[key]:Number(el.value)}));
+}
+bindSlider("ttsVol","ttsVolV","volume");
+bindSlider("ttsSpeed","ttsSpeedV","speed");
+bindSlider("ttsPitch","ttsPitchV","pitch");
+$("ttsVoice").addEventListener("change",()=>saveTts({voice:$("ttsVoice").value}));
+$("announceOn").addEventListener("change",()=>saveTts({announce:$("announceOn").checked}));
+$("announceInterval").addEventListener("change",
+  ()=>saveTts({announce_interval:Number($("announceInterval").value)}));
+$("announceSay").onclick=()=>fetch("/tts/announce",{method:"POST"}).catch(()=>{});
+
+// Restore the persisted TTS settings into the controls on page load.
+function loadTts(){
+  fetch("/tts/config").then(r=>r.ok?r.json():null).then(s=>{
+    if(!s) return;
+    const set=(id,v)=>{ if($(id)) $(id).value=v; };
+    set("ttsVoice",s.voice); set("ttsVol",s.volume); set("ttsSpeed",s.speed);
+    set("ttsPitch",s.pitch); set("announceInterval",s.announce_interval);
+    $("ttsVolV").textContent=s.volume; $("ttsSpeedV").textContent=s.speed;
+    $("ttsPitchV").textContent=s.pitch; $("announceOn").checked=!!s.announce;
+  }).catch(()=>{});
+}
+loadTts();
 
 // ---- OLED face / mood ---- empty string = dashboard, else the selected mood.
 function sendFace(){

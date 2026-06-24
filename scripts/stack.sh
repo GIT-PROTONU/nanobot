@@ -77,7 +77,7 @@ PY
   pgrep -f 'rosbridge_websocket' >/dev/null \
     || launch rosbridge "$ros/rosbridge_server/rosbridge_websocket --ros-args -p port:=9090"
   pgrep -f 'web_control/lib/web_control' >/dev/null \
-    || launch web "$own/web_control/lib/web_control/web_server --ros-args -p web_port:=8080 -p rosbridge_port:=9090"
+    || launch web "$own/web_control/lib/web_control/web_server --ros-args --params-file $PARAMS -p web_port:=8080 -p rosbridge_port:=9090"
   pgrep -f 'oled_display/lib/oled_display' >/dev/null \
     || launch oled "$own/oled_display/lib/oled_display/display_node --ros-args --params-file $PARAMS"
   # Sensor hub: imu_driver + sys_monitor + wheel_odometry + lds_driver_py in ONE process
