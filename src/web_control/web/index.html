@@ -195,6 +195,17 @@
       </div>
       <p class="hint">Board health from <b>/diagnostics</b> (sys_monitor), 1 Hz.
         <b>wifi</b> = signal strength (green ≥ −60 dBm, amber ≥ −75, red below).</p>
+      <h2>Fan</h2>
+      <div class="imu">
+        <span>output</span><b id="fanDuty">–</b>
+        <span>mode</span><b id="fanMode">auto</b>
+      </div>
+      <label><input type="checkbox" id="fanAuto" checked> Auto (track CPU temp)</label>
+      <label>Override <span id="fanOvV">50</span> %</label>
+      <input id="fanOv" type="range" min="0" max="100" step="5" value="50" disabled>
+      <p class="hint">SBC cooling fan PWM on the ESP32 (<b>/fan_pwm</b>). In <b>Auto</b> the
+        speed ramps with CPU temperature (<b>sys_monitor</b>); uncheck to force a fixed
+        speed (sets <b>fan_override</b>).</p>
       <h2>LDS</h2>
       <div class="imu">
         <span>rate</span><b id="ldsHz">–</b>
@@ -271,6 +282,8 @@ let ros=null, odomTopic=null, cmdTopic=null, faceTopic=null, systemTopic=null,
 // ESP32 coprocessor topics
 let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
     hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
+// cooling fan: read /fan_pwm, override via /sys_monitor/set_parameters
+let fanTopic=null, fanParamSrv=null;
 // slam_nav view+plan state (read by the map panel script below)
 let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
 let homeTopic=null, saveTopic=null, testTopic=null, testResTopic=null;
@@ -318,6 +331,26 @@ $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
 function publishLdsTgt(){ if(ldsTgtTopic)
   ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); }
+// Fan override -> sys_monitor fan_override param (rcl_interfaces SetParameters; type 3 =
+// double). v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
+function setFanOverride(v){
+  if(!fanParamSrv) return;
+  fanParamSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name:"fan_override",
+    value:{type:3,bool_value:false,integer_value:0,double_value:v,string_value:"",
+      byte_array_value:[],bool_array_value:[],integer_array_value:[],
+      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
+}
+function fanApply(){
+  const auto=$("fanAuto").checked;
+  $("fanOv").disabled=auto;
+  $("fanMode").textContent=auto?"auto":"manual";
+  setFanOverride(auto?-1:Number($("fanOv").value)/100);
+}
+$("fanAuto").onchange=fanApply;
+$("fanOv").oninput=()=>$("fanOvV").textContent=$("fanOv").value;
+$("fanOv").onchange=()=>{ if(!$("fanAuto").checked) setFanOverride(Number($("fanOv").value)/100); };
+// On (re)connect, push the current Auto/override state once so the node matches the UI.
+function syncFan(){ setFanOverride($("fanAuto").checked?-1:Number($("fanOv").value)/100); }
 // On (re)connect, push the slider's current value once so the robot's spin setpoint
 // matches the UI without a manual drag (the firmware boots at 300 rpm; this keeps the
 // shown value authoritative even if it differs).
@@ -425,7 +458,7 @@ $("btnShutdown").onclick=()=>{
 
 function connect(){
   ros=new ROSLIB.Ros({url:`ws://${$("host").value}`});
-  ros.on("connection",()=>{connected=true;setConn(true);subscribe();syncLdsTgt();});
+  ros.on("connection",()=>{connected=true;setConn(true);subscribe();syncLdsTgt();syncFan();});
   ros.on("close",()=>{connected=false;setConn(false);});
   ros.on("error",()=>{setConn(false);});
 }
@@ -464,6 +497,12 @@ function subscribe(){
   ldsParamSrv=new ROSLIB.Service({ros,name:"/lds_driver/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
   odoParamSrv=new ROSLIB.Service({ros,name:"/wheel_odometry/set_parameters",
+    serviceType:"rcl_interfaces/srv/SetParameters"});
+  // cooling fan: live duty readout + override service (sys_monitor owns the curve).
+  fanTopic=new ROSLIB.Topic({ros,name:"/fan_pwm",messageType:"std_msgs/msg/Float32",
+    throttle_rate:1000,queue_length:1});
+  fanTopic.subscribe(m=>$("fanDuty").textContent=(m.data*100).toFixed(0)+"%");
+  fanParamSrv=new ROSLIB.Service({ros,name:"/sys_monitor/set_parameters",
     serviceType:"rcl_interfaces/srv/SetParameters"});
 
   // ---- ESP32 coprocessor (native zenoh-pico over UART, in the rmw_zenoh graph) ----

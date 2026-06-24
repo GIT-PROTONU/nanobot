@@ -157,6 +157,14 @@ imu_driver:
 sys_monitor:
   ros__parameters:
     publish_rate: 1.0         # Hz; CPU/mem/temp/disk are slow-moving
+    # Cooling fan: publishes a PWM duty (0..1) on /fan_pwm that the ESP32 actuates
+    # (firmware FAN_PIN). Auto curve ramps the fan with the SBC CPU temperature; the
+    # web UI Fan slider overrides it (sets fan_override). All retunable live.
+    fan_temp_min: 45.0        # °C: below this the fan idles at fan_min_duty
+    fan_temp_max: 70.0        # °C: at/above this the fan runs at fan_max_duty
+    fan_min_duty: 0.0         # 0..1 duty at/below fan_temp_min (raise if the fan stalls low)
+    fan_max_duty: 1.0         # 0..1 duty at/above fan_temp_max
+    fan_override: -1.0        # <0 = auto (use the curve); 0..1 = forced fixed duty
 
 # ---- Web control (rosbridge websocket + static page) ------------------------
 web_control:

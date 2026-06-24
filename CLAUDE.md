@@ -39,7 +39,9 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   NO Fast-DDS, no agent. It joins the SBC's `rmw_zenoh` graph directly, emitting
   rmw_zenoh's exact wire format + liveliness tokens (see the `src/main.cpp` header).
   Subscribes `/cmd_vel` (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM), `/led`
-  (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint). Publishes
+  (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint), `/fan_pwm`
+  (Float32 0..1 → SBC cooling-fan LEDC PWM; published by `sys_monitor` from the CPU-temp
+  curve, web-overridable). Publishes
   `/wheel_ticks` (Int64MultiArray `[L,R]`) from **single-channel** rising-edge GPIO-
   interrupt counts (**signed by commanded direction** — the encoders have no 2nd channel,
   so the ISR signs each tick by the last `/cmd_vel` wheel direction), `/left_wheel_suspended` +
@@ -56,7 +58,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=26,
   off-ground switches L=18 R=27, motor STBY=23, H-bridge IN L=25/4 R=32/33 (fwd/rev),
   onboard LED=2, **UART2 = zenoh link (TX=17, RX=16) → SBC `/dev/ttyS1`**, **LDS data on
-  UART1 RX=GPIO14 (TX=GPIO13 unused)**, LDS spin-motor PWM=21. (SBC side: ESP32 link on
+  UART1 RX=GPIO14 (TX=GPIO13 unused)**, LDS spin-motor PWM=21, cooling-fan PWM=22 (via a
+  logic-level MOSFET — the ESP can't source fan current). (SBC side: ESP32 link on
   `/dev/ttyS1`/UART1-PG6/PG7, LDS scan on `/dev/ttyS2`/UART2-PA0/PA1, OLED on
   `/dev/i2c-0`/PA11-PA12 @400kHz.) Keep diff-drive limits synced to `robot.yaml`.
 - **The link needs a serial-capable `zenohd`** — the conda `libzenohc` is built without

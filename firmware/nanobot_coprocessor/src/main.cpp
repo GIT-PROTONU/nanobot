@@ -6,6 +6,7 @@
 //   sub  cmd_vel               geometry_msgs/Twist       -> diff-drive -> H-bridge PWM
 //   sub  led                   std_msgs/Bool             -> onboard LED
 //   sub  lds_target_rpm        std_msgs/Float32          -> LDS spin-speed PID setpoint
+//   sub  fan_pwm               std_msgs/Float32 (0..1)   -> SBC cooling fan PWM duty
 //   pub  wheel_ticks           std_msgs/Int64MultiArray  [L,R] raw cumulative counts
 //   pub  left/right_wheel_suspended std_msgs/Bool        per-wheel off-ground switch
 //   pub  esp32_temp            std_msgs/Float32          die temperature (C)
@@ -62,6 +63,15 @@
 // the left-motor PWM. UART2 stays the SBC zenoh link, UART0 the debug console.
 #define LDS_RX_PIN    14      // UART1 RX (was 35)
 #define LDS_MOTOR_PIN 21
+
+// SBC cooling fan PWM. Driven by sys_monitor's /fan_pwm (duty 0..1 from the SBC CPU
+// temperature; web UI can override). GPIO22 is free here (it's the default I2C SCL, but
+// this firmware uses no I2C). The ESP can't source fan current — drive the fan through a
+// logic-level MOSFET/transistor gated by this pin. CONFIRM the pin against your wiring.
+#define FAN_PIN       22
+// Fan duty held at boot until the SBC's sys_monitor takes over /fan_pwm (~30-60 s into
+// SBC bring-up) and kept on link loss (no watchdog stop) so cooling never silently dies.
+#define FAN_BOOT_DUTY 0.4f
 
 #define PWM_FREQ_HZ   20000
 #define PWM_RES_BITS  10
@@ -137,6 +147,7 @@ static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RAD
 #define CH_RIGHT_FWD 2
 #define CH_RIGHT_REV 3
 #define CH_LDS       4
+#define CH_FAN       5
 
 // ============================ shared cross-core state =========================
 static volatile int32_t  g_left_ticks  = 0, g_right_ticks = 0;   // encoder ISR counts (signed)
@@ -153,6 +164,7 @@ static volatile uint32_t g_last_cmd_ms = 0;
 static volatile float    g_lds_rpm = 0, g_lds_duty = 0, g_lds_hz = 0;
 static volatile uint32_t g_lds_frames = 0, g_lds_last_ms = 0;
 static volatile float    g_lds_target = LDS_TARGET_RPM;
+static volatile float    g_fan_duty = FAN_BOOT_DUTY;   // /fan_pwm 0..1 (Core0 write, Core1 apply)
 static volatile float    g_temp = 0;
 static volatile int32_t  g_hall = 0;
 static volatile bool     g_susp_l = false, g_susp_r = false;
@@ -303,6 +315,9 @@ static void led_cb(z_loaned_sample_t* sm, void*){
 static void ldstgt_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_lds_target = f>0?f:0; }
 }
+static void fan_cb(z_loaned_sample_t* sm, void*){
+  uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_fan_duty = clampf(f,0,1); }
+}
 #if LINK_RX_TIMEOUT_MS
 // /esp32_ping (Int32) from the SBC web_control node — payload ignored; arrival = link alive.
 static void ping_cb(z_loaned_sample_t*, void*){ g_last_ping_ms = millis(); g_ping_seen = true; }
@@ -322,7 +337,7 @@ static bool zenohConnect(){
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
-  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt;   // kept alive (static)
+  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan;   // kept alive (static)
   z_owned_closure_sample_t cl;
   z_view_keyexpr_t ke;
   z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
@@ -331,6 +346,9 @@ static bool zenohConnect(){
   z_view_keyexpr_from_str_unchecked(&ke, KE("led",T_BOOL));
   z_closure_sample(&cl, led_cb, NULL, NULL);
   z_declare_subscriber(z_session_loan(&s), &sub_led, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  z_view_keyexpr_from_str_unchecked(&ke, KE("fan_pwm",T_F32));
+  z_closure_sample(&cl, fan_cb, NULL, NULL);
+  z_declare_subscriber(z_session_loan(&s), &sub_fan, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
 #if LINK_RX_TIMEOUT_MS
   static z_owned_subscriber_t sub_ping;
   z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
@@ -464,6 +482,9 @@ void setup(){
   pinMode(MOTOR_STBY,OUTPUT); digitalWrite(MOTOR_STBY,HIGH);
   applyMotors(0,0);
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
+  // SBC cooling fan PWM — start at the boot duty so there's airflow before the SBC connects.
+  ledcSetup(CH_FAN,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(FAN_PIN,CH_FAN);
+  ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
 
   pinMode(LEFT_ENC,INPUT_PULLUP);  attachInterrupt(digitalPinToInterrupt(LEFT_ENC),leftEncISR,RISING);
   pinMode(RIGHT_ENC,INPUT_PULLUP); attachInterrupt(digitalPinToInterrupt(RIGHT_ENC),rightEncISR,RISING);
@@ -545,6 +566,8 @@ void loop(){   // Core 1: real-time control
     last_ctl=now;
     if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){ g_left_duty=0; g_right_duty=0; }
     applyMotors(g_left_duty, g_right_duty);
+    // Fan has NO cmd watchdog (unlike motors): cooling must persist if /cmd_vel stops.
+    ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
   }
   if (now-last_sens >= 100){                                // suspension debounce + LED @10 Hz
     last_sens=now;

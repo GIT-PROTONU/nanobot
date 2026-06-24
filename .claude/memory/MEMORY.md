@@ -20,3 +20,5 @@
 - [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
 - [TTS / speech](tts-speech.md) — robot speaks (en/de) via pico2wave in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh)
 - [Behaviour layer plan](behavior-layer-plan.md) — supervisor/reflexes "feel alive"; leaning Sismic statecharts (vs hand-rolled/YASMIN/Zenoh-Flow/SCXML); slow brain + OLED keeps fast face; NOT built yet
+- [Stack autoheal](stack-autoheal.md) — nano-heal.timer runs `stack.sh heal` every 20s to relaunch crashed nodes (idempotent do_up); gated on nano-stack.service; catches crashes not hangs
+- [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; not yet flashed/deployed

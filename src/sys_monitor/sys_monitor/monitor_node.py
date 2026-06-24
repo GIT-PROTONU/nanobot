@@ -18,6 +18,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from std_msgs.msg import Float32
 
 # Soft thresholds -> status WARN (purely advisory, shown in the UI).
 TEMP_WARN_C = 75.0
@@ -53,6 +54,17 @@ class MonitorNode(Node):
         super().__init__("sys_monitor")
         self.declare_parameter("publish_rate", 1.0)
         rate = self.get_parameter("publish_rate").value
+
+        # Cooling fan: publish a PWM duty (0..1) on /fan_pwm for the ESP32 to actuate.
+        # Auto curve ramps the fan with CPU temperature between fan_temp_min..fan_temp_max
+        # (mapped fan_min_duty..fan_max_duty). The web UI can force a fixed duty by setting
+        # fan_override >= 0 (a -1 sentinel = auto). All settable live via /set_parameters.
+        self.declare_parameter("fan_temp_min", 45.0)   # °C: fan starts ramping above this
+        self.declare_parameter("fan_temp_max", 70.0)   # °C: fan at full above this
+        self.declare_parameter("fan_min_duty", 0.0)    # duty at/below fan_temp_min
+        self.declare_parameter("fan_max_duty", 1.0)    # duty at/above fan_temp_max
+        self.declare_parameter("fan_override", -1.0)   # <0 = auto; 0..1 = forced duty
+        self.fan_pub = self.create_publisher(Float32, "/fan_pwm", 10)
 
         self.pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
         self.host = socket.gethostname()
@@ -198,6 +210,25 @@ class MonitorNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.status = [st]
         self.pub.publish(msg)
+
+        self._publish_fan(cpu_t)
+
+    def _publish_fan(self, cpu_t):
+        """Publish the cooling-fan duty (0..1) on /fan_pwm: web override if set, else a
+        linear ramp on CPU temperature. If temp is unreadable, fail safe to fan_max_duty."""
+        override = self.get_parameter("fan_override").value
+        lo_d = self.get_parameter("fan_min_duty").value
+        hi_d = self.get_parameter("fan_max_duty").value
+        if override is not None and override >= 0.0:
+            duty = override
+        elif cpu_t != cpu_t:                       # NaN: no thermal zone -> cool at full
+            duty = hi_d
+        else:
+            lo_t = self.get_parameter("fan_temp_min").value
+            hi_t = self.get_parameter("fan_temp_max").value
+            frac = 0.0 if hi_t <= lo_t else (cpu_t - lo_t) / (hi_t - lo_t)
+            duty = lo_d + max(0.0, min(1.0, frac)) * (hi_d - lo_d)
+        self.fan_pub.publish(Float32(data=float(max(0.0, min(1.0, duty)))))
 
 
 def main():
