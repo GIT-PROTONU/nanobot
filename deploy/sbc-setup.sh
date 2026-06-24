@@ -77,15 +77,21 @@ install -m 0440 "$HERE/sudoers/nano-power" /etc/sudoers.d/nano-power
 [ "$USER_NAME" = ibster ] || sed -i "s/^ibster /$USER_NAME /" /etc/sudoers.d/nano-power
 visudo -cf /etc/sudoers.d/nano-power
 
-echo "== 5/5  systemd: start the stack on boot (nano-stack.service) =="
-install -m 0644 "$HERE/systemd/nano-stack.service" /etc/systemd/system/nano-stack.service
-if [ "$USER_NAME" != ibster ]; then
-  sed -i "s|ibster|$USER_NAME|g; s|/home/ibster|$(eval echo "~$USER_NAME")|g" \
-    /etc/systemd/system/nano-stack.service
-fi
+echo "== 5/5  systemd: start the stack on boot (nano-stack.service) + autoheal (nano-heal.timer) =="
+# nano-heal.timer fires stack.sh heal every 20s; heal is idempotent (relaunches only
+# dead nodes), so it's a no-op when healthy and revives a crashed node automatically.
+for unit in nano-stack.service nano-heal.service nano-heal.timer; do
+  install -m 0644 "$HERE/systemd/$unit" "/etc/systemd/system/$unit"
+  if [ "$USER_NAME" != ibster ]; then
+    sed -i "s|ibster|$USER_NAME|g; s|/home/ibster|$(eval echo "~$USER_NAME")|g" \
+      "/etc/systemd/system/$unit"
+  fi
+done
 systemctl daemon-reload
 systemctl enable nano-stack.service
+systemctl enable nano-heal.timer
 
 echo
-echo "Done. The stack auto-starts on boot. Build first (pixi install/build), then:"
-echo "  sudo reboot   — OR start now with:  sudo systemctl start nano-stack"
+echo "Done. The stack auto-starts on boot and crashed nodes self-heal (nano-heal.timer)."
+echo "Build first (pixi install/build), then:"
+echo "  sudo reboot   — OR start now with:  sudo systemctl start nano-stack nano-heal.timer"

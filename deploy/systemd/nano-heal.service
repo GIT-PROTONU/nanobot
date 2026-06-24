@@ -1,0 +1,16 @@
+[Unit]
+Description=Nano stack autoheal (relaunch any crashed node)
+# Only heal while the stack is supposed to be up: Requisite fails this unit
+# (without starting it) if nano-stack.service isn't active, so a manual
+# `systemctl stop nano-stack` also stops healing. The timer is gated the same way.
+After=nano-stack.service
+Requisite=nano-stack.service
+
+[Service]
+# stack.sh heal == idempotent `up`: relaunches only dead nodes (pgrep-guarded),
+# a no-op when everything is alive. Oneshot — fires, heals, exits.
+Type=oneshot
+User=ibster
+WorkingDirectory=/home/ibster/Nano
+ExecStart=/home/ibster/.pixi/bin/pixi run bash scripts/stack.sh heal
+TimeoutStartSec=120

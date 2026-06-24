@@ -61,8 +61,11 @@ do_up() {
   # endpoint, and set exit_on_failure:false so a transient serial desync can't kill the
   # router. (The ESP32 firmware also disables its LDS UART so it can keep the zenoh
   # serial link fed under the rmw config's tighter transport timings.)
+  # Regenerate the router config + (re)launch zenohd ONLY when it's down. Kept inside
+  # the guard so a periodic `heal` tick (nano-heal.timer) spawns no python when healthy.
   local rcfg="$LOG/router_serial.json5"
-  python - "$rcfg" "$ESP32_UART" "$ESP32_BAUD" <<'PY'
+  pgrep -x 'zenohd-serial' >/dev/null || {
+    python - "$rcfg" "$ESP32_UART" "$ESP32_BAUD" <<'PY'
 import sys, os
 out, uart, baud = sys.argv[1], sys.argv[2], sys.argv[3]
 src = f"{os.environ['CONDA_PREFIX']}/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_ROUTER_CONFIG.json5"
@@ -72,8 +75,8 @@ new = f'    endpoints: [\n      "tcp/[::]:7447",\n      "serial/{uart}#baudrate=
 assert t.count(old) == 1, "router config listen-endpoints block not found as expected"
 open(out, "w").write(t.replace(old, new).replace("exit_on_failure: true", "exit_on_failure: false"))
 PY
-  pgrep -x 'zenohd-serial' >/dev/null \
-    || { launch zenohd "$ZENOHD_SERIAL -c $rcfg"; sleep 6; }
+    launch zenohd "$ZENOHD_SERIAL -c $rcfg"; sleep 6;
+  }
   pgrep -f 'rosbridge_websocket' >/dev/null \
     || launch rosbridge "$ros/rosbridge_server/rosbridge_websocket --ros-args -p port:=9090"
   pgrep -f 'web_control/lib/web_control' >/dev/null \
@@ -155,6 +158,11 @@ case "${1:-status}" in
   up)      echo "stack up…";      do_up;   sleep 5; status ;;
   down)    echo "stack down…";    do_down; status ;;          # do_down now blocks until gone
   restart) echo "stack restart…"; do_down; do_up; sleep 5; status ;;
+  # heal: same idempotent launch as `up`, run periodically by nano-heal.timer.
+  # do_up's pgrep guards make it a NO-OP when everything is alive (no relaunch, no
+  # output); a crashed/missing node gets relaunched and `launch` logs the one line.
+  # No trailing status/sleep so a healthy tick is silent in the journal.
+  heal)    do_up ;;
   status)  status ;;
-  *) echo "usage: $0 {up|down|restart|status}"; exit 2 ;;
+  *) echo "usage: $0 {up|down|restart|heal|status}"; exit 2 ;;
 esac
