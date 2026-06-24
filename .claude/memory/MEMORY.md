@@ -19,3 +19,4 @@
 - [CPU reduction plan](cpu-reduction-plan.md) — 3-tier idle-CPU plan (IMU device auto-rate / SLAM skip-when-stationary / OLED de-chatter), all keep sensor rates+function; nothing built yet, user to pick scope
 - [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
 - [TTS / speech](tts-speech.md) — robot speaks (en/de) via pico2wave in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh)
+- [Behaviour layer plan](behavior-layer-plan.md) — supervisor/reflexes "feel alive"; leaning Sismic statecharts (vs hand-rolled/YASMIN/Zenoh-Flow/SCXML); slow brain + OLED keeps fast face; NOT built yet
