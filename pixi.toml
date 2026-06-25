@@ -54,6 +54,10 @@ smbus2 = "*"            # I2C for the PCA9685 driver
 [pypi-dependencies]
 luma-oled = "*"         # SSD1306 OLED over I2C
 # (gpiod removed: wheel encoders now decode on the ESP32 coprocessor, not GPIO.)
+# Statechart interpreter for the behaviour layer (src/behavior). Pure-python (~5-8 MB),
+# no native build — safe on the 1 GB / 7 GB board. The behavior node degrades to a
+# no-op if it's missing, so an un-resolved board still boots the rest of the stack.
+sismic = ">=1.6"
 
 [tasks]
 # Build the colcon workspace (msgs + all python packages). See scripts/build.sh

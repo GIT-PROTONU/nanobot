@@ -29,6 +29,13 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   not launched by `stack.sh`/`robot.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
+- `behavior` — **behaviour layer (Sismic statechart)**. First node `mood_node`: an idle
+  "feel alive" presence supervisor that drives the OLED face (`/oled_face`) during true
+  idle and stands down when another owner uses the panel (motion/goal, TTS, manual web
+  mood, pick-up). **Expression-only — never publishes `/cmd_vel`.** The chart lives in
+  `presence.py` (ROS-free, unit-tested offline: `pixi run python -m pytest
+  src/behavior/test`); the node only maps topics→events. No-op if sismic is missing or
+  `behavior.enable:=false`. See the behavior-layer-plan memory.
 - `sensor_hub` — **runs `imu_driver` + `sys_monitor` + `wheel_odometry` + `lds_driver_py`
   in ONE process** (one executor) to save ~100+ MB RAM on the 1 GB board. Same node
   names/topics/params/services — purely an packaging change. `stack.sh` launches this

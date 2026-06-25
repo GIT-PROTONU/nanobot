@@ -166,6 +166,23 @@ sys_monitor:
     fan_max_duty: 1.0         # 0..1 duty at/above fan_temp_max
     fan_override: -1.0        # <0 = auto (use the curve); 0..1 = forced fixed duty
 
+# ---- Behaviour layer (Sismic statechart) ------------------------------------
+# First node of the behaviour layer: an idle "feel alive" presence supervisor. It is
+# expression-ONLY — it drives the OLED face (/oled_face) during true idle and stands
+# down (touches nothing) the moment another owner uses the panel (motion/goal, TTS
+# speech, a manual web mood, or pick-up). It NEVER publishes /cmd_vel, so it can't
+# affect motion safety; if sismic isn't installed it runs as a no-op.
+behavior:
+  ros__parameters:
+    enable: true              # false = node spins but does nothing (easy kill switch)
+    tick_rate: 4.0            # Hz the statechart is stepped (after() time resolution)
+    greet_secs: 3.0           # boot "hello" happy-face duration, then -> dashboard
+    idle_secs: 90.0           # s of continuous idle before a brief liveliness beat
+    perform_secs: 4.0         # s the liveliness "look around" beat lasts
+    motion_eps: 0.02          # |cmd_vel| above this counts as the robot moving
+    motion_hold: 1.2          # s after the last motion still counted as "active"
+    speak_timeout: 5.0        # s without an /oled_word before "not speaking" again
+
 # ---- Web control (rosbridge websocket + static page) ------------------------
 web_control:
   ros__parameters:

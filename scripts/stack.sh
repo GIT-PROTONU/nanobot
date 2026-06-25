@@ -83,6 +83,11 @@ PY
     || launch web "$own/web_control/lib/web_control/web_server --ros-args --params-file $PARAMS -p web_port:=8080 -p rosbridge_port:=9090"
   pgrep -f 'oled_display/lib/oled_display' >/dev/null \
     || launch oled "$own/oled_display/lib/oled_display/display_node --ros-args --params-file $PARAMS"
+  # Behaviour layer (Sismic statechart): idle "feel alive" presence supervisor. Drives
+  # the OLED face during true idle only; expression-only (never /cmd_vel). No-op if
+  # sismic/params disabled, so it's safe to always launch.
+  pgrep -f 'behavior/lib/behavior' >/dev/null \
+    || launch behavior "$own/behavior/lib/behavior/mood_node --ros-args --params-file $PARAMS"
   # Sensor hub: imu_driver + sys_monitor + wheel_odometry + lds_driver_py in ONE process
   # (one executor) to save ~100+ MB of RAM vs four separate interpreters on the 1 GB board.
   # Same node names/topics/params, so /odom, /diagnostics, /scan, /imu/*, the live-retune
@@ -110,6 +115,7 @@ NODE_PATS=(
   'sys_monitor/lib/sys_monitor'
   'imu_driver/lib/imu_driver'
   'oled_display/lib/oled_display'
+  'behavior/lib/behavior'
   'web_control/lib/web_control'
   'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon'
 )
@@ -148,6 +154,7 @@ do_down() {
 status() {
   for s in "zenohd:zenohd-serial" "rosbridge:rosbridge_websocket" \
            "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
+           "behavior:behavior/lib/behavior" \
            "sensors:sensor_hub/lib/sensor_hub" \
            "nav:slam_nav/lib/slam_nav"; do
     if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi

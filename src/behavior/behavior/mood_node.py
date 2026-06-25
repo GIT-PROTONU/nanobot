@@ -1,0 +1,229 @@
+"""Idle "feel alive" presence supervisor — the first node of the behaviour layer.
+
+This is the smallest genuinely-useful slice of the planned statechart behaviour
+layer (see the behavior-layer-plan memory): a **Sismic** statechart that makes the
+robot feel a little alive when it's otherwise sitting idle, by driving the OLED
+*face* (`/oled_face`). It is deliberately conservative:
+
+  * **Expression only.** It NEVER publishes `/cmd_vel` (or anything that moves the
+    robot), so it cannot affect motion safety. The worst it can ever do is show a
+    face on the OLED at the wrong moment.
+  * **It yields the panel.** The OLED face has several legitimate owners already —
+    the web UI's manual mood buttons, TTS "karaoke" words, and slam_nav's pick-up
+    reaction. This node only animates a face during *true idle* and "stands down"
+    (touches nothing) the instant any of those takes over, so it doesn't fight them.
+  * **Degrades to nothing.** If Sismic isn't importable, or the node is disabled by
+    param, it simply spins doing nothing — the rest of the stack is unaffected.
+
+The statechart (embedded below as YAML) is the slow "brain": states + timed
+transitions via Sismic's built-in ``after(...)`` guard. The node only translates raw
+ROS topics into a handful of semantic signals and decides when to stand down. This
+keeps the behaviour declarative and unit-testable in isolation (no ROS needed) —
+which is exactly why Sismic was chosen over a hand-rolled FSM.
+
+Lifecycle (single region):
+
+    greeting --after(greet_secs)--> idle_life{ resting <-> performing }
+       │                                  │
+       └────────────── standdown ─────────┴──> dormant --resume--> idle_life
+
+  * **greeting** — a brief happy face at boot ("hello"), then settle to the dashboard.
+  * **resting**  — the dashboard (face cleared). After ``idle_secs`` of continuous
+    idle, briefly come alive.
+  * **performing** — a short happy "look around" beat (``perform_secs``), then back to
+    resting. So during long idle the robot blinks to life every now and then.
+  * **dormant** — something else owns the panel (the robot is moving / has a goal, is
+    speaking, is picked up, or the web UI set a manual mood). Touch nothing until clear.
+
+Consumes (all light std/geometry msgs): `/cmd_vel`, `/goal_pose`, `/oled_word`,
+`/oled_face` (to detect a manual/foreign mood vs our own echo),
+`/left_wheel_suspended`, `/right_wheel_suspended`. Drives `/oled_face` only.
+
+The statechart itself lives in `presence.py` (ROS-free, so it's unit-testable offline:
+`pixi run python -m pytest src/behavior/test`).
+"""
+import time
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Bool, String
+from geometry_msgs.msg import Twist, PoseStamped
+
+from .presence import build_interpreter
+
+# Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
+# Import defensively so a board that hasn't run `pixi install` yet still boots the
+# rest of the stack — the node just runs as a no-op (like oled_display without luma).
+try:
+    from sismic.model import Event
+    from sismic.clock import SimulatedClock
+    HAVE_SISMIC = True
+except Exception as exc:  # pragma: no cover - depends on env
+    HAVE_SISMIC = False
+    _SISMIC_ERR = exc
+
+SELF_ECHO_WINDOW = 1.5   # s: a /oled_face equal to our own recent publish = our echo
+
+
+class MoodNode(Node):
+    def __init__(self):
+        super().__init__("behavior")
+        self.declare_parameters("", [
+            ("enable", True),
+            ("tick_rate", 4.0),       # Hz the statechart is stepped (after() resolution)
+            ("greet_secs", 3.0),      # boot "hello" face duration
+            ("idle_secs", 90.0),      # continuous idle before a liveliness beat
+            ("perform_secs", 4.0),    # liveliness beat duration
+            ("motion_eps", 0.02),     # |cmd_vel| above this counts as moving
+            ("motion_hold", 1.2),     # s after last motion still counted "active"
+            ("speak_timeout", 5.0),   # s without an /oled_word before "not speaking"
+        ])
+        g = self.get_parameter
+        self.enable = bool(g("enable").value)
+        self.tick_rate = max(1.0, float(g("tick_rate").value))
+        self.motion_eps = float(g("motion_eps").value)
+        self.motion_hold = float(g("motion_hold").value)
+        self.speak_timeout = float(g("speak_timeout").value)
+
+        # --- signals updated by callbacks, read by the tick ---
+        self._susp_l = False
+        self._susp_r = False
+        self._last_motion = -1e9       # monotonic time of last cmd_vel motion / goal
+        self._speaking = False
+        self._last_word_t = -1e9
+        self._external_active = False  # a non-empty /oled_face from someone else (web/slam)
+        # echo suppression so we don't mistake our OWN /oled_face for a foreign mood
+        self._self_face = ("", -1e9)
+        self._owns_face = False        # we currently have a non-empty face shown
+
+        self.face_pub = self.create_publisher(String, "oled_face", 10)
+
+        self._interp = None
+        if not self.enable:
+            self.get_logger().info("behavior disabled (enable:=false) — idle no-op")
+        elif not HAVE_SISMIC:
+            self.get_logger().error(
+                f"sismic unavailable: {_SISMIC_ERR} — behaviour layer is a no-op "
+                "(run `pixi install` to add it)")
+        else:
+            self._start_chart()
+
+        # Subscriptions are created regardless (cheap), but only matter once the chart
+        # is running. Faces/words/twists/switches are all small, low-rate messages.
+        self.create_subscription(Twist, "cmd_vel", self._on_cmd, 10)
+        self.create_subscription(PoseStamped, "goal_pose", self._on_goal, 5)
+        self.create_subscription(String, "oled_word", self._on_word, 10)
+        self.create_subscription(String, "oled_face", self._on_face, 10)
+        self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
+        self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
+
+        if self._interp is not None:
+            self.create_timer(1.0 / self.tick_rate, self._tick)
+
+    # --- statechart setup ----------------------------------------------------
+    def _start_chart(self):
+        try:
+            g = self.get_parameter
+            self._t0 = time.monotonic()
+            self._clock = SimulatedClock()
+            self._clock.time = 0.0
+            # build_interpreter runs the initial step, so the chart enters `greeting`
+            # and shows the boot face. Best-effort: if the OLED node isn't up yet the
+            # publish is simply lost.
+            self._interp, _ = build_interpreter(
+                self._emit_face,
+                greet_secs=float(g("greet_secs").value),
+                idle_secs=float(g("idle_secs").value),
+                perform_secs=float(g("perform_secs").value),
+                clock=self._clock)
+            self.get_logger().info("behavior up: idle 'feel alive' presence statechart")
+        except Exception as exc:
+            self._interp = None
+            self.get_logger().error(f"statechart init failed: {exc} — running as no-op")
+
+    # --- the injected face action + the node's own release path --------------
+    def _emit_face(self, mood):
+        """Publish a mood on /oled_face. Called both by the statechart (`on entry`) and
+        by the node to release the panel. Records the value so the /oled_face
+        subscription can tell our own echo from a foreign (web/slam_nav) mood."""
+        mood = str(mood)
+        self._self_face = (mood, time.monotonic())
+        self._owns_face = bool(mood)
+        self.face_pub.publish(String(data=mood))
+
+    # --- signal callbacks ----------------------------------------------------
+    def _on_cmd(self, msg: Twist):
+        if abs(msg.linear.x) > self.motion_eps or abs(msg.angular.z) > self.motion_eps:
+            self._last_motion = time.monotonic()
+
+    def _on_goal(self, _msg: PoseStamped):
+        # A new goal means the robot is about to work — treat it as activity.
+        self._last_motion = time.monotonic()
+
+    def _on_word(self, msg: String):
+        self._speaking = bool(msg.data.strip())
+        self._last_word_t = time.monotonic()
+
+    def _on_face(self, msg: String):
+        """Track whether someone ELSE is driving the face (web manual mood, or
+        slam_nav's pick-up reaction). Suppress our own echo so we don't stand down
+        from a face we set ourselves."""
+        data = msg.data
+        sf, st = self._self_face
+        if data == sf and (time.monotonic() - st) < SELF_ECHO_WINDOW:
+            return                                  # our own publish bouncing back
+        self._external_active = bool(data.strip())  # "" = the other owner released it
+
+    def _on_susp_l(self, msg: Bool):
+        self._susp_l = bool(msg.data)
+
+    def _on_susp_r(self, msg: Bool):
+        self._susp_r = bool(msg.data)
+
+    # --- the periodic statechart step ----------------------------------------
+    def _tick(self):
+        now = time.monotonic()
+        self._clock.time = now - self._t0
+
+        picked = self._susp_l and self._susp_r
+        manual = self._external_active
+        speaking = self._speaking and (now - self._last_word_t) < self.speak_timeout
+        active = (now - self._last_motion) < self.motion_hold
+        stand = picked or manual or speaking or active
+
+        try:
+            dormant = "dormant" in self._interp.configuration
+            if stand and not dormant:
+                # Hand the panel back. If we're standing down for *another writer*
+                # (pick-up / a manual web mood), stay silent — they own /oled_face and
+                # a stray "" from us would stomp their value. If it's just motion or
+                # speech (nobody else writes the face), release to the dashboard so we
+                # don't leave a stale happy face up while the robot drives/talks.
+                if (picked or manual):
+                    self._owns_face = False
+                elif self._owns_face:
+                    self._emit_face("")
+                self._interp.queue(Event("standdown"))
+            elif (not stand) and dormant:
+                self._interp.queue(Event("resume"))
+            self._interp.execute()
+        except Exception as exc:
+            # The behaviour layer must never take the process down; log + keep going.
+            self.get_logger().error(f"statechart step failed: {exc}",
+                                    throttle_duration_sec=10.0)
+
+
+def main():
+    rclpy.init()
+    node = MoodNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
