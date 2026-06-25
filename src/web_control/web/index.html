@@ -2,268 +2,457 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nano Robot · Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0e14">
+<title>Nano · Control</title>
 <!-- roslib: talks to rosbridge_server over websocket. For a fully offline robot,
      download this file into web/ and change the src to "roslib.min.js". -->
 <script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
 <style>
-  :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--txt:#c9d1d9;
-    --accent:#58a6ff;--green:#3fb950;--red:#f85149;--amber:#d29922}
+  :root{
+    --bg:#0b0e14; --surface:#141923; --surface-2:#1c2330; --border:#262d3a;
+    --txt:#d6dde8; --muted:#8b95a6;
+    --accent:#4d9fff; --accent-ink:#06131f;
+    --green:#3fb950; --red:#f0556a; --amber:#d6a429;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
   *{box-sizing:border-box}
-  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
-    font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;
+    background:var(--bg);color:var(--txt);
+    font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-tap-highlight-color:transparent}
   #app{display:flex;flex-direction:column;height:100%}
-  header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;
-    padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
-  header h1{font-size:14px;margin:0 12px 0 0;color:var(--accent)}
-  button,select,input{background:#21262d;color:var(--txt);border:1px solid var(--line);
-    border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer}
-  button:hover{border-color:var(--accent)}
-  button.primary{background:var(--accent);color:#0d1117;border-color:var(--accent);font-weight:600}
-  button.danger{background:var(--red);color:#0d1117;border-color:var(--red);font-weight:600}
+
+  /* ---------- top status bar ---------- */
+  #topbar{flex:none;display:flex;align-items:center;gap:10px;
+    padding:10px 14px;padding-top:calc(10px + env(safe-area-inset-top));
+    background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:8px;font-weight:600;letter-spacing:.12em;font-size:15px}
+  #dot{width:9px;height:9px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red);transition:.2s}
+  #dot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .status{background:transparent;border:none;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;padding:2px 4px}
   .spacer{flex:1}
-  .stat{color:#8b949e}.stat b{color:var(--txt)}
-  #dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--red);margin-right:5px}
-  #dot.ok{background:var(--green)}
-  main{flex:1;display:flex;min-height:0}
-  #wrap{flex:1;position:relative;min-width:0}
-  canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
-  canvas:active{cursor:grabbing}
-  #side{width:240px;display:flex;flex-direction:column;background:var(--panel);
-    border-left:1px solid var(--line);padding:12px;gap:14px;overflow-y:auto}
-  #side h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0}
-  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
-  .pad button{padding:14px 0;font-size:16px}
-  .pad .blank{visibility:hidden}
-  label{display:flex;justify-content:space-between;gap:8px;align-items:center}
-  .hint{color:#6e7681;font-size:11px}
-  kbd{background:#21262d;border:1px solid var(--line);border-radius:4px;padding:0 4px}
-  .imu{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;align-items:baseline}
-  .imu span{color:#8b949e}
-  .imu b{text-align:right;font-variant-numeric:tabular-nums}
+  .metrics{display:flex;gap:12px;overflow-x:auto;scrollbar-width:none;mask-image:linear-gradient(90deg,transparent,#000 12px)}
+  .metrics::-webkit-scrollbar{display:none}
+  .metrics .m{display:flex;flex-direction:column;align-items:flex-end;line-height:1.15;flex:none}
+  .metrics .m label{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.05em}
+  .metrics .m b{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px}
+
+  /* ---------- body layout ---------- */
+  #body{flex:1;display:flex;flex-direction:column;min-height:0}
+  #left{display:flex;flex-direction:column;flex:none;min-width:0}
+
+  /* hero viewport */
+  #hero{position:relative;flex:none;height:34vh;min-height:210px;background:#000;
+    border-bottom:1px solid var(--border);overflow:hidden}
+  .view{position:absolute;inset:0;display:none}
+  .view.on{display:block}
+  #wrap{position:absolute;inset:0}
+  canvas#cv{position:absolute;inset:0;width:100%;height:100%;display:block;
+    touch-action:none;cursor:grab}
+  canvas#cv:active{cursor:grabbing}
+  #mapWrap{position:absolute;inset:0;background:#000}
+  #mapWrap canvas{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+    max-width:100%;max-height:100%;image-rendering:pixelated}
+  #mapWait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    text-align:center;color:var(--muted);font-size:13px;padding:18px}
+  #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none}
+
+  #viewSwitch{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:6;
+    display:flex;gap:2px;padding:3px;border-radius:999px;
+    background:rgba(11,14,20,.66);backdrop-filter:blur(10px);border:1px solid var(--border)}
+  #viewSwitch button{border:none;background:transparent;color:var(--muted);
+    padding:6px 16px;border-radius:999px;font:inherit;font-size:12px;font-weight:500;cursor:pointer;transition:.12s}
+  #viewSwitch button.active{background:var(--accent);color:var(--accent-ink);font-weight:600}
+  .overlay-btn{position:absolute;top:10px;right:10px;z-index:6;
+    background:rgba(11,14,20,.66);backdrop-filter:blur(10px);border:1px solid var(--border);
+    color:var(--txt);border-radius:10px;padding:7px 11px;font:inherit;font-size:12px;cursor:pointer}
+
+  /* contextual controls under the hero (map / camera) */
+  #heroCtl>div{display:none;padding:12px;border-bottom:1px solid var(--border);
+    display:flex;flex-direction:column;gap:10px}
+  #ctlMap,#ctlCam{display:none!important}
+  #ctlMap.on,#ctlCam.on{display:flex!important}
+  #mapCtl{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  #mapStats{font-size:12px;color:var(--muted)}
+  #mapTestOut{white-space:pre-wrap;font-size:11px;line-height:1.4;font-family:var(--mono);
+    color:var(--muted);margin:0}
+
+  /* ---------- right column (tabs + panels) ---------- */
+  #right{flex:1;display:flex;flex-direction:column;min-height:0}
+  #tabbar{position:fixed;bottom:0;left:0;right:0;z-index:30;display:flex;
+    background:var(--surface);border-top:1px solid var(--border);
+    padding-bottom:env(safe-area-inset-bottom)}
+  #tabbar button{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+    background:transparent;border:none;color:var(--muted);
+    padding:9px 0 11px;font:inherit;font-size:11px;cursor:pointer;transition:.12s}
+  #tabbar button .ic{font-size:19px;line-height:1}
+  #tabbar button.active{color:var(--accent)}
+  #panels{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;
+    padding:12px 12px calc(80px + env(safe-area-inset-bottom));
+    display:flex;flex-direction:column;gap:12px}
+  .panel{display:none;flex-direction:column;gap:12px}
+  .panel.active{display:flex}
+
+  /* ---------- cards & controls ---------- */
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;
+    padding:14px;display:flex;flex-direction:column;gap:11px}
+  .card h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+    color:var(--muted);font-weight:600}
+
+  .btn{background:var(--surface-2);color:var(--txt);border:1px solid var(--border);
+    border-radius:11px;padding:11px 14px;font:inherit;font-weight:500;cursor:pointer;
+    transition:.12s;min-height:44px;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+  .btn:hover{border-color:var(--accent)}
+  .btn:active{transform:scale(.98)}
+  .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+  .btn.danger{background:transparent;color:var(--red);border-color:#532430}
+  .btn.danger:hover{background:var(--red);color:#fff;border-color:var(--red)}
+  .btn.big{font-size:16px;font-weight:600;padding:15px}
+
+  input[type=text],input[type=number],select{width:100%;background:var(--surface-2);
+    color:var(--txt);border:1px solid var(--border);border-radius:11px;
+    padding:11px 12px;font:inherit;min-height:44px}
+  input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  input[type=range]{width:100%;accent-color:var(--accent);height:30px}
+
+  .field{display:flex;flex-direction:column;gap:7px}
+  .field>label{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted)}
+  .field>label b,.field>label span{color:var(--txt);font-family:var(--mono)}
+  .field.inline{flex-direction:row;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+  .field.inline input{width:auto;flex:none;max-width:6em;min-height:40px}
+  .row{display:flex;gap:8px;align-items:center}
+  .grow{flex:1;min-width:0}
+  .prefix{color:var(--muted);font-family:var(--mono);font-size:13px;flex:none}
+
+  /* toggle switch */
+  .switch{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;user-select:none;min-height:40px}
+  .switch input{position:absolute;opacity:0;width:0;height:0}
+  .switch .track{flex:none;width:42px;height:25px;border-radius:13px;background:var(--surface-2);
+    border:1px solid var(--border);position:relative;transition:.16s}
+  .switch .track::after{content:"";position:absolute;top:2px;left:2px;width:19px;height:19px;
+    border-radius:50%;background:var(--muted);transition:.16s}
+  .switch input:checked+.track{background:var(--accent);border-color:var(--accent)}
+  .switch input:checked+.track::after{transform:translateX(17px);background:#fff}
+
+  /* key/value telemetry grid */
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:7px 14px;align-items:baseline;font-size:13px}
+  .kv>span{color:var(--muted)}
+  .kv>b{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
   .exp{cursor:pointer;user-select:none}
-  .cores{grid-column:1/-1;display:none;flex-direction:column;gap:4px;margin:2px 0 0 6px}
-  .core{display:grid;grid-template-columns:1.4em 1fr 2.6em;gap:6px;align-items:center}
-  .core .lbl{color:#8b949e}
-  .core .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden}
+  .cores{grid-column:1/-1;display:none;flex-direction:column;gap:6px;margin:2px 0}
+  .core{display:grid;grid-template-columns:1.7em 1fr 2.9em;gap:8px;align-items:center}
+  .core .lbl{color:var(--muted);font-size:11px}
+  .core .bar{height:7px;background:var(--surface-2);border-radius:4px;overflow:hidden}
   .core .bar i{display:block;height:100%;width:0;background:var(--green);transition:width .25s}
-  .core b{text-align:right;font-variant-numeric:tabular-nums}
-  .chk{display:flex;gap:6px;align-items:center;cursor:pointer;margin-top:2px}
-  .chk input{width:auto;cursor:pointer}
-  #cam{display:none;width:100%;border:1px solid var(--line);border-radius:6px;
-    background:#000;aspect-ratio:4/3}
+  .core b{text-align:right;font-family:var(--mono);font-size:12px}
+
+  /* mic level meter */
+  .meter{display:grid;grid-template-columns:2.2em 1fr 3em;gap:9px;align-items:center;font-size:12px}
+  .meter .lbl{color:var(--muted)}
+  .meter .bar{height:9px;background:var(--surface-2);border-radius:5px;overflow:hidden}
+  .meter .bar i{display:block;height:100%;width:0;background:var(--green);transition:background .2s}
+  .meter b{text-align:right;font-family:var(--mono)}
+
+  /* joystick */
+  .joywrap{display:flex;justify-content:center;padding:6px 0 10px}
+  #joy{width:210px;height:210px;max-width:62vw;max-height:62vw;border-radius:50%;
+    position:relative;touch-action:none;display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(circle at 50% 42%,var(--surface-2),var(--surface));
+    border:1px solid var(--border);box-shadow:inset 0 2px 30px rgba(0,0,0,.5)}
+  #joy::before{content:"";position:absolute;inset:16%;border-radius:50%;border:1px dashed var(--border)}
+  #joy::after{content:"";position:absolute;width:8px;height:8px;border-radius:50%;background:var(--border)}
+  #joyKnob{width:78px;height:78px;border-radius:50%;pointer-events:none;will-change:transform;
+    background:radial-gradient(circle at 50% 35%,#6fb2ff,var(--accent) 60%,#2f73c9);
+    box-shadow:0 8px 20px rgba(0,0,0,.55),inset 0 2px 4px rgba(255,255,255,.3)}
+
+  .hint{color:var(--muted);font-size:11.5px;line-height:1.55;margin:2px 0 0}
+  body.no-tips .hint{display:none!important}
+  kbd{background:var(--surface-2);border:1px solid var(--border);border-radius:5px;
+    padding:1px 6px;font-size:11px;font-family:var(--mono)}
+  .muted{color:var(--muted);font-size:11px}
+
+  /* ---------- desktop ---------- */
+  @media(min-width:880px){
+    #body{flex-direction:row}
+    #left{flex:1;min-width:0}
+    #hero{flex:1;height:auto}
+    #heroCtl{flex:none}
+    #right{flex:none;width:390px;border-left:1px solid var(--border)}
+    #tabbar{position:static;border-top:none;border-bottom:1px solid var(--border);padding-bottom:0}
+    #tabbar button{flex-direction:row;gap:7px;padding:13px 0;font-size:13px}
+    #tabbar button .ic{font-size:16px}
+    #panels{padding:14px}
+  }
 </style>
 </head>
-<body>
+<body class="no-tips">
 <div id="app">
-  <header>
-    <h1>NANO</h1>
-    <span class="stat"><span id="dot"></span><b id="conn">disconnected</b></span>
-    <label>ws:// <input id="host" style="width:150px"> </label>
-    <button id="connect" class="primary">Connect</button>
-    <button id="fit">Auto-fit</button>
+  <header id="topbar">
+    <span class="brand"><span id="dot"></span>NANO</span>
+    <button class="status" id="statusChip"><b id="conn">disconnected</b></button>
     <div class="spacer"></div>
-    <span class="stat">scan Hz <b id="hz">0</b></span>
-    <span class="stat">pts <b id="pts">0</b></span>
-    <span class="stat">x <b id="px">0</b></span>
-    <span class="stat">y <b id="py">0</b></span>
-    <span class="stat">θ <b id="pth">0</b></span>
-  </header>
-  <main>
-    <div id="wrap"><canvas id="cv"></canvas></div>
-    <div id="side">
-      <h2>Map</h2>
-      <label class="chk"><input type="checkbox" id="mapOn"> show map</label>
-      <div id="mapWrap" style="display:none;background:#000;border-radius:6px;overflow:hidden;position:relative;min-height:64px">
-        <canvas id="mapcv" style="width:100%;display:block;image-rendering:pixelated"></canvas>
-        <div id="mapWait" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9aa;font-size:13px;text-align:center;padding:10px">waiting for map… is the lidar spinning?<br>(set <b>LDS&nbsp;target</b> &gt; 0 rpm below)</div>
-      </div>
-      <div id="mapCtl" style="display:none;gap:6px;margin-top:6px;grid-template-columns:1fr 1fr">
-        <label class="chk"><input type="checkbox" id="mapMotion"> enable motion</label>
-        <button id="mapStop" class="danger">■ Stop</button>
-        <label class="chk"><input type="checkbox" id="mapExplore"> auto-explore</label>
-        <button id="mapHome">⌂ Go home</button>
-        <button id="mapSave">💾 Save map</button>
-        <button id="mapTest">🔧 Self-test</button>
-      </div>
-      <div id="mapStats" class="hint" style="display:none;margin-top:4px"></div>
-      <pre id="mapTestOut" class="hint" style="display:none;white-space:pre-wrap;margin-top:4px;font-size:11px;line-height:1.4"></pre>
-      <p class="hint" id="mapHint" style="display:none">2D occupancy map from
-        <b>slam_nav</b> (/scan + /odom + IMU yaw, scan-to-map matched), served raw from
-        <b>/dev/shm</b> via <b>/map</b>. Polls only while shown. <b>Click the map to set a
-        goal</b> — the green path is the plan (<b>/plan</b>). It only drives when
-        <b>enable motion</b> is on (else it just plans). Red = robot, yellow = goal,
-        cyan = where it's been, ⌂ = home. <b>Auto-explore</b> drives to unmapped frontiers;
-        <b>Save map</b> persists it (needs <code>map_store</code> set).</p>
-      <h2>Camera</h2>
-      <label class="chk"><input type="checkbox" id="camOn"> show webcam</label>
-      <img id="cam" alt="">
-      <p class="hint" id="camHint" style="display:none">USB webcam MJPEG
-        (<b>/stream.mjpg</b>). Streams only while shown.</p>
-      <h2>Mic</h2>
-      <label class="chk"><input type="checkbox" id="micOn"> listen
-        <span id="micState" class="hint"></span></label>
-      <div class="core" style="margin-top:4px">
-        <span class="lbl">in</span><span class="bar"><i id="micBar"></i></span><b id="micPct">–</b>
-      </div>
-      <p class="hint">Webcam microphone, raw PCM (<b>/audio.pcm</b>). Captures only
-        while listening; bar shows the input level.</p>
-      <h2>Teleop</h2>
-      <div class="pad">
-        <span class="blank"></span>
-        <button data-v="1"  data-w="0">▲</button>
-        <span class="blank"></span>
-        <button data-v="0"  data-w="1">◀</button>
-        <button id="stop" class="danger">■</button>
-        <button data-v="0"  data-w="-1">▶</button>
-        <span class="blank"></span>
-        <button data-v="-1" data-w="0">▼</button>
-        <span class="blank"></span>
-      </div>
-      <label>Max linear <span id="linv">0.25</span> m/s</label>
-      <input id="lin" type="range" min="0.05" max="0.4" step="0.01" value="0.25">
-      <label>Max angular <span id="angv">1.5</span> rad/s</label>
-      <input id="ang" type="range" min="0.2" max="3.0" step="0.1" value="1.5">
-      <h2>Speech</h2>
-      <label style="flex-direction:column;align-items:stretch;gap:6px">
-        <input id="oledText" type="text" maxlength="300" placeholder="text to speak…">
-        <select id="ttsVoice">
-          <option value="en-US">English (US)</option>
-          <option value="en-GB">English (UK)</option>
-          <option value="de-DE">German</option>
-        </select>
-        <div style="display:flex;gap:6px">
-          <button id="oledSend" class="primary" style="flex:1">Speak</button>
-          <button id="ttsStop">Stop</button>
-        </div>
-      </label>
-      <label>Volume <span id="ttsVolV">100</span>%</label>
-      <input id="ttsVol" type="range" min="0" max="100" step="5" value="100">
-      <label>Speed <span id="ttsSpeedV">100</span>%</label>
-      <input id="ttsSpeed" type="range" min="50" max="200" step="5" value="100">
-      <label>Pitch <span id="ttsPitchV">100</span>%</label>
-      <input id="ttsPitch" type="range" min="50" max="200" step="5" value="100">
-      <p class="hint">Speaks the text aloud (SVOX Pico TTS) and karaokes it onto the
-        OLED — each word shows as it's said, so a long line doesn't need to fit the
-        small screen. Voice = English / German; all settings persist across a reboot.
-        <b>Volume</b> trims the synthesis (100% = cleanest, no clipping) — for overall
-        <i>loudness</i> use the speaker's hardware mixer. <kbd>Enter</kbd> speaks.</p>
-      <label><input id="announceOn" type="checkbox"> Speak system stats every
-        <input id="announceInterval" type="number" min="5" max="3600" step="5" value="30"
-          style="width:5em"> s</label>
-      <button id="announceSay">Say stats now</button>
-      <p class="hint">Announces CPU&nbsp;%, RAM&nbsp;% and CPU temperature on a timer.
-        Runs in the robot (web_control), so it <b>keeps going after you close this
-        page</b> and survives a reboot. Uses the selected voice/volume/speed/pitch.</p>
-      <label><input id="faceOn" type="checkbox"> Face / eye animation</label>
-      <label>Mood
-        <select id="faceMood">
-          <option value="happy">Happy</option>
-          <option value="angry">Angry</option>
-          <option value="focused">Focused</option>
-          <option value="stress">Stress test (max load)</option>
-        </select>
-      </label>
-      <p class="hint">Publishes the mood on <b>/oled_face</b> (empty = dashboard). The
-        eyes blink &amp; glance at random so it never looks like a loop; frames are
-        only sent on change, so idle eyes cost ~no CPU.</p>
-      <h2>IMU</h2>
-      <div class="imu">
-        <span>roll</span><b id="imuR">–</b>
-        <span>pitch</span><b id="imuP">–</b>
-        <span>yaw</span><b id="imuY">–</b>
-        <span>|accel|</span><b id="imuA">–</b>
-        <span>|gyro|</span><b id="imuG">–</b>
-        <span>rate</span><b id="imuHz">–</b>
-      </div>
-      <label>Publish rate <span id="imuRateV">100</span> Hz</label>
-      <input id="imuRate" type="range" min="1" max="200" step="1" value="100">
-      <p class="hint">BWT901CL. Readout from the light <b>/imu/web</b> + <b>/imu/euler</b>
-        summaries. Slider retunes the <b>/imu/data</b> publish rate live (default 100 Hz,
-        max 200); the device stream rate auto-follows. Angles °, accel m/s², gyro °/s.</p>
-      <h2>System</h2>
-      <div class="imu">
-        <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
-        <div class="cores" id="sysCores"></div>
-        <span>load</span><b id="sysLoad">–</b>
-        <span>mem</span><b id="sysMem">–</b>
-        <span>temp</span><b id="sysTemp">–</b>
-        <span>disk</span><b id="sysDisk">–</b>
-        <span>wifi</span><b id="sysWifi">–</b>
-        <span>uptime</span><b id="sysUp">–</b>
-      </div>
-      <p class="hint">Board health from <b>/diagnostics</b> (sys_monitor), 1 Hz.
-        <b>wifi</b> = signal strength (green ≥ −60 dBm, amber ≥ −75, red below).</p>
-      <h2>Fan</h2>
-      <div class="imu">
-        <span>output</span><b id="fanDuty">–</b>
-        <span>mode</span><b id="fanMode">auto</b>
-      </div>
-      <label><input type="checkbox" id="fanAuto" checked> Auto (track CPU temp)</label>
-      <label>Override <span id="fanOvV">50</span> %</label>
-      <input id="fanOv" type="range" min="0" max="100" step="5" value="50" disabled>
-      <p class="hint">SBC cooling fan PWM on the ESP32 (<b>/fan_pwm</b>). In <b>Auto</b> the
-        speed ramps with CPU temperature (<b>sys_monitor</b>); uncheck to force a fixed
-        speed (sets <b>fan_override</b>).</p>
-      <h2>LDS</h2>
-      <div class="imu">
-        <span>rate</span><b id="ldsHz">–</b>
-        <span>points</span><b id="ldsPts">–</b>
-      </div>
-      <label>Publish rate <span id="ldsRateV">10</span> Hz</label>
-      <input id="ldsRate" type="range" min="1" max="10" step="1" value="10">
-      <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider caps
-        (decimates) it lower.</p>
-      <h2>Coprocessor (ESP32)</h2>
-      <div class="imu">
-        <span>link</span><b id="espHb">–</b>
-        <span>ticks L/R</span><b id="espTicks">–</b>
-        <span>tick rate</span><b id="espTickHz">–</b>
-        <span>L wheel</span><b id="espSuspL">–</b>
-        <span>R wheel</span><b id="espSuspR">–</b>
-        <span>temp</span><b id="espTemp">–</b>
-        <span>hall</span><b id="espHall">–</b>
-        <span>LDS spin</span><b id="espLdsRpm">–</b>
-        <span>LDS frames</span><b id="espLdsHz">–</b>
-        <span>LDS duty</span><b id="espLdsDuty">–</b>
-      </div>
-      <label>LDS target <span id="ldsTgtV">300</span> rpm</label>
-      <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300">
-      <p class="hint">Live values from the ESP32 coprocessor (native zenoh-pico over UART):
-        <b>/wheel_ticks</b>, <b>/left|right_wheel_suspended</b>, <b>/esp32_temp</b>,
-        <b>/esp32_hall</b>, <b>/lds_rpm</b>, <b>/lds_hz</b>, <b>/lds_duty</b>,
-        <b>/esp32_heartbeat</b>. Slider publishes <b>std_msgs/Float32</b> on
-        <b>/lds_target_rpm</b> (PID spin-speed setpoint).</p>
-      <h2>Odometry</h2>
-      <div class="imu">
-        <span>x</span><b id="odoX">–</b>
-        <span>y</span><b id="odoY">–</b>
-        <span>θ</span><b id="odoTh">–</b>
-      </div>
-      <label>Publish rate <span id="odoRateV">15</span> Hz</label>
-      <input id="odoRate" type="range" min="1" max="50" step="1" value="15">
-      <p class="hint"><b>/odom</b> + TF from <b>wheel_odometry</b>. Slider retunes the
-        node publish rate live (lower = less SBC CPU).</p>
-      <h2>View</h2>
-      <label>Max range <input id="maxr" type="number" value="6" step="0.5" style="width:70px"> m</label>
-      <p class="hint">Drive with the pad or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> /
-        arrow keys (hold). Release or <kbd>Space</kbd> = stop. Scroll = zoom, drag = pan.
-        Publishes <b>geometry_msgs/Twist</b> on <b>/cmd_vel</b>; subscribes
-        <b>sensor_msgs/LaserScan</b> on <b>/scan</b>.</p>
-      <h2>Power</h2>
-      <div style="display:grid;gap:6px">
-        <button id="btnReset">↻ Reset stack</button>
-        <button id="btnReboot" class="danger">⟳ Restart SBC</button>
-        <button id="btnShutdown" class="danger">⏻ Shutdown SBC</button>
-      </div>
-      <p class="hint">Reset restarts the ROS stack (the page reconnects in a few
-        seconds). Restart SBC reboots the whole board — the page reconnects once it
-        boots back up. Shutdown powers off the board — you then power it back on
-        by hand.</p>
+    <div class="metrics">
+      <span class="m"><label>x</label><b id="px">0</b></span>
+      <span class="m"><label>y</label><b id="py">0</b></span>
+      <span class="m"><label>θ</label><b id="pth">0</b></span>
+      <span class="m"><label>scan Hz</label><b id="hz">0</b></span>
+      <span class="m"><label>pts</label><b id="pts">0</b></span>
     </div>
-  </main>
+  </header>
+
+  <div id="body">
+    <section id="left">
+      <div id="hero">
+        <div id="view-lidar" class="view on">
+          <div id="wrap"><canvas id="cv"></canvas></div>
+          <button id="fit" class="overlay-btn">⤢ Fit</button>
+        </div>
+        <div id="view-map" class="view">
+          <div id="mapWrap">
+            <canvas id="mapcv"></canvas>
+            <div id="mapWait">waiting for map… is the lidar spinning?<br>
+              (set <b>LDS target</b> &gt; 0 rpm in <b>Sensors</b>)</div>
+          </div>
+        </div>
+        <div id="view-cam" class="view">
+          <img id="cam" alt="">
+        </div>
+        <div id="viewSwitch">
+          <button data-view="lidar" class="active">Lidar</button>
+          <button data-view="map">Map</button>
+          <button data-view="cam">Camera</button>
+        </div>
+      </div>
+
+      <div id="heroCtl">
+        <div id="ctlMap">
+          <!-- hidden checkbox driven by the view switcher; keeps the old map handler -->
+          <input type="checkbox" id="mapOn" hidden>
+          <div id="mapCtl">
+            <label class="switch"><input type="checkbox" id="mapMotion"><span class="track"></span> Motion</label>
+            <button id="mapStop" class="btn danger">■ Stop</button>
+            <label class="switch"><input type="checkbox" id="mapExplore"><span class="track"></span> Auto-explore</label>
+            <button id="mapHome" class="btn">⌂ Go home</button>
+            <button id="mapSave" class="btn">💾 Save map</button>
+            <button id="mapTest" class="btn">🔧 Self-test</button>
+          </div>
+          <div id="mapStats"></div>
+          <pre id="mapTestOut" style="display:none"></pre>
+          <p class="hint" id="mapHint" style="display:none">2D occupancy map from
+            <b>slam_nav</b>, served raw from <b>/dev/shm</b>. <b>Tap the map to set a goal</b> —
+            the green line is the plan. It only drives when <b>Motion</b> is on (else it just
+            plans). Red = robot, yellow = goal, cyan = trail, ⌂ = home. <b>Auto-explore</b>
+            drives to unmapped frontiers; <b>Save map</b> persists it.</p>
+        </div>
+        <div id="ctlCam">
+          <!-- hidden checkbox driven by the view switcher; keeps the old camera handler -->
+          <input type="checkbox" id="camOn" hidden>
+          <label class="switch"><input type="checkbox" id="micOn"><span class="track"></span>
+            Listen <span id="micState" class="muted"></span></label>
+          <div class="meter"><span class="lbl">in</span><span class="bar"><i id="micBar"></i></span><b id="micPct">–</b></div>
+          <p class="hint" id="camHint" style="display:none">USB webcam MJPEG (<b>/stream.mjpg</b>)
+            and the webcam mic as raw PCM (<b>/audio.pcm</b>). Both stream only while open.</p>
+        </div>
+      </div>
+    </section>
+
+    <aside id="right">
+      <nav id="tabbar">
+        <button data-tab="drive" class="active"><span class="ic">🕹</span>Drive</button>
+        <button data-tab="speak"><span class="ic">💬</span>Speak</button>
+        <button data-tab="sensors"><span class="ic">📊</span>Sensors</button>
+        <button data-tab="system"><span class="ic">⚙️</span>System</button>
+      </nav>
+      <div id="panels">
+
+        <!-- ===== DRIVE ===== -->
+        <section id="panel-drive" class="panel active">
+          <div class="card">
+            <h2>Drive</h2>
+            <div class="joywrap"><div id="joy"><div id="joyKnob"></div></div></div>
+            <button id="stop" class="btn danger big">■ STOP</button>
+            <div class="field"><label>Max speed <span id="linv">0.25</span> m/s</label>
+              <input id="lin" type="range" min="0.05" max="0.4" step="0.01" value="0.25"></div>
+            <div class="field"><label>Max turn <span id="angv">1.5</span> rad/s</label>
+              <input id="ang" type="range" min="0.2" max="3.0" step="0.1" value="1.5"></div>
+            <p class="hint">Drag the joystick to drive (speed scales with how far you push),
+              or use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrow keys on a keyboard.
+              Release or <kbd>Space</kbd> stops. Publishes <b>/cmd_vel</b>.</p>
+          </div>
+        </section>
+
+        <!-- ===== SPEAK ===== -->
+        <section id="panel-speak" class="panel">
+          <div class="card">
+            <h2>Text to speech</h2>
+            <input id="oledText" type="text" maxlength="300" placeholder="Type something to say…">
+            <select id="ttsVoice">
+              <option value="en-US">English (US)</option>
+              <option value="en-GB">English (UK)</option>
+              <option value="de-DE">German</option>
+            </select>
+            <div class="row">
+              <button id="oledSend" class="btn primary grow">▶ Speak</button>
+              <button id="ttsStop" class="btn">Stop</button>
+            </div>
+            <div class="field"><label>Volume <span id="ttsVolV">100</span>%</label>
+              <input id="ttsVol" type="range" min="0" max="100" step="5" value="100"></div>
+            <div class="field"><label>Speed <span id="ttsSpeedV">100</span>%</label>
+              <input id="ttsSpeed" type="range" min="50" max="200" step="5" value="100"></div>
+            <div class="field"><label>Pitch <span id="ttsPitchV">100</span>%</label>
+              <input id="ttsPitch" type="range" min="50" max="200" step="5" value="100"></div>
+            <p class="hint">Speaks aloud (SVOX Pico) and karaokes each word onto the OLED.
+              English / German only; all settings persist across a reboot. <b>Volume</b> trims the
+              synthesis (100% = cleanest) — for loudness use the speaker's hardware mixer.
+              <kbd>Enter</kbd> speaks.</p>
+          </div>
+          <div class="card">
+            <h2>Announce</h2>
+            <label class="switch"><input type="checkbox" id="announceOn"><span class="track"></span>
+              Speak system stats</label>
+            <div class="field inline">every <input id="announceInterval" type="number" min="5" max="3600"
+              step="5" value="30"> s</div>
+            <button id="announceSay" class="btn">Say stats now</button>
+            <p class="hint">Announces CPU&nbsp;%, RAM&nbsp;% and CPU temp on a timer. Runs in the
+              robot, so it <b>keeps going after you close this page</b> and survives a reboot.</p>
+          </div>
+          <div class="card">
+            <h2>Face</h2>
+            <label class="switch"><input type="checkbox" id="faceOn"><span class="track"></span>
+              Eye animation</label>
+            <div class="field"><label>Mood</label>
+              <select id="faceMood">
+                <option value="happy">Happy</option>
+                <option value="angry">Angry</option>
+                <option value="focused">Focused</option>
+                <option value="stress">Stress test (max load)</option>
+              </select></div>
+            <p class="hint">Publishes the mood on <b>/oled_face</b> (off = dashboard). Eyes blink &amp;
+              glance at random; frames are only sent on change, so idle eyes cost ~no CPU.</p>
+          </div>
+        </section>
+
+        <!-- ===== SENSORS ===== -->
+        <section id="panel-sensors" class="panel">
+          <div class="card">
+            <h2>System health</h2>
+            <div class="kv">
+              <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
+              <div class="cores" id="sysCores"></div>
+              <span>load</span><b id="sysLoad">–</b>
+              <span>memory</span><b id="sysMem">–</b>
+              <span>temp</span><b id="sysTemp">–</b>
+              <span>disk</span><b id="sysDisk">–</b>
+              <span>wifi</span><b id="sysWifi">–</b>
+              <span>uptime</span><b id="sysUp">–</b>
+            </div>
+            <p class="hint">Board health from <b>/diagnostics</b>, 1 Hz. Tap <b>CPU</b> for per-core.
+              <b>wifi</b> = signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
+          </div>
+          <div class="card">
+            <h2>IMU</h2>
+            <div class="kv">
+              <span>roll</span><b id="imuR">–</b>
+              <span>pitch</span><b id="imuP">–</b>
+              <span>yaw</span><b id="imuY">–</b>
+              <span>|accel|</span><b id="imuA">–</b>
+              <span>|gyro|</span><b id="imuG">–</b>
+              <span>rate</span><b id="imuHz">–</b>
+            </div>
+            <div class="field"><label>Publish rate <span id="imuRateV">100</span> Hz</label>
+              <input id="imuRate" type="range" min="1" max="200" step="1" value="100"></div>
+            <p class="hint">BWT901CL via <b>/imu/web</b> + <b>/imu/euler</b>. Slider retunes the
+              <b>/imu/data</b> rate live (device stream auto-follows). Angles °, accel m/s², gyro °/s.</p>
+          </div>
+          <div class="card">
+            <h2>Odometry</h2>
+            <div class="kv">
+              <span>x</span><b id="odoX">–</b>
+              <span>y</span><b id="odoY">–</b>
+              <span>θ</span><b id="odoTh">–</b>
+            </div>
+            <div class="field"><label>Publish rate <span id="odoRateV">15</span> Hz</label>
+              <input id="odoRate" type="range" min="1" max="50" step="1" value="15"></div>
+            <p class="hint"><b>/odom</b> + TF from <b>wheel_odometry</b>. Lower rate = less CPU.</p>
+          </div>
+          <div class="card">
+            <h2>Lidar (LDS)</h2>
+            <div class="kv">
+              <span>rate</span><b id="ldsHz">–</b>
+              <span>points</span><b id="ldsPts">–</b>
+            </div>
+            <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
+              <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
+            <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.</p>
+          </div>
+          <div class="card">
+            <h2>Cooling fan</h2>
+            <div class="kv">
+              <span>output</span><b id="fanDuty">–</b>
+              <span>mode</span><b id="fanMode">auto</b>
+            </div>
+            <label class="switch"><input type="checkbox" id="fanAuto" checked><span class="track"></span>
+              Auto (track CPU temp)</label>
+            <div class="field"><label>Override <span id="fanOvV">50</span> %</label>
+              <input id="fanOv" type="range" min="0" max="100" step="5" value="50" disabled></div>
+            <p class="hint">SBC fan PWM on the ESP32 (<b>/fan_pwm</b>). Auto ramps with CPU temp;
+              turn it off to force a fixed speed.</p>
+          </div>
+          <div class="card">
+            <h2>Coprocessor (ESP32)</h2>
+            <div class="kv">
+              <span>link</span><b id="espHb">–</b>
+              <span>ticks L/R</span><b id="espTicks">–</b>
+              <span>tick rate</span><b id="espTickHz">–</b>
+              <span>L wheel</span><b id="espSuspL">–</b>
+              <span>R wheel</span><b id="espSuspR">–</b>
+              <span>temp</span><b id="espTemp">–</b>
+              <span>hall</span><b id="espHall">–</b>
+              <span>LDS spin</span><b id="espLdsRpm">–</b>
+              <span>LDS frames</span><b id="espLdsHz">–</b>
+              <span>LDS duty</span><b id="espLdsDuty">–</b>
+            </div>
+            <div class="field"><label>LDS target <span id="ldsTgtV">300</span> rpm</label>
+              <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
+            <p class="hint">Live from the ESP32 (zenoh-pico over UART). Slider publishes
+              <b>/lds_target_rpm</b> (PID spin setpoint).</p>
+          </div>
+        </section>
+
+        <!-- ===== SYSTEM ===== -->
+        <section id="panel-system" class="panel">
+          <div class="card">
+            <h2>Connection</h2>
+            <div class="field"><label>rosbridge</label>
+              <div class="row"><span class="prefix">ws://</span><input id="host" class="grow"></div></div>
+            <button id="connect" class="btn primary">Connect</button>
+            <p class="hint">rosbridge websocket. The page auto-connects on load and reconnects
+              after a stack reset / reboot.</p>
+          </div>
+          <div class="card">
+            <h2>View</h2>
+            <div class="field inline">Max lidar range
+              <input id="maxr" type="number" value="6" step="0.5"> m</div>
+            <label class="switch"><input type="checkbox" id="tipsOn"><span class="track"></span>
+              Show tips &amp; help text</label>
+            <p class="hint">On the Lidar view: scroll / pinch to zoom, drag to pan, <b>Fit</b> recentres.</p>
+          </div>
+          <div class="card">
+            <h2>Power</h2>
+            <button id="btnReset" class="btn">↻ Reset stack</button>
+            <button id="btnReboot" class="btn danger">⟳ Restart SBC</button>
+            <button id="btnShutdown" class="btn danger">⏻ Shutdown SBC</button>
+            <p class="hint">Reset restarts the ROS stack (reconnects in a few seconds). Restart
+              reboots the board. Shutdown powers it off — you then power it back on by hand.</p>
+          </div>
+        </section>
+
+      </div>
+    </aside>
+  </div>
 </div>
+
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
@@ -752,16 +941,6 @@ function publishCmd(){
     angular:{x:0,y:0,z:curW*Number($("ang").value)}}));
 }
 setInterval(()=>{ if(connected && (curV||curW)) publishCmd(); },100); // 10 Hz while moving
-
-// pad buttons: press-and-hold
-document.querySelectorAll(".pad button[data-v]").forEach(btn=>{
-  const v=Number(btn.dataset.v), w=Number(btn.dataset.w);
-  const down=e=>{e.preventDefault();setCmd(v,w);publishCmd();};
-  const up  =e=>{e.preventDefault();setCmd(0,0);publishCmd();};
-  btn.addEventListener("pointerdown",down);
-  btn.addEventListener("pointerup",up);
-  btn.addEventListener("pointerleave",up);
-});
 $("stop").onclick=()=>{setCmd(0,0);publishCmd();};
 
 // keyboard
@@ -792,16 +971,16 @@ new ResizeObserver(resize).observe($("wrap"));
 function draw(){
   const w=cv.clientWidth,h=cv.clientHeight; ctx.clearRect(0,0,w,h);
   const cx=w/2+panX, cy=h/2+panY;
-  ctx.strokeStyle="#21262d"; ctx.fillStyle="#484f58";
+  ctx.strokeStyle="#1c2330"; ctx.fillStyle="#3a4150";
   for(let r=1;r<=8;r++){ctx.beginPath();ctx.arc(cx,cy,r*scale,0,7);ctx.stroke();}
-  ctx.strokeStyle="#30363d";ctx.beginPath();
+  ctx.strokeStyle="#262d3a";ctx.beginPath();
   ctx.moveTo(0,cy);ctx.lineTo(w,cy);ctx.moveTo(cx,0);ctx.lineTo(cx,h);ctx.stroke();
-  ctx.fillStyle="#6e7681";ctx.fillText("rings = 1 m",8,h-8);
+  ctx.fillStyle="#6e7681";ctx.font="11px system-ui,sans-serif";ctx.fillText("rings = 1 m",10,h-10);
   // robot heading +x is to the right; draw a little nose
-  ctx.fillStyle="#f85149";ctx.beginPath();ctx.arc(cx,cy,5,0,7);ctx.fill();
-  ctx.strokeStyle="#f85149";ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+14,cy);ctx.stroke();
+  ctx.fillStyle="#f0556a";ctx.beginPath();ctx.arc(cx,cy,5,0,7);ctx.fill();
+  ctx.strokeStyle="#f0556a";ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+14,cy);ctx.stroke();
   // points: ROS x forward (up on screen), y left
-  ctx.fillStyle="#58a6ff";
+  ctx.fillStyle="#4d9fff";
   for(const p of frame){ const X=cx-p.y*scale, Y=cy-p.x*scale; ctx.fillRect(X-1.5,Y-1.5,3,3); }
   requestAnimationFrame(draw);
 }
@@ -819,12 +998,13 @@ cv.addEventListener("pointerup",()=>dragging=false);
 resize(); requestAnimationFrame(draw);
 connect();   // auto-connect on load
 </script>
+
 <script>
-// ---- SLAM map panel (Stage 1) ------------------------------------------------
+// ---- SLAM map panel ----------------------------------------------------------
 // Self-contained, pure HTTP: poll the raw occupancy map from /map (same-origin,
 // written by slam_nav to /dev/shm) and render it — no rosbridge involved. The map
 // file is a JSON metadata line, '\n', then raw int8 occupancy (-1 unknown, 0 free ..
-// 100 occupied; row 0 = origin_y). Stage 2 hooks canvas clicks -> /goal_pose.
+// 100 occupied; row 0 = origin_y). Canvas clicks -> /goal_pose.
 (function(){
   "use strict";
   const $=id=>document.getElementById(id);
@@ -904,8 +1084,6 @@ connect();   // auto-connect on load
 
   $("mapOn").addEventListener("change",e=>{
     const on=e.target.checked;
-    $("mapWrap").style.display=on?"block":"none";
-    $("mapCtl").style.display=on?"grid":"none";
     $("mapStats").style.display=on?"block":"none";
     $("mapHint").style.display=on?"block":"none";
     if(on){
@@ -928,7 +1106,7 @@ connect();   // auto-connect on load
   $("mapHome").addEventListener("click",()=>{ if(homeTopic) homeTopic.publish(new ROSLIB.Message({data:true})); });
   $("mapSave").addEventListener("click",()=>{ if(saveTopic) saveTopic.publish(new ROSLIB.Message({data:true})); });
   $("mapTest").addEventListener("click",()=>{
-    if(!$("mapMotion").checked){ alert("Enable motion first — the self-test drives the robot."); return; }
+    if(!$("mapMotion").checked){ alert("Enable Motion first — the self-test drives the robot."); return; }
     if(!confirm("Run the calibration self-test?\nThe robot will drive forward, back, then spin in place.")) return;
     const el=$("mapTestOut"); el.style.display="block"; el.textContent="running self-test…";
     if(testTopic) testTopic.publish(new ROSLIB.Message({data:true}));
@@ -939,6 +1117,83 @@ connect();   // auto-connect on load
     if(cmdTopic) cmdTopic.publish(new ROSLIB.Message(
       {linear:{x:0,y:0,z:0},angular:{x:0,y:0,z:0}}));   // belt-and-braces halt
   });
+})();
+</script>
+
+<script>
+// ---- UI chrome: bottom tabs, hero view switcher, tips, virtual joystick ------
+(function(){
+  "use strict";
+  const $=id=>document.getElementById(id);
+
+  // bottom tab bar -> show one panel
+  function showTab(name){
+    document.querySelectorAll("#tabbar button").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
+    document.querySelectorAll(".panel").forEach(p=>p.classList.toggle("active",p.id==="panel-"+name));
+  }
+  document.querySelectorAll("#tabbar button").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+  $("statusChip").onclick=()=>showTab("system");
+
+  // hero view switcher: Lidar / Map / Camera. Reuses the existing (now hidden)
+  // mapOn / camOn checkboxes — flipping them runs the original start/stop handlers.
+  function setChk(id,val){ const el=$(id); if(el && el.checked!==val){ el.checked=val; el.dispatchEvent(new Event("change")); } }
+  function showView(name){
+    document.querySelectorAll("#viewSwitch button").forEach(b=>b.classList.toggle("active",b.dataset.view===name));
+    $("view-lidar").classList.toggle("on",name==="lidar");
+    $("view-map").classList.toggle("on",name==="map");
+    $("view-cam").classList.toggle("on",name==="cam");
+    $("ctlMap").classList.toggle("on",name==="map");
+    $("ctlCam").classList.toggle("on",name==="cam");
+    setChk("mapOn",name==="map");
+    setChk("camOn",name==="cam");
+  }
+  document.querySelectorAll("#viewSwitch button").forEach(b=>b.onclick=()=>showView(b.dataset.view));
+
+  // tips: hide all the explanatory help text by default for a cleaner UI
+  $("tipsOn").onchange=()=>document.body.classList.toggle("no-tips",!$("tipsOn").checked);
+
+  // virtual joystick -> analog setCmd(v,w). Push forward = +v, push left = +w
+  // (matches the keyboard mapping). Speed scales with how far it's pushed; the
+  // global 10 Hz publisher keeps streaming /cmd_vel while it's held off-centre.
+  (function(){
+    const joy=$("joy"), knob=$("joyKnob"); if(!joy) return;
+    let id=null, cx=0, cy=0, R=60;
+    const begin=e=>{
+      id=e.pointerId;
+      const jr=joy.getBoundingClientRect(), kr=knob.getBoundingClientRect();
+      cx=jr.left+jr.width/2; cy=jr.top+jr.height/2; R=(jr.width-kr.width)/2;
+      joy.setPointerCapture(id); move(e); e.preventDefault();
+    };
+    const move=e=>{
+      if(e.pointerId!==id) return;
+      let dx=e.clientX-cx, dy=e.clientY-cy; const d=Math.hypot(dx,dy);
+      if(d>R){ dx*=R/d; dy*=R/d; }
+      knob.style.transform=`translate(${dx}px,${dy}px)`;
+      setCmd(-dy/R, -dx/R); publishCmd();      // up = forward, left = +yaw
+    };
+    const end=e=>{
+      if(e.pointerId!==id) return; id=null;
+      knob.style.transform="translate(0,0)"; setCmd(0,0); publishCmd();
+    };
+    joy.addEventListener("pointerdown",begin);
+    joy.addEventListener("pointermove",move);
+    joy.addEventListener("pointerup",end);
+    joy.addEventListener("pointercancel",end);
+
+    // Mirror every command source on the knob, so keyboard (WASD / arrows) visibly
+    // drives it too. Both inputs funnel through the global setCmd(v,w); wrap it to
+    // reposition the knob — skip while a finger is dragging (move() already owns it).
+    const curR=()=>{ const jr=joy.getBoundingClientRect(), kr=knob.getBoundingClientRect();
+      return (jr.width-kr.width)/2 || R; };
+    function place(v,w){ const r=curR(); let x=-w*r, y=-v*r; const d=Math.hypot(x,y);
+      if(d>r){ x*=r/d; y*=r/d; } knob.style.transform=`translate(${x}px,${y}px)`; }
+    const baseSet=setCmd;
+    setCmd=(v,w)=>{ baseSet(v,w); if(id===null) place(v,w); };
+  })();
+
+  // initial UI state
+  showTab("drive");
+  showView("lidar");
 })();
 </script>
 </body>
