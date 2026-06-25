@@ -9,6 +9,15 @@ running **Armbian**, with **ROS 2 Humble** installed as conda packages via
 (chosen for low RAM; needs `rmw_zenohd` running). The web UI is **rosbridge + a
 static HTML page** (`web_control`), not Foxglove.
 
+> **zenoh vs rosbridge are different layers, not competitors.** `rmw_zenoh` is the
+> node-to-node RMW (incl. the ESP32 via zenoh-pico through `zenohd-serial`). A browser
+> can't speak zenoh/DDS, so `rosbridge_websocket` (a Python rclpy node *on* the zenoh
+> graph) bridges ROS↔browser over a WebSocket on `:9090` for roslib. Heavy topics
+> (`/scan`, `/map`) bypass rosbridge entirely via `/dev/shm`+HTTP, so what's left on it
+> is light. Going zenoh-all-the-way to the browser is possible (zenoh-ts + a router
+> plugin) but not worth it — you'd lose ROS typing and hand-decode CDR in JS. See the
+> rosbridge-vs-zenoh-transport memory.
+
 Hardware: Roborock **LDS02RR** lidar (scan on **UART2 `/dev/ttyS2`**; RPM also read by
 the ESP32), single-channel **wheel
 encoders** + **motors** (now via an **ESP32-WROOM coprocessor**, see below),
