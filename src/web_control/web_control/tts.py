@@ -14,6 +14,15 @@ Design — deliberately near-zero idle cost on the 1 GB / quad-A53 board:
     the clip's true duration (read from the WAV header) across the words weighted
     by length. It's an estimate, but it tracks short phrases well and is free.
 
+**Backends.** The robot uses `pico2wave`+`aplay` (the only fully-featured path:
+voice markup, German lingware, ALSA device targeting). But so the same TTS can be
+exercised on a dev PC with no ROS/robot attached, the engine falls back to the OS's
+built-in synthesiser when pico isn't installed: **Windows SAPI** (via PowerShell's
+`System.Speech`) or **macOS `say`**. Every backend produces a WAV at `WAV_PATH` and
+reports its duration, so the karaoke/word-timing logic below is backend-agnostic.
+Voice/volume/speed markup is best-effort on the fallback backends (pitch and the
+en-GB/de voice nuances are pico-only).
+
 `say()` is fire-and-forget and self-cancelling: a new request stops the current
 utterance (audio + OLED) and starts the new one. `on_word(word)` is called as each
 word begins, and `on_word("")` once at the end to hand the panel back to the
@@ -26,7 +35,10 @@ the current voice; the web layer persists those across reboots (see web_server).
 """
 import contextlib
 import os
+import platform
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import wave
@@ -35,7 +47,11 @@ import wave
 # back to the default). Matching pico lingware is installed by deploy/install-picotts.sh.
 VOICES = ("en-US", "en-GB", "de-DE")
 
-WAV_PATH = "/dev/shm/nano_tts.wav"   # tmpfs scratch; overwritten per utterance
+# tmpfs scratch on the robot (no SD-card wear); the OS temp dir on a dev PC that has
+# no /dev/shm (Windows/macOS). Overwritten per utterance either way.
+_SCRATCH = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+WAV_PATH = os.path.join(_SCRATCH, "nano_tts.wav")
+_TXT_PATH = os.path.join(_SCRATCH, "nano_tts.txt")   # for the macOS `say -f` backend
 MAX_CHARS = 300                      # hard cap on a single utterance (also bounds synth time)
 
 # Hard clamps for the Pico markup levels (percent; 100 = normal). The UI exposes
@@ -76,6 +92,15 @@ class TtsEngine:
         self._on_word = on_word or (lambda _w: None)
         self._log = logger or (lambda *_: None)
 
+        # Pick the synthesis/playback backend once. The robot has pico+aplay (the
+        # full-featured path); a dev PC falls back to the OS speech engine so TTS is
+        # still testable off-robot. "" = no usable backend (available() -> False).
+        self._ps = shutil.which("powershell") or shutil.which("pwsh") or ""  # Windows SAPI
+        self._say = shutil.which("say") or ""                                # macOS
+        self._afplay = shutil.which("afplay") or ""                          # macOS player
+        self._backend = self._pick_backend()
+        self._log(f"tts: backend={self._backend or 'none'}")
+
         # Live voice + markup levels (percent). Set via configure(); the web layer
         # restores the persisted values on startup.
         self._voice = default_voice if default_voice in VOICES else "en-US"
@@ -86,15 +111,26 @@ class TtsEngine:
         self._lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
-        self._proc = None                             # current aplay process
-        self._available = None                        # memoized binary check (see available)
+        self._proc = None                             # current playback process
+        self._available = None                        # memoized capability check (see available)
+
+    def _pick_backend(self):
+        """Choose the backend by what's installed (pico preferred — it's the only one
+        with the German lingware + level markup + ALSA device targeting)."""
+        if self._pico and self._aplay:
+            return "pico"
+        if platform.system() == "Windows" and self._ps:
+            return "sapi"
+        if platform.system() == "Darwin" and self._say:
+            return "say"
+        return ""
 
     def available(self):
-        """True if both the synth and playback binaries were found (and TTS is on).
-        Resolved once at construction, so this is just a couple of truthiness checks
-        — cheap to call from the always-on stats announcer."""
+        """True if a synthesis/playback backend was found (and TTS is on). Resolved
+        once, so this is just a couple of truthiness checks — cheap to call from the
+        always-on stats announcer."""
         if self._available is None:
-            self._available = bool(self._enabled and self._pico and self._aplay)
+            self._available = bool(self._enabled and self._backend)
         return self._available
 
     def configure(self, voice=None, volume=None, speed=None, pitch=None):
@@ -136,7 +172,9 @@ class TtsEngine:
         if not text:
             return
         voice = voice if voice in VOICES else self._voice
-        synth = self._ssml(text)                       # snapshot current vol/speed/pitch
+        # Pico level markup is pico-only; the OS fallback backends speak plain text
+        # (they apply volume/speed natively in _synth_* from the snapshot below).
+        synth = self._ssml(text) if self._backend == "pico" else text
         with self._lock:
             # Stop any in-flight utterance and WAIT for its worker to fully unwind
             # (incl. its trailing on_word("")) before starting the new one, so the
@@ -146,8 +184,11 @@ class TtsEngine:
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=1.5)
             self._stop = threading.Event()
+            # Snapshot the current markup levels for backends that apply them in synth.
+            levels = (self._volume, self._speed, self._pitch)
             self._thread = threading.Thread(
-                target=self._run, args=(voice, text, synth, self._stop), daemon=True)
+                target=self._run, args=(voice, text, synth, levels, self._stop),
+                daemon=True)
             self._thread.start()
 
     def stop(self):
@@ -157,7 +198,7 @@ class TtsEngine:
 
     # ---- internals -----------------------------------------------------------
     def _cancel_locked(self):
-        """Signal the worker to stop and kill its aplay. Caller holds _lock."""
+        """Signal the worker to stop and kill its playback. Caller holds _lock."""
         self._stop.set()
         p = self._proc
         if p and p.poll() is None:
@@ -166,15 +207,8 @@ class TtsEngine:
             except Exception:
                 pass
 
-    def _synth(self, voice, text):
-        """Run pico2wave → WAV_PATH. Returns the clip duration in seconds, or 0."""
-        try:
-            subprocess.run([self._pico, "-l", voice, "-w", WAV_PATH, text],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=20, check=True)
-        except Exception as exc:
-            self._log(f"tts: pico2wave failed ({exc})")
-            return 0.0
+    def _wav_duration(self):
+        """Duration (s) of the just-written WAV_PATH, or 0 if it can't be read."""
         try:
             with contextlib.closing(wave.open(WAV_PATH, "rb")) as w:
                 rate = w.getframerate() or 1
@@ -182,8 +216,89 @@ class TtsEngine:
         except Exception:
             return 0.0
 
-    def _run(self, voice, display_text, synth_text, stop):
-        dur = self._synth(voice, synth_text)
+    def _synth(self, voice, text, levels):
+        """Run the active backend to write WAV_PATH. Returns the clip duration (s)."""
+        try:
+            if self._backend == "pico":
+                return self._synth_pico(voice, text)
+            if self._backend == "sapi":
+                return self._synth_sapi(voice, text, levels)
+            if self._backend == "say":
+                return self._synth_say(voice, text, levels)
+        except Exception as exc:
+            self._log(f"tts: synth failed ({exc})")
+        return 0.0
+
+    def _synth_pico(self, voice, text):
+        subprocess.run([self._pico, "-l", voice, "-w", WAV_PATH, text],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=20, check=True)
+        return self._wav_duration()
+
+    def _synth_sapi(self, voice, text, levels):
+        """Windows SAPI via PowerShell System.Speech → WAV. Text + tunables are passed
+        through the environment (never interpolated into the command) so arbitrary
+        spoken text can't break or inject into the PowerShell script."""
+        volume, speed, _pitch = levels
+        env = dict(os.environ)
+        env["NANO_TTS_TEXT"] = text
+        env["NANO_TTS_WAV"] = WAV_PATH
+        env["NANO_TTS_VOICE"] = voice
+        env["NANO_TTS_VOL"] = str(clamp(min(volume, 100), 0, 100))   # SAPI Volume 0..100
+        env["NANO_TTS_RATE"] = str(clamp(round((speed - 100) / 20.0), -10, 10))  # SAPI Rate
+        script = (
+            "Add-Type -AssemblyName System.Speech;"
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+            "try { $s.SelectVoiceByHints("
+            "[System.Speech.Synthesis.VoiceGender]::NotSet,"
+            "[System.Speech.Synthesis.VoiceAge]::NotSet, 0,"
+            "[System.Globalization.CultureInfo]::GetCultureInfo($env:NANO_TTS_VOICE)) } catch {};"
+            "$s.Volume = [int]$env:NANO_TTS_VOL;"
+            "$s.Rate = [int]$env:NANO_TTS_RATE;"
+            "$s.SetOutputToWaveFile($env:NANO_TTS_WAV);"
+            "$s.Speak($env:NANO_TTS_TEXT);"
+            "$s.Dispose()"
+        )
+        subprocess.run([self._ps, "-NoProfile", "-NonInteractive", "-Command", script],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=30, check=True, env=env)
+        return self._wav_duration()
+
+    def _synth_say(self, voice, text, levels):
+        """macOS `say` → 16-bit WAV. Text goes via a temp file (-f) to avoid quoting."""
+        _volume, speed, _pitch = levels
+        with open(_TXT_PATH, "w") as f:
+            f.write(text)
+        cmd = [self._say, "-o", WAV_PATH, "--data-format=LEI16@22050", "-f", _TXT_PATH]
+        if speed != 100:                                # say -r words/minute (~175 normal)
+            cmd += ["-r", str(int(175 * speed / 100.0))]
+        if voice.startswith("de"):
+            cmd += ["-v", "Anna"]                       # a built-in German voice if present
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=30, check=True)
+        return self._wav_duration()
+
+    def _spawn_player(self):
+        """Start (and return) a killable process playing WAV_PATH on the active
+        backend, or None if there's no player. WAV_PATH is a fixed constant, so
+        embedding it in the PowerShell command is safe (no user input)."""
+        if self._backend == "pico":
+            cmd = [self._aplay, "-q"]
+            if self._device:
+                cmd += ["-D", self._device]
+            cmd.append(WAV_PATH)
+        elif self._backend == "sapi":
+            cmd = [self._ps, "-NoProfile", "-NonInteractive", "-Command",
+                   f"(New-Object System.Media.SoundPlayer '{WAV_PATH}').PlaySync()"]
+        elif self._backend == "say" and self._afplay:
+            cmd = [self._afplay, WAV_PATH]
+        else:
+            return None
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _run(self, voice, display_text, synth_text, levels, stop):
+        dur = self._synth(voice, synth_text, levels)
         if stop.is_set():
             return
         if dur <= 0.0:
@@ -201,15 +316,11 @@ class TtsEngine:
             acc += wt
 
         try:
-            cmd = [self._aplay, "-q"]
-            if self._device:
-                cmd += ["-D", self._device]
-            cmd.append(WAV_PATH)
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                          stdout=subprocess.DEVNULL,
-                                          stderr=subprocess.DEVNULL)
+            self._proc = self._spawn_player()
+            if self._proc is None:
+                raise RuntimeError("no player backend")
         except Exception as exc:
-            self._log(f"tts: aplay failed ({exc})")
+            self._log(f"tts: playback failed ({exc})")
             self._on_word("")
             return
         self._log(f"tts: speaking {len(words)} words in {voice} (~{dur:.1f}s)")
@@ -249,10 +360,11 @@ def _resolve_bin(binary):
     minimal). Returns "" if not found anywhere."""
     if os.path.isabs(binary):
         return binary if os.access(binary, os.X_OK) else ""
-    dirs = os.environ.get("PATH", "").split(os.pathsep) + ["/usr/local/bin", "/usr/bin", "/bin"]
-    for d in dirs:
-        if d:
-            cand = os.path.join(d, binary)
-            if os.access(cand, os.X_OK):
-                return cand
+    found = shutil.which(binary)
+    if found:
+        return found
+    for d in ("/usr/local/bin", "/usr/bin", "/bin"):
+        cand = os.path.join(d, binary)
+        if os.access(cand, os.X_OK):
+            return cand
     return ""

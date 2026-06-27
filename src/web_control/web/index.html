@@ -191,6 +191,15 @@
     image-rendering:pixelated}
   #simTools .tool.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
   #panel-sim .row .btn,#panel-sim .row label.btn{flex:1}
+  /* AI decision log */
+  .logbox{margin-top:8px}
+  .logbox>summary{cursor:pointer;color:var(--muted);font-size:12px;user-select:none}
+  .log{margin-top:6px;max-height:220px;overflow:auto;font-family:var(--mono);
+    font-size:11px;line-height:1.5;color:var(--text)}
+  .logrow{padding:3px 0;border-bottom:1px solid var(--border);word-break:break-word}
+  .logrow .lt{color:var(--muted)}
+  .logrow .ls{color:var(--muted)}
+  .logrow .lm{color:var(--muted);font-size:10px}
 </style>
 </head>
 <body class="no-tips">
@@ -314,6 +323,37 @@
               English / German only; all settings persist across a reboot. <b>Volume</b> trims the
               synthesis (100% = cleanest) — for loudness use the speaker's hardware mixer.
               <kbd>Enter</kbd> speaks.</p>
+          </div>
+          <div class="card">
+            <h2>AI · OpenRouter</h2>
+            <p class="hint" id="llmStatus">checking…</p>
+            <label class="switch"><input type="checkbox" id="llmOn"><span class="track"></span>
+              Enable</label>
+            <input id="llmPrompt" type="text" maxlength="200" placeholder="(optional) steer what it says…">
+            <div class="row">
+              <button id="llmSay" class="btn primary grow">✨ Say something</button>
+              <button id="llmObserve" class="btn grow">👁 Observe</button>
+              <button id="llmLook" class="btn grow">📷 Look</button>
+            </div>
+            <input id="llmChat" type="text" maxlength="200" placeholder="Chat with the robot…">
+            <div class="row">
+              <button id="llmSend" class="btn primary grow">Send</button>
+            </div>
+            <p class="hint" id="llmReply"></p>
+            <div class="field"><label>Model</label>
+              <input id="llmModel" type="text" maxlength="120"
+                placeholder="deepseek/deepseek-v4-flash"></div>
+            <div class="field"><label>Persona (from personality.json)</label>
+              <input id="llmPersona" type="text" readonly
+                placeholder="run scripts/personality_creator.py, then restart"></div>
+            <p class="hint">Generates a spoken line <b>+ a matching OLED face</b> via OpenRouter.
+              Needs an API key (robot.yaml / <code>OPENROUTER_API_KEY</code>). No key or offline =
+              silent. Autonomous chatter is driven by the behaviour statechart (configured in
+              <code>robot.yaml</code>), not here.</p>
+            <details class="logbox">
+              <summary>🧠 Decision log</summary>
+              <div id="llmLog" class="log">…</div>
+            </details>
           </div>
           <div class="card">
             <h2>Announce</h2>
@@ -951,6 +991,85 @@ function loadTts(){
   }).catch(()=>{});
 }
 loadTts();
+
+// ---- AI (OpenRouter) ---- the spoken line + a matching OLED face are generated
+// server-side (POST /llm/say|chat|observe|look); the server speaks it (TTS) and
+// publishes the mood on /oled_face. enable/model/persona persist server-side. Autonomous
+// chatter is driven by the behaviour statechart, not here. The decision log (/llm/log)
+// records every decision + outcome (incl. statechart beats + skips).
+function llmApply(s){
+  if(!s) return;
+  const set=(id,v)=>{ if($(id)&&v!=null) $(id).value=v; };
+  if($("llmOn")) $("llmOn").checked=!!s.enabled;
+  set("llmModel",s.model); set("llmPersona",s.persona);
+  if($("llmStatus")) $("llmStatus").textContent =
+    s.available ? ("ready · "+(s.model_effective||"")) :
+    (s.enabled ? "enabled but no API key configured" : "disabled");
+}
+function llmSave(patch){
+  fetch("/llm/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(patch)}).then(r=>r.ok?r.json():null).then(llmApply).catch(()=>{});
+}
+function showReply(r){
+  const el=$("llmReply"); if(!el) return;
+  if(!r){ el.textContent="(no reply)"; }
+  else if(r.error){ el.textContent="⚠ "+r.error; }
+  else el.textContent="🤖 "+(r.say||"")+(r.mood?("  ["+r.mood+"]"):"");
+  loadLlmLog();                                  // an action just made a new decision
+}
+function llmPost(url,body){
+  $("llmReply").textContent="…";
+  fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)})
+    .then(r=>r.ok?r.json():{error:r.status===503?"AI unavailable (no key / disabled)":("http "+r.status)})
+    .then(showReply).catch(()=>showReply({error:"network"}));
+}
+$("llmSay").onclick=()=>llmPost("/llm/say",{prompt:$("llmPrompt").value.trim()});
+$("llmObserve").onclick=()=>llmPost("/llm/observe",{});  // comment on its own sensors
+$("llmLook").onclick=()=>llmPost("/llm/look",{});        // comment on what the camera sees
+function sendChat(){
+  const m=$("llmChat").value.trim(); if(!m) return;
+  $("llmChat").value=""; llmPost("/llm/chat",{message:m});
+}
+$("llmSend").onclick=sendChat;
+$("llmChat").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();sendChat();} });
+$("llmPrompt").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();$("llmSay").click();} });
+$("llmOn").addEventListener("change",()=>llmSave({enabled:$("llmOn").checked}));
+$("llmModel").addEventListener("change",()=>llmSave({model:$("llmModel").value.trim()}));
+// Persona is read-only here — it's single-sourced from personality.json (the creator's
+// output). Edit it by re-running scripts/personality_creator.py and restarting.
+fetch("/llm/config").then(r=>r.ok?r.json():null).then(llmApply).catch(()=>{});
+
+// ---- Decision log ---- where + how each AI decision got made (incl. statechart beats
+// and skips). Poll while the <details> is open; also refreshed right after each action.
+const STATUS_ICON={spoke:"🗣",  "no-reply":"🤐", "skipped-busy":"⏳",
+  "llm-unavailable":"🚫", "no-frame":"📷✗", error:"⚠"};
+function fmtLogRow(e){
+  const time=new Date((e.t||0)*1000).toLocaleTimeString();
+  const who=e.trigger+(e.state&&e.state!==e.trigger.replace(/^beat:/,"")?(" "+e.state):"");
+  const cam=e.camera?" 📷":"";
+  const out=e.say?("“"+e.say+"”"+(e.mood?(" ["+e.mood+"]"):"")):(e.detail||"");
+  const ic=STATUS_ICON[e.status]||"•";
+  return `<div class="logrow"><span class="lt">${time}</span> ${ic} <b>${who}</b>${cam}`
+    +` <span class="ls">${e.status}</span>`+(out?(" — "+out):"")
+    +(e.model?` <span class="lm">${e.model}</span>`:"")+`</div>`;
+}
+function loadLlmLog(){
+  const box=$("llmLog"); if(!box) return;
+  fetch("/llm/log").then(r=>r.ok?r.json():null).then(d=>{
+    const es=(d&&d.entries)||[];
+    box.innerHTML = es.length ? es.slice(0,40).map(fmtLogRow).join("")
+                              : "<i>no decisions yet</i>";
+  }).catch(()=>{});
+}
+const llmLogDetails=$("llmLog")&&$("llmLog").closest("details");
+let llmLogTimer=null;
+if(llmLogDetails){
+  llmLogDetails.addEventListener("toggle",()=>{
+    clearInterval(llmLogTimer);
+    if(llmLogDetails.open){ loadLlmLog(); llmLogTimer=setInterval(loadLlmLog,4000); }
+  });
+}
 
 // ---- OLED face / mood ---- empty string = dashboard, else the selected mood.
 function sendFace(){

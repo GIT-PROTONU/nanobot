@@ -22,7 +22,7 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
@@ -96,6 +96,11 @@ class NavNode(Node):
             ("recover_refine", 3),        # recovery coarse-to-fine passes
             ("recover_spin", 0.6),        # rad/s in-place spin while relocalizing (needs motion)
             ("recover_timeout", 12.0),    # s before giving up the active relocalize search
+            # --- personality -> motion (the behaviour layer's `caution` trait, clamped
+            #     REFLEXIVELY here so the cognitive layer can never push motion unsafe) ---
+            ("trait_motion", False),       # opt-in: let `caution` nudge stop_distance/max_lin
+            ("stop_distance_max", 0.45),   # m: the cautious extreme of stop_distance (caution=1)
+            ("max_lin_min", 0.08),         # m/s: the cautious extreme of max_lin (caution=1)
         ])
         g = self.get_parameter
         self.grid = GridMap(
@@ -120,6 +125,13 @@ class NavNode(Node):
         self.goal_tol = float(g("goal_tol").value)
         self.stop_distance = float(g("stop_distance").value)
         self.front_angle = float(g("front_angle").value)
+        # personality -> motion: keep the params as the relaxed (caution=0) end; caution
+        # eases stop_distance up + max_lin down toward the configured cautious extremes.
+        self._trait_motion = bool(g("trait_motion").value)
+        self._base_stop = self.stop_distance
+        self._base_max_lin = self.max_lin
+        self._stop_max = float(g("stop_distance_max").value)
+        self._max_lin_min = float(g("max_lin_min").value)
 
         # extras
         self.map_store = str(g("map_store").value)
@@ -207,6 +219,9 @@ class NavNode(Node):
         # per-wheel off-ground switches from the ESP32 (pick-up detection)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
+        if self._trait_motion:                  # personality -> motion thresholds (clamped)
+            latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.create_subscription(String, "cognition/traits", self._on_traits, latched)
         self.create_subscription(Bool, "selftest", self._on_selftest, 1)  # calibration drive
         self.create_timer(1.0 / max(1.0, float(g("control_rate").value)), self._control)
         self.add_on_set_parameters_callback(self._on_params)
@@ -256,6 +271,21 @@ class NavNode(Node):
 
     def _on_susp_r(self, msg):
         self._susp_r = bool(msg.data)
+
+    def _on_traits(self, msg):
+        """Map the behaviour layer's `caution` trait (0..1) onto the reactive motion
+        thresholds, CLAMPED to safe bounds here in the reflex node — so the cognitive
+        layer influences but can never override motion safety. Higher caution => stops
+        earlier + drives slower."""
+        try:
+            caution = float((json.loads(msg.data).get("traits") or {}).get("caution"))
+        except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            return
+        c = max(0.0, min(1.0, caution))
+        self.stop_distance = min(max(self._base_stop + c * (self._stop_max - self._base_stop),
+                                     self._base_stop), self._stop_max)
+        self.max_lin = max(min(self._base_max_lin - c * (self._base_max_lin - self._max_lin_min),
+                               self._base_max_lin), self._max_lin_min)
 
     def _on_selftest(self, msg):
         if msg.data:

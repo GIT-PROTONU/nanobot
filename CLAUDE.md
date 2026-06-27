@@ -38,13 +38,36 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   not launched by `stack.sh`/`robot.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
-- `behavior` — **behaviour layer (Sismic statechart)**. First node `mood_node`: an idle
-  "feel alive" presence supervisor that drives the OLED face (`/oled_face`) during true
-  idle and stands down when another owner uses the panel (motion/goal, TTS, manual web
-  mood, pick-up). **Expression-only — never publishes `/cmd_vel`.** The chart lives in
-  `presence.py` (ROS-free, unit-tested offline: `pixi run python -m pytest
-  src/behavior/test`); the node only maps topics→events. No-op if sismic is missing or
-  `behavior.enable:=false`. See the behavior-layer-plan memory.
+- `behavior` — **behaviour layer (Sismic statechart)**. `mood_node`: an idle "feel alive"
+  presence supervisor that drives the OLED face (`/oled_face`) during true idle and stands
+  down when another owner uses the panel (motion/goal, TTS, manual web mood, pick-up).
+  **Expression-only — never publishes `/cmd_vel`.** The chart lives in `presence.py`
+  (ROS-free, unit-tested offline: `pixi run python -m pytest src/behavior/test`); the node
+  maps topics→events. No-op if sismic is missing or `behavior.enable:=false`.
+  - **The chart is also the single brain for autonomous LLM expression.** Its idle beats
+    are *predefined states with offline default faces*: `musing` (sensors) every idle
+    cycle, `looking` (camera) every `look_every`-th cycle (gated by `camera_beats`). On a
+    beat the node shows the default face immediately AND (if `enrich_enable`) fires a
+    **fire-and-forget** `/cognition/request` (JSON `{beat,state,prompt,camera}`) that
+    `web_control` executes asynchronously (LLM line + optional camera + mood). A
+    slow/absent LLM = a silent face-beat; the chart never waits. The per-beat convention
+    (default face + prompt + camera flag) is the `BEATS` table in `presence.py`; add a beat
+    = add a state calling `do_beat('name')` + a BEATS entry.
+  - **Parametric personality + evolution.** `traits` (curiosity/extraversion/caution/
+    playfulness, 0..1) + a `registry` (musing/looking priority/enable/gates) live as mutable
+    dicts in the Sismic context, seeded from `personality.json` (made by
+    `scripts/personality_creator.py`, persisted as they drift). Guards read them (curiosity
+    gates the camera beat; extraversion scales the idle cadence; registry can demote beats),
+    they're folded into the cognition prompt, and `mood_node` publishes them latched on
+    `/cognition/traits` (slam_nav maps `caution`→stop_distance/max_lin, **clamped reflexively
+    in slam_nav** so the brain can't push motion unsafe — gated by `trait_motion`). Evolution
+    is event-driven + smoothed: an `evolve` event (exponential smoothing, internal transition)
+    from **fast rules** (pickup→caution, in mood_node) OR **slow LLM reflection**
+    (`web_control`, pro model reads the decision log on `reflect_period` + on events →
+    `/cognition/evolve`). A `brain_lost` heartbeat (`brain_timeout` with no evolve) reverts to
+    the **seeded baseline** (not generic defaults). Reflexes (`greeting`/`resting`/`dormant`/
+    pickup) are NOT in the registry, so the brain can never disable them. See the
+    llm-openrouter-personality memory.
 - `sensor_hub` — **runs `imu_driver` + `sys_monitor` + `wheel_odometry` + `lds_driver_py`
   in ONE process** (one executor) to save ~100+ MB RAM on the 1 GB board. Same node
   names/topics/params/services — purely an packaging change. `stack.sh` launches this
@@ -136,6 +159,58 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     in the node, so it **keeps running after every browser closes** and resumes after
     a reboot. `POST /tts/announce` says it once now. CPU/RAM/temp come from the same
     cheap `/proc` + thermal reads the OLED uses; phrasing follows the selected voice.
+  - **Cross-platform TTS for dev testing**: `tts.py` is ROS-free and auto-selects a
+    backend — the robot's `pico2wave`+`aplay` if present, else **Windows SAPI** (via
+    PowerShell `System.Speech`) or macOS `say`. So `scripts/dev_tts_test.py` (no ROS)
+    speaks a line on a dev PC: `python scripts/dev_tts_test.py "hi"`, or
+    `--llm "prompt"` to run the full OpenRouter→speech pipeline (needs
+    `OPENROUTER_API_KEY`). Pico level markup + German lingware are pico-only; the
+    fallbacks speak plain text with native rate/volume. `scripts/dev_webui.py` serves
+    the **real `web/index.html`** on a dev PC (ROS-free stand-in for `web_server`) wiring
+    only `/llm/*`+`/tts*`, so the "AI · OpenRouter" card + Speak box can be tested in a
+    browser locally (telemetry/joystick/map show offline — no rosbridge). Reads the
+    persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`.
+- **LLM personality (OpenRouter)** lives in `web_control` (`llm.py`, ROS-free) — it
+  offloads "say something" / chat lines **plus the matching OLED expression** to a model
+  on OpenRouter. `LlmClient.generate()` is a blocking stdlib-`urllib` POST (no SDK) that
+  returns `{"say","mood"}`; the **mood is constrained to the OLED's four faces** +
+  `neutral` (coerced if the model strays). **Two text tiers:** `llm_model`
+  (`deepseek/deepseek-v4-flash`, cheap) for everything; `llm_smart_model`
+  (`deepseek/deepseek-v4-pro`, reasoning) only for chat (`generate(smart=True)`).
+  `LlmClient.model_for(smart,image)` resolves the slug; pro is a reasoning model so
+  `llm_max_tokens` is 1024 (too low → empty JSON = no-reply). `LlmClient.complete(system,
+  user,smart=,json_object=)` is a general (non-`{say,mood}`) call used by tools.
+  `scripts/personality_creator.py` (ROS-free) runs a short questionnaire through the smart
+  model → writes `personality.json` ({name,persona,traits,registry}) + a robot.yaml snippet.
+  **`POST /llm/observe`** is sensor-aware chatter: it builds a short plain-English snapshot
+  of the robot's own body — CPU/RAM/temp (`/proc`), IMU motion+tilt (`/imu/web`+`/imu/euler`),
+  pick-up (`/left|right_wheel_suspended`) — and has the model comment in character on how it
+  "feels" (web "👁 Observe" button). **`POST /llm/look`** is vision: it grabs one JPEG from
+  the webcam (`CameraStream.add_viewer→get_frame→remove_viewer`), base64-data-URIs it as an
+  `image_url` part, and routes to the **vision** model (`llm_vision_model`, default the
+  credit-free `nvidia/nemotron-nano-12b-v2-vl:free` — the text model can't see) so it
+  comments on what it sees (web "📷 Look" button). `generate(image_jpeg=…)` skips
+  `response_format` for image requests (some multimodal models reject it). Note: many
+  OpenRouter `:free` vision slugs come and go (Llama-3.2-vision is paid-only now) — pick a
+  current one via OpenRouter's `/models` API if the default stops working. Endpoints: `POST
+  /llm/say` (one-shot), `POST /llm/chat` (rolling history), `GET|POST /llm/config`,
+  `GET /llm/log`. The web "AI" card (Speak tab) drives the on-demand ones. **Autonomous
+  chatter is NOT here** — it's driven by the `behavior` statechart's beats via
+  `/cognition/request`, which `web_control` executes (`_on_cog`→`_run_beat`: capture frame
+  if asked, append the sensor snapshot, `_generate`). The old standalone idle-chatter timer
+  was retired (one brain). Best-effort: **no key / no network = silent no-op**, never on
+  the critical path. All config is in `robot.yaml` (`llm_*`, and the `behavior:` beat
+  knobs); the **key is read from `llm_api_key` or, when blank, `$OPENROUTER_API_KEY`** —
+  keep real keys out of the committed yaml. UI toggles (enable/model/persona) persist to
+  `~/.local/state/nanobot/llm.json` (never the key). Calls run off the ROS executor thread
+  and are one-at-a-time guarded.
+  - **Decision log** (`GET /llm/log`, web "🧠 Decision log" panel): every generation path
+    (`say`/`chat`/`observe`/`look`/`beat:*`) records a `CognitionLog` entry (trigger,
+    state, camera, model, status, say/mood, latency) — incl. skip reasons
+    (`skipped-busy`/`llm-unavailable`/`no-frame`). Appended as JSON lines to
+    `cognition_log_path` (default `~/.local/state/nanobot/cognition.log`) and seeded back
+    into the ring buffer on start, so it survives reboots. See the
+    llm-openrouter-personality memory.
 - **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
   Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
   so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`

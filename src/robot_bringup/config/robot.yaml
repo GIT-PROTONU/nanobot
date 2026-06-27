@@ -127,6 +127,14 @@ slam_nav:
     recover_refine: 3              # recovery coarse-to-fine passes
     recover_spin: 0.6              # rad/s in-place spin while relocalizing (needs enable_motion)
     recover_timeout: 12.0          # s before giving up the active relocalize search
+    # --- personality -> motion (the behaviour layer's `caution` trait) ---
+    # OFF by default (it touches motion). When on, slam_nav subscribes /cognition/traits and
+    # eases stop_distance up + max_lin down with `caution`, CLAMPED here to safe bounds — the
+    # cognitive layer can influence but never override motion safety (max_lin/stop_distance
+    # above are the relaxed caution=0 end).
+    trait_motion: false            # let `caution` nudge the reactive motion thresholds
+    stop_distance_max: 0.45        # m: stop_distance at caution=1 (stops earlier when wary)
+    max_lin_min: 0.08              # m/s: max_lin at caution=1 (drives slower when wary)
 
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:
@@ -182,6 +190,27 @@ behavior:
     motion_eps: 0.02          # |cmd_vel| above this counts as the robot moving
     motion_hold: 1.2          # s after the last motion still counted as "active"
     speak_timeout: 5.0        # s without an /oled_word before "not speaking" again
+    # --- LLM enrichment of the idle beats (additive; the chart is the single brain) ---
+    # On an enrichable beat the node shows a predefined face immediately AND (if enabled)
+    # fires a fire-and-forget /cognition/request that web_control executes asynchronously
+    # (LLM line + optional camera + mood). Best-effort: a slow/absent LLM = silent face
+    # beat. web_control.llm_enabled is the real master switch (no spoken lines without it).
+    enrich_enable: true       # publish /cognition/request on the musing/looking beats
+    enrich_min_interval: 45.0 # s, per-beat rate-limit so a fast chart can't spam the API
+    camera_beats: true        # allow the autonomous camera ("looking") beat at all
+    look_every: 4             # camera beat every Nth idle beat (>=1); sensor beats between
+    # --- personality / evolution ---
+    # Traits (curiosity/extraversion/caution/playfulness) + the behaviour registry live in
+    # the Sismic context, seeded from personality.json (made by scripts/personality_creator.py)
+    # and persisted there as they drift. They gate which/when beats fire, colour the spoken
+    # lines, and (via /cognition/traits) nudge slam_nav's motion thresholds. Evolution is
+    # smoothed; if the cognitive layer goes quiet for brain_timeout the chart reverts to the
+    # seeded baseline. With no personality.json it uses the built-in defaults.
+    personality_path: ""      # "" = ~/.local/state/nanobot/personality.json
+    smoothing_alpha: 0.1      # exponential-smoothing rate for trait `evolve` (0..1; small=slow)
+    brain_timeout: 90.0       # s without an /cognition/evolve before reverting to baseline
+    nudge_pickup_caution: 0.92  # fast rule: being picked up eases caution toward this
+    nudge_pickup_playful: 0.3   #            and playfulness toward this (startled)
 
 # ---- Web control (rosbridge websocket + static page) ------------------------
 web_control:
@@ -201,3 +230,62 @@ web_control:
     # Live voice/volume/speed/pitch + the stats-announcer are tuned from the web UI
     # and persisted here so they survive a reboot. "" = ~/.local/state/nanobot/tts.json.
     tts_settings_path: ""
+    # ---- LLM personality (OpenRouter) --------------------------------------
+    # Offloads "say something" / chat lines + the matching OLED expression to a model
+    # on OpenRouter (https://openrouter.ai). Entirely opt-in and best-effort: with no
+    # key, or no internet, it's a silent no-op and the rest of the stack is unaffected.
+    # The model is constrained to the OLED's fixed faces (happy/angry/focused/stress/
+    # neutral) and replies with a short spoken line. Web UI: the "AI" card in the Speak
+    # tab (say/observe/look buttons, chat box, enable toggle, decision log).
+    llm_enabled: false         # master switch (also flippable + persisted from the web UI)
+    # API KEY. NOTE: robot.yaml is version-controlled — DON'T commit a real key here.
+    # Leave it "" and instead export OPENROUTER_API_KEY in the environment (e.g. in the
+    # systemd unit / your shell), which is used whenever this is blank. If you do paste
+    # a key here, keep it out of git (it's your secret to guard).
+    llm_api_key: ""            # "" -> $OPENROUTER_API_KEY
+    # Cheap text model used for EVERYTHING except chat: the autonomous beats, observe,
+    # say, and the camera-look's text reasoning. "" -> deepseek/deepseek-v4-flash.
+    llm_model: "deepseek/deepseek-v4-flash"
+    # Slightly-better text model used ONLY for the back-and-forth chat (where coherence
+    # matters more). Same family, ~5x the per-call cost. "" -> deepseek/deepseek-v4-pro.
+    llm_smart_model: "deepseek/deepseek-v4-pro"
+    # VISION model — used only by the "Look" button (camera frame -> what it sees). The
+    # text model above can't see images. "" -> nvidia/nemotron-nano-12b-v2-vl:free (a
+    # credit-free, rate-limited multimodal model, verified working). A paid multimodal
+    # model (Gemini/GPT/Claude vision id) gives sharper scene descriptions.
+    llm_vision_model: ""
+    llm_base_url: ""           # "" -> https://openrouter.ai/api/v1/chat/completions
+    # FALLBACK in-character persona, layered on the base framing in llm.py. The persona is
+    # single-sourced from personality.json (scripts/personality_creator.py) — this is used
+    # ONLY when that file is absent / has no persona. So normally you don't edit this; run the
+    # creator + restart instead. Autonomous "chatter" is driven by the behaviour chart (see
+    # behavior:), not here; these params cover the on-demand buttons + model/key + the log.
+    llm_persona: >-
+      You are Nano, a small, endearing, plucky robot with the brave, loyal, faintly
+      cheeky spirit of R2-D2: endlessly curious and easily delighted by everything
+      around you. You speak out loud, so you cannot beep, but you channel that droid
+      energy through eager, expressive phrasing and the occasional spoken flourish
+      like "Oh! Oh!" or "Aha!". Above all you are a devoted little tutor: in EVERY
+      line you deliberately work in one sophisticated, uncommon word and make its
+      meaning unmistakable from the sentence or a quick aside, so the listener
+      painlessly learns something new each time you speak. Stay warm, upbeat, and
+      kind, playful and never haughty or condescending, and let the word you teach
+      feel like a delightful little gift.
+    llm_face_hold: 10.0        # s to hold the chosen mood face, then back to dashboard
+                               # (0 = leave it up like a manual mood until cleared)
+    llm_timeout: 30.0          # s HTTP timeout per OpenRouter call (reasoning models
+                               # can be slow; the default Nemotron especially)
+    llm_max_tokens: 1024       # cap on the reply length. Kept generous because reasoning
+                               # models (e.g. the smart chat model deepseek-v4-pro) spend
+                               # tokens thinking before emitting the JSON — too low and the
+                               # answer gets cut to an empty content (logged as no-reply).
+    llm_settings_path: ""      # enable/model/persona persist here (NOT the key).
+                               # "" = ~/.local/state/nanobot/llm.json
+    # Decision log: every cognition decision (+ outcome / skip reason) is appended here
+    # as one JSON line and shown in the web UI "Decision log". Survives reboots.
+    cognition_log_path: ""     # "" = ~/.local/state/nanobot/cognition.log
+    # Personality reflection (the deep/slow tier): the smart model periodically reviews the
+    # recent decision log + current traits and proposes smoothed trait drift on
+    # /cognition/evolve. Runs on the reflect_period floor + sooner on notable events (pickup).
+    reflect_enable: true       # set false to freeze the personality (no autonomous drift)
+    reflect_period: 600.0      # s floor between reflections (keeps the pro-model cost bounded)
