@@ -17,6 +17,7 @@ import functools
 import http.server
 import json
 import os
+import random
 import subprocess
 import threading
 import time
@@ -33,6 +34,7 @@ from .mjpeg_camera import CameraStream
 from .mic_audio import AudioStream
 from .tts import TtsEngine, VOICES, clamp
 from .llm import LlmClient, MOODS
+from .phrasebank import PhraseBank
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
@@ -99,6 +101,15 @@ class WebServerNode(Node):
         self.declare_parameter("llm_face_hold", 10.0)      # s to hold an LLM mood (0=keep)
         self.declare_parameter("llm_timeout", 20.0)        # s HTTP timeout per call
         self.declare_parameter("llm_max_tokens", 160)      # cap reply length
+        self.declare_parameter("llm_smart_max_per_hour", 15)   # hourly cap on pro/smart text (0=off)
+        self.declare_parameter("llm_vision_max_per_hour", 10)  # hourly cap on camera/vision (0=off)
+        # Phrase bank: pre-generated lines for the frequent body-reaction beats (instant,
+        # free, offline). See phrasebank.py.
+        self.declare_parameter("phrasebank_enable", True)
+        self.declare_parameter("phrasebank_path", "")          # "" -> XDG state dir
+        self.declare_parameter("phrasebank_live_ratio", 0.2)   # P(use live LLM anyway for variety)
+        self.declare_parameter("phrasebank_drift", 0.6)        # trait drift that triggers regen
+        self.declare_parameter("phrasebank_per_category", 6)   # lines generated per situation
         self.declare_parameter("llm_settings_path", "")    # "" -> XDG state dir
         self.declare_parameter("cognition_log_path", "")   # decision log; "" -> XDG state dir
         self.declare_parameter("reflect_enable", True)     # slow personality reflection
@@ -161,12 +172,15 @@ class WebServerNode(Node):
         # execute below. We still serve the on-demand say/chat/observe/look endpoints.
         self._llm_settings = self._load_llm_settings()
         self._persona = self._load_persona()           # single-sourced from personality.json
+        self._persona_name = self._load_persona_name() # the robot's name (for phrase bank)
         self._llm = LlmClient(
             enabled=self._llm_settings["enabled"],
             api_key=g("llm_api_key").value,
             model=self._llm_settings["model"], base_url=g("llm_base_url").value,
             persona=self._persona, vision_model=g("llm_vision_model").value,
             smart_model=g("llm_smart_model").value,
+            smart_max_per_hour=int(g("llm_smart_max_per_hour").value),
+            vision_max_per_hour=int(g("llm_vision_max_per_hour").value),
             timeout=float(g("llm_timeout").value), max_tokens=int(g("llm_max_tokens").value),
             logger=self.get_logger().info)
         self._llm_face_hold = float(g("llm_face_hold").value)
@@ -178,6 +192,13 @@ class WebServerNode(Node):
         # survives reboots. Seeded from the file tail on start.
         self._log_lock = threading.Lock()
         self._cog_log = deque(self._load_cog_log(), maxlen=LLM_LOG_MAX)
+        # Phrase bank: the frequent body-reaction lines, pre-generated + filled live.
+        self._bank_enable = bool(g("phrasebank_enable").value)
+        self._bank_live_ratio = float(g("phrasebank_live_ratio").value)
+        self._bank_drift = float(g("phrasebank_drift").value)
+        self._bank_per_cat = int(g("phrasebank_per_category").value)
+        self._bank = PhraseBank(path=(g("phrasebank_path").value or None),
+                                logger=self.get_logger().info)
         # Statechart-driven enrichment requests: the behaviour node decides when/what,
         # we execute (capture frame if asked, add sensors, generate, speak + emote).
         self.create_subscription(String, "cognition/request", self._on_cog, 10)
@@ -204,6 +225,15 @@ class WebServerNode(Node):
         self.get_logger().info(
             f"llm: {'enabled' if self._llm.available() else 'idle (no key / disabled)'}"
             f" model={self._llm.model}")
+        self._bank_regen_check()                        # build/refresh the bank if needed
+
+    def _bank_regen_check(self):
+        """Regenerate the phrase bank in the background if it's empty or the soul has drifted
+        too far (no-op if disabled / LLM offline / drift small)."""
+        if self._bank_enable and self._llm.available():
+            self._bank.maybe_regenerate(self._llm, self._persona, self._traits,
+                                        name=self._persona_name, threshold=self._bank_drift,
+                                        per_category=self._bank_per_cat, background=True)
 
     def _publish_ping(self):
         self._ping_seq = (self._ping_seq + 1) & 0x7FFFFFFF
@@ -332,6 +362,20 @@ class WebServerNode(Node):
             pass
         return self.get_parameter("llm_persona").value or ""
 
+    def _load_persona_name(self):
+        """The robot's name from personality.json (used in the phrase bank's {name}); 'Nano'
+        as a fallback."""
+        path = (self.get_parameter("personality_path").value
+                or os.path.expanduser("~/.local/state/nanobot/personality.json"))
+        try:
+            with open(path, encoding="utf-8") as f:
+                name = (json.load(f) or {}).get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        except Exception:
+            pass
+        return "Nano"
+
     def _save_llm_settings(self):
         try:
             path = self._llm_settings_file()
@@ -355,6 +399,7 @@ class WebServerNode(Node):
         s["vision_model"] = self._llm.vision_model
         s["persona"] = self._persona              # read-only: single-sourced from personality.json
         s["moods"] = list(MOODS)
+        s["rate_limits"] = self._llm.rate_limits()     # {tier: [used_last_hour, cap]}; 0 cap = off
         return s
 
     def update_llm_settings(self, data):
@@ -414,6 +459,23 @@ class WebServerNode(Node):
         with self._log_lock:
             return {"entries": list(self._cog_log)[::-1]}   # newest first
 
+    # --- phrase bank ---------------------------------------------------------
+    def get_phrasebank(self):
+        s = self._bank.stats()
+        s["enabled"] = self._bank_enable
+        s["live_ratio"] = self._bank_live_ratio
+        s["needs_regen"] = self._bank.needs_regen(self._persona, self._traits, self._bank_drift)
+        return s
+
+    def regenerate_phrasebank(self):
+        """Force a (background) regeneration regardless of drift — for the web UI button."""
+        if not self._llm.available():
+            return {"error": "llm unavailable"}
+        self._bank.maybe_regenerate(self._llm, self._persona, self._traits,
+                                    name=self._persona_name, threshold=-1.0,  # <0 => always
+                                    per_category=self._bank_per_cat, background=True)
+        return {"status": "regenerating"}
+
     # --- statechart enrichment executor (/cognition/request) -----------------
     def _on_cog(self, msg: String):
         """A beat request from the behaviour chart: {beat, state, prompt, camera}. We
@@ -440,10 +502,15 @@ class WebServerNode(Node):
     def _run_beat(self, trigger, state, prompt, camera):
         frame = None
         if camera:
+            if not self._llm.can_call(image=True):     # don't spin up the camera if capped
+                self._log_decision(trigger, state, camera, status="rate-limited")
+                return
             frame = self._capture_frame()
             if frame is None:
                 self._log_decision(trigger, state, camera, status="no-frame")
                 return
+        elif self._bank_say(trigger, state):           # frequent body beat -> cached line
+            return                                     # (free/instant/offline; no LLM call)
         full = (prompt + " Your current personality (0..1) is " + self._traits_phrase()
                 + ", and your body senses: " + self._sensor_snapshot())
         self._generate(full, image_jpeg=frame, trigger=trigger, state=state, camera=camera)
@@ -459,6 +526,7 @@ class WebServerNode(Node):
         if isinstance(data.get("traits"), dict):
             self._traits.update({k: data["traits"][k] for k in REFLECT_TRAITS
                                  if k in data["traits"]})
+            self._bank_regen_check()                    # soul moved -> refresh bank if too far
 
     # --- personality reflection (deep/slow tier) -----------------------------
     def _reflect_tick(self):
@@ -571,8 +639,43 @@ class WebServerNode(Node):
             parts.append("resting on the ground")
         return ", ".join(parts) if parts else "no sensor data available"
 
+    def _sensor_signals(self):
+        """The same body state as _sensor_snapshot(), but structured for the phrase bank's
+        classifier (NaN/None where a source is missing or stale)."""
+        now = time.monotonic()
+        cpu, mem, temp = self._cpu_percent_quick(), self._mem_percent(), self._cpu_temp()
+        moving = None
+        if (now - self._imu_at) < 3.0:
+            moving = self._imu_gyro > 0.3 or abs(self._imu_accel - 9.81) > 1.5
+        tilt = None
+        if (now - self._eul_at) < 3.0:
+            tilt = max(abs(self._roll), abs(self._pitch))
+        pickup = 2 if (self._susp_l and self._susp_r) else (1 if (self._susp_l or self._susp_r) else 0)
+        return {"cpu": cpu, "mem": mem, "temp": temp, "moving": moving,
+                "tilt": tilt, "pickup": pickup}
+
+    def _bank_say(self, trigger, state="", camera=False):
+        """Try the pre-generated phrase bank for a body-reaction line: classify the live
+        sensors, pick + fill a cached line, speak/emote it, log it. Returns the reply dict
+        if a line was used, else None (caller falls back to the live LLM). Honours the
+        live-LLM ratio (sometimes returns None on purpose so a fresh line gets generated)."""
+        if not self._bank_enable or camera:
+            return None
+        if random.random() < self._bank_live_ratio:     # occasionally go live for variety
+            return None
+        reply = self._bank.pick(self._sensor_signals())
+        if not reply:
+            return None
+        self._express(reply["mood"], reply["say"])
+        self._log_decision(trigger, state, camera, status="bank", model="phrasebank",
+                           say=reply["say"], mood=reply["mood"], detail=reply["category"])
+        return reply
+
     def llm_observe(self):
         """Build a sensor snapshot and have the robot comment on how it feels."""
+        bank = self._bank_say("observe")               # frequent -> prefer the cached bank
+        if bank:
+            return bank
         snap = self._sensor_snapshot()
         self.get_logger().info(f"llm observe: {snap}")
         prompt = (f"Your own body's sensors report right now: {snap}. In character, say "
@@ -601,6 +704,9 @@ class WebServerNode(Node):
     def llm_look(self):
         """Capture a camera frame (+ the sensor snapshot) and have the robot comment on
         what it SEES, via the vision model. Falls back to None if no frame is available."""
+        if not self._llm.can_call(image=True):         # capped: skip the capture entirely
+            self._log_decision("look", "", True, status="rate-limited")
+            return {"error": "vision hourly limit reached"}
         frame = self._capture_frame()
         if frame is None:
             self.get_logger().warning("llm look: no camera frame")
@@ -764,6 +870,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._respond_json(self._node.get_llm_settings() if self._node else {})
         if path == "/llm/log":
             return self._respond_json(self._node.get_cog_log() if self._node else {"entries": []})
+        if path == "/llm/phrases":
+            return self._respond_json(self._node.get_phrasebank() if self._node else {})
         if path == "/stream.mjpg":
             return self._stream_mjpeg()
         if path == "/audio.pcm":
@@ -846,6 +954,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._respond(503, "no node")
             else:
                 self._respond_json(self._node.update_llm_settings(self._read_json()))
+        elif path == "/llm/phrases/regenerate":
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._node.regenerate_phrasebank())
         elif path == "/system/restart":
             # Restart the whole ROS stack. Detached + new session so it survives
             # do_down killing this very web server, then do_up brings it back.

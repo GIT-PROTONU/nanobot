@@ -122,6 +122,14 @@ Then `web_control: tts_device` can stay `""`. (For a USB speaker instead, skip t
 script and set `tts_device` to the USB card — find it with `aplay -l`.) Skip TTS
 entirely and everything else still runs — it just reports "unavailable".
 
+## 3c. (Optional) Personality / "brain"
+
+Nano has an autonomous personality layer — a statechart that decides *when* to act and an
+OpenRouter LLM that decides *what* to say (spoken line + OLED face), with traits that evolve
+over time. It's entirely best-effort: no key / no network = silent, and it can never make the
+robot unsafe. See **[docs/brain.md](docs/brain.md)** for the full picture, and test it
+off-robot with `scripts/dev_webui.py --behavior`.
+
 ## 4. Run
 
 `rmw_zenoh` needs its router for discovery. In one terminal:

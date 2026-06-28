@@ -279,6 +279,24 @@ web_control:
                                # models (e.g. the smart chat model deepseek-v4-pro) spend
                                # tokens thinking before emitting the JSON — too low and the
                                # answer gets cut to an empty content (logged as no-reply).
+    # Hourly caps on the EXPENSIVE tiers so the autonomous loop (beats + reflection) can't
+    # run up the OpenRouter bill. A sliding 1-hour window per tier; calls over the cap are
+    # silently skipped (logged as "rate-limited" in the decision log; the cheap default text
+    # model is never capped). 0 = unlimited.
+    llm_smart_max_per_hour: 15  # pro/smart text model (chat + personality reflection)
+    llm_vision_max_per_hour: 10 # vision/camera model (look beats + manual "Look")
+    # Phrase bank: the most frequent thing Nano does is react to its own body (the
+    # autonomous "musing" beats + manual Observe). Instead of a live LLM call every idle
+    # cycle, we PRE-GENERATE a bank of in-character lines (grouped by situation, with
+    # {placeholders} for live values like {temp}/{cpu}/{tilt}), then at runtime classify the
+    # sensors, pick a line, and fill it in: instant, free, works offline. The bank is
+    # regenerated in the background when the personality ("soul") has drifted too far from
+    # the one it was made with (or via scripts/pregenerate_phrases.py / the web button).
+    phrasebank_enable: true
+    phrasebank_path: ""         # "" = ~/.local/state/nanobot/phrases.json
+    phrasebank_live_ratio: 0.2  # fraction of body beats that STILL go live (for freshness)
+    phrasebank_drift: 0.6       # summed trait change (0..4) that triggers a regeneration
+    phrasebank_per_category: 6  # lines pre-generated per situation (9 situations)
     llm_settings_path: ""      # enable/model/persona persist here (NOT the key).
                                # "" = ~/.local/state/nanobot/llm.json
     # Decision log: every cognition decision (+ outcome / skip reason) is appended here

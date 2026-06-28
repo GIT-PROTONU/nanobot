@@ -38,7 +38,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   not launched by `stack.sh`/`robot.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
-- `behavior` — **behaviour layer (Sismic statechart)**. `mood_node`: an idle "feel alive"
+- `behavior` — **behaviour layer (Sismic statechart)**. *Human-readable overview of the
+  whole brain (statechart + LLM + traits/evolution + model caps + decision log):
+  [`docs/brain.md`](docs/brain.md); the bullets below are the terse engineering summary.*
+  `mood_node`: an idle "feel alive"
   presence supervisor that drives the OLED face (`/oled_face`) during true idle and stands
   down when another owner uses the panel (motion/goal, TTS, manual web mood, pick-up).
   **Expression-only — never publishes `/cmd_vel`.** The chart lives in `presence.py`
@@ -209,8 +212,20 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     state, camera, model, status, say/mood, latency) — incl. skip reasons
     (`skipped-busy`/`llm-unavailable`/`no-frame`). Appended as JSON lines to
     `cognition_log_path` (default `~/.local/state/nanobot/cognition.log`) and seeded back
-    into the ring buffer on start, so it survives reboots. See the
+    into the ring buffer on start, so it survives reboots. **Both `web_server` (robot) and
+    `scripts/dev_webui.py` (dev) write the same file/format**, so history is shared. See the
     llm-openrouter-personality memory.
+  - **Phrase bank** (`phrasebank.py`): the most frequent lines — the body-reaction beats
+    (`musing`/`observe`) — are **pre-generated** instead of hitting the LLM every idle cycle.
+    A batch of in-character lines per *situation* (picked_up/hot/busy/idle/… classified from
+    the sensors), each with **placeholders** (`{name}{cpu}{mem}{temp}{tilt}`) filled with
+    live values at speak time → instant, free, offline, still varied. Logged
+    `status="bank"`. `pick()` prefers lines whose placeholders are all fillable. The bank
+    (`~/.local/state/nanobot/phrases.json`) stores the persona+traits **signature** it was
+    made with and **auto-regenerates in the background** when the soul drifts too far
+    (`phrasebank_drift`) or the persona changes; `phrasebank_live_ratio` still sends a few
+    beats live for freshness. Force/inspect: `scripts/pregenerate_phrases.py [--show]`,
+    `GET /llm/phrases`, `POST /llm/phrases/regenerate`. Config: `phrasebank_*` in robot.yaml.
 - **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
   Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
   so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`

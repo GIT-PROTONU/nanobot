@@ -40,10 +40,15 @@ sys.path.insert(0, os.path.join(_ROOT, "src", "behavior"))   # ROS-free presence
 
 from web_control.tts import TtsEngine, VOICES, clamp        # noqa: E402
 from web_control.llm import LlmClient, MOODS, _extract_json  # noqa: E402
+from web_control.phrasebank import PhraseBank                # noqa: E402
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
 LOG_MAX = 50
+# Same decision-log file + JSON-line format the robot's web_server uses, so a dev run and
+# the real robot share one history (and it survives across runs). robot.yaml's
+# cognition_log_path overrides; "" falls back here.
+DEFAULT_COG_LOG = os.path.expanduser("~/.local/state/nanobot/cognition.log")
 TRAITS = ("curiosity", "extraversion", "caution", "playfulness")
 
 
@@ -126,26 +131,89 @@ class DevState:
             model=cfg.get("llm_model", ""), persona=persona,
             vision_model=cfg.get("llm_vision_model", ""),
             smart_model=cfg.get("llm_smart_model", ""),
+            smart_max_per_hour=int(cfg.get("llm_smart_max_per_hour", 15)),
+            vision_max_per_hour=int(cfg.get("llm_vision_max_per_hour", 10)),
             logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
         self.settings = {"enabled": True, "model": cfg.get("llm_model", ""), "persona": persona}
         self.history = []
         self._busy = False
         self._lock = threading.Lock()
-        self._log = deque(maxlen=LOG_MAX)                   # decision log (in-memory on dev)
+        # Decision log: persisted to the same JSON-line file the robot uses, and seeded
+        # back from it on start so history survives across dev runs (and is shared w/ robot).
+        self._cog_log_path = (cfg.get("cognition_log_path") or "").strip() or DEFAULT_COG_LOG
         self._loglock = threading.Lock()
+        self._log = deque(self._load_cog_log(), maxlen=LOG_MAX)
         self._pending_evolve = None                         # reflection -> chart (drained by loop)
         self._lock_pe = threading.Lock()
         self._busy_reflect = False
+        # Phrase bank: pre-generated body-reaction lines (same module + file the robot uses).
+        self._bank_enable = bool(cfg.get("phrasebank_enable", True))
+        self._bank_live_ratio = float(cfg.get("phrasebank_live_ratio", 0.2))
+        self._bank_drift = float(cfg.get("phrasebank_drift", 0.6))
+        self._bank_per_cat = int(cfg.get("phrasebank_per_category", 6))
+        self._bank = PhraseBank(path=(cfg.get("phrasebank_path") or None),
+                                logger=lambda m: print(f"[bank] {m}", file=sys.stderr))
+        self._traits = dict(self.personality.get("traits") or {})   # for bank regen signature
         print(f"[dev] TTS backend ready={self.tts.available()}  "
               f"LLM ready={self.llm.available()} (model {self.llm.model})", file=sys.stderr)
         if not self.llm.available():
             print("[dev] ! No OPENROUTER_API_KEY set — the AI card will say 'unavailable'.",
                   file=sys.stderr)
+        self._bank_regen_check()                            # build/refresh the bank if needed
+
+    def _bank_regen_check(self):
+        if self._bank_enable and self.llm.available():
+            self._bank.maybe_regenerate(self.llm, self.llm.persona, self._traits,
+                                        name=self.personality.get("name", "Nano"),
+                                        threshold=self._bank_drift,
+                                        per_category=self._bank_per_cat, background=True)
+
+    @staticmethod
+    def _synth_signals():
+        """A plausible, slightly-random structured body snapshot (dev stand-in for the
+        robot's real sensors) — feeds both the phrase-bank classifier and the LLM snapshot."""
+        return {"cpu": random.randint(8, 90), "mem": random.randint(28, 70),
+                "temp": random.randint(34, 64),
+                "moving": random.random() < 0.25,
+                "tilt": random.choice([2, 6, 14, 22, 30]),
+                "pickup": random.choice([0, 0, 0, 1, 2])}
+
+    def _bank_say(self, trigger, state=""):
+        """Try the cached phrase bank for a body-reaction line (instant/free/offline);
+        returns the reply dict if used (also speaks + logs), else None."""
+        if not self._bank_enable or random.random() < self._bank_live_ratio:
+            return None
+        reply = self._bank.pick(self._synth_signals())
+        if not reply:
+            return None
+        self._express(reply)
+        self._log_decision(trigger, state, False, status="bank", model="phrasebank",
+                           say=reply["say"], mood=reply["mood"], detail=reply["category"])
+        print(f"[bank] {reply['category']}: {reply['say']}", file=sys.stderr)
+        return reply
 
     def _on_word(self, w):
         print(w, end=" ", flush=True) if w else print()
 
     # ---- decision log -------------------------------------------------------
+    def _load_cog_log(self):
+        """Seed the ring from the last LOG_MAX JSON lines on disk (same file the robot's
+        web_server writes), so dev runs keep history too. Best-effort -> [] on any problem."""
+        try:
+            with open(self._cog_log_path, encoding="utf-8") as f:
+                lines = f.readlines()[-LOG_MAX:]
+        except Exception:
+            return []
+        out = []
+        for ln in lines:
+            ln = ln.strip()
+            if ln:
+                try:
+                    out.append(json.loads(ln))
+                except Exception:
+                    pass
+        return out
+
     def _log_decision(self, trigger, state="", camera=False, status="", model="",
                       prompt="", say="", mood="", ms=0, detail=""):
         entry = {"t": time.time(), "trigger": trigger, "state": state,
@@ -153,18 +221,42 @@ class DevState:
                  "say": say, "mood": mood, "status": status, "detail": detail, "ms": ms}
         with self._loglock:
             self._log.append(entry)
+        try:                                               # append as one JSON line (robot fmt)
+            os.makedirs(os.path.dirname(self._cog_log_path), exist_ok=True)
+            with open(self._cog_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
         return entry
 
     def get_cog_log(self):
         with self._loglock:
             return {"entries": list(self._log)[::-1]}
 
+    # ---- phrase bank --------------------------------------------------------
+    def get_phrasebank(self):
+        s = self._bank.stats()
+        s["enabled"] = self._bank_enable
+        s["live_ratio"] = self._bank_live_ratio
+        s["needs_regen"] = self._bank.needs_regen(self.llm.persona, self._traits, self._bank_drift)
+        return s
+
+    def regenerate_phrasebank(self):
+        if not self.llm.available():
+            return {"error": "llm unavailable"}
+        self._bank.maybe_regenerate(self.llm, self.llm.persona, self._traits,
+                                    name=self.personality.get("name", "Nano"),
+                                    threshold=-1.0, per_category=self._bank_per_cat,
+                                    background=True)
+        return {"status": "regenerating"}
+
     # ---- the same shapes web_server returns ----
     def llm_config(self):
         s = dict(self.settings)
         s.update(available=self.llm.available(), configured=self.llm.available(),
                  model_effective=self.llm.model, smart_model=self.llm.smart_model,
-                 vision_model=self.llm.vision_model, moods=list(MOODS))
+                 vision_model=self.llm.vision_model, moods=list(MOODS),
+                 rate_limits=self.llm.rate_limits())
         return s
 
     def update_llm_config(self, data):
@@ -212,6 +304,9 @@ class DevState:
         return reply
 
     def llm_look(self, trigger="look", state=""):
+        if not self.llm.can_call(image=True):           # capped: skip the webcam capture
+            self._log_decision(trigger, state, True, status="rate-limited")
+            return {"error": "vision hourly limit reached"}
         frame = _capture_webcam_jpeg()
         if frame is None:
             self._log_decision(trigger, state, True, status="no-frame")
@@ -229,17 +324,19 @@ class DevState:
         return self._generate(prompt, trigger="say")
 
     def llm_observe(self, trigger="observe", state=""):
+        bank = self._bank_say(trigger, state)           # frequent -> prefer the cached bank
+        if bank:
+            return bank
         # No ROS sensors on a dev PC, so synthesise a plausible snapshot (slightly random
         # so it varies) — enough to test that the robot comments on its sensor state.
-        cpu, mem, temp = random.randint(8, 45), random.randint(28, 62), random.randint(43, 59)
-        body = random.choice([
-            "physically still, sitting level, resting on the ground",
-            "sitting level and resting on the ground",
-            "being moved or jostled, sitting level, on the ground",
-            "leaning slightly (14 degrees), resting on the ground",
-            "physically still, lifted off the ground (being held)",
-        ])
-        snap = f"CPU load {cpu}%, memory {mem}% used, main board {temp} degrees C, {body}"
+        sig = self._synth_signals()
+        body = []
+        body.append("being moved or jostled" if sig["moving"] else "physically still")
+        body.append(f"tilted ({sig['tilt']} degrees)" if sig["tilt"] > 10 else "sitting level")
+        body.append({0: "resting on the ground", 1: "with one wheel off the ground",
+                     2: "lifted off the ground (being held)"}[sig["pickup"]])
+        snap = (f"CPU load {sig['cpu']}%, memory {sig['mem']}% used, main board "
+                f"{sig['temp']} degrees C, " + ", ".join(body))
         print(f"[observe] (synthetic) {snap}", file=sys.stderr)
         prompt = (f"Your own body's sensors report right now: {snap}. In character, say "
                   "one short spoken line reacting to how you physically feel or what your "
@@ -353,6 +450,8 @@ def run_behavior(state, idle_secs, reflect_secs):
         if ev:
             interp.queue(Event("evolve", traits=ev[0], registry=ev[1]))
             print(f"[behavior] traits now {dict(interp.context['traits'])}", file=sys.stderr)
+            state._traits = dict(interp.context["traits"])   # track soul for bank-regen
+            state._bank_regen_check()                        # refresh bank if it drifted too far
         try:
             interp.execute()
         except Exception as exc:
@@ -398,6 +497,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.llm_config())
         if p == "/llm/log":
             return self._json(self.state.get_cog_log())
+        if p == "/llm/phrases":
+            return self._json(self.state.get_phrasebank())
         if p == "/tts/config":
             return self._json(self.state.tts_config())
         return super().do_GET()
@@ -426,6 +527,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.llm_look() or {"error": "no reply"})
         if p == "/llm/config":
             return self._json(s.update_llm_config(self._body()))
+        if p == "/llm/phrases/regenerate":
+            return self._json(s.regenerate_phrasebank())
         if p == "/tts":
             d = self._body()
             text = (d.get("text") or "").strip()

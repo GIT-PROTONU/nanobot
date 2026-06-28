@@ -24,8 +24,11 @@ import base64
 import json
 import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections import deque
 
 # The OLED can only render these expressions. "neutral" is the calm default face;
 # "" (dashboard) is never chosen by the model — clearing is the caller's job.
@@ -99,7 +102,8 @@ class LlmClient:
 
     def __init__(self, enabled=True, api_key="", model=None, base_url=None,
                  persona="", timeout=30.0, max_tokens=1024, vision_model=None,
-                 smart_model=None, logger=None):
+                 smart_model=None, smart_max_per_hour=0, vision_max_per_hour=0,
+                 logger=None):
         # Env wins when the explicit key is blank, so the secret can stay out of the
         # (version-controlled) robot.yaml entirely.
         self._key = (api_key or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
@@ -112,10 +116,19 @@ class LlmClient:
         self._timeout = float(timeout) if timeout else 20.0
         self._max_tokens = int(max_tokens) if max_tokens else 160
         self._log = logger or (lambda *_: None)
+        # Hourly caps on the *expensive* tiers so autonomous beats/reflection can't run up
+        # the bill: the smart/pro text model and the vision/camera model. 0 = unlimited.
+        # The cheap default (flash) model is never capped. A sliding 1-hour window of call
+        # timestamps per tier; calls over the cap return None (the caller stays silent).
+        self._max = {"smart": max(0, int(smart_max_per_hour or 0)),
+                     "vision": max(0, int(vision_max_per_hour or 0))}
+        self._calls = {"smart": deque(), "vision": deque()}
+        self._rate_lock = threading.Lock()
 
     # ---- config (web-tunable at runtime) ------------------------------------
     def configure(self, enabled=None, model=None, persona=None, api_key=None,
-                  vision_model=None, smart_model=None):
+                  vision_model=None, smart_model=None, smart_max_per_hour=None,
+                  vision_max_per_hour=None):
         if enabled is not None:
             self._enabled = bool(enabled)
         if model is not None:
@@ -128,6 +141,52 @@ class LlmClient:
             self._persona = persona.strip()
         if api_key is not None:
             self._key = api_key.strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+        if smart_max_per_hour is not None:
+            self._max["smart"] = max(0, int(smart_max_per_hour))
+        if vision_max_per_hour is not None:
+            self._max["vision"] = max(0, int(vision_max_per_hour))
+
+    # ---- hourly rate limiting (expensive tiers only) ------------------------
+    @staticmethod
+    def _tier(smart=False, image=False):
+        """The cost tier a call falls in: 'vision' (image), 'smart' (pro text), or None
+        (the cheap default model — never capped). Image wins, matching model_for()."""
+        return "vision" if image else ("smart" if smart else None)
+
+    def _prune(self, tier, now):
+        dq = self._calls[tier]
+        while dq and now - dq[0] >= 3600.0:
+            dq.popleft()
+        return dq
+
+    def can_call(self, smart=False, image=False):
+        """Peek whether a call on this tier is within its hourly cap, WITHOUT consuming a
+        slot. Lets a caller skip expensive prep (e.g. a webcam capture) when it would only
+        be rate-limited anyway. True for the uncapped cheap tier."""
+        tier = self._tier(smart, image)
+        if tier is None or self._max[tier] <= 0:
+            return True
+        with self._rate_lock:
+            return len(self._prune(tier, time.monotonic())) < self._max[tier]
+
+    def _rate_consume(self, tier):
+        """Record a call against its hourly cap; return False (and record nothing) if it
+        would exceed the cap. No-op/True for the uncapped cheap tier."""
+        if tier is None or self._max[tier] <= 0:
+            return True
+        with self._rate_lock:
+            now = time.monotonic()
+            dq = self._prune(tier, now)
+            if len(dq) >= self._max[tier]:
+                return False
+            dq.append(now)
+            return True
+
+    def rate_limits(self):
+        """Current caps + usage in the last hour, for config display. {tier: [used, max]}."""
+        with self._rate_lock:
+            now = time.monotonic()
+            return {t: [len(self._prune(t, now)), self._max[t]] for t in self._max}
 
     @property
     def model(self):
@@ -168,6 +227,10 @@ class LlmClient:
         treats None as "stay silent". Never raises."""
         if not self.available():
             return None
+        tier = self._tier(smart=smart, image=bool(image_jpeg))
+        if not self._rate_consume(tier):
+            self._log(f"llm: {tier} hourly cap reached ({self._max[tier]}/h) — skipping")
+            return None
         system = SYSTEM_BASE + (("\n\n" + self._persona) if self._persona else "")
         messages = [{"role": "system", "content": system}]
         if history:
@@ -205,6 +268,10 @@ class LlmClient:
         personality creator (smart=True) and, later, the reflection loop. `json_object`
         hints the provider to emit a JSON object."""
         if not self.available():
+            return None
+        tier = self._tier(smart=smart)
+        if not self._rate_consume(tier):
+            self._log(f"llm: {tier} hourly cap reached ({self._max[tier]}/h) — skipping")
             return None
         messages = [{"role": "system", "content": str(system)},
                     {"role": "user", "content": str(user)}]
