@@ -34,13 +34,21 @@ if [ "${DEPLOY_SOUL:-1}" = "1" ]; then
   echo ">> pushing devstate/ soul + phrase bank to $HOST:$STATE_DIR (DEPLOY_SOUL=1)"
   "$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" "mkdir -p $STATE_DIR"
   pushed=0
-  for f in personality.json phrases.json; do
+  for f in personality.json phrases.json workshop.json; do
     if [ -f "devstate/$f" ]; then
       "$PSCP" -batch -pw "$PW" -hostkey "$HK" "devstate/$f" "$HOST:$STATE_DIR/$f"
       echo "   copied devstate/$f"
       pushed=1
     fi
   done
+  # Skills the dev harness minted in its workshop (devstate/skills/*.md) -> the board's writable
+  # learned dir, so deploy carries them alongside the soul/bank + the workshop.json ledger.
+  if [ -d "devstate/skills" ] && ls devstate/skills/*.md >/dev/null 2>&1; then
+    "$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" "mkdir -p $STATE_DIR/skills"
+    "$PSCP" -batch -pw "$PW" -hostkey "$HK" devstate/skills/*.md "$HOST:$STATE_DIR/skills/"
+    echo "   copied devstate/skills/*.md"
+    pushed=1
+  fi
   [ "$pushed" = 0 ] && echo "   (nothing in devstate/ to push — run personality_creator.py first)"
 fi
 

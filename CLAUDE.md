@@ -276,6 +276,22 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   `skill:<name>`. The dir resolves via `skills_dir` → share → source tree
   (`resolve_skills_dir`); `dev_webui.py` wires the same panel off-robot (topic actions no-op
   there, no ROS). See [[skill-library]].
+- **Skill workshop** (`skillsmith.py`, ROS-free + unit-tested): meditation is a **skill-synthesis
+  loop**, not just consolidation. On meditation entry `CognitionCore.run_skill_workshop()` runs
+  **suggest → check → rehearse → trial → adopt/retire**: the smart model mines the decision log
+  (gaps / repeated `no-pick`/`stumped`) for ONE *new* or *adapted* capability, it's validated
+  (`validate_candidate`: parse round-trip, kind whitelist, no name collision; action skills born
+  `enabled:false`), **rehearsed once** + smart-model **critiqued**, then written to a writable
+  **"learned" dir** (`workshop_dir`, default `~/.local/state/nanobot/skills`, loaded as
+  `SkillLibrary(extra_dir=…)` — separate from the committed catalogue, deploy-synced like the
+  soul/bank) and tracked in `workshop.json` (`WorkshopState`). A trial is a normal, immediately
+  auto-eligible skill; the `gate()` **auto-adopts** it (permanent) after `min_runs` good runs +
+  net-👍 + no errors, or **auto-retires** (deletes the file) on errors/net-👎. The contextual
+  👍/👎 reward is forwarded to the trial that last ran (`reward_trial_skill`). Manual override:
+  `GET /skills/workshop` + `POST /skills/workshop/{keep,kill}` (web "🛠 Skills" card, 🧪 trials).
+  `deploy.sh` pushes `devstate/skills/*.md` + `workshop.json` with the soul. Config: `workshop_*`
+  in robot.yaml. Runs identically on the dev harness (mints into `devstate/skills/`). See
+  [[meditation-skill-workshop]].
 - **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
   Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
   so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`

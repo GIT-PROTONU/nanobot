@@ -364,3 +364,17 @@ web_control:
     skills_enable: true        # load + offer the skill library
     skills_allow_actions: false  # permit topic-publishing (physical) skills — OFF by default
     skills_dir: ""             # "" = installed share (<pkg>/skills) or the source tree skills/
+    # Skill workshop: while meditating, the robot mines its own experience (decision log) to
+    # propose ONE new or improved capability, checks + rehearses it, then puts it on TRIAL. A
+    # trial is a normal, immediately-usable skill; it earns permanence (adopt) after enough good
+    # runs + net-positive 👍 reward with no errors, or is rolled back (retire) on errors/👎. You
+    # can also Keep/Kill any trial from the web "🛠 Skills" card. Minted skills live in
+    # workshop_dir (a writable, deploy-synced "learned" area, separate from the committed
+    # catalogue). Action-tier (topic) skills are still born disabled + gated by skills_allow_actions.
+    workshop_enable: true       # mint/adapt skills during meditation (false = meditation only consolidates)
+    workshop_dir: ""            # "" -> ~/.local/state/nanobot/skills (deploy-synced like the soul)
+    workshop_path: ""           # trial ledger; "" -> ~/.local/state/nanobot/workshop.json
+    workshop_rounds: 1          # candidate skills proposed per meditation entry
+    workshop_min_runs: 3        # successful runs before a trial may auto-adopt
+    workshop_retire_errors: 2   # error count that auto-retires a trial
+    workshop_retire_net_neg: 2  # net 👎 (down - up) that auto-retires a trial

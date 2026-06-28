@@ -190,7 +190,16 @@ class DevState:
             self_model_enable=bool(cfg.get("self_model_enable", True)),
             self_model_path=(cfg.get("self_model_path") or "").strip() or _dev_state("self_model.json"),
             consolidate_every=int(cfg.get("consolidate_every", 6)),
-            prelude_enable=bool(cfg.get("prelude_enable", True)))
+            prelude_enable=bool(cfg.get("prelude_enable", True)),
+            # The skill workshop mints/adapts skills into a project-local "learned" dir so you
+            # can see them in the repo (deploy carries devstate/ to the board, like the soul).
+            workshop_enable=bool(cfg.get("workshop_enable", True)),
+            workshop_dir=(cfg.get("workshop_dir") or "").strip() or _dev_state("skills"),
+            workshop_path=(cfg.get("workshop_path") or "").strip() or _dev_state("workshop.json"),
+            workshop_rounds=int(cfg.get("workshop_rounds", 1)),
+            workshop_min_runs=int(cfg.get("workshop_min_runs", 3)),
+            workshop_retire_errors=int(cfg.get("workshop_retire_errors", 2)),
+            workshop_retire_net_neg=int(cfg.get("workshop_retire_net_neg", 2)))
         self._pending_evolve = None                         # reflection -> chart (drained by loop)
         self._lock_pe = threading.Lock()
         # --- Purpose Engine + Horizon Planner (the real ROS-free brain orchestration) -----
@@ -381,6 +390,8 @@ class DevState:
             detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
         self.cog.log_decision("reward", status=status, detail=detail,
                               say=("👍" if value > 0 else "👎" if value < 0 else "·"))
+        if scope == "contextual":
+            self.cog.reward_trial_skill(value)          # credit a trial skill that just ran
         self._brain.apply_reward(value, target, scope=scope)
         self._brain.run_reflection()                    # reflect now so the weights update
         print(f"[reward] {status} ({scope})", file=sys.stderr)
@@ -393,9 +404,19 @@ class DevState:
         if on:
             self.cog.bank_regen_check()
             threading.Thread(target=self.cog.consolidate, daemon=True).start()  # long-term self
+            threading.Thread(target=self.cog.run_skill_workshop, daemon=True).start()  # mint a skill
         self.cog.log_decision("meditate", status=("on" if on else "off"))
         print(f"[meditate] {'on' if on else 'off'}", file=sys.stderr)
         return {"status": "ok", "meditating": self._brain.meditating}
+
+    def brain_workshop(self):
+        return self.cog.get_workshop()
+
+    def workshop_keep(self, data):
+        return self.cog.keep_skill(str(data.get("name", "")))
+
+    def workshop_kill(self, data):
+        return self.cog.kill_skill(str(data.get("name", "")))
 
     def tts_config(self):
         return {"voice": self.tts.voice, "volume": 100, "speed": 100, "pitch": 100,
@@ -493,6 +514,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.get_phrasebank())
         if p == "/skills":
             return self._json(self.state.get_skills())
+        if p == "/skills/workshop":
+            return self._json(self.state.brain_workshop())
         if p == "/tts/config":
             return self._json(self.state.tts_config())
         # Brain readouts — the robot serves these over rosbridge (latched topics); the dev
@@ -538,6 +561,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.invoke_skill(name))
         if p == "/skills/reload":
             return self._json(s.reload_skills())
+        if p == "/skills/workshop/keep":
+            return self._json(s.workshop_keep(self._body()))
+        if p == "/skills/workshop/kill":
+            return self._json(s.workshop_kill(self._body()))
         if p == "/brain/reward":
             return self._json(s.brain_reward(self._body()))
         if p == "/brain/meditate":

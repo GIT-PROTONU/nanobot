@@ -374,6 +374,13 @@
               picks one on its own on a <b>skill beat</b>. <b>Action</b> skills (move / LED) run
               only when <code>skills_allow_actions</code> is enabled in <code>robot.yaml</code>;
               motion stays clamped by <code>slam_nav</code>.</p>
+            <h2 style="margin-top:10px">🧪 Workshop · skills on trial</h2>
+            <p class="hint" id="workshopStatus">loading…</p>
+            <div id="workshopList" class="skills"></div>
+            <p class="hint">While <b>meditating</b> the robot mines its experience to invent or
+              improve a skill, then puts it on <b>trial</b>. A trial earns permanence on its own
+              after enough good runs + 👍 with no errors, or you can <b>Keep</b> / <b>Kill</b> it
+              here. <b>Kill</b> deletes the trial file; <b>Keep</b> adopts it for good.</p>
           </div>
           <div class="card">
             <h2>🧠 Brain · purpose &amp; learning</h2>
@@ -1160,9 +1167,51 @@ function invokeSkill(name){
 }
 if($("skillsReload")) $("skillsReload").onclick=()=>{
   const st=$("skillsStatus"); if(st) st.textContent="reloading…";
-  fetch("/skills/reload",{method:"POST"}).then(()=>loadSkills()).catch(()=>loadSkills());
+  fetch("/skills/reload",{method:"POST"}).then(()=>{loadSkills();loadWorkshop();})
+    .catch(()=>{loadSkills();loadWorkshop();});
 };
 loadSkills();
+
+// ---- Workshop · skills on trial ---- meditation mints/adapts a skill from experience and
+// puts it on trial; it auto-adopts after enough good runs + 👍 (no errors) or auto-retires on
+// errors/👎. Keep/Kill are the manual overrides (POST to web_control / the dev harness).
+function fmtTrial(t){
+  const net=(t.reward_pos||0)-(t.reward_neg||0);
+  const stat=`runs ${t.runs||0} · 👍${t.reward_pos||0} 👎${t.reward_neg||0}`
+    +((t.errors)?` · ⚠${t.errors}`:"");
+  const badge=t.status==="adopted"?`<span class="ls" style="color:#7fd">adopted</span>`
+    :t.status==="retired"?`<span class="ls">retired</span>`
+    :`<span class="ls" style="color:#fd7">trial</span>`;
+  const origin=t.origin==="adapt"?`adapt of ${t.parent||"?"}`:"new";
+  const btns=(t.status==="trial")
+    ?`<button class="btn skkeep" data-name="${t.name}">Keep</button>`
+      +`<button class="btn skkill" data-name="${t.name}">Kill</button>`:"";
+  return `<div class="skillrow"><div class="skmeta"><b>🧪 ${t.name}</b> ${badge}`
+    +` <span class="lm">${origin}</span><div class="skdesc">${t.rationale||""}</div>`
+    +`<div class="skdesc">${stat}</div></div>${btns}</div>`;
+}
+function loadWorkshop(){
+  const box=$("workshopList"), st=$("workshopStatus"); if(!box||!st) return;
+  fetch("/skills/workshop").then(r=>r.ok?r.json():null).then(d=>{
+    if(!d){ st.textContent="unavailable"; box.innerHTML=""; return; }
+    if(d.enabled===false){ st.textContent="workshop disabled"; box.innerHTML=""; return; }
+    const tr=d.trials||[];
+    const live=tr.filter(t=>t.status==="trial").length;
+    st.textContent=(d.busy?"meditating — proposing a skill… · ":"")
+      +`${live} on trial · ${tr.length} tracked`;
+    box.innerHTML=tr.length?tr.map(fmtTrial).join("")
+      :"<i>none yet — meditate to invent one</i>";
+    box.querySelectorAll(".skkeep").forEach(b=>b.onclick=()=>workshopAct("keep",b.dataset.name));
+    box.querySelectorAll(".skkill").forEach(b=>b.onclick=()=>workshopAct("kill",b.dataset.name));
+  }).catch(()=>{ st.textContent="offline"; });
+}
+function workshopAct(act,name){
+  const st=$("workshopStatus"); if(st) st.textContent=act+"ing "+name+"…";
+  fetch("/skills/workshop/"+act,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name})}).then(()=>{loadWorkshop();loadSkills();})
+    .catch(()=>{ if(st) st.textContent="network error"; });
+}
+loadWorkshop();
 
 // ---- Brain · purpose & learning ---- the Purpose Engine (goals + intrinsic reward) and
 // the Horizon Planner's A/B bandit live in the behaviour node and publish latched JSON on

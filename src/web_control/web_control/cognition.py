@@ -35,7 +35,8 @@ from collections import deque
 
 from .llm import MOODS, _extract_json
 from .phrasebank import PhraseBank
-from .skills import SkillLibrary
+from .skills import SkillLibrary, _slug
+from .skillsmith import WorkshopState, render_skill_md, validate_candidate
 
 REFLECT_TRAITS = ("curiosity", "extraversion", "caution", "playfulness")  # personality axes
 LLM_HISTORY_MAX = 8          # chat turns kept for context (user+assistant messages)
@@ -72,7 +73,9 @@ class CognitionCore:
                  bank_per_category=8, skills_dir="", skills_enable=True,
                  skills_allow_actions=False, self_model_path=None, self_model_enable=True,
                  consolidate_every=6, self_model_max_chars=600, prelude_enable=True,
-                 prelude_face="focused"):
+                 prelude_face="focused", workshop_enable=True, workshop_path=None,
+                 workshop_dir="", workshop_rounds=1, workshop_min_runs=3,
+                 workshop_retire_errors=2, workshop_retire_net_neg=2):
         self.llm = llm
         self.tts = tts
         self.persona = (persona or "").strip()
@@ -111,7 +114,12 @@ class CognitionCore:
         self.skills_enable = bool(skills_enable)
         self.skills_allow_actions = bool(skills_allow_actions)
         self.skills_dir = skills_dir
-        self._skills = SkillLibrary(skills_dir if skills_enable else "", logger=self._log)
+        # The writable "learned" dir is where the workshop mints skills (kept out of the
+        # committed catalogue; it's the deploy-synced state home, like the soul/phrase bank).
+        self._workshop_dir = workshop_dir or os.path.expanduser(
+            "~/.local/state/nanobot/skills")
+        self._skills = SkillLibrary(skills_dir if skills_enable else "", logger=self._log,
+                                    extra_dir=self._workshop_dir if skills_enable else "")
         self._reflect_busy = False
         # Long-term self-narrative (smart-LLM, durable across reboots). Loaded here and folded
         # into every spoken line's system prompt (LlmClient.set_self_note); rewritten slowly by
@@ -126,6 +134,18 @@ class CognitionCore:
             self.llm.set_self_note(self.self_narrative)
         self._reflect_count = 0
         self._consolidate_busy = False
+        # Skill workshop: meditation's experience-driven skill-synthesis loop (suggest -> check
+        # -> rehearse -> trial -> adopt/retire). The pure ledger + gate live in skillsmith.py;
+        # this class owns the LLM steps + the .md file writes. A trial skill is a normal,
+        # immediately-usable skill; the ledger just tracks whether it earns permanence.
+        self._workshop_enable = bool(workshop_enable) and self.skills_enable
+        self._workshop_rounds = max(1, int(workshop_rounds))
+        self._workshop = WorkshopState(
+            workshop_path or os.path.expanduser("~/.local/state/nanobot/workshop.json"),
+            logger=self._log, min_runs=workshop_min_runs,
+            retire_errors=workshop_retire_errors, retire_net_neg=workshop_retire_net_neg)
+        self._workshop_busy = False
+        self._last_trial_skill = None        # the trial skill that ran most recently (reward target)
         # Interaction fillers: an instant "thinking" line the moment a slow call starts (so a
         # skill/beat feels instant), and a graceful "stumped" line when a call comes back empty
         # instead of dead air. Both pull from the phrase bank (offline-safe FALLBACK_LINES).
@@ -455,6 +475,7 @@ class CognitionCore:
                 return {"error": "no camera frame"}
         reply = self.generate(self._skill_prompt(skill), image_jpeg=frame,
                               trigger=trigger, state=state, camera=bool(frame), prelude=True)
+        self._note_trial_run(skill.name, ok=bool(reply))
         return reply or {"error": "no reply"}
 
     def _do_topic_skill(self, skill, trigger, state):
@@ -475,7 +496,226 @@ class CognitionCore:
             self.express(face, say)                      # literal expression (no LLM call)
         self.log_decision(trigger, state, status=("acted" if ok else "error"),
                           model="action", say=say, mood=face, detail=detail)
+        self._note_trial_run(skill.name, ok=ok)
         return {"status": "acted" if ok else "error", "detail": detail, "name": skill.name}
+
+    # ---- skill workshop (meditation's self-improvement loop) ----------------
+    def run_skill_workshop(self, rounds=None):
+        """Meditation's skill-synthesis loop: mine experience -> propose ONE new/adapted skill
+        -> deterministic check -> rehearse once -> smart-model critique -> commit on trial.
+        Then sweep the gate so ripe trials adopt/retire. Best-effort + one-at-a-time guarded;
+        a no-op without the LLM or with the workshop disabled. Returns a small status dict."""
+        if not self._workshop_enable:
+            return {"status": "disabled"}
+        if not self.llm.available():
+            self.log_decision("workshop", status="llm-unavailable")
+            return {"status": "llm-unavailable"}
+        with self._llm_lock:                       # share the LLM guard so we never overlap a beat
+            if self._workshop_busy or self._llm_busy:
+                return {"status": "busy"}
+            self._workshop_busy = True
+        rounds = self._workshop_rounds if rounds is None else max(1, int(rounds))
+        out = []
+        try:
+            for _ in range(rounds):
+                out.append(self._workshop_round())
+        finally:
+            self._workshop_busy = False
+        self.sweep_workshop()                      # adopt/retire any trial that has earned it
+        return {"status": "ok", "rounds": out}
+
+    def _workshop_round(self):
+        """One propose->check->rehearse->critique->trial cycle. Returns a per-round status."""
+        spec = self._suggest_skill()
+        if not spec:
+            self.log_decision("workshop:suggest", status="no-reply",
+                              model=(self.llm.last_model or self.llm.smart_model))
+            return {"status": "no-suggestion"}
+        name = _slug(spec.get("name"))
+        ok, why = validate_candidate(spec, self._skills.skills.keys(),
+                                     self.skills_allow_actions)
+        if not ok:
+            self.log_decision("workshop:reject", status="invalid", say=name, detail=why)
+            return {"status": "rejected", "name": name, "reason": why}
+        path = self._write_skill_file(name, render_skill_md(spec))
+        if not path:
+            return {"status": "write-failed", "name": name}
+        self._skills.reload()                      # the candidate is now a live (rehearsable) skill
+        skill = self._skills.get(name)
+        rehearsal = self._rehearse_skill(skill)
+        verdict = self._critique_skill(spec, rehearsal)
+        if not verdict.get("keep", True):
+            self._delete_skill_file(path)
+            self._skills.reload()
+            self.log_decision("workshop:discard", status="critique", say=name,
+                              detail=str(verdict.get("reason", ""))[:120])
+            return {"status": "discarded", "name": name, "reason": verdict.get("reason")}
+        self._workshop.track(name, origin=str(spec.get("mode", "new")),
+                             parent=str(spec.get("target", "")),
+                             rationale=str(spec.get("rationale", "")), path=path)
+        self.log_decision("workshop:trial", status="trialing", say=name,
+                          detail=str(spec.get("rationale", ""))[:120])
+        return {"status": "trialing", "name": name}
+
+    def _suggest_skill(self):
+        """Ask the smart model to invent ONE small new capability or improve an existing one,
+        grounded in the recent decision log (gaps, repeated 'no-pick'/'stumped', requests)."""
+        cat = self._skills.format_catalogue(self.skills_allow_actions) or "(none yet)"
+        kinds = "say, observe, look" + (", topic" if self.skills_allow_actions else "")
+        selfctx = (f" You have become: {self.self_narrative}." if self.self_narrative else "")
+        system = (
+            f"You are the quiet, self-improving mind of a small robot named "
+            f"{self.persona_name} during meditation. From its recent experience you invent ONE "
+            "small new capability, or improve an existing one, so it serves the people around "
+            "it a little better. A capability is a short instruction the robot follows to speak "
+            "or act. Reply ONLY compact JSON: "
+            '{"mode":"new"|"adapt","target":"<existing name, only if adapt>",'
+            '"name":"<short-kebab-name>","description":"<one line>",'
+            '"trigger":"<when to use it>","action":{"kind":"<one of: %s>","sources":'
+            '["sensors"|"scan"|"audio"|"memory"]},"body":"<2-4 sentences telling the robot HOW '
+            'to perform it>","rationale":"<why, from experience>"}. Use a NEW kebab name even '
+            "when adapting (a variant); omit sources for a plain say. No prose outside the JSON."
+            % kinds)
+        user = (f"Existing capabilities:\n{cat}\n\nYour personality (0..1): "
+                f"{self.traits_phrase()}.{selfctx}\n\nRecent experience (look for gaps, "
+                f"repeated stumbles, things people seemed to want):\n"
+                f"{self.recent_events_text(40)}\n\nPropose one capability to add or improve.")
+        content = self.llm.complete(system, user, smart=True, json_object=True)
+        obj = _extract_json(content or "")
+        return obj if isinstance(obj, dict) and obj.get("name") else None
+
+    def _rehearse_skill(self, skill):
+        """Dry-run the candidate ONCE to get a real sample of its output, without speaking it
+        aloud (meditation stays calm). Narrative kinds get a text generation; an action kind
+        is described, not published. Returns a {say,mood}-ish dict or None."""
+        if skill is None:
+            return None
+        if skill.is_action:
+            return {"say": "(action: would publish %s)" % skill.action.get("topic", ""),
+                    "mood": ""}
+        try:
+            return self.llm.generate(self._skill_prompt(skill), smart=False)
+        except Exception:
+            return None
+
+    def _critique_skill(self, spec, rehearsal):
+        """Smart-model self-check on the rehearsed candidate: is it useful, safe, in-character,
+        not a duplicate? Returns {"keep":bool,"reason":str}. An unparseable/empty critique
+        defaults to keep=True (the deterministic checks + rehearsal already passed); only an
+        explicit "keep": false vetoes — so a flaky model never blocks all learning."""
+        sample = (rehearsal or {}).get("say") if isinstance(rehearsal, dict) else ""
+        system = ("You quality-check a small robot's proposed new capability before it goes on "
+                  "trial. Judge whether it is useful, safe, in character, and not a duplicate "
+                  'of what it can already do. Reply ONLY compact JSON '
+                  '{"keep": true|false, "reason": "<one short line>"}.')
+        user = ("Proposed capability:\n- name: %s\n- description: %s\n- trigger: %s\n- how: %s\n"
+                "- rationale: %s\n\nA rehearsal of it produced: %r\n\nShould it go on trial?"
+                % (spec.get("name"), spec.get("description"), spec.get("trigger"),
+                   spec.get("body"), spec.get("rationale"), sample or "(no output)"))
+        content = self.llm.complete(system, user, smart=True, json_object=True)
+        obj = _extract_json(content or "")
+        if not isinstance(obj, dict) or "keep" not in obj:
+            return {"keep": True, "reason": ""}
+        return {"keep": bool(obj.get("keep")), "reason": str(obj.get("reason", ""))}
+
+    # ---- trial bookkeeping: runs, reward, the adopt/retire gate --------------
+    def _note_trial_run(self, name, ok=True):
+        """Record one trial-skill invocation + apply the gate now (a clearly good/bad skill
+        needn't wait for the next meditation). No-op for untracked / non-trial skills."""
+        if not self._workshop.is_trial(name):
+            return
+        self._last_trial_skill = _slug(name)
+        self._workshop.record_run(name, ok=ok)
+        self._apply_gate(name)
+
+    def reward_trial_skill(self, value):
+        """Credit a human 👍/👎 (the 'happy user' signal) to the trial skill that ran most
+        recently, then re-gate it. Returns whether a trial was credited."""
+        name = self._last_trial_skill
+        if not (name and self._workshop.is_trial(name)):
+            return False
+        self._workshop.record_reward(name, value)
+        self._apply_gate(name)
+        return True
+
+    def sweep_workshop(self):
+        """Apply the gate across every trial (called after minting + on the slow tick)."""
+        for name, decision in self._workshop.gate_all():
+            self._apply_decision(name, decision)
+
+    def _apply_gate(self, name):
+        self._apply_decision(name, self._workshop.gate(name))
+
+    def _apply_decision(self, name, decision):
+        if decision == "adopt":
+            self._adopt_skill(name)
+        elif decision == "retire":
+            self._retire_skill(name)
+
+    def _adopt_skill(self, name):
+        """Graduate a trial to permanent. The .md already lives in the durable learned dir
+        (deploy-synced like the soul/phrase bank), so adoption is just a status flip + log."""
+        name = _slug(name)
+        rec = self._workshop.skills.get(name) or {}
+        self._workshop.keep(name)
+        self.log_decision("workshop:adopt", status="adopted", say=name,
+                          detail="runs=%s +%s/-%s" % (rec.get("runs"), rec.get("reward_pos"),
+                                                      rec.get("reward_neg")))
+
+    def _retire_skill(self, name):
+        """Roll a trial back: delete its .md (the parent of an `adapt` is never touched) and
+        drop the ledger record so the library stops offering it."""
+        name = _slug(name)
+        rec = self._workshop.skills.get(name) or {}
+        self._delete_skill_file(rec.get("path", ""))
+        self._workshop.forget(name)
+        self._skills.reload()
+        self.log_decision("workshop:retire", status="retired", say=name)
+
+    # ---- workshop file IO + web API -----------------------------------------
+    def _write_skill_file(self, name, text):
+        """Write a generated skill into the writable 'learned' dir (creating it if needed).
+        Returns the path, or "" if there's nowhere writable (logged, no trial)."""
+        if not text:
+            return ""
+        d = self._skills.write_dir() or self.skills_dir
+        if not d:
+            self._log("workshop: no writable skills directory")
+            return ""
+        path = os.path.join(d, _slug(name) + ".md")
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            return path
+        except Exception as exc:
+            self._log("workshop: failed to write %s: %s" % (path, exc))
+            return ""
+
+    def _delete_skill_file(self, path):
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception as exc:
+                self._log("workshop: failed to remove %s: %s" % (path, exc))
+
+    def get_workshop(self):
+        return {"enabled": self._workshop_enable, "busy": self._workshop_busy,
+                "trials": self._workshop.to_public()}
+
+    def keep_skill(self, name):
+        """Manual override: adopt a trial now (a happy user pressing Keep)."""
+        if not self._workshop.is_trial(name):
+            return {"error": "unknown trial: %s" % name}
+        self._adopt_skill(name)
+        return {"status": "adopted", "name": _slug(name)}
+
+    def kill_skill(self, name):
+        """Manual override: discard a trial now (delete its file + forget it)."""
+        if self._workshop.status_of(name) is None:
+            return {"error": "unknown trial: %s" % name}
+        self._retire_skill(name)
+        return {"status": "retired", "name": _slug(name)}
 
     # ---- lifecycle speech ---------------------------------------------------
     def speak_lifecycle(self, category, face=None):

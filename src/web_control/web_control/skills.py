@@ -170,8 +170,14 @@ class SkillLibrary:
     """Loads + indexes the ``*.md`` skill files in a directory. Tolerant: a bad file is
     skipped (logged), a missing directory yields an empty (but usable) library."""
 
-    def __init__(self, directory, logger=None):
+    def __init__(self, directory, logger=None, extra_dir=""):
         self.directory = directory or ""
+        # An optional second, WRITABLE directory loaded alongside the built-ins — the home for
+        # skills the robot mints itself (the workshop's trial/adopted .md files). Kept separate
+        # so the committed catalogue stays read-only and the learned ones live in the synced
+        # state area. A learned skill with a new name adds a capability; a name collision lets
+        # the learned file override the built-in (it loads last).
+        self.extra_dir = extra_dir or ""
         self._log = logger or (lambda *_: None)
         self.skills = {}                              # slug -> Skill (sorted by filename)
         self.error = ""
@@ -179,23 +185,31 @@ class SkillLibrary:
 
     def load(self):
         self.skills, self.error = {}, ""
-        d = self.directory
-        if not d or not os.path.isdir(d):
-            self.error = "no skills directory at %r" % (d,)
+        if not self.directory or not os.path.isdir(self.directory):
+            self.error = "no skills directory at %r" % (self.directory,)
             self._log("skills: " + self.error)
-            return self
-        for path in sorted(glob.glob(os.path.join(d, "*.md"))):
-            if os.path.basename(path).lower() == "readme.md":
-                continue                              # docs, not a capability
-            try:
-                sk = parse_skill_file(path)
-            except Exception as exc:
-                self._log("skills: failed to parse %s: %s" % (os.path.basename(path), exc))
+        for d in (self.directory, self.extra_dir):    # built-ins first, then learned (override)
+            if not d or not os.path.isdir(d):
                 continue
-            if sk is not None:
-                self.skills[sk.name] = sk
-        self._log("skills: loaded %d from %s" % (len(self.skills), d))
+            for path in sorted(glob.glob(os.path.join(d, "*.md"))):
+                if os.path.basename(path).lower() == "readme.md":
+                    continue                          # docs, not a capability
+                try:
+                    sk = parse_skill_file(path)
+                except Exception as exc:
+                    self._log("skills: failed to parse %s: %s"
+                              % (os.path.basename(path), exc))
+                    continue
+                if sk is not None:
+                    self.skills[sk.name] = sk
+        self._log("skills: loaded %d from %s%s" % (
+            len(self.skills), self.directory,
+            (" + " + self.extra_dir) if self.extra_dir else ""))
         return self
+
+    def write_dir(self):
+        """Where newly-minted skills are written: the learned dir if set, else the main dir."""
+        return self.extra_dir or self.directory
 
     reload = load
 

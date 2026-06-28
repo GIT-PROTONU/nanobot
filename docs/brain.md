@@ -176,6 +176,37 @@ can reach for a capability, but physics/safety always wins.
 Every invocation lands in the decision log as `skill:<name>`. `scripts/dev_webui.py` wires the
 same panel off-robot (narrative skills speak through your laptop; topic actions no-op, no ROS).
 
+## The workshop — Nano invents its own skills while meditating
+
+Meditation isn't just a calm pause + consolidation; it's a **self-improvement loop** that can
+mint *new* capabilities. When you toggle meditation on, alongside the usual reflect/consolidate,
+`CognitionCore.run_skill_workshop()` runs a bounded **suggest → check → rehearse → trial → adopt**
+cycle (the pure pieces are in `web_control/skillsmith.py`, unit-tested offline):
+
+1. **Suggest** — the *smart* model reads the recent decision log (looking for gaps, repeated
+   `no-pick`/`stumped`, things people seemed to want) + the existing catalogue, and proposes
+   **one** capability: brand `new` or an `adapt` (a fresh variant of an existing one).
+2. **Check** — deterministic, local: the candidate must round-trip through the skill parser, use
+   a known action kind, not collide with an existing name, and (for action skills) only when
+   `skills_allow_actions` is on. Generated action skills are **always born `enabled: false`**.
+3. **Rehearse** — the skill is dry-run once (no speaking aloud) and the *actual* output is fed to
+   a smart-model **critique** ("useful, safe, in-character, not a duplicate?"). An explicit veto
+   discards it.
+4. **Trial** — survivors are written into a writable **"learned" dir** (`workshop_dir`, default
+   `~/.local/state/nanobot/skills` — deploy-synced like the soul/phrase bank, kept separate from
+   the committed catalogue) and tracked in `workshop.json`. A trial is a **normal, immediately
+   usable skill** — fully auto-eligible to the skill beat (action tier still gated).
+5. **Adopt / retire** — the `gate()` watches each trial's evidence: it **auto-adopts** (permanent)
+   after enough good runs **+ net-positive 👍 reward + no errors**, and **auto-retires** (deletes
+   the file, rolls back) on errors or net-👎. The 👍/👎 you give right after a skill runs is the
+   "happy user" signal. You can always **Keep** or **Kill** a trial yourself from the "🛠 Skills"
+   card (`/skills/workshop` + `/keep` + `/kill`).
+
+So the brain doesn't just *use* skills — over time, guided by what actually pleased people, it
+**grows new ones and prunes the duds**, and the survivors become a permanent part of who it is.
+The same loop runs on the dev harness (skills land in `devstate/skills/`), so you can watch it
+invent a capability in a browser with no robot.
+
 ## On-demand interactions (you, not the chart)
 
 The web UI's "AI" card drives the manual paths, all in `web_control`:

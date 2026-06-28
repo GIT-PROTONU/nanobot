@@ -136,6 +136,16 @@ class WebServerNode(Node):
         self.declare_parameter("skills_enable", True)      # load + offer the skill library
         self.declare_parameter("skills_allow_actions", False)  # permit topic-publishing skills
         self.declare_parameter("skills_dir", "")           # "" -> installed share / source skills/
+        # Skill workshop: meditation's experience-driven skill-synthesis loop (suggest -> check
+        # -> rehearse -> trial -> adopt/retire). Minted skills live in workshop_dir (a writable,
+        # deploy-synced "learned" area, separate from the committed catalogue).
+        self.declare_parameter("workshop_enable", True)        # mint/adapt skills while meditating
+        self.declare_parameter("workshop_dir", "")             # "" -> ~/.local/state/nanobot/skills
+        self.declare_parameter("workshop_path", "")            # ledger; "" -> XDG state dir
+        self.declare_parameter("workshop_rounds", 1)           # candidates proposed per meditation
+        self.declare_parameter("workshop_min_runs", 3)         # runs before a trial may adopt
+        self.declare_parameter("workshop_retire_errors", 2)    # errors that retire a trial
+        self.declare_parameter("workshop_retire_net_neg", 2)   # net 👎 that retire a trial
         # Lifecycle speech + the persistent "AI offline" indicator (all offline-safe via the
         # phrase bank's FALLBACK_LINES, so they work with no key / no network).
         self.declare_parameter("startup_greeting", True)   # speak a greeting line on boot
@@ -248,7 +258,14 @@ class WebServerNode(Node):
             self_model_enable=bool(g("self_model_enable").value),
             self_model_path=(g("self_model_path").value or None),
             consolidate_every=int(g("consolidate_every").value),
-            prelude_enable=bool(g("prelude_enable").value))
+            prelude_enable=bool(g("prelude_enable").value),
+            workshop_enable=bool(g("workshop_enable").value),
+            workshop_dir=(g("workshop_dir").value or ""),
+            workshop_path=(g("workshop_path").value or None),
+            workshop_rounds=int(g("workshop_rounds").value),
+            workshop_min_runs=int(g("workshop_min_runs").value),
+            workshop_retire_errors=int(g("workshop_retire_errors").value),
+            workshop_retire_net_neg=int(g("workshop_retire_net_neg").value))
         # Statechart-driven enrichment requests: the behaviour node decides when/what, the
         # core executes (capture frame if asked, add sensors, generate, speak + emote).
         self.create_subscription(String, "cognition/request", self._on_cog, 10)
@@ -505,6 +522,10 @@ class WebServerNode(Node):
             detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
         self._cog.log_decision("reward", status=status, detail=detail,
                                say=("👍" if value > 0 else "👎" if value < 0 else "·"))
+        # Also credit a trial skill that just ran (the workshop's "happy user" signal): a
+        # contextual 👍/👎 right after a skill helps it earn (or lose) permanence.
+        if scope == "contextual":
+            self._cog.reward_trial_skill(value)
         self._reward_pub.publish(String(data=json.dumps(
             {"value": value, "scope": scope, "target": target})))
         return {"status": "ok", "value": value, "scope": scope}
@@ -520,8 +541,20 @@ class WebServerNode(Node):
             self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
             self._cog.bank_regen_check()           # refresh the phrase bank (background)
             threading.Thread(target=self._cog.consolidate, daemon=True).start()  # long-term self
+            # The skill workshop: mine experience -> mint/adapt a skill on trial (off-thread,
+            # it makes several LLM calls). Sweeps the adopt/retire gate when it finishes.
+            threading.Thread(target=self._cog.run_skill_workshop, daemon=True).start()
         self._cog.log_decision("meditate", status=("on" if on else "off"))
         return {"status": "ok", "meditating": on}
+
+    def brain_workshop(self):
+        return self._cog.get_workshop()
+
+    def workshop_keep(self, data):
+        return self._cog.keep_skill(str(data.get("name", "")))
+
+    def workshop_kill(self, data):
+        return self._cog.kill_skill(str(data.get("name", "")))
 
     # --- statechart enrichment executor (/cognition/request) -----------------
     def _on_cog(self, msg: String):
@@ -917,6 +950,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._respond_json(self._node.get_phrasebank() if self._node else {})
         if path == "/skills":
             return self._respond_json(self._node.get_skills() if self._node else {"skills": []})
+        if path == "/skills/workshop":
+            return self._respond_json(
+                self._node.brain_workshop() if self._node else {"trials": []})
         if path == "/stream.mjpg":
             return self._stream_mjpeg()
         if path == "/audio.pcm":
@@ -1021,6 +1057,18 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._respond(503, "no node")
             else:
                 self._respond_json(self._node.reload_skills())
+        elif path == "/skills/workshop/keep":
+            # Manually adopt a trial skill now: {"name":"<skill>"} (Keep button).
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._node.workshop_keep(self._read_json()))
+        elif path == "/skills/workshop/kill":
+            # Manually discard a trial skill now: {"name":"<skill>"} (Kill button).
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._node.workshop_kill(self._read_json()))
         elif path == "/brain/reward":
             # Reward the current behaviour: {"value":±1,"scope":"contextual"|"global","target"?}.
             if self._node is None:
