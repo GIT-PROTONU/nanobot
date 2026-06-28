@@ -211,6 +211,20 @@ behavior:
     brain_timeout: 90.0       # s without an /cognition/evolve before reverting to baseline
     nudge_pickup_caution: 0.92  # fast rule: being picked up eases caution toward this
     nudge_pickup_playful: 0.3   #            and playfulness toward this (startled)
+    # --- Purpose Engine + Horizon Planner (goals/reward + A/B; narrative-only) ---
+    # The slow "identity" layer owns the robot's objective + intrinsic-reward weights; the
+    # "strategy" layer turns that into a verified task it narrates as a "pursuing" beat (an
+    # upgrade of the idle musing beat) and A/B-tests how the line is phrased, learning from
+    # the web 👍/👎 reward. Both are deterministic + fully local (the LLM reflection above
+    # still separately owns trait drift). Reflection reads the shared decision log.
+    purpose_enable: true        # run the goal/reward + planner layer (false = pure presence)
+    purpose_period: 600.0       # s between purpose reflections (faster while meditating)
+    pursue_min_interval: 180.0  # s, min gap between goal-pursuit ("pursuing") beats
+    ab_epsilon: 0.2             # A/B bandit exploration rate (0..1; higher = explores more)
+    meditate_face: "focused"    # OLED face shown while meditating/consolidating
+    purpose_path: ""            # "" = ~/.local/state/nanobot/purpose.json
+    experiments_path: ""        # "" = ~/.local/state/nanobot/experiments.json
+    cognition_log_path: ""      # shared decision log (read-only); "" = ~/.local/state/nanobot/cognition.log
 
 # ---- Web control (rosbridge websocket + static page) ------------------------
 web_control:

@@ -217,6 +217,11 @@ class WebServerNode(Node):
         self._evolve_pub = self.create_publisher(String, "cognition/evolve", 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, "cognition/traits", self._on_traits, latched)
+        # Brain controls from the web UI (the behaviour node consumes these): human reward
+        # -> A/B bandit + reward shaping; meditation -> consolidation/sleep mode.
+        self._reward_pub = self.create_publisher(String, "cognition/reward", 10)
+        self._meditate_pub = self.create_publisher(Bool, "meditate", latched)
+        self._meditating = False
         # Sensor snapshot for the "Observe" feature (light: we just store the latest
         # value from each, with its arrival time for staleness). CPU/RAM/temp come from
         # the same cheap /proc reads the announcer uses; these add IMU + pick-up.
@@ -467,6 +472,40 @@ class WebServerNode(Node):
         with self._log_lock:
             return {"entries": list(self._cog_log)[::-1]}   # newest first
 
+    # --- brain controls (reward + meditation) --------------------------------
+    def brain_reward(self, data):
+        """Record a human reward and publish it for the behaviour node. Contextual reward
+        (with a `target` echoed from /task_current) credits a specific A/B arm; global reward
+        shapes the intrinsic-reward weights via the decision log on the next reflection."""
+        try:
+            value = clamp(float(data.get("value", 0)), -1, 1)
+        except (TypeError, ValueError):
+            value = 0.0
+        scope = "global" if data.get("scope") == "global" else "contextual"
+        target = data.get("target") if isinstance(data.get("target"), dict) else None
+        status = "up" if value > 0 else ("down" if value < 0 else "neutral")
+        detail = scope
+        if target:
+            detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
+        self._log_decision("reward", status=status, detail=detail,
+                           say=("👍" if value > 0 else "👎" if value < 0 else "·"))
+        self._reward_pub.publish(String(data=json.dumps(
+            {"value": value, "scope": scope, "target": target})))
+        return {"status": "ok", "value": value, "scope": scope}
+
+    def brain_meditate(self, data):
+        """Toggle meditation/consolidation. Publishes /meditate for the behaviour node (calm
+        face + paused beats + local purpose/A/B consolidation) and, on entry, kicks the LLM
+        reflection + phrase-bank regeneration here so the whole brain consolidates at once."""
+        on = bool(data.get("on"))
+        self._meditating = on
+        self._meditate_pub.publish(Bool(data=on))
+        if on:
+            self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
+            self._bank_regen_check()               # refresh the phrase bank (background)
+        self._log_decision("meditate", status=("on" if on else "off"))
+        return {"status": "ok", "meditating": on}
+
     # --- phrase bank ---------------------------------------------------------
     def get_phrasebank(self):
         s = self._bank.stats()
@@ -547,7 +586,10 @@ class WebServerNode(Node):
         self._was_picked = picked
         if now < self._reflect_next or self._reflect_busy:
             return
-        self._reflect_next = now + float(self.get_parameter("reflect_period").value)
+        period = float(self.get_parameter("reflect_period").value)
+        if self._meditating:
+            period = min(period, 60.0)             # consolidate faster while meditating/charging
+        self._reflect_next = now + period
         threading.Thread(target=self._reflect, daemon=True).start()
 
     def _recent_events_text(self, n=25):
@@ -968,6 +1010,18 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._respond(503, "no node")
             else:
                 self._respond_json(self._node.regenerate_phrasebank())
+        elif path == "/brain/reward":
+            # Reward the current behaviour: {"value":±1,"scope":"contextual"|"global","target"?}.
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._node.brain_reward(self._read_json()))
+        elif path == "/brain/meditate":
+            # Toggle meditation/consolidation mode: {"on":bool}.
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._node.brain_meditate(self._read_json()))
         elif path == "/system/restart":
             # Restart the whole ROS stack. Detached + new session so it survives
             # do_down killing this very web server, then do_up brings it back.

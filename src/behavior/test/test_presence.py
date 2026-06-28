@@ -72,7 +72,24 @@ def test_beats_rotate_sensor_then_camera():
     seq = _run_cycles(interp, clock, 4)
     assert seq == ["musing", "musing", "musing", "looking"]
     assert beats == seq                          # do_beat fired with the right names
-    assert set(BEATS) == {"musing", "looking"}   # convention table matches the chart
+    # The chart rotates musing/looking; `pursuing` is a node-side upgrade of the musing
+    # beat (delivered by mood_node when the planner has a task), not a separate chart state.
+    assert set(BEATS) == {"musing", "looking", "pursuing"}
+
+
+def test_meditate_pauses_beats_until_wake():
+    interp, clock, faces, beats = _build(look_every=4)
+    _step(interp, clock, GREET + 0.1)            # -> resting
+    interp.queue(Event("meditate"))
+    _step(interp, clock, GREET + 0.2)
+    assert "meditating" in interp.configuration
+    assert faces[-1] == "focused"                # the calm meditate face
+    before = list(beats)
+    _run_cycles(interp, clock, 3)                # no beats should fire while meditating
+    assert beats == before
+    interp.queue(Event("wake"))
+    _step(interp, clock, clock.time + 0.1)
+    assert "resting" in interp.configuration     # back to normal presence
 
 
 def test_camera_beats_off_only_musing():

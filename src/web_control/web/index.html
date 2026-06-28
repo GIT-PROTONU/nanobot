@@ -356,6 +356,27 @@
             </details>
           </div>
           <div class="card">
+            <h2>🧠 Brain · purpose &amp; learning</h2>
+            <p class="hint" id="purposeObjective">objective: …</p>
+            <div class="kv" id="rewardBars"></div>
+            <p class="hint">Now pursuing: <b id="taskCurrent">—</b></p>
+            <div class="row">
+              <button id="rewardUp" class="btn grow">👍 Good</button>
+              <button id="rewardDown" class="btn grow">👎 Meh</button>
+            </div>
+            <p class="hint">Rewards the line it's saying <b>now</b> (trains the A/B test for that
+              beat). With nothing being pursued it nudges the robot's <b>overall</b> taste.</p>
+            <label class="switch"><input type="checkbox" id="meditateOn"><span class="track"></span>
+              🧘 Meditation mode</label>
+            <p class="hint">Pauses expression and <b>consolidates</b>: reflects on recent
+              experience, updates its purpose &amp; reward weights, picks the A/B winners and
+              regenerates its phrase bank. Meant for while it charges; manual toggle for now.</p>
+            <details class="logbox">
+              <summary>🧪 Experiments</summary>
+              <div id="abLog" class="log">…</div>
+            </details>
+          </div>
+          <div class="card">
             <h2>Announce</h2>
             <label class="switch"><input type="checkbox" id="announceOn"><span class="track"></span>
               Speak system stats</label>
@@ -587,6 +608,8 @@ let fanTopic=null, fanParamSrv=null;
 // slam_nav view+plan state (read by the map panel script below)
 let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
 let homeTopic=null, saveTopic=null, testTopic=null, testResTopic=null;
+// Brain: purpose / current task / A/B experiment stats (latched, from the behaviour node)
+let purposeTopic=null, taskTopic=null, expTopic=null;
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -848,6 +871,14 @@ function subscribe(){
   planTopic=new ROSLIB.Topic({ros,name:"/plan",messageType:"nav_msgs/msg/Path",
     throttle_rate:200,queue_length:1});
   planTopic.subscribe(m=>{ mapPlan=(m.poses||[]).map(p=>[p.pose.position.x,p.pose.position.y]); });
+  // Brain: purpose / current task / experiment stats (latched JSON strings from the
+  // behaviour node; it also republishes on a ~5 s heartbeat so we don't miss the latch).
+  purposeTopic=new ROSLIB.Topic({ros,name:"/purpose",messageType:"std_msgs/msg/String"});
+  purposeTopic.subscribe(m=>renderPurpose(m.data));
+  taskTopic=new ROSLIB.Topic({ros,name:"/task_current",messageType:"std_msgs/msg/String"});
+  taskTopic.subscribe(m=>renderTask(m.data));
+  expTopic=new ROSLIB.Topic({ros,name:"/experiments",messageType:"std_msgs/msg/String"});
+  expTopic.subscribe(m=>renderExperiments(m.data));
 }
 
 // ---- ESP32 coprocessor handlers ----
@@ -1070,6 +1101,60 @@ if(llmLogDetails){
     if(llmLogDetails.open){ loadLlmLog(); llmLogTimer=setInterval(loadLlmLog,4000); }
   });
 }
+
+// ---- Brain · purpose & learning ---- the Purpose Engine (goals + intrinsic reward) and
+// the Horizon Planner's A/B bandit live in the behaviour node and publish latched JSON on
+// /purpose, /task_current, /experiments. Reward (👍/👎) + meditation POST to web_control,
+// which logs + republishes them for the behaviour node. All narrative-only (no motion).
+let lastTask=null;
+function renderPurpose(s){
+  try{ const p=JSON.parse(s);
+    $("purposeObjective").textContent="objective: "+((p.objective&&p.objective.text)||"—");
+    const r=p.intrinsic_reward||{};
+    $("rewardBars").innerHTML=Object.keys(r).map(k=>
+      `<span>${k}</span><b>${Math.round(r[k]*100)}%</b>`).join("");
+  }catch(e){}
+}
+function renderTask(s){
+  try{ const t=JSON.parse(s);
+    lastTask = (t && t.task) ? t : null;          // only a real task is a reward target
+    $("taskCurrent").textContent = (t && (t.text||t.task)) || "—";
+  }catch(e){ lastTask=null; }
+}
+function renderExperiments(s){
+  const box=$("abLog"); if(!box) return;
+  try{ const d=JSON.parse(s), exps=d.experiments||{};
+    box.innerHTML=Object.keys(exps).map(eid=>{
+      const e=exps[eid], vs=e.variants||{};
+      const rows=Object.keys(vs).map(v=>
+        `<div class="logrow">${v===e.winner?"★":"·"} <b>${v}</b>`
+        +` <span class="ls">n=${vs[v].n||0}</span> reward ${(vs[v].mean||0).toFixed(2)}</div>`
+      ).join("");
+      return `<div class="logrow"><b>${eid}</b></div>${rows}`;
+    }).join("")||"<i>no experiments</i>";
+  }catch(e){}
+}
+function sendReward(value){
+  const body={value, scope: lastTask?"contextual":"global", target: lastTask};
+  fetch("/brain/reward",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)}).then(()=>loadLlmLog()).catch(()=>{});
+}
+if($("rewardUp")) $("rewardUp").onclick=()=>sendReward(1);
+if($("rewardDown")) $("rewardDown").onclick=()=>sendReward(-1);
+if($("meditateOn")) $("meditateOn").addEventListener("change",()=>{
+  fetch("/brain/meditate",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({on:$("meditateOn").checked})}).catch(()=>{});
+});
+// No-rosbridge fallback (the dev_webui harness): when not connected to rosbridge, poll the
+// brain readouts over plain HTTP. On the real robot these come over rosbridge (and the GETs
+// 404), so this only does anything on the dev host while disconnected.
+function pollBrainHttp(){
+  if(connected) return;
+  fetch("/purpose").then(r=>r.ok?r.text():null).then(s=>{ if(s) renderPurpose(s); }).catch(()=>{});
+  fetch("/task_current").then(r=>r.ok?r.text():null).then(s=>{ if(s) renderTask(s); }).catch(()=>{});
+  fetch("/experiments").then(r=>r.ok?r.text():null).then(s=>{ if(s) renderExperiments(s); }).catch(()=>{});
+}
+setInterval(pollBrainHttp, 3000); pollBrainHttp();
 
 // ---- OLED face / mood ---- empty string = dashboard, else the selected mood.
 function sendFace(){

@@ -14,6 +14,17 @@ LLM: `musing`→sensors (synthetic) and `looking`→your webcam (needs `opencv-p
 you can watch/hear the whole enriched-behaviour loop — and every decision shows in the
 web UI "🧠 Decision log".
 
+The **🧠 Brain card** (Speak tab) is fully wired here too: this harness runs the real
+ROS-free `behavior.purpose` (Purpose Engine) + `behavior.planner` (Horizon Planner + A/B
+bandit), serves the readouts the robot publishes over rosbridge (`/purpose`,
+`/task_current`, `/experiments`) over plain HTTP (the page polls them when rosbridge is
+absent), and handles `/brain/reward` + `/brain/meditate`. So you can reward the current
+line (👍/👎 → the A/B bandit learns), watch the reward weights drift, and toggle
+meditation — all without the board. With `--behavior` the idle `musing` beat upgrades to a
+`pursuing` beat (planner task → webcam observation), so 👍/👎 becomes *contextual* and
+credits the chosen variant. (State persists to the same `~/.local/state/nanobot/*.json`
+the robot uses; delete `purpose.json` + `experiments.json` for a clean slate.)
+
 Telemetry/joystick/map show offline (no rosbridge). The API key comes from
 $OPENROUTER_API_KEY; persona/model are read from robot.yaml.
 
@@ -41,6 +52,10 @@ sys.path.insert(0, os.path.join(_ROOT, "src", "behavior"))   # ROS-free presence
 from web_control.tts import TtsEngine, VOICES, clamp        # noqa: E402
 from web_control.llm import LlmClient, MOODS, _extract_json  # noqa: E402
 from web_control.phrasebank import PhraseBank                # noqa: E402
+# The Purpose Engine + Horizon Planner are ROS-free, so the dev harness runs the real ones.
+from behavior.purpose import (default_purpose, merge_purpose,   # noqa: E402
+                              reflect_purpose, summarize_experience)
+from behavior.planner import Planner                            # noqa: E402
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
@@ -157,6 +172,25 @@ class DevState:
         self._bank = PhraseBank(path=(cfg.get("phrasebank_path") or None),
                                 logger=lambda m: print(f"[bank] {m}", file=sys.stderr))
         self._traits = dict(self.personality.get("traits") or {})   # for bank regen signature
+        # --- Purpose Engine + Horizon Planner (the real ROS-free modules) -----
+        # On the dev host there's no behaviour node, so we run the goal/reward layer here so
+        # the web "🧠 Brain" card is fully exercisable: objective + reward weights, the
+        # pursuing beat, A/B variants + 👍/👎 reward, and meditation. The pursuing beat is
+        # camera+vision (like `looking`), so it shares the single webcam + the one-at-a-time
+        # LLM lock with the on-demand 📷 Look / 👁 Observe buttons — keep a real rate limit
+        # here (not 0) so autonomous pursuing doesn't starve those manual buttons.
+        bcfg = _load_cfg("behavior")
+        self._meditating = False
+        self._rng = random.Random()
+        self._task = None                                   # current /task_current payload
+        self._purpose = merge_purpose(self._load_json(self._purpose_file()),
+                                      name=self.personality.get("name", "Nano"))
+        self._planner = None
+        if bool(bcfg.get("purpose_enable", True)):
+            self._planner = Planner(
+                objective_id=self._purpose["objective"]["id"],
+                state=self._load_json(self._experiments_file()),
+                epsilon=float(bcfg.get("ab_epsilon", 0.2)), min_interval=60.0)
         print(f"[dev] TTS backend ready={self.tts.available()}  "
               f"LLM ready={self.llm.available()} (model {self.llm.model})", file=sys.stderr)
         if not self.llm.available():
@@ -361,11 +395,22 @@ class DevState:
     # ---- statechart beat (used by --behavior) -------------------------------
     def fire_beat(self, name):
         """The chart's do_beat: run the matching enrichment in a worker thread (async,
-        like the robot's fire-and-forget request) so the chart never waits on the LLM."""
+        like the robot's fire-and-forget request) so the chart never waits on the LLM.
+
+        Goal-pursuit upgrade (mirrors mood_node._do_beat): the idle musing beat becomes a
+        `pursuing` beat whenever the planner has a verified task. Meditation pauses all beats."""
+        if self._meditating:
+            print(f"\n[beat] {name} (paused — meditating)", file=sys.stderr)
+            return
         print(f"\n[beat] {name}", file=sys.stderr)
+        spec = None
+        if name == "musing" and self._planner is not None:
+            spec = self._planner.next_task(self._world_state(), self._rng, now=time.monotonic())
 
         def work():
-            if name == "looking":
+            if spec is not None:
+                self._deliver_pursuing(spec)
+            elif name == "looking":
                 self.llm_look(trigger="beat:looking", state="looking")
             else:
                 self.llm_observe(trigger="beat:musing", state="musing")
@@ -413,6 +458,120 @@ class DevState:
             ev, self._pending_evolve = self._pending_evolve, None
         return ev
 
+    # ---- purpose engine + planner (dev mirror of mood_node) -----------------
+    @staticmethod
+    def _state_file(name):
+        return os.path.expanduser(f"~/.local/state/nanobot/{name}")
+
+    def _purpose_file(self):
+        return self._state_file("purpose.json")
+
+    def _experiments_file(self):
+        return self._state_file("experiments.json")
+
+    @staticmethod
+    def _load_json(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _save_json(path, obj):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(obj, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _world_state(self):
+        return {"picked": False, "sensors_fresh": True, "meditating": self._meditating}
+
+    def get_purpose(self):
+        return self._purpose
+
+    def get_task_current(self):
+        return self._task or {}
+
+    def get_experiments(self):
+        return self._planner.summary() if self._planner is not None else {"experiments": {}}
+
+    def _run_purpose_reflection(self, force=False):
+        if self._planner is None:
+            return
+        with self._loglock:
+            entries = list(self._log)
+        new, changed = reflect_purpose(self._purpose, summarize_experience(entries),
+                                       dict(self._traits))
+        self._purpose = new
+        self._planner.set_objective(new["objective"]["id"])
+        if changed or force:
+            self._save_json(self._purpose_file(), self._purpose)
+
+    def _save_experiments(self):
+        if self._planner is not None:
+            self._save_json(self._experiments_file(), self._planner.to_state())
+
+    def _deliver_pursuing(self, spec):
+        """Narrate the planner's task as a pursuing beat (dev: webcam = the robot's camera).
+        Sets /task_current (so 👍/👎 credits the right A/B arm) even when the LLM is offline."""
+        self._task = {"task": spec["task"], "exp": spec["exp"], "variant": spec["variant"],
+                      "text": spec["text"], "t": time.time()}
+        print(f"[pursue] {spec['task']} (variant={spec['variant']})", file=sys.stderr)
+        prompt = "Say one short spoken line as you {task} right now.".format(task=spec["text"])
+        if spec.get("style_hint"):
+            prompt += " " + spec["style_hint"]
+        frame = None
+        if spec["camera"] and self.llm.available():
+            if self._busy:        # a manual Look/Observe (or another beat) owns the LLM/camera
+                self._log_decision("beat:pursuing", "pursuing", True, status="skipped-busy")
+                return
+            if not self.llm.can_call(image=True):
+                self._log_decision("beat:pursuing", "pursuing", True, status="rate-limited")
+                return
+            frame = _capture_webcam_jpeg()
+            if frame is None:
+                self._log_decision("beat:pursuing", "pursuing", True, status="no-frame")
+                return
+        self._generate(prompt, image_jpeg=frame, trigger="beat:pursuing", state="pursuing",
+                       camera=bool(spec["camera"]))
+
+    def brain_reward(self, data):
+        """Mirror web_server.brain_reward: log + (contextual) credit the A/B arm + reflect so
+        the reward weights visibly move on the card."""
+        try:
+            value = clamp(float(data.get("value", 0)), -1, 1)
+        except (TypeError, ValueError):
+            value = 0.0
+        scope = "global" if data.get("scope") == "global" else "contextual"
+        target = data.get("target") if isinstance(data.get("target"), dict) else None
+        status = "up" if value > 0 else ("down" if value < 0 else "neutral")
+        detail = scope
+        if target:
+            detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
+        self._log_decision("reward", status=status, detail=detail,
+                           say=("👍" if value > 0 else "👎" if value < 0 else "·"))
+        if scope != "global" and self._planner is not None:
+            self._planner.on_reward(value, target)
+            self._save_experiments()
+        self._run_purpose_reflection()                  # reflect now so the weights update
+        print(f"[reward] {status} ({scope})", file=sys.stderr)
+        return {"status": "ok", "value": value, "scope": scope}
+
+    def brain_meditate(self, data):
+        """Mirror web_server.brain_meditate: pause beats, consolidate (reflect + A/B + bank)."""
+        on = bool(data.get("on"))
+        self._meditating = on
+        if on:
+            self._run_purpose_reflection(force=True)
+            self._save_experiments()
+            self._bank_regen_check()
+        self._log_decision("meditate", status=("on" if on else "off"))
+        print(f"[meditate] {'on' if on else 'off'}", file=sys.stderr)
+        return {"status": "ok", "meditating": on}
+
     def tts_config(self):
         return {"voice": self.tts.voice, "volume": 100, "speed": 100, "pitch": 100,
                 "announce": False, "announce_interval": 30}
@@ -446,11 +605,14 @@ def run_behavior(state, idle_secs, reflect_secs):
     print(f"[behavior] statechart running — idle_secs={idle_secs}, camera_beats="
           f"{camera_beats}, look_every={look_every}, reflect_secs={reflect_secs}. "
           f"Stop clicking and listen; watch the Decision log.", file=sys.stderr)
-    t0 = last_reflect = time.monotonic()
+    t0 = last_reflect = last_purpose = time.monotonic()
     while True:
         time.sleep(0.5)
         now = time.monotonic()
         clock.time = now - t0
+        if (now - last_purpose) > 30.0:        # local Purpose Engine: drift reward weights
+            last_purpose = now
+            state._run_purpose_reflection()
         ev = state.take_evolve()               # apply reflection drift (queued single-threaded)
         if ev:
             interp.queue(Event("evolve", traits=ev[0], registry=ev[1]))
@@ -506,6 +668,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.get_phrasebank())
         if p == "/tts/config":
             return self._json(self.state.tts_config())
+        # Brain readouts — the robot serves these over rosbridge (latched topics); the dev
+        # harness serves them over HTTP and the page polls them when rosbridge is absent.
+        if p == "/purpose":
+            return self._json(self.state.get_purpose())
+        if p == "/task_current":
+            return self._json(self.state.get_task_current())
+        if p == "/experiments":
+            return self._json(self.state.get_experiments())
         return super().do_GET()
 
     def do_POST(self):
@@ -534,6 +704,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.update_llm_config(self._body()))
         if p == "/llm/phrases/regenerate":
             return self._json(s.regenerate_phrasebank())
+        if p == "/brain/reward":
+            return self._json(s.brain_reward(self._body()))
+        if p == "/brain/meditate":
+            return self._json(s.brain_meditate(self._body()))
         if p == "/tts":
             d = self._body()
             text = (d.get("text") or "").strip()

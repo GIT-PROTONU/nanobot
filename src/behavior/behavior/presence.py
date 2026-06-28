@@ -42,6 +42,12 @@ BEATS = {
         face="focused", camera=True,
         prompt=("Say one short spoken line about what you can see in front of you "
                 "right now.")),
+    # Goal-pursuit beat: delivered in place of `musing` when the Horizon Planner has a
+    # verified task to narrate. `{task}` is filled with the task phrase (+ an A/B style
+    # hint) by mood_node._deliver_pursuing. The face/camera here are the offline defaults.
+    "pursuing": Beat(
+        face="focused", camera=True,
+        prompt="Say one short spoken line as you {task} right now."),
 }
 
 # Personality schema + the frozen fail-safe baseline the heartbeat reverts to.
@@ -78,6 +84,10 @@ statechart:
         action: apply_evolve(event.traits, event.registry)
       - event: brain_lost
         action: revert()
+      # Meditation/consolidation: from anywhere, drop into a calm "meditating" state that
+      # pauses the idle beats (the node consolidates the brain in the background) until `wake`.
+      - event: meditate
+        target: meditating
     states:
       - name: greeting
         on entry: face('happy')
@@ -133,12 +143,18 @@ statechart:
         transitions:
           - event: resume
             target: idle_life
+      - name: meditating
+        on entry: face(meditate_face)
+        transitions:
+          - event: wake
+            target: idle_life
 """
 
 
 def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
                       perform_secs=4.0, camera_beats=True, look_every=4,
-                      traits=None, registry=None, alpha=0.1, clock=None):
+                      traits=None, registry=None, alpha=0.1, clock=None,
+                      meditate_face="focused"):
     """Parse + validate the chart and return (interpreter, clock), already advanced into
     `greeting`. `traits`/`registry` seed the live personality (merged over the frozen
     defaults); `alpha` is the exponential-smoothing rate for `evolve`. The live dicts are
@@ -190,6 +206,7 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
         "beat_i": 0,
         "traits": live_traits,
         "registry": live_registry,
+        "meditate_face": str(meditate_face),
     })
     interpreter.execute()        # run the initial step -> enter `greeting`
     return interpreter, clock
