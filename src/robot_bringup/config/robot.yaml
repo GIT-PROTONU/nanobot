@@ -199,6 +199,7 @@ behavior:
     enrich_min_interval: 45.0 # s, per-beat rate-limit so a fast chart can't spam the API
     camera_beats: true        # allow the autonomous camera ("looking") beat at all
     look_every: 4             # camera beat every Nth idle beat (>=1); sensor beats between
+    greet_face: "happy"       # "startup mood": OLED face shown at boot (the greeting beat)
     # --- personality / evolution ---
     # Traits (curiosity/extraversion/caution/playfulness) + the behaviour registry live in
     # the Sismic context, seeded from personality.json (made by scripts/personality_creator.py)
@@ -319,7 +320,8 @@ web_control:
     phrasebank_path: ""         # "" = ~/.local/state/nanobot/phrases.json
     phrasebank_live_ratio: 0.2  # fraction of body beats that STILL go live (for freshness)
     phrasebank_drift: 0.6       # summed trait change (0..4) that triggers a regeneration
-    phrasebank_per_category: 6  # lines pre-generated per situation (9 situations)
+    phrasebank_per_category: 8  # lines pre-generated per situation (9 body + 4 lifecycle:
+                                # greeting/farewell/restarting/offline, used at those moments)
     llm_settings_path: ""      # enable/model/persona persist here (NOT the key).
                                # "" = ~/.local/state/nanobot/llm.json
     # Decision log: every cognition decision (+ outcome / skip reason) is appended here
@@ -330,3 +332,9 @@ web_control:
     # /cognition/evolve. Runs on the reflect_period floor + sooner on notable events (pickup).
     reflect_enable: true       # set false to freeze the personality (no autonomous drift)
     reflect_period: 600.0      # s floor between reflections (keeps the pro-model cost bounded)
+    # Lifecycle speech + the persistent "AI offline" indicator. All offline-safe (the phrase
+    # bank ships built-in fallback lines), so they work with no key / no network.
+    startup_greeting: true     # speak a greeting line a few seconds after boot
+    llm_offline_indicator: true  # while the LLM is enabled but unreachable, show the offline
+                               # face + speak the offline line (persists until it recovers)
+    offline_face: "sleepy"     # OLED mood shown while the LLM brain is unreachable

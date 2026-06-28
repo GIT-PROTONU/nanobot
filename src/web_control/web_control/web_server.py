@@ -117,6 +117,11 @@ class WebServerNode(Node):
         self.declare_parameter("cognition_log_path", "")   # decision log; "" -> XDG state dir
         self.declare_parameter("reflect_enable", True)     # slow personality reflection
         self.declare_parameter("reflect_period", 600.0)    # s floor between reflections
+        # Lifecycle speech + the persistent "AI offline" indicator (all offline-safe via the
+        # phrase bank's FALLBACK_LINES, so they work with no key / no network).
+        self.declare_parameter("startup_greeting", True)   # speak a greeting line on boot
+        self.declare_parameter("llm_offline_indicator", True)  # persistent face+line when LLM is down
+        self.declare_parameter("offline_face", "sleepy")   # OLED mood shown while the LLM is unreachable
         g = self.get_parameter
         port = g("web_port").value
 
@@ -214,6 +219,10 @@ class WebServerNode(Node):
         self._reflect_busy = False
         self._reflect_next = time.monotonic() + float(g("reflect_period").value)
         self._was_picked = False
+        # Persistent "AI offline" indicator state (driven from the 1 Hz ping tick).
+        self._llm_fail_streak = 0        # consecutive failed real calls (network down w/ a key)
+        self._llm_offline = None         # None=unknown, True=showing offline, False=online
+        self._llm_offline_reassert = 0.0 # monotonic of last face re-assert while offline
         self._evolve_pub = self.create_publisher(String, "cognition/evolve", 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, "cognition/traits", self._on_traits, latched)
@@ -237,6 +246,12 @@ class WebServerNode(Node):
             f"llm: {'enabled' if self._llm.available() else 'idle (no key / disabled)'}"
             f" model={self._llm.model}")
         self._bank_regen_check()                        # build/refresh the bank if needed
+        if bool(g("startup_greeting").value):
+            # Say hello a few seconds after boot (once the OLED/TTS are up). Offline-safe via
+            # the phrase bank's greeting fallback; the boot face is the behaviour node's job.
+            t = threading.Timer(3.0, lambda: self._speak_lifecycle("greeting"))
+            t.daemon = True
+            t.start()
 
     def _bank_regen_check(self):
         """Regenerate the phrase bank in the background if it's empty or the soul has drifted
@@ -251,6 +266,7 @@ class WebServerNode(Node):
         self._ping_pub.publish(Int32(data=self._ping_seq))
         self._announce_tick()                          # piggy-backs on this 1 Hz tick
         self._reflect_tick()                           # ditto (cheap when not due)
+        self._llm_health_tick()                        # persistent "AI offline" indicator
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -782,6 +798,59 @@ class WebServerNode(Node):
         if say and self._tts is not None and self._tts.available():
             self._tts.say(say)
 
+    # --- lifecycle speech + persistent "AI offline" indicator ----------------
+    def _speak_lifecycle(self, category, face=None):
+        """Speak a pre-generated lifecycle line (greeting/farewell/restarting/offline) and
+        optionally set an OLED face. Offline-safe (phrase bank FALLBACK_LINES), best-effort."""
+        try:
+            reply = self._bank.pick(None, name=self._persona_name, category=category)
+        except Exception:
+            reply = None
+        say = reply["say"] if reply else ""
+        if face:
+            self._face_pub.publish(String(data=face))
+        if say and self._tts is not None and self._tts.available():
+            self._tts.say(say)
+        self._log_decision("life:" + category, status=("spoke" if say else "no-line"),
+                           model="phrasebank", say=say, mood=(face or ""))
+        return say
+
+    def system_announce(self, action):
+        """Speak the matching farewell/restart line just before a stack/board action."""
+        cat = "farewell" if action in ("shutdown", "poweroff") else "restarting"
+        return self._speak_lifecycle(cat)
+
+    def _llm_health_tick(self):
+        """Persistent 'AI offline' indicator: when the LLM is enabled but unreachable, show
+        the offline face + speak the offline line once, and clear when it recovers. Edge-
+        triggered, with a slow re-assert so a transient TTS word / manual mood doesn't lose
+        the face. Counts repeated real-call failures too, so a network drop (key present) also
+        trips it — not just a missing key. The behaviour node stands down on the foreign face,
+        so its idle beats pause while we're offline."""
+        if not self.get_parameter("llm_offline_indicator").value:
+            return
+        if not bool(self._llm_settings.get("enabled")):
+            offline = False                            # LLM opted out -> presence runs normally
+        elif not self._llm.available():
+            offline = True                             # enabled but no key
+        else:
+            offline = self._llm_fail_streak >= 2       # key present but calls keep failing
+        face = str(self.get_parameter("offline_face").value or "sleepy")
+        now = time.monotonic()
+        if offline != self._llm_offline:
+            prev = self._llm_offline
+            self._llm_offline = offline
+            if offline:
+                self.get_logger().warning("LLM unreachable - showing offline mood")
+                self._speak_lifecycle("offline", face=face)
+                self._llm_offline_reassert = now
+            elif prev:                                     # only if we WERE showing offline
+                self.get_logger().info("LLM reachable again - clearing offline mood")
+                self._face_pub.publish(String(data=""))    # hand the panel back
+        elif offline and (now - self._llm_offline_reassert) > 20.0:
+            self._llm_offline_reassert = now               # best-effort re-assert
+            self._face_pub.publish(String(data=face))
+
     def _generate(self, prompt, history=None, image_jpeg=None, trigger="manual",
                   state="", camera=False, smart=False):
         """Blocking generate + express, guarded so only one call runs at a time (the
@@ -805,10 +874,12 @@ class WebServerNode(Node):
         model = self._llm.last_model or self._llm.model_for(smart=smart, image=bool(image_jpeg))
         ms = int((time.monotonic() - t0) * 1000)
         if reply:
+            self._llm_fail_streak = 0                   # a real call succeeded -> online
             self._express(reply["mood"], reply["say"])
             self._log_decision(trigger, state, camera, status="spoke", model=model,
                                prompt=prompt, say=reply["say"], mood=reply["mood"], ms=ms)
         else:
+            self._llm_fail_streak += 1                  # feeds the persistent offline indicator
             self._log_decision(trigger, state, camera, status="no-reply", model=model,
                                prompt=prompt, ms=ms)
         return reply
@@ -1026,18 +1097,25 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             # Restart the whole ROS stack. Detached + new session so it survives
             # do_down killing this very web server, then do_up brings it back.
             self._set_oled_action("restart")   # tells the OLED to show "Restarting stack"
+            if self._node:
+                self._node.system_announce("restart")   # speak the restart line first
             self._run_detached(
-                'cd "$HOME/Nano" && "$HOME/.pixi/bin/pixi" run bash scripts/stack.sh restart')
+                'cd "$HOME/Nano" && "$HOME/.pixi/bin/pixi" run bash scripts/stack.sh restart',
+                delay=3)                       # let the spoken line play before teardown
             self._respond(200, "restarting stack")
         elif path == "/system/reboot":
             # Reboot the whole SBC (needs the scoped NOPASSWD sudo rule for systemctl).
             self._set_oled_action("reboot")    # tells the OLED to show "Restarting"
-            self._run_detached("sudo -n /usr/bin/systemctl reboot")
+            if self._node:
+                self._node.system_announce("reboot")
+            self._run_detached("sudo -n /usr/bin/systemctl reboot", delay=3)
             self._respond(200, "rebooting")
         elif path == "/system/shutdown":
             # Power off the SBC (needs the scoped NOPASSWD sudo rule for systemctl).
             self._set_oled_action("shutdown")  # tells the OLED to show "Shutting down" + go dark
-            self._run_detached("sudo -n /usr/bin/systemctl poweroff")
+            if self._node:
+                self._node.system_announce("shutdown")  # speak the farewell line first
+            self._run_detached("sudo -n /usr/bin/systemctl poweroff", delay=3)
             self._respond(200, "shutting down")
         else:
             self.send_error(404)
@@ -1053,9 +1131,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             pass
 
     @staticmethod
-    def _run_detached(cmd):
-        # 1 s delay lets the HTTP response flush before the action runs.
-        subprocess.Popen(["bash", "-lc", "sleep 1; " + cmd],
+    def _run_detached(cmd, delay=1):
+        # The delay lets the HTTP response flush (and any spoken line play) before the
+        # action runs. start_new_session so it survives this web server being killed.
+        subprocess.Popen(["bash", "-lc", f"sleep {int(delay)}; " + cmd],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
 

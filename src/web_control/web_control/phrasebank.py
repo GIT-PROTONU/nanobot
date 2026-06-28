@@ -45,7 +45,34 @@ CATEGORIES = {
     "busy":      "its processor is working hard (about {cpu}% CPU load)",
     "idle":      "it is calm and idle — sitting level and still on the ground, nothing "
                  "notable happening",
+    # --- lifecycle situations (NOT returned by classify(); the caller picks them by name at
+    # the matching moment: startup / shutdown / restart / when the AI brain is unreachable).
+    # Pre-generated like the rest so the line is instant + offline-safe; FALLBACK_LINES cover
+    # a brand-new bank that has never been generated (e.g. the LLM was never configured).
+    "greeting":   "it has just powered on / woken up and is booting to life, greeting whoever "
+                  "is around",
+    "farewell":   "it is shutting down and powering off for now, saying goodbye",
+    "restarting": "it is restarting its own software to apply an update or to recover",
+    "offline":    "its thinking AI brain is unreachable right now (no internet or no API key), "
+                  "so it is running on simple built-in instincts only",
 }
+# Built-in last-resort lines for the lifecycle categories, used when the bank has no entry for
+# them yet (e.g. it was never generated because the LLM has never been online). Offline-safe.
+# {name} is the only placeholder; the offline lines carry the "sleepy" mood (see oled_display).
+FALLBACK_LINES = {
+    "greeting":   [{"say": "Hi, {name} is awake.", "mood": "happy"},
+                   {"say": "Good to be back. Hello there.", "mood": "happy"},
+                   {"say": "Booting up and ready.", "mood": "happy"}],
+    "farewell":   [{"say": "Powering down now. See you soon.", "mood": "neutral"},
+                   {"say": "Going to sleep. Bye for now.", "mood": "neutral"}],
+    "restarting": [{"say": "Restarting myself, one moment.", "mood": "focused"},
+                   {"say": "Be right back, restarting.", "mood": "focused"}],
+    "offline":    [{"say": "My thinking is offline right now.", "mood": "sleepy"},
+                   {"say": "I can't reach my brain, running on instinct.", "mood": "sleepy"},
+                   {"say": "No connection. Resting until my mind returns.", "mood": "sleepy"}],
+}
+# Lifecycle categories are picked by name, never by classify().
+LIFECYCLE_CATEGORIES = tuple(FALLBACK_LINES.keys())
 PLACEHOLDER_HELP = ("You may use these placeholders, which are filled with live values at "
                     "speak time: {name} (its name), {cpu} (CPU load percent), {mem} (memory "
                     "percent used), {temp} (main-board temperature in C), {tilt} (tilt angle "
@@ -151,18 +178,30 @@ class PhraseBank:
                     "total": sum(len(v) for v in cats.values())}
 
     # ---- runtime pick -------------------------------------------------------
-    def pick(self, signals, name=None):
-        """Classify `signals`, pick a random line from that category (falling back to
-        'idle'), fill its placeholders, and return {"say","mood","category"} — or None if
-        the bank has nothing usable (caller then falls back to the live LLM). Prefers lines
-        whose every placeholder can actually be filled right now, so a cached line that
-        references e.g. {tilt} isn't chosen when tilt is unknown (which would read wrong)."""
-        cat, vars_ = classify(signals)
-        with self._lock:
-            cats = self._data.get("categories", {})
-            entries = cats.get(cat) or cats.get("idle") or []
-            nm = name or self._data.get("name") or "Nano"
-        vars_["name"] = nm
+    def pick(self, signals, name=None, category=None):
+        """Pick a cached line and return {"say","mood","category"} — or None if the bank has
+        nothing usable (caller then falls back to the live LLM / a default).
+
+        If `category` is given, pick from THAT category by name (for the lifecycle lines —
+        greeting / farewell / restarting / offline — which aren't sensor-classified), falling
+        back to the built-in FALLBACK_LINES for it, then None. Otherwise classify `signals`
+        and pick a body-reaction line (falling back to 'idle'). Prefers lines whose every
+        placeholder can be filled right now, so a cached line that references e.g. {tilt}
+        isn't chosen when tilt is unknown (which would read wrong)."""
+        if category is not None:
+            cat = str(category)
+            with self._lock:
+                entries = list((self._data.get("categories", {}) or {}).get(cat) or [])
+                nm = name or self._data.get("name") or "Nano"
+            entries = entries or FALLBACK_LINES.get(cat, [])
+            vars_ = {"name": nm}
+        else:
+            cat, vars_ = classify(signals)
+            with self._lock:
+                cats = self._data.get("categories", {})
+                entries = cats.get(cat) or cats.get("idle") or []
+                nm = name or self._data.get("name") or "Nano"
+            vars_["name"] = nm
         fillable = [e for e in entries if self._fillable(e.get("say", ""), vars_)]
         plain = [e for e in entries if not _PLACEHOLDER_RE.search(e.get("say", ""))]
         pool = fillable or plain or entries           # best -> safe -> last resort

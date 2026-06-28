@@ -197,6 +197,42 @@ class DevState:
             print("[dev] ! No OPENROUTER_API_KEY set — the AI card will say 'unavailable'.",
                   file=sys.stderr)
         self._bank_regen_check()                            # build/refresh the bank if needed
+        # Lifecycle speech: greet on launch + a 1 Hz "AI offline" indicator (mirrors the
+        # robot). Remove the key to hear/see the offline line + sleepy face on the dev host.
+        self._dev_offline = None
+        t = threading.Timer(2.0, lambda: self._speak_lifecycle("greeting")); t.daemon = True
+        t.start()
+        threading.Thread(target=self._health_loop, daemon=True).start()
+
+    def _speak_lifecycle(self, category, face=None):
+        """Speak a pre-generated lifecycle line (greeting/farewell/restarting/offline),
+        offline-safe via the phrase bank's FALLBACK_LINES. Dev: prints the face, no OLED."""
+        try:
+            reply = self._bank.pick(None, name=self.personality.get("name", "Nano"),
+                                    category=category)
+        except Exception:
+            reply = None
+        say = reply["say"] if reply else ""
+        if face:
+            print(f"\n[face] {face}", file=sys.stderr)
+        if say and self.tts.available():
+            print(f"[life:{category}] ", end="", flush=True)
+            self.tts.say(say)
+        self._log_decision("life:" + category, status=("spoke" if say else "no-line"),
+                           model="phrasebank", say=say, mood=(face or ""))
+        return say
+
+    def _health_loop(self):
+        while True:
+            time.sleep(1.0)
+            offline = bool(self.settings.get("enabled")) and not self.llm.available()
+            if offline != self._dev_offline:
+                prev = self._dev_offline
+                self._dev_offline = offline
+                if offline:
+                    self._speak_lifecycle("offline", face="sleepy")
+                elif prev:                                  # only if we WERE offline
+                    print("\n[face] dashboard (LLM online)", file=sys.stderr)
 
     def _bank_regen_check(self):
         if self._bank_enable and self.llm.available():

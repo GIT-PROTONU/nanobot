@@ -90,7 +90,7 @@ statechart:
         target: meditating
     states:
       - name: greeting
-        on entry: face('happy')
+        on entry: face(greet_face)
         transitions:
           - target: idle_life
             guard: after(greet_secs)
@@ -154,7 +154,7 @@ statechart:
 def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
                       perform_secs=4.0, camera_beats=True, look_every=4,
                       traits=None, registry=None, alpha=0.1, clock=None,
-                      meditate_face="focused"):
+                      meditate_face="focused", greet_face="happy"):
     """Parse + validate the chart and return (interpreter, clock), already advanced into
     `greeting`. `traits`/`registry` seed the live personality (merged over the frozen
     defaults); `alpha` is the exponential-smoothing rate for `evolve`. The live dicts are
@@ -207,6 +207,7 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
         "traits": live_traits,
         "registry": live_registry,
         "meditate_face": str(meditate_face),
+        "greet_face": str(greet_face),
     })
     interpreter.execute()        # run the initial step -> enter `greeting`
     return interpreter, clock

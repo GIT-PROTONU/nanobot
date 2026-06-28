@@ -83,7 +83,8 @@ IMU_TIMEOUT_S = 1.5    # /imu/web ~15 Hz
 LDS_TIMEOUT_S = 3.0    # /lds_hz a few Hz
 
 BLINK_DUR = 0.16       # seconds for one eyelid close+open
-KNOWN_MOODS = ("happy", "angry", "focused", "stress")
+# "sleepy" = the AI-offline mood: closed/content eyes + a slow rising "z z z" (see _sleepy).
+KNOWN_MOODS = ("happy", "angry", "focused", "stress", "sleepy")
 
 # Eye geometry, sized to fill a 128x64 panel. The inner gap is 2*(EYE_DX-EYE_W);
 # EYE_DX=37 / EYE_W=20 → a 34 px gap between the eyes with ~7 px edge margins, so
@@ -517,6 +518,18 @@ class DisplayNode(Node):
         draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
         self._pupil(draw, cx, cy, eh, px, py, 5, max(2, eh - 3))
 
+    def _sleepy(self, draw, zc):
+        """Sleepy / 'AI offline' face: two closed, content eyes (downward arcs) and a slow
+        rising 'z z z' in the corner. Drawn at near-zero cost (dirty-checked, ~1 fps)."""
+        W, H = self.width, self.height
+        cy = H // 2 + 4
+        for cx in (W // 2 - EYE_DX, W // 2 + EYE_DX):
+            for dy in (0, 1, 2):                     # thicken the closed-eye arc
+                draw.arc((cx - EYE_W, cy - 8 + dy, cx + EYE_W, cy + 8 + dy), 20, 160, fill=255)
+        zx, zy = W - 30, 18                          # rising z z z, top-right
+        for i in range(zc):
+            draw.text((zx + i * 8, zy - i * 6), "z", font=self.font, fill=255)
+
     def _stress(self, draw):
         """Worst-case animation: a full-screen pattern that changes every single
         frame, so the dirty-check never skips and we flush at the bus ceiling.
@@ -544,6 +557,18 @@ class DisplayNode(Node):
             self._face_sig = ("stress", self._frame)
             with canvas(self.device) as draw:
                 self._stress(draw)
+            return
+
+        if self.face_mood == "sleepy":
+            # Mostly static (cheap) closed eyes + a slowly cycling "z z z". Shown while the
+            # LLM brain is unreachable, so it can sit up for a long time at ~no cost.
+            zc = int(now * 1.2) % 3 + 1              # 1..3 z's, ~1.2 Hz cycle
+            sig = ("sleepy", zc)
+            if sig == self._face_sig:
+                return
+            self._face_sig = sig
+            with canvas(self.device) as draw:
+                self._sleepy(draw, zc)
             return
 
         # All moods: eye-whites stay fixed at the base position and the gaze drives

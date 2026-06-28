@@ -102,6 +102,7 @@ class MoodNode(Node):
             ("pursue_min_interval", 180.0), # s, min gap between goal-pursuit ("pursuing") beats
             ("ab_epsilon", 0.2),            # A/B bandit exploration rate (0..1)
             ("meditate_face", "focused"),   # OLED face shown while meditating/consolidating
+            ("greet_face", "happy"),        # OLED "startup mood" shown at boot (greeting)
             ("purpose_path", ""),           # "" -> ~/.local/state/nanobot/purpose.json
             ("experiments_path", ""),       # "" -> ~/.local/state/nanobot/experiments.json
             # The shared decision log written by web_control — the Purpose Engine's
@@ -127,6 +128,7 @@ class MoodNode(Node):
         self._pursue_min_interval = float(g("pursue_min_interval").value)
         self._ab_epsilon = float(g("ab_epsilon").value)
         self._meditate_face = str(g("meditate_face").value or "focused")
+        self._greet_face = str(g("greet_face").value or "happy")
         self.personality = self._load_personality()
 
         # --- signals updated by callbacks, read by the tick ---
@@ -224,7 +226,7 @@ class MoodNode(Node):
                 camera_beats=self.camera_beats, look_every=self.look_every,
                 traits=self.personality["traits"], registry=self.personality["registry"],
                 alpha=self.smoothing_alpha, clock=self._clock,
-                meditate_face=self._meditate_face)
+                meditate_face=self._meditate_face, greet_face=self._greet_face)
             self.get_logger().info(
                 f"behavior up: presence statechart (personality '{self.personality['name']}', "
                 f"traits {self.personality['traits']})")
