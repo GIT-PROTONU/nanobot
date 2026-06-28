@@ -1,50 +1,36 @@
-"""Idle "feel alive" presence supervisor — the first node of the behaviour layer.
+"""Idle "feel alive" presence supervisor — the behaviour layer's ROS node.
 
-This is the smallest genuinely-useful slice of the planned statechart behaviour
-layer (see the behavior-layer-plan memory): a **Sismic** statechart that makes the
-robot feel a little alive when it's otherwise sitting idle, by driving the OLED
-*face* (`/oled_face`). It is deliberately conservative:
+This is the ROS *glue* around the brain. The slow, declarative thinking lives in three
+ROS-free modules so it can be unit-tested offline (`pixi run python -m pytest
+src/behavior/test`):
 
-  * **Expression only.** It NEVER publishes `/cmd_vel` (or anything that moves the
-    robot), so it cannot affect motion safety. The worst it can ever do is show a
-    face on the OLED at the wrong moment.
-  * **It yields the panel.** The OLED face has several legitimate owners already —
-    the web UI's manual mood buttons, TTS "karaoke" words, and slam_nav's pick-up
-    reaction. This node only animates a face during *true idle* and "stands down"
-    (touches nothing) the instant any of those takes over, so it doesn't fight them.
-  * **Degrades to nothing.** If Sismic isn't importable, or the node is disabled by
-    param, it simply spins doing nothing — the rest of the stack is unaffected.
+  * `presence.py` — the Sismic statechart (states + timed transitions + the personality
+    context the guards read).
+  * `purpose.py` / `planner.py` — the Purpose Engine (goals + intrinsic reward) and the
+    Horizon Planner (task queue + A/B bandit).
+  * `brain.py` — the platform-agnostic *orchestration* of the above (`PurposeBrain`) and of
+    the chart-context personality (`Personality`). The SAME orchestration runs on the dev
+    web harness (`scripts/dev_webui.py`) via injected adapters, so there's one base, not two.
 
-The statechart (embedded below as YAML) is the slow "brain": states + timed
-transitions via Sismic's built-in ``after(...)`` guard. The node only translates raw
-ROS topics into a handful of semantic signals and decides when to stand down. This
-keeps the behaviour declarative and unit-testable in isolation (no ROS needed) —
-which is exactly why Sismic was chosen over a hand-rolled FSM.
+This node just: parses params, builds the chart, maps raw ROS topics into the chart's
+semantic signals, and on each tick steps the chart and delegates to `PurposeBrain` /
+`Personality`. It is deliberately conservative:
 
-Lifecycle (single region):
-
-    greeting --after(greet_secs)--> idle_life{ resting <-> performing }
-       │                                  │
-       └────────────── standdown ─────────┴──> dormant --resume--> idle_life
-
-  * **greeting** — a brief happy face at boot ("hello"), then settle to the dashboard.
-  * **resting**  — the dashboard (face cleared). After ``idle_secs`` of continuous
-    idle, briefly come alive.
-  * **performing** — a short happy "look around" beat (``perform_secs``), then back to
-    resting. So during long idle the robot blinks to life every now and then.
-  * **dormant** — something else owns the panel (the robot is moving / has a goal, is
-    speaking, is picked up, or the web UI set a manual mood). Touch nothing until clear.
+  * **Expression only.** It NEVER publishes `/cmd_vel` (or anything that moves the robot),
+    so it cannot affect motion safety. The worst it can do is show a face on the OLED.
+  * **It yields the panel.** The OLED face has other legitimate owners (the web UI's manual
+    mood buttons, TTS "karaoke" words, slam_nav's pick-up reaction). This node animates a
+    face only during *true idle* and "stands down" the instant any of those takes over.
+  * **Degrades to nothing.** If Sismic isn't importable, or the node is disabled by param,
+    it spins doing nothing — the rest of the stack is unaffected.
 
 Consumes (all light std/geometry msgs): `/cmd_vel`, `/goal_pose`, `/oled_word`,
-`/oled_face` (to detect a manual/foreign mood vs our own echo),
-`/left_wheel_suspended`, `/right_wheel_suspended`. Drives `/oled_face` only.
-
-The statechart itself lives in `presence.py` (ROS-free, so it's unit-testable offline:
-`pixi run python -m pytest src/behavior/test`).
+`/oled_face` (to detect a manual/foreign mood vs our own echo), `/left|right_wheel_suspended`,
+`/cognition/evolve`, `/cognition/reward`, `/meditate`. Drives `/oled_face`,
+`/cognition/request`, and the latched `/cognition/traits` + `/purpose` + `/task_current` +
+`/experiments` readouts.
 """
-import copy
 import json
-import os
 import random
 import time
 
@@ -54,10 +40,8 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, String
 from geometry_msgs.msg import Twist, PoseStamped
 
-from .presence import build_interpreter, BEATS, DEFAULT_TRAITS, DEFAULT_REGISTRY
-from .purpose import (default_purpose, merge_purpose, reflect_purpose,
-                      summarize_experience)
-from .planner import Planner
+from .presence import build_interpreter, BEATS
+from .brain import PurposeBrain, Personality
 
 # Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
 # Import defensively so a board that hasn't run `pixi install` yet still boots the
@@ -122,20 +106,8 @@ class MoodNode(Node):
         self.enrich_min_interval = float(g("enrich_min_interval").value)
         self.camera_beats = bool(g("camera_beats").value)
         self.look_every = max(1, int(g("look_every").value))
-        self._skills_enable = bool(g("skills_enable").value)
-        self._skill_every = max(1, int(g("skill_every").value))
-        self._body_beat_n = 0          # counts body (musing) beats, for the skill cadence
-        self.smoothing_alpha = float(g("smoothing_alpha").value)
-        self.brain_timeout = float(g("brain_timeout").value)
-        self._nudge_pickup_caution = float(g("nudge_pickup_caution").value)
-        self._nudge_pickup_playful = float(g("nudge_pickup_playful").value)
-        self._purpose_enable = bool(g("purpose_enable").value)
-        self._purpose_period = max(30.0, float(g("purpose_period").value))
-        self._pursue_min_interval = float(g("pursue_min_interval").value)
-        self._ab_epsilon = float(g("ab_epsilon").value)
         self._meditate_face = str(g("meditate_face").value or "focused")
         self._greet_face = str(g("greet_face").value or "happy")
-        self.personality = self._load_personality()
 
         # --- signals updated by callbacks, read by the tick ---
         self._susp_l = False
@@ -154,37 +126,40 @@ class MoodNode(Node):
         # per beat via _beat_last so a fast-cycling chart can't spam the API.
         self.cog_pub = self.create_publisher(String, "cognition/request", 10)
         self._beat_last = {}
-        # Latched publisher of the current personality so late subscribers (slam_nav's
-        # motion clamp, web_control's reflection) get it immediately.
+        # Latched readouts so late subscribers (slam_nav's motion clamp, web_control's
+        # reflection, the web UI brain card) get them immediately; PurposeBrain/Personality
+        # also republish them on a slow heartbeat for late (volatile-QoS) rosbridge subs.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.traits_pub = self.create_publisher(String, "cognition/traits", latched)
-        # --- Purpose Engine + Horizon Planner ---------------------------------
-        # The slow "identity" layer (goals + intrinsic reward) and the "strategy" layer
-        # (task queue + A/B bandit). Pure/local; narrative-only. Latched topics let the web
-        # UI read the current purpose / task / experiment stats; they're also republished on a
-        # slow heartbeat so a late (volatile-QoS) rosbridge subscriber still picks them up.
         self.purpose_pub = self.create_publisher(String, "purpose", latched)
         self.task_pub = self.create_publisher(String, "task_current", latched)
         self.experiments_pub = self.create_publisher(String, "experiments", latched)
-        self._rng = random.Random()
-        self._purpose = merge_purpose(self._load_json(self._purpose_file()),
-                                      name=self.personality.get("name", "Nano"))
-        self._planner = None
-        if self._purpose_enable:
-            self._planner = Planner(
-                objective_id=self._purpose["objective"]["id"],
-                state=self._load_json(self._experiments_file()),
-                epsilon=self._ab_epsilon, min_interval=self._pursue_min_interval)
-        self._purpose_last = 0.0           # monotonic of last purpose reflection
-        self._pub_hb = 0.0                 # monotonic of last latched-topic republish
-        self._meditating = False
-        # Evolution state (drivers feed Sismic `evolve`/`brain_lost` events).
-        self._last_brain = time.monotonic()    # last time the cognitive layer spoke
-        self._brain_lost = False
-        self._was_picked = False               # rising-edge detect for the pickup rule
-        self._pers_last_pub = None             # last published traits/registry snapshot
-        self._pers_dirty = False
-        self._pers_last_save = 0.0
+
+        # --- the brain (ROS-free orchestration; see brain.py) --------------------
+        # Personality owns the chart-context traits/registry + their evolution/persist;
+        # PurposeBrain owns the goal/reward layer + the A/B planner. Both publish their state
+        # through the adapters below (here: latched ROS topics).
+        self._personality = Personality(
+            path=g("personality_path").value, logger=self.get_logger().warning,
+            heartbeat_enable=self.enrich_enable, brain_timeout=float(g("brain_timeout").value),
+            nudge_pickup_caution=float(g("nudge_pickup_caution").value),
+            nudge_pickup_playful=float(g("nudge_pickup_playful").value),
+            publish=lambda s: self.traits_pub.publish(String(data=json.dumps(s))))
+        self._brain = PurposeBrain(
+            name=self._personality.name, enable=bool(g("purpose_enable").value),
+            rng=random.Random(), epsilon=float(g("ab_epsilon").value),
+            pursue_min_interval=float(g("pursue_min_interval").value),
+            reflect_period=float(g("purpose_period").value),
+            skills_enable=bool(g("skills_enable").value),
+            skill_every=max(1, int(g("skill_every").value)),
+            purpose_path=g("purpose_path").value, experiments_path=g("experiments_path").value,
+            cog_log_path=g("cognition_log_path").value,
+            picked=lambda: self._susp_l and self._susp_r,
+            traits_snapshot=self._personality.live_traits,
+            publish_purpose=lambda o: self.purpose_pub.publish(String(data=json.dumps(o))),
+            publish_task=lambda p: self.task_pub.publish(String(data=json.dumps(p))),
+            publish_experiments=lambda s: self.experiments_pub.publish(String(data=json.dumps(s))),
+            logger=self.get_logger().info)
 
         self._interp = None
         if not self.enable:
@@ -230,12 +205,13 @@ class MoodNode(Node):
                 idle_secs=float(g("idle_secs").value),
                 perform_secs=float(g("perform_secs").value),
                 camera_beats=self.camera_beats, look_every=self.look_every,
-                traits=self.personality["traits"], registry=self.personality["registry"],
-                alpha=self.smoothing_alpha, clock=self._clock,
+                traits=self._personality.traits, registry=self._personality.registry,
+                alpha=float(g("smoothing_alpha").value), clock=self._clock,
                 meditate_face=self._meditate_face, greet_face=self._greet_face)
+            self._personality.attach(self._interp)
             self.get_logger().info(
-                f"behavior up: presence statechart (personality '{self.personality['name']}', "
-                f"traits {self.personality['traits']})")
+                f"behavior up: presence statechart (personality '{self._personality.name}', "
+                f"traits {self._personality.traits})")
         except Exception as exc:
             self._interp = None
             self.get_logger().error(f"statechart init failed: {exc} — running as no-op")
@@ -259,32 +235,25 @@ class MoodNode(Node):
 
     def _do_beat(self, name):
         """Injected as the chart's `do_beat`. Always shows the beat's predefined default
-        face (so a beat is meaningful even with no LLM), then — if enrichment is enabled
-        and this beat isn't rate-limited — fires a fire-and-forget /cognition/request for
+        face (so a beat is meaningful even with no LLM), then — if enrichment is enabled and
+        this beat isn't rate-limited — fires a fire-and-forget /cognition/request for
         web_control to enrich asynchronously (LLM line + camera + mood). Never blocks.
 
-        Goal-pursuit upgrade: the idle sensor beat (`musing`) becomes a `pursuing` beat
-        whenever the Horizon Planner has a verified task to narrate (and pursuing isn't
-        rate-limited) — that's how the Purpose/Planner layers reach expression."""
+        The idle `musing` beat is upgraded by the brain: to a `pursuing` beat when the Horizon
+        Planner has a verified task, else to a `skill` beat every Nth body beat — that's how the
+        Purpose/Planner/skill layers reach expression. Goals win the slot, then skills, else a
+        plain musing beat."""
         beat = BEATS.get(name)
         if beat is None:
             return
-        if (name == "musing" and self._planner is not None and self._purpose_enable
-                and not self._meditating and self._enrich_ready("pursuing")):
-            spec = self._planner.next_task(self._world_state(), self._rng,
-                                           now=time.monotonic())
+        if name == "musing" and self._enrich_ready("pursuing"):
+            spec = self._brain.next_pursuing(time.monotonic())
             if spec is not None:
-                self._deliver_pursuing(spec)
+                self._deliver_pursuing(spec, beat=BEATS["pursuing"])
                 return
-        # Skill-beat upgrade (mirrors pursuing): every Nth body beat, hand off to web_control
-        # to PICK a capability from the skill library (skills/*.md) and perform it. Goals
-        # (pursuing) win the slot; skills come next; otherwise it's a plain musing beat.
-        if name == "musing" and self._skills_enable and not self._meditating:
-            self._body_beat_n += 1
-            if (self._body_beat_n % self._skill_every == 0
-                    and self._enrich_ready("skill")):
-                self._deliver_skill_beat()
-                return
+        if name == "musing" and self._brain.take_skill_beat() and self._enrich_ready("skill"):
+            self._deliver_skill_beat()
+            return
         self._emit_face(beat.face)                 # offline-safe default, echo-tracked
         if not self._enrich_ready(name):
             return
@@ -292,34 +261,21 @@ class MoodNode(Node):
         req = {"beat": name, "state": name, "prompt": beat.prompt,
                "camera": bool(beat.camera), "audio": False,
                # carry the current personality so the executor can colour the line
-               "traits": dict(self._interp.context["traits"])}
+               "traits": self._personality.live_traits()}
         self.cog_pub.publish(String(data=json.dumps(req)))
 
-    def _world_state(self):
-        """The light world snapshot the planner verifies a task against (narrative-only)."""
-        return {"picked": self._susp_l and self._susp_r,
-                "sensors_fresh": True,
-                "meditating": self._meditating}
-
-    def _deliver_pursuing(self, spec):
-        """Narrate the planner's current task as a `pursuing` beat: show the default face,
-        publish the task (so the web UI + reward path can credit the right A/B arm), and fire
-        an enrichment request carrying the task phrase + the A/B style hint + variant ids."""
-        beat = BEATS["pursuing"]
+    def _deliver_pursuing(self, spec, beat):
+        """Narrate the planner's current task as a `pursuing` beat: show the default face and
+        fire an enrichment request carrying the task phrase + the A/B style hint + variant ids.
+        (The task + moved A/B stats are already announced by PurposeBrain.next_pursuing.)"""
         self._emit_face(beat.face)
         self._beat_last["pursuing"] = time.monotonic()
-        target = {"task": spec["task"], "exp": spec["exp"], "variant": spec["variant"]}
-        self.task_pub.publish(String(data=json.dumps(
-            {**target, "text": spec["text"], "t": time.time()})))
-        prompt = beat.prompt.format(task=spec["text"])
-        if spec.get("style_hint"):
-            prompt = prompt + " " + spec["style_hint"]
-        req = {"beat": "pursuing", "state": "pursuing", "prompt": prompt,
+        req = {"beat": "pursuing", "state": "pursuing",
+               "prompt": self._brain.pursuing_prompt(spec, beat.prompt),
                "camera": bool(spec["camera"]), "audio": False,
                "exp": spec["exp"], "variant": spec["variant"], "task": spec["task"],
-               "traits": dict(self._interp.context["traits"])}
+               "traits": self._personality.live_traits()}
         self.cog_pub.publish(String(data=json.dumps(req)))
-        self._publish_experiments()                # stats moved (new assignment)
 
     def _deliver_skill_beat(self):
         """Fire a `skill` beat: show the offline-safe default face, then hand off to
@@ -330,230 +286,44 @@ class MoodNode(Node):
             self._emit_face(beat.face)
         self._beat_last["skill"] = time.monotonic()
         req = {"beat": "skill", "state": "acting", "prompt": "", "camera": False,
-               "audio": False, "traits": dict(self._interp.context["traits"])}
+               "audio": False, "traits": self._personality.live_traits()}
         self.cog_pub.publish(String(data=json.dumps(req)))
 
-    # --- personality: load / evolve / heartbeat / publish / persist ----------
-    def _personality_file(self):
-        p = self.get_parameter("personality_path").value
-        return p or os.path.expanduser("~/.local/state/nanobot/personality.json")
-
-    def _load_personality(self):
-        """Seed personality from personality.json (written by the creator / persisted as it
-        drifts), merged over the frozen defaults. Best-effort."""
-        base = {"name": "Nano", "persona": "", "traits": dict(DEFAULT_TRAITS),
-                "registry": copy.deepcopy(DEFAULT_REGISTRY)}
-        try:
-            with open(self._personality_file(), encoding="utf-8") as f:
-                saved = json.load(f)
-            if isinstance(saved, dict):
-                for k in ("name", "persona"):
-                    if isinstance(saved.get(k), str):
-                        base[k] = saved[k]
-                if isinstance(saved.get("traits"), dict):
-                    base["traits"].update(saved["traits"])
-                if isinstance(saved.get("registry"), dict):
-                    for n, patch in saved["registry"].items():
-                        base["registry"].setdefault(n, {}).update(patch or {})
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            self.get_logger().warning(f"personality load failed ({exc}) — using defaults")
-        return base
-
+    # --- cognitive-layer inputs ----------------------------------------------
     def _on_evolve(self, msg: String):
-        """A trait/registry proposal from the cognitive layer -> a Sismic `evolve` event
-        (smoothed in the chart). Also feeds the heartbeat (the brain is alive)."""
+        """A trait/registry proposal from the cognitive layer -> Personality (smoothed in the
+        chart, feeds the brain-alive heartbeat)."""
         if self._interp is None:
             return
         try:
-            p = json.loads(msg.data)
+            payload = json.loads(msg.data)
         except Exception:
             return
-        self._interp.queue(Event("evolve", traits=p.get("traits") or {},
-                                 registry=p.get("registry") or {}))
-        self._last_brain = time.monotonic()
-        if self._brain_lost:
-            self._brain_lost = False
+        if self._personality.on_evolve(payload):
             self.get_logger().info("cognitive layer reachable again")
-
-    def _personality_events(self, now, picked):
-        """Queue the fast rule-nudges + the heartbeat revert (both as Sismic events, applied
-        on this tick's execute)."""
-        if picked and not self._was_picked:        # being handled -> warier, less playful
-            self._interp.queue(Event("evolve", registry={}, traits={
-                "caution": self._nudge_pickup_caution,
-                "playfulness": self._nudge_pickup_playful}))
-        self._was_picked = picked
-        if (self.enrich_enable and not self._brain_lost
-                and (now - self._last_brain) > self.brain_timeout):
-            self._interp.queue(Event("brain_lost"))
-            self._brain_lost = True
-            self.get_logger().warning(
-                "cognitive layer unreachable — reverting to baseline personality")
-
-    def _personality_publish(self, now):
-        """Publish (latched) the current personality on change; persist it, throttled."""
-        ctx = self._interp.context
-        snap = (dict(ctx["traits"]), copy.deepcopy(ctx["registry"]))
-        if snap != self._pers_last_pub:
-            self.traits_pub.publish(String(data=json.dumps(
-                {"traits": snap[0], "registry": snap[1]})))
-            self._pers_last_pub = snap
-            self._pers_dirty = True
-        if self._pers_dirty and (now - self._pers_last_save) > 15.0:
-            self._save_personality()
-            self._pers_dirty = False
-            self._pers_last_save = now
-
-    def _save_personality(self):
-        try:
-            ctx = self._interp.context
-            self.personality["traits"] = dict(ctx["traits"])
-            self.personality["registry"] = copy.deepcopy(ctx["registry"])
-            path = self._personality_file()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.personality, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, path)
-        except Exception as exc:
-            self.get_logger().warning(f"could not persist personality ({exc})")
-
-    # --- purpose engine + planner: load / reflect / reward / meditate --------
-    def _state_path(self, param, default_name):
-        p = self.get_parameter(param).value
-        return p or os.path.expanduser(f"~/.local/state/nanobot/{default_name}")
-
-    def _purpose_file(self):
-        return self._state_path("purpose_path", "purpose.json")
-
-    def _experiments_file(self):
-        return self._state_path("experiments_path", "experiments.json")
-
-    def _cog_log_file(self):
-        return self._state_path("cognition_log_path", "cognition.log")
-
-    def _load_json(self, path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return None
-        except Exception as exc:
-            self.get_logger().warning(f"could not read {path} ({exc})")
-            return None
-
-    def _save_json(self, path, obj):
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(obj, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, path)
-        except Exception as exc:
-            self.get_logger().warning(f"could not persist {path} ({exc})")
-
-    def _read_cog_log(self, n=40):
-        """Tail the last n JSON lines of the shared decision log (the Purpose Engine's
-        experience input). Best-effort: [] if absent/unreadable."""
-        try:
-            with open(self._cog_log_file(), encoding="utf-8") as f:
-                lines = f.readlines()[-n:]
-        except Exception:
-            return []
-        out = []
-        for ln in lines:
-            ln = ln.strip()
-            if ln:
-                try:
-                    out.append(json.loads(ln))
-                except Exception:
-                    pass
-        return out
-
-    def _run_purpose_reflection(self, force=False):
-        """Reflect on recent experience (the shared log) + traits -> drift the intrinsic
-        reward weights + keep the planner's objective in sync. Deterministic, local."""
-        if self._planner is None or self._interp is None:
-            return
-        exp = summarize_experience(self._read_cog_log())
-        traits = dict(self._interp.context["traits"])
-        new, changed = reflect_purpose(self._purpose, exp, traits)
-        self._purpose = new
-        self._planner.set_objective(new["objective"]["id"])
-        if changed or force:
-            self._publish_purpose()
-            self._save_json(self._purpose_file(), self._purpose)
-
-    def _publish_purpose(self):
-        self.purpose_pub.publish(String(data=json.dumps(self._purpose)))
-
-    def _publish_experiments(self):
-        if self._planner is not None:
-            self.experiments_pub.publish(String(data=json.dumps(self._planner.summary())))
-
-    def _save_experiments(self):
-        if self._planner is not None:
-            self._save_json(self._experiments_file(), self._planner.to_state())
 
     def _on_reward(self, msg: String):
         """A human reward from the web UI: credit the A/B arm that produced the narrated line
         (contextual). Global reward shapes the intrinsic-reward weights via the decision log on
         the next purpose reflection (web_control logs every reward there)."""
-        if self._planner is None:
-            return
         try:
             r = json.loads(msg.data)
         except Exception:
             return
-        if str(r.get("scope")) != "global":
-            target = r.get("target") if isinstance(r.get("target"), dict) else None
-            if self._planner.on_reward(r.get("value", 0), target):
-                self._save_experiments()
-                self._publish_experiments()
+        self._brain.apply_reward(r.get("value", 0), r.get("target"),
+                                 scope=str(r.get("scope")))
 
     def _on_meditate(self, msg: Bool):
         """Toggle meditation/consolidation. While on, the chart shows a calm face and pauses
-        beats; we consolidate the local brain (reflect on purpose + finalize A/B winners).
-        The LLM reflection + phrase-bank regen run on the web_control side."""
+        beats; the brain consolidates (reflect on purpose + finalize A/B winners). The LLM
+        reflection + phrase-bank regen run on the web_control side."""
         on = bool(msg.data)
-        if on == self._meditating:
+        if not self._brain.set_meditating(on, traits=self._personality.live_traits()):
             return
-        self._meditating = on
-        if self._interp is None:
-            return
-        if on:
-            self._interp.queue(Event("meditate"))
-            self.get_logger().info("meditating — consolidating brain (beats paused)")
-            self._run_purpose_reflection(force=True)
-            self._finalize_experiments()
-        else:
-            self._interp.queue(Event("wake"))
-            self.get_logger().info("meditation ended — resuming presence")
-
-    def _finalize_experiments(self):
-        if self._planner is None:
-            return
-        summ = self._planner.summary()
-        winners = ", ".join(f"{eid}->{e['winner']}"
-                            for eid, e in summ["experiments"].items())
-        self.get_logger().info(f"A/B winners: {winners or '(none)'}")
-        self._save_experiments()
-        self._publish_experiments()
-
-    def _purpose_tick(self, now):
-        """Slow loop, driven off the chart tick: reflect periodically (faster while
-        meditating) and republish the latched topics on a heartbeat for late subscribers."""
-        if self._purpose_enable and self._planner is not None:
-            period = 30.0 if self._meditating else self._purpose_period
-            if (now - self._purpose_last) >= period:
-                self._purpose_last = now
-                self._run_purpose_reflection()
-        if (now - self._pub_hb) >= 5.0:             # heartbeat republish (cheap, small msgs)
-            self._pub_hb = now
-            self._publish_purpose()
-            self._publish_experiments()
+        if self._interp is not None:
+            self._interp.queue(Event("meditate" if on else "wake"))
+        self.get_logger().info("meditating — consolidating brain (beats paused)" if on
+                               else "meditation ended — resuming presence")
 
     # --- signal callbacks ----------------------------------------------------
     def _on_cmd(self, msg: Twist):
@@ -599,7 +369,7 @@ class MoodNode(Node):
             # Meditation is a deliberate, sticky mode (only `wake` leaves it), so we skip the
             # normal stand-down/resume arbitration while consolidating.
             dormant = "dormant" in self._interp.configuration
-            if not self._meditating:
+            if not self._brain.meditating:
                 if stand and not dormant:
                     # Hand the panel back. If we're standing down for *another writer*
                     # (pick-up / a manual web mood), stay silent — they own /oled_face and
@@ -613,10 +383,12 @@ class MoodNode(Node):
                     self._interp.queue(Event("standdown"))
                 elif (not stand) and dormant:
                     self._interp.queue(Event("resume"))
-            self._personality_events(now, picked)      # fast rules + heartbeat
+            if self._personality.tick_events(now, picked) == "lost":   # fast rules + heartbeat
+                self.get_logger().warning(
+                    "cognitive layer unreachable — reverting to baseline personality")
             self._interp.execute()
-            self._personality_publish(now)             # publish + persist on change
-            self._purpose_tick(now)                    # purpose reflection + latched republish
+            self._personality.publish_and_persist(now)     # publish + persist on change
+            self._brain.tick(now)                          # purpose reflection + latched republish
         except Exception as exc:
             # The behaviour layer must never take the process down; log + keep going.
             self.get_logger().error(f"statechart step failed: {exc}",
@@ -624,10 +396,9 @@ class MoodNode(Node):
 
     def destroy_node(self):
         if self._interp is not None:               # persist the latest drift on clean exit
-            self._save_personality()
-        if self._planner is not None:              # persist purpose + A/B state
-            self._save_json(self._purpose_file(), self._purpose)
-            self._save_experiments()
+            self._personality.save()
+        if self._brain.enable:                     # persist purpose + A/B state
+            self._brain.save()
         super().destroy_node()
 
 

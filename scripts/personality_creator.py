@@ -30,7 +30,10 @@ sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 from web_control.llm import LlmClient, _extract_json      # noqa: E402
 
 TRAITS = ("curiosity", "extraversion", "caution", "playfulness")
-DEFAULT_OUT = os.path.expanduser("~/.local/state/nanobot/personality.json")
+# Dev tooling keeps its state in the project-local devstate/ folder (visible/editable in the
+# repo, the same place scripts/dev_webui.py reads its "soul" from). Override with --out; copy
+# the result to the board's ~/.local/state/nanobot/personality.json to give the robot this soul.
+DEFAULT_OUT = os.path.join(_ROOT, "devstate", "personality.json")
 
 DESIGNER_SYSTEM = (
     "You design the initial personality for Nano, a small expressive mobile robot that "

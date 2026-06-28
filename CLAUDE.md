@@ -47,6 +47,13 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   **Expression-only — never publishes `/cmd_vel`.** The chart lives in `presence.py`
   (ROS-free, unit-tested offline: `pixi run python -m pytest src/behavior/test`); the node
   maps topics→events. No-op if sismic is missing or `behavior.enable:=false`.
+  - **`mood_node` is thin ROS glue; the orchestration is ROS-free in `brain.py`** —
+    mirroring how `web_control.cognition.CognitionCore` factored the LLM side. `PurposeBrain`
+    owns the Purpose Engine + Horizon Planner orchestration (beat-upgrade decisions, reflect,
+    reward, meditation, persist) and `Personality` owns the chart-context traits/evolution
+    (seed/evolve/heartbeat/persist); both announce state through injected adapters. The SAME
+    two classes run on the dev harness (`scripts/dev_webui.py`) — one base, not a robot/dev
+    copy. Unit-tested offline in `test/test_brain.py`. See [[llm-openrouter-personality]].
   - **The chart is also the single brain for autonomous LLM expression.** Its idle beats
     are *predefined states with offline default faces*: `musing` (sensors) every idle
     cycle, `looking` (camera) every `look_every`-th cycle (gated by `camera_beats`). On a

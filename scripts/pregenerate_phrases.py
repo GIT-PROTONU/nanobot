@@ -27,6 +27,9 @@ from web_control.llm import LlmClient                       # noqa: E402
 from web_control.phrasebank import PhraseBank, CATEGORIES   # noqa: E402
 
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
+# Dev tooling keeps its state in the project-local devstate/ folder (same as dev_webui.py),
+# so the soul + phrase bank are visible/editable in the repo. A robot.yaml *_path override wins.
+DEV_STATE_DIR = os.path.join(_ROOT, "devstate")
 
 
 def _cfg(section):
@@ -42,8 +45,7 @@ def _cfg(section):
 def _personality():
     base = {"name": "Nano", "persona": "", "traits": {}}
     try:
-        with open(os.path.expanduser("~/.local/state/nanobot/personality.json"),
-                  encoding="utf-8") as f:
+        with open(os.path.join(DEV_STATE_DIR, "personality.json"), encoding="utf-8") as f:
             saved = json.load(f)
         for k in base:
             if k in saved:
@@ -62,7 +64,8 @@ def main():
     cfg = _cfg("web_control")
     pers = _personality()
     persona = pers.get("persona") or cfg.get("llm_persona", "")
-    bank = PhraseBank(path=(cfg.get("phrasebank_path") or None),
+    bank = PhraseBank(path=(cfg.get("phrasebank_path") or os.path.join(DEV_STATE_DIR,
+                                                                       "phrases.json")),
                       logger=lambda m: print(m, file=sys.stderr))
 
     if args.show:

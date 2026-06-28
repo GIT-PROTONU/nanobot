@@ -30,3 +30,9 @@ __pycache__/
 
 # local OpenRouter key for the dev web UI (never commit)
 scripts/.openrouter_key
+
+# dev web UI (scripts/dev_webui.py) runtime state — the "soul" + logs + goal/reward state.
+# Volatile + drifts, so kept out of git; the folder stays (see devstate/.gitkeep). To version
+# a hand-made personality anyway: git add -f devstate/personality.json
+/devstate/*
+!/devstate/.gitkeep

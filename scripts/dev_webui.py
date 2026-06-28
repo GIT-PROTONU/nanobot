@@ -22,8 +22,8 @@ absent), and handles `/brain/reward` + `/brain/meditate`. So you can reward the 
 line (👍/👎 → the A/B bandit learns), watch the reward weights drift, and toggle
 meditation — all without the board. With `--behavior` the idle `musing` beat upgrades to a
 `pursuing` beat (planner task → webcam observation), so 👍/👎 becomes *contextual* and
-credits the chosen variant. (State persists to the same `~/.local/state/nanobot/*.json`
-the robot uses; delete `purpose.json` + `experiments.json` for a clean slate.)
+credits the chosen variant. (All dev state — the personality "soul" + decision log + goal/
+reward state — persists to the project-local `devstate/` folder; delete it for a clean slate.)
 
 Telemetry/joystick/map show offline (no rosbridge). The API key comes from
 $OPENROUTER_API_KEY; persona/model are read from robot.yaml.
@@ -53,17 +53,28 @@ from web_control.llm import LlmClient                        # noqa: E402
 from web_control.skills import resolve_skills_dir            # noqa: E402
 # The SAME cognition core the robot runs — one base to maintain (see cognition.py).
 from web_control.cognition import CognitionCore              # noqa: E402
-# The Purpose Engine + Horizon Planner are ROS-free, so the dev harness runs the real ones.
-from behavior.purpose import (merge_purpose,                 # noqa: E402
-                              reflect_purpose, summarize_experience)
-from behavior.planner import Planner                            # noqa: E402
+# The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Horizon
+# Planner), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
+from behavior.brain import PurposeBrain                      # noqa: E402
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
-# Same decision-log file + JSON-line format the robot's web_server uses, so a dev run and
-# the real robot share one history (and it survives across runs). robot.yaml's
-# cognition_log_path overrides; "" falls back here.
-DEFAULT_COG_LOG = os.path.expanduser("~/.local/state/nanobot/cognition.log")
+# All dev-harness state — the "soul" (personality.json), the decision log (cognition.log),
+# and the goal/reward state (purpose.json, experiments.json, phrases.json) — lives in ONE
+# project-local folder so you can see/edit it in the repo while developing, instead of buried
+# in ~/.local/state/nanobot (where the robot keeps its own). It's gitignored (volatile state).
+DEV_STATE_DIR = os.path.join(_ROOT, "devstate")
+os.makedirs(DEV_STATE_DIR, exist_ok=True)
+
+
+def _dev_state(name):
+    """A path inside the project-local dev-state folder (a robot.yaml *_path override wins)."""
+    return os.path.join(DEV_STATE_DIR, name)
+
+
+# Decision-log file (same JSON-lines format the robot's web_server uses). A robot.yaml
+# cognition_log_path overrides; "" falls back to the project-local folder.
+DEFAULT_COG_LOG = _dev_state("cognition.log")
 
 
 def _capture_webcam_jpeg(log=lambda m: print(m, file=sys.stderr)):
@@ -102,8 +113,7 @@ def _load_personality():
     on any problem so the harness still runs with the chart's built-in defaults."""
     base = {"name": "Nano", "persona": "", "traits": {}, "registry": {}}
     try:
-        with open(os.path.expanduser("~/.local/state/nanobot/personality.json"),
-                  encoding="utf-8") as f:
+        with open(_dev_state("personality.json"), encoding="utf-8") as f:
             saved = json.load(f)
         if isinstance(saved, dict):
             for k in base:
@@ -167,7 +177,8 @@ class DevState:
             publish_action=lambda _a: (False, "no ROS on the dev harness — actions are robot-only"),
             logger=lambda m: print(f"[cog] {m}", file=sys.stderr), persist_settings=None,
             cog_log_path=(cfg.get("cognition_log_path") or "").strip() or DEFAULT_COG_LOG,
-            face_hold=0.0, bank_path=(cfg.get("phrasebank_path") or None),
+            face_hold=0.0,
+            bank_path=(cfg.get("phrasebank_path") or "").strip() or _dev_state("phrases.json"),
             bank_enable=bool(cfg.get("phrasebank_enable", True)),
             bank_live_ratio=float(cfg.get("phrasebank_live_ratio", 0.2)),
             bank_drift=float(cfg.get("phrasebank_drift", 0.6)),
@@ -177,24 +188,22 @@ class DevState:
             skills_allow_actions=bool(cfg.get("skills_allow_actions", False)))
         self._pending_evolve = None                         # reflection -> chart (drained by loop)
         self._lock_pe = threading.Lock()
-        # Autonomous skill-beat cadence (mirrors mood_node: every Nth body beat -> a skill beat).
-        self._skills_enable = bool(bcfg.get("skills_enable", True))
-        self._skill_every = max(1, int(bcfg.get("skill_every", 6)))
-        self._body_beat_n = 0
-        # --- Purpose Engine + Horizon Planner (the real ROS-free modules) -----
-        # On the dev host there's no behaviour node, so we run the goal/reward layer here so
-        # the web "🧠 Brain" card is fully exercisable: objective + reward weights, the
-        # pursuing beat, A/B variants + 👍/👎 reward, and meditation.
-        self._meditating = False
-        self._rng = random.Random()
-        self._task = None                                   # current /task_current payload
-        self._purpose = merge_purpose(self._load_json(self._purpose_file()), name=name)
-        self._planner = None
-        if bool(bcfg.get("purpose_enable", True)):
-            self._planner = Planner(
-                objective_id=self._purpose["objective"]["id"],
-                state=self._load_json(self._experiments_file()),
-                epsilon=float(bcfg.get("ab_epsilon", 0.2)), min_interval=60.0)
+        # --- Purpose Engine + Horizon Planner (the real ROS-free brain orchestration) -----
+        # On the dev host there's no behaviour node, so we run the SAME PurposeBrain the robot
+        # runs (behavior.brain) so the web "🧠 Brain" card is fully exercisable: objective +
+        # reward weights, the pursuing/skill beats, A/B variants + 👍/👎 reward, and meditation.
+        # Dev adapters: experience = the shared decision log; never picked up; no publishing
+        # (the page polls the getters below over HTTP instead of latched topics).
+        self._brain = PurposeBrain(
+            name=name, enable=bool(bcfg.get("purpose_enable", True)), rng=random.Random(),
+            epsilon=float(bcfg.get("ab_epsilon", 0.2)), pursue_min_interval=60.0,
+            skills_enable=bool(bcfg.get("skills_enable", True)),
+            skill_every=max(1, int(bcfg.get("skill_every", 6))),
+            purpose_path=_dev_state("purpose.json"),
+            experiments_path=_dev_state("experiments.json"), cog_log_path=DEFAULT_COG_LOG,
+            read_cog_log=lambda: self.cog.get_cog_log()["entries"],
+            traits_snapshot=lambda: dict(self.cog.traits),
+            logger=lambda m: print(f"[brain] {m}", file=sys.stderr))
         print(f"[dev] TTS backend ready={self.tts.available()}  "
               f"LLM ready={self.llm.available()} (model {self.llm.model})", file=sys.stderr)
         if not self.llm.available():
@@ -286,20 +295,15 @@ class DevState:
         """The chart's do_beat: run the matching enrichment in a worker thread (async,
         like the robot's fire-and-forget request) so the chart never waits on the LLM.
 
-        Goal-pursuit + skill upgrades (mirror mood_node._do_beat): the idle musing beat becomes
-        a `pursuing` beat when the planner has a verified task, else a `skill` beat every Nth
-        body beat. Meditation pauses all beats."""
-        if self._meditating:
+        Goal-pursuit + skill upgrades are decided by the shared PurposeBrain (exactly as on the
+        robot): the idle musing beat becomes a `pursuing` beat when the planner has a verified
+        task, else a `skill` beat every Nth body beat. Meditation pauses all beats."""
+        if self._brain.meditating:
             print(f"\n[beat] {name} (paused — meditating)", file=sys.stderr)
             return
         print(f"\n[beat] {name}", file=sys.stderr)
-        spec = None
-        if name == "musing" and self._planner is not None:
-            spec = self._planner.next_task(self._world_state(), self._rng, now=time.monotonic())
-        skill_beat = False
-        if spec is None and name == "musing" and self._skills_enable:
-            self._body_beat_n += 1
-            skill_beat = self._body_beat_n % self._skill_every == 0
+        spec = self._brain.next_pursuing(time.monotonic()) if name == "musing" else None
+        skill_beat = name == "musing" and spec is None and self._brain.take_skill_beat()
 
         def work():
             if spec is not None:
@@ -328,70 +332,23 @@ class DevState:
             ev, self._pending_evolve = self._pending_evolve, None
         return ev
 
-    # ---- purpose engine + planner (dev mirror of mood_node) -----------------
-    @staticmethod
-    def _state_file(name):
-        return os.path.expanduser(f"~/.local/state/nanobot/{name}")
-
-    def _purpose_file(self):
-        return self._state_file("purpose.json")
-
-    def _experiments_file(self):
-        return self._state_file("experiments.json")
-
-    @staticmethod
-    def _load_json(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _save_json(path, obj):
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(obj, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def _world_state(self):
-        return {"picked": False, "sensors_fresh": True, "meditating": self._meditating}
-
+    # ---- purpose engine + planner (served from the shared PurposeBrain) ------
     def get_purpose(self):
-        return self._purpose
+        return self._brain.purpose
 
     def get_task_current(self):
-        return self._task or {}
+        return self._brain.task or {}
 
     def get_experiments(self):
-        return self._planner.summary() if self._planner is not None else {"experiments": {}}
-
-    def _run_purpose_reflection(self, force=False):
-        if self._planner is None:
-            return
-        entries = self.cog.get_cog_log()["entries"]
-        new, changed = reflect_purpose(self._purpose, summarize_experience(entries),
-                                       dict(self.cog.traits))
-        self._purpose = new
-        self._planner.set_objective(new["objective"]["id"])
-        if changed or force:
-            self._save_json(self._purpose_file(), self._purpose)
-
-    def _save_experiments(self):
-        if self._planner is not None:
-            self._save_json(self._experiments_file(), self._planner.to_state())
+        return self._brain.summary()
 
     def _deliver_pursuing(self, spec):
         """Narrate the planner's task as a pursuing beat (dev: webcam = the robot's camera).
-        Sets /task_current (so 👍/👎 credits the right A/B arm) even when the LLM is offline."""
-        self._task = {"task": spec["task"], "exp": spec["exp"], "variant": spec["variant"],
-                      "text": spec["text"], "t": time.time()}
+        PurposeBrain.next_pursuing already set /task_current (so 👍/👎 credits the right A/B
+        arm) even when the LLM is offline."""
         print(f"[pursue] {spec['task']} (variant={spec['variant']})", file=sys.stderr)
-        prompt = "Say one short spoken line as you {task} right now.".format(task=spec["text"])
-        if spec.get("style_hint"):
-            prompt += " " + spec["style_hint"]
+        prompt = self._brain.pursuing_prompt(
+            spec, "Say one short spoken line as you {task} right now.")
         frame = None
         if spec["camera"] and self.llm.available():
             if not self.llm.can_call(image=True):
@@ -419,24 +376,20 @@ class DevState:
             detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
         self.cog.log_decision("reward", status=status, detail=detail,
                               say=("👍" if value > 0 else "👎" if value < 0 else "·"))
-        if scope != "global" and self._planner is not None:
-            self._planner.on_reward(value, target)
-            self._save_experiments()
-        self._run_purpose_reflection()                  # reflect now so the weights update
+        self._brain.apply_reward(value, target, scope=scope)
+        self._brain.run_reflection()                    # reflect now so the weights update
         print(f"[reward] {status} ({scope})", file=sys.stderr)
         return {"status": "ok", "value": value, "scope": scope}
 
     def brain_meditate(self, data):
         """Mirror web_server.brain_meditate: pause beats, consolidate (reflect + A/B + bank)."""
         on = bool(data.get("on"))
-        self._meditating = on
+        self._brain.set_meditating(on)                  # flag + (on entry) reflect + A/B finalize
         if on:
-            self._run_purpose_reflection(force=True)
-            self._save_experiments()
             self.cog.bank_regen_check()
         self.cog.log_decision("meditate", status=("on" if on else "off"))
         print(f"[meditate] {'on' if on else 'off'}", file=sys.stderr)
-        return {"status": "ok", "meditating": on}
+        return {"status": "ok", "meditating": self._brain.meditating}
 
     def tts_config(self):
         return {"voice": self.tts.voice, "volume": 100, "speed": 100, "pitch": 100,
@@ -478,7 +431,7 @@ def run_behavior(state, idle_secs, reflect_secs):
         clock.time = now - t0
         if (now - last_purpose) > 30.0:        # local Purpose Engine: drift reward weights
             last_purpose = now
-            state._run_purpose_reflection()
+            state._brain.run_reflection()
         ev = state.take_evolve()               # apply reflection drift (queued single-threaded)
         if ev:
             interp.queue(Event("evolve", traits=ev[0], registry=ev[1]))
