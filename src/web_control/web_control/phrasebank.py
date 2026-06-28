@@ -55,6 +55,14 @@ CATEGORIES = {
     "restarting": "it is restarting its own software to apply an update or to recover",
     "offline":    "its thinking AI brain is unreachable right now (no internet or no API key), "
                   "so it is running on simple built-in instincts only",
+    # --- interaction fillers (also name-picked, never classified): a short line spoken the
+    # INSTANT a slow LLM call starts (thinking) so there's no dead air, and a graceful line
+    # when a call comes back empty (stumped) instead of going silent.
+    "thinking":   "it has just been asked to do or say something and is taking a brief moment "
+                  "to think before it answers. Reply with ONE-WORD fillers only (e.g. Hmm, "
+                  "Thinking, Wait) — said out loud the instant it starts working",
+    "stumped":    "it tried to think of something to say but its mind came up blank this time, "
+                  "and it shrugs the lost thought off lightly",
 }
 # Built-in last-resort lines for the lifecycle categories, used when the bank has no entry for
 # them yet (e.g. it was never generated because the LLM has never been online). Offline-safe.
@@ -70,6 +78,14 @@ FALLBACK_LINES = {
     "offline":    [{"say": "My thinking is offline right now.", "mood": "sleepy"},
                    {"say": "I can't reach my brain, running on instinct.", "mood": "sleepy"},
                    {"say": "No connection. Resting until my mind returns.", "mood": "sleepy"}],
+    # The pre-call filler must be VERY short (one word) so it's spoken almost instantly.
+    "thinking":   [{"say": "Hmm...", "mood": "focused"},
+                   {"say": "Thinking...", "mood": "focused"},
+                   {"say": "Wait...", "mood": "focused"},
+                   {"say": "Working...", "mood": "focused"}],
+    "stumped":    [{"say": "Hmm, my mind went blank there.", "mood": "neutral"},
+                   {"say": "I lost my train of thought.", "mood": "neutral"},
+                   {"say": "Sorry, the words escaped me.", "mood": "neutral"}],
 }
 # Lifecycle categories are picked by name, never by classify().
 LIFECYCLE_CATEGORIES = tuple(FALLBACK_LINES.keys())
@@ -239,9 +255,15 @@ class PhraseBank:
 
     # ---- (re)generation -----------------------------------------------------
     def generate(self, llm, persona, traits, name="Nano", per_category=6):
-        """Blocking: ask the *cheap* model for `per_category` in-character lines per
+        """Blocking: ask the *smart* model for `per_category` in-character lines per
         situation (using placeholders) and write the bank. Returns True on success. Best-
-        effort: if the LLM is unavailable or every category fails, leaves the old bank."""
+        effort: if the LLM is unavailable or every category fails, leaves the old bank.
+
+        The SMART tier is used on purpose: small cheap models reliably return an empty
+        ``{"lines": []}`` for this batch (multi-line, structured) request, whereas the smart
+        model follows it. Generation is rare (once per persona/drift) and free-first, so the
+        extra capability is nearly free — unlike the per-beat lines, which stay on the cheap
+        tier. Single-line beat generation is unaffected."""
         if llm is None or not llm.available():
             self._log("phrasebank: LLM unavailable — cannot generate")
             return False
@@ -259,8 +281,13 @@ class PhraseBank:
                 f"lines {name} might say in this situation. Vary them. For each, also pick a "
                 'mood (face) from exactly: ' + ", ".join(MOODS) + ". Reply with ONLY compact "
                 'JSON: {"lines": [{"say": "...", "mood": "..."}, ...]}.')
-            raw = llm.complete(system, user, smart=False, json_object=True)
-            lines = self._parse_lines(raw)
+            lines = []
+            for attempt in range(3):              # free models are flaky / return empty arrays;
+                raw = llm.complete(system, user, smart=True, json_object=True)
+                lines = self._parse_lines(raw)
+                if lines:
+                    break
+                time.sleep(1.5)                   # pace the burst + let a rotating free slug recover
             if lines:
                 new_cats[cat] = lines
                 self._log(f"phrasebank: {cat}: {len(lines)} lines")

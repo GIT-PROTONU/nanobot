@@ -12,7 +12,12 @@ just let the stack auto-regenerate when the personality drifts too far.
     set OPENROUTER_API_KEY first, then:
     python scripts/pregenerate_phrases.py            # regenerate from robot.yaml + personality.json
     python scripts/pregenerate_phrases.py --show     # just print the current bank, don't generate
+    python scripts/pregenerate_phrases.py --if-needed # regenerate ONLY if missing/drifted (else no-op)
     python scripts/pregenerate_phrases.py --per-category 8
+
+--if-needed uses the SAME PhraseBank.needs_regen() the runtime uses (empty bank, persona
+change, or trait drift past phrasebank_drift), and degrades to a non-fatal warning (exit 0)
+if it can't build — so a launcher can call it as a pre-step without ever blocking startup.
 """
 import argparse
 import json
@@ -58,6 +63,8 @@ def _personality():
 def main():
     ap = argparse.ArgumentParser(description="Pre-generate Nano's spoken-line phrase bank.")
     ap.add_argument("--show", action="store_true", help="print the current bank and exit")
+    ap.add_argument("--if-needed", action="store_true",
+                    help="regenerate only if the bank is missing/drifted; else no-op (exit 0)")
     ap.add_argument("--per-category", type=int, default=None, help="lines per situation")
     args = ap.parse_args()
 
@@ -72,6 +79,20 @@ def main():
         print(json.dumps(bank.stats(), indent=2))
         return
 
+    # --if-needed is a launcher pre-step: skip if the bank is already current, and never abort
+    # startup on a missing key / failed generation (warn + exit 0 — runtime can still regen).
+    fatal = not args.if_needed
+    if args.if_needed:
+        if not bool(cfg.get("phrasebank_enable", True)):
+            print("Phrase bank disabled (phrasebank_enable=false) — skipping.", file=sys.stderr)
+            return
+        threshold = float(cfg.get("phrasebank_drift", 0.6))
+        if not bank.needs_regen(persona, pers.get("traits"), threshold):
+            print(f"Phrase bank is current ({bank.stats()['total']} lines at {bank.path}) "
+                  "— no rebuild needed.", file=sys.stderr)
+            return
+        print("Phrase bank missing or drifted — rebuilding…", file=sys.stderr)
+
     llm = LlmClient(enabled=True, api_key="", model=cfg.get("llm_model", ""),
                     persona=persona, smart_model=cfg.get("llm_smart_model", ""),
                     free_model=cfg.get("llm_free_model", ""),
@@ -79,7 +100,7 @@ def main():
                     logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
     if not llm.available():
         print("! No OPENROUTER_API_KEY (or llm_api_key) — cannot generate.", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(1 if fatal else 0)
 
     per_cat = args.per_category or int(cfg.get("phrasebank_per_category", 6))
     print(f"Generating {per_cat} lines for each of {len(CATEGORIES)} situations as "
@@ -88,7 +109,7 @@ def main():
                        per_category=per_cat)
     if not ok:
         print("! Generation failed (no lines produced).", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(1 if fatal else 0)
     st = bank.stats()
     print(f"\nWrote {st['total']} lines to {bank.path}", file=sys.stderr)
     print(json.dumps(st["counts"], indent=2))

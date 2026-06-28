@@ -58,6 +58,19 @@ if (-not $py) {
     exit 1
 }
 
+# --- 2.5 Ensure the phrase bank exists / is current -------------------------------------
+# An empty or drifted devstate\phrases.json makes every body beat fall through to a slow
+# LIVE LLM call; the single-flight guard then logs the next beats 'skipped-busy' -> long
+# silences and "phrasebank: ... no lines (kept old)" spam. Build it once here if needed.
+# '--if-needed' is a no-op when the bank is current and NEVER blocks startup (warns + exits 0
+# on a missing key / failed build; the runtime can still regenerate in the background).
+$pregen = Join-Path $scriptsDir "pregenerate_phrases.py"
+Write-Host "Checking phrase bank (devstate\phrases.json)..." -ForegroundColor Cyan
+& $py $pregen "--if-needed"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  (phrase-bank pre-build skipped/failed - continuing; runtime will retry)" -ForegroundColor Yellow
+}
+
 # --- 3. Launch the full dev UI (autonomous beats on) ------------------------------------
 $devui = Join-Path $scriptsDir "dev_webui.py"
 $argv = @($devui, "--behavior") + $args

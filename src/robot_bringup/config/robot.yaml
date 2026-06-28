@@ -338,6 +338,16 @@ web_control:
     # /cognition/evolve. Runs on the reflect_period floor + sooner on notable events (pickup).
     reflect_enable: true       # set false to freeze the personality (no autonomous drift)
     reflect_period: 600.0      # s floor between reflections (keeps the pro-model cost bounded)
+    # Long-term self-narrative (the slowest tier): the smart model folds accumulated experience
+    # into a short, first-person "who I'm becoming" paragraph that's persisted (survives reboots,
+    # never reverts on a brain outage like traits do) and folded into every spoken line's prompt.
+    self_model_enable: true    # set false to freeze the long-term self-narrative
+    self_model_path: ""        # "" -> XDG state dir (~/.local/state/nanobot/self_model.json)
+    consolidate_every: 6       # rewrite the narrative every Nth reflection (+ on meditation entry)
+    # Interaction fillers so a slow/failed LLM call is never dead air: skills/beats speak an
+    # instant "thinking" line (from the phrase bank) the moment the call starts, and a "stumped"
+    # line if it comes back empty. Both are offline-safe (built-in fallback lines).
+    prelude_enable: true       # false = silent during/after slow LLM calls (old behaviour)
     # Lifecycle speech + the persistent "AI offline" indicator. All offline-safe (the phrase
     # bank ships built-in fallback lines), so they work with no key / no network.
     startup_greeting: true     # speak a greeting line a few seconds after boot

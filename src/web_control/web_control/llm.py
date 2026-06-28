@@ -130,6 +130,10 @@ class LlmClient:
         self._last_model = ""                              # slug that produced the last reply
         self._url = (base_url or "").strip() or DEFAULT_BASE_URL
         self._persona = (persona or "").strip()
+        # A durable, smart-LLM-maintained "self-narrative" (who the robot is becoming), folded
+        # into the system prompt under the fixed persona. Set by CognitionCore.consolidate();
+        # empty until the first consolidation. Long-term identity drift, vs the volatile traits.
+        self._self_note = ""
         self._timeout = float(timeout) if timeout else 20.0
         self._max_tokens = int(max_tokens) if max_tokens else 160
         self._log = logger or (lambda *_: None)
@@ -275,6 +279,10 @@ class LlmClient:
     def persona(self):
         return self._persona
 
+    def set_self_note(self, text):
+        """Set the durable self-narrative folded into the system prompt (see `_self_note`)."""
+        self._self_note = (text or "").strip()
+
     def available(self):
         """True if the feature is on AND a key is configured. Cheap — no network."""
         return bool(self._enabled and self._key)
@@ -293,6 +301,8 @@ class LlmClient:
         if not self.available():
             return None
         system = SYSTEM_BASE + (("\n\n" + self._persona) if self._persona else "")
+        if self._self_note:                                # durable, evolving self-narrative
+            system += "\n\nWhat you have come to understand about yourself: " + self._self_note
         messages = [{"role": "system", "content": system}]
         if history:
             messages.extend(history)

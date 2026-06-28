@@ -126,6 +126,10 @@ class WebServerNode(Node):
         self.declare_parameter("cognition_log_path", "")   # decision log; "" -> XDG state dir
         self.declare_parameter("reflect_enable", True)     # slow personality reflection
         self.declare_parameter("reflect_period", 600.0)    # s floor between reflections
+        self.declare_parameter("self_model_enable", True)  # durable smart-LLM self-narrative
+        self.declare_parameter("self_model_path", "")      # "" -> XDG state dir
+        self.declare_parameter("consolidate_every", 6)     # rewrite the self-narrative every Nth reflect
+        self.declare_parameter("prelude_enable", True)     # instant "thinking" filler + "stumped" on fail
         # Skill library: a portable, self-documenting capability catalogue (skills/*.md).
         # The brain can pick one on a `skill` beat + the web UI can invoke any of them. The
         # gated action tier (topic-publishing skills) is OFF unless skills_allow_actions is on.
@@ -227,6 +231,7 @@ class WebServerNode(Node):
             face=lambda m: self._face_pub.publish(String(data=m)),
             capture_frame=self._capture_frame, sensor_snapshot=self._sensor_snapshot,
             sensor_signals=self._sensor_signals, scan_summary=self._scan_summary,
+            audio_summary=self._audio_summary,
             publish_action=self._publish_skill_action, logger=self.get_logger().info,
             persist_settings=self._save_llm_settings,
             cog_log_path=(g("cognition_log_path").value or ""),
@@ -239,7 +244,11 @@ class WebServerNode(Node):
             skills_dir=resolve_skills_dir(g("skills_dir").value,
                                           get_package_share_directory("web_control")),
             skills_enable=bool(g("skills_enable").value),
-            skills_allow_actions=self._skills_allow_actions)
+            skills_allow_actions=self._skills_allow_actions,
+            self_model_enable=bool(g("self_model_enable").value),
+            self_model_path=(g("self_model_path").value or None),
+            consolidate_every=int(g("consolidate_every").value),
+            prelude_enable=bool(g("prelude_enable").value))
         # Statechart-driven enrichment requests: the behaviour node decides when/what, the
         # core executes (capture frame if asked, add sensors, generate, speak + emote).
         self.create_subscription(String, "cognition/request", self._on_cog, 10)
@@ -510,6 +519,7 @@ class WebServerNode(Node):
         if on:
             self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
             self._cog.bank_regen_check()           # refresh the phrase bank (background)
+            threading.Thread(target=self._cog.consolidate, daemon=True).start()  # long-term self
         self._cog.log_decision("meditate", status=("on" if on else "off"))
         return {"status": "ok", "meditating": on}
 
@@ -566,6 +576,40 @@ class WebServerNode(Node):
         where = ("ahead" if d < 45 or d >= 315 else "to your left" if d < 135
                  else "behind you" if d < 225 else "to your right")
         return "the nearest object is about %.2f m %s" % (dist, where)
+
+    def _audio_summary(self, listen=0.4):
+        """One plain-English line about what the mic currently hears (for the `listen` skill).
+        Briefly taps the ref-counted AudioStream — piggybacks on arecord if a browser is
+        already listening, else spins it up for ~`listen` s — and turns the raw S16LE level
+        into words. The RMS/peak thresholds are rough and meant to be TUNED ON HARDWARE.
+        Returns 'no audio available' if the mic isn't there or nothing arrives."""
+        import queue as _q
+        if getattr(self, "_mic", None) is None:
+            return "no audio available"
+        sink = self._mic.add_listener()
+        chunks, deadline = [], time.monotonic() + max(0.1, float(listen))
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    chunks.append(sink.get(timeout=0.2))
+                except _q.Empty:
+                    pass
+        finally:
+            self._mic.remove_listener(sink)
+        raw = b"".join(chunks)
+        if len(raw) < 2:
+            return "no audio available"
+        samples = array.array("h")
+        samples.frombytes(raw[: len(raw) // 2 * 2])     # whole 16-bit frames only
+        if not samples:
+            return "no audio available"
+        peak = max(abs(s) for s in samples)
+        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+        level = ("near silence" if rms < 200 else "quiet" if rms < 800
+                 else "a steady ambient murmur" if rms < 3000
+                 else "noticeably loud" if rms < 8000 else "very loud")
+        sharp = peak > 12000 and peak > rms * 6          # a transient over the background
+        return "the room sounds like %s%s" % (level, "; a sharp sound just spiked" if sharp else "")
 
     def _publish_skill_action(self, action):
         """The core's `publish_action` adapter: turn a skill's `action` into a clamped ROS

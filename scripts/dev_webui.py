@@ -174,6 +174,7 @@ class DevState:
             face=lambda m: print(f"\n[face] {m or 'dashboard'}", file=sys.stderr),
             capture_frame=_capture_webcam_jpeg, sensor_snapshot=self._synth_snapshot,
             sensor_signals=self._synth_signals, scan_summary=lambda: "no scan (dev harness)",
+            audio_summary=lambda: "a quiet room with a faint hum (dev harness — no mic)",
             publish_action=lambda _a: (False, "no ROS on the dev harness — actions are robot-only"),
             logger=lambda m: print(f"[cog] {m}", file=sys.stderr), persist_settings=None,
             cog_log_path=(cfg.get("cognition_log_path") or "").strip() or DEFAULT_COG_LOG,
@@ -185,7 +186,11 @@ class DevState:
             bank_per_category=int(cfg.get("phrasebank_per_category", 6)),
             skills_dir=resolve_skills_dir(cfg.get("skills_dir", "")),
             skills_enable=bool(cfg.get("skills_enable", True)),
-            skills_allow_actions=bool(cfg.get("skills_allow_actions", False)))
+            skills_allow_actions=bool(cfg.get("skills_allow_actions", False)),
+            self_model_enable=bool(cfg.get("self_model_enable", True)),
+            self_model_path=(cfg.get("self_model_path") or "").strip() or _dev_state("self_model.json"),
+            consolidate_every=int(cfg.get("consolidate_every", 6)),
+            prelude_enable=bool(cfg.get("prelude_enable", True)))
         self._pending_evolve = None                         # reflection -> chart (drained by loop)
         self._lock_pe = threading.Lock()
         # --- Purpose Engine + Horizon Planner (the real ROS-free brain orchestration) -----
@@ -359,7 +364,7 @@ class DevState:
                 self.cog.log_decision("beat:pursuing", "pursuing", True, status="no-frame")
                 return
         self.cog.generate(prompt, image_jpeg=frame, trigger="beat:pursuing", state="pursuing",
-                          camera=bool(spec["camera"]))
+                          camera=bool(spec["camera"]), prelude=True)
 
     def brain_reward(self, data):
         """Mirror web_server.brain_reward: log + (contextual) credit the A/B arm + reflect so
@@ -387,6 +392,7 @@ class DevState:
         self._brain.set_meditating(on)                  # flag + (on entry) reflect + A/B finalize
         if on:
             self.cog.bank_regen_check()
+            threading.Thread(target=self.cog.consolidate, daemon=True).start()  # long-term self
         self.cog.log_decision("meditate", status=("on" if on else "off"))
         print(f"[meditate] {'on' if on else 'off'}", file=sys.stderr)
         return {"status": "ok", "meditating": self._brain.meditating}

@@ -17,6 +17,7 @@ V4L2 or a laptop webcam, or whether an action publishes a real ROS message:
       sensor_snapshot()       -> a plain-English body description (str)
       sensor_signals()        -> the structured body dict for the phrase-bank classifier
       scan_summary()          -> one line about the latest lidar scan (str)
+      audio_summary()         -> one line about what the microphone currently hears (str)
       publish_action(action)  -> (ok: bool, detail: str); the GATED topic tier (no-op off-robot)
       logger(msg)             -> log a line
       persist_settings(s)     -> persist the {enabled,model} UI settings (None = don't persist)
@@ -40,6 +41,17 @@ REFLECT_TRAITS = ("curiosity", "extraversion", "caution", "playfulness")  # pers
 LLM_HISTORY_MAX = 8          # chat turns kept for context (user+assistant messages)
 LLM_LOG_MAX = 50             # decision-log ring buffer length (also what the file tail loads)
 
+# Skill `sources:` -> (prompt template, the CognitionCore method that supplies the text).
+# Adding a new live-context source for skills is one row here (+ its adapter). The aliases let
+# a skill file say sound/mic/events/recent and resolve to the canonical source.
+SKILL_SOURCES = {
+    "sensors": ("Your body senses right now: {}.", "_sensor_snapshot"),
+    "scan":    ("Your lidar reports: {}.", "_scan_summary"),
+    "audio":   ("Through your microphone you hear: {}.", "_audio_summary"),
+    "memory":  ("Lately you have been doing:\n{}", "recent_events_text"),
+}
+SOURCE_ALIASES = {"sound": "audio", "mic": "audio", "events": "memory", "recent": "memory"}
+
 
 def clamp01(v, lo=0.0, hi=1.0):
     try:
@@ -53,11 +65,14 @@ class CognitionCore:
 
     def __init__(self, *, llm, tts, persona="", persona_name="Nano", traits=None,
                  settings=None, face=None, capture_frame=None, sensor_snapshot=None,
-                 sensor_signals=None, scan_summary=None, publish_action=None,
+                 sensor_signals=None, scan_summary=None, audio_summary=None,
+                 publish_action=None,
                  logger=None, persist_settings=None, cog_log_path="", face_hold=10.0,
                  bank_path=None, bank_enable=True, bank_live_ratio=0.2, bank_drift=0.6,
                  bank_per_category=8, skills_dir="", skills_enable=True,
-                 skills_allow_actions=False):
+                 skills_allow_actions=False, self_model_path=None, self_model_enable=True,
+                 consolidate_every=6, self_model_max_chars=600, prelude_enable=True,
+                 prelude_face="focused"):
         self.llm = llm
         self.tts = tts
         self.persona = (persona or "").strip()
@@ -72,6 +87,7 @@ class CognitionCore:
         self._sensor_snapshot = sensor_snapshot or (lambda: "no sensor data available")
         self._sensor_signals = sensor_signals or (lambda: {})
         self._scan_summary = scan_summary or (lambda: "no scan available")
+        self._audio_summary = audio_summary or (lambda: "no audio available")
         self._publish_action = publish_action or (lambda _a: (False, "no action backend"))
         self._log = logger or (lambda *_: None)
         self._persist_settings = persist_settings
@@ -97,6 +113,24 @@ class CognitionCore:
         self.skills_dir = skills_dir
         self._skills = SkillLibrary(skills_dir if skills_enable else "", logger=self._log)
         self._reflect_busy = False
+        # Long-term self-narrative (smart-LLM, durable across reboots). Loaded here and folded
+        # into every spoken line's system prompt (LlmClient.set_self_note); rewritten slowly by
+        # consolidate(). Unlike the smoothed traits it never reverts, so character compounds.
+        self._self_model_enable = bool(self_model_enable)
+        self._consolidate_every = max(0, int(consolidate_every))
+        self._self_model_max = max(120, int(self_model_max_chars))
+        self._self_model_path = self_model_path or os.path.expanduser(
+            "~/.local/state/nanobot/self_model.json")
+        self.self_narrative = self._load_self_model()
+        if self.self_narrative:
+            self.llm.set_self_note(self.self_narrative)
+        self._reflect_count = 0
+        self._consolidate_busy = False
+        # Interaction fillers: an instant "thinking" line the moment a slow call starts (so a
+        # skill/beat feels instant), and a graceful "stumped" line when a call comes back empty
+        # instead of dead air. Both pull from the phrase bank (offline-safe FALLBACK_LINES).
+        self._prelude_enable = bool(prelude_enable)
+        self._prelude_face = str(prelude_face or "")
 
     def available(self):
         return self.llm.available()
@@ -167,11 +201,42 @@ class CognitionCore:
         if say and self.tts is not None and self.tts.available():
             self.tts.say(say)
 
+    def _pick_filler(self, category):
+        """Pick an offline-safe interaction filler from the bank (FALLBACK_LINES back it)."""
+        try:
+            return self._bank.pick(None, name=self.persona_name, category=category)
+        except Exception:
+            return None
+
+    def _speak_prelude(self):
+        """Speak an instant 'thinking' filler so a slow call isn't dead air. Non-blocking:
+        tts.say plays on a worker thread, so the LLM call starts immediately in parallel and
+        the real line's express() barges in (tts is barge-in) when it arrives."""
+        reply = self._pick_filler("thinking")
+        if not (reply and reply.get("say")):
+            return
+        if self._prelude_face:
+            self._face(self._prelude_face)              # immediate visual "I'm on it"
+        if self.tts is not None and self.tts.available():
+            self.tts.say(reply["say"])
+
+    def _speak_stumped(self, state=""):
+        """When an attempted call comes back empty, say a light 'lost the thought' line from
+        the bank instead of going silent. Logged separately so the no-reply stays visible."""
+        reply = self._pick_filler("stumped")
+        if not (reply and reply.get("say")):
+            return
+        self.express(reply["mood"], reply["say"])
+        self.log_decision("stumped", state=state, status="bank", model="phrasebank",
+                          say=reply["say"], mood=reply["mood"])
+
     def generate(self, prompt, history=None, image_jpeg=None, trigger="manual",
-                 state="", camera=False, smart=False):
+                 state="", camera=False, smart=False, prelude=False):
         """Blocking generate + express, guarded so only one call runs at a time (little
         RAM/CPU; the API costs money). Records the decision + outcome. Returns the reply dict
-        or None. Safe to call from any worker thread."""
+        or None. Safe to call from any worker thread. With `prelude`, speak an instant
+        "thinking" filler the moment the (slow) call starts so it doesn't feel like dead air;
+        on an empty reply, speak a "stumped" line instead of going silent."""
         if not self.llm.available():
             self.log_decision(trigger, state, camera, status="llm-unavailable")
             return None
@@ -180,6 +245,8 @@ class CognitionCore:
                 self.log_decision(trigger, state, camera, status="skipped-busy")
                 return None
             self._llm_busy = True
+        if prelude and self._prelude_enable:            # instant filler while we wait (non-blocking)
+            self._speak_prelude()
         t0 = time.monotonic()
         try:
             reply = self.llm.generate(prompt, history=history, image_jpeg=image_jpeg,
@@ -195,6 +262,8 @@ class CognitionCore:
                               prompt=prompt, say=reply["say"], mood=reply["mood"], ms=ms)
         else:
             self.llm_fail_streak += 1                   # feeds the persistent offline indicator
+            if self._prelude_enable:                    # don't go silent on a failed call
+                self._speak_stumped(state)
             self.log_decision(trigger, state, camera, status="no-reply", model=model,
                               prompt=prompt, ms=ms)
         return reply
@@ -227,7 +296,7 @@ class CognitionCore:
         prompt = (f"Your own body's sensors report right now: {snap}. In character, say "
                   "one short spoken line reacting to how you physically feel or what your "
                   "sensors notice, and pick a fitting mood.")
-        return self.generate(prompt, trigger=trigger, state=state)
+        return self.generate(prompt, trigger=trigger, state=state, prelude=True)
 
     def llm_look(self, trigger="look", state=""):
         """Capture a frame (+ the sensor snapshot) and comment on what it SEES (vision)."""
@@ -243,7 +312,8 @@ class CognitionCore:
         prompt = ("This is the live view from your own camera. Your body also senses: "
                   f"{snap}. In character, say one short spoken line about what you can "
                   "see in front of you right now, and pick a fitting mood.")
-        return self.generate(prompt, image_jpeg=frame, trigger=trigger, state=state, camera=True)
+        return self.generate(prompt, image_jpeg=frame, trigger=trigger, state=state,
+                             camera=True, prelude=True)
 
     # ---- statechart beat executor (the chart's /cognition/request) ----------
     def run_beat(self, trigger, state, prompt, camera):
@@ -262,7 +332,8 @@ class CognitionCore:
             return                                       # (free/instant/offline; no LLM call)
         full = (prompt + " Your current personality (0..1) is " + self.traits_phrase()
                 + ", and your body senses: " + self._sensor_snapshot())
-        self.generate(full, image_jpeg=frame, trigger=trigger, state=state, camera=camera)
+        self.generate(full, image_jpeg=frame, trigger=trigger, state=state, camera=camera,
+                      prelude=True)
 
     # ---- phrase bank --------------------------------------------------------
     def bank_say(self, trigger, state="", camera=False):
@@ -356,11 +427,14 @@ class CognitionCore:
         (sensors / lidar) + the current personality. {say,mood} shape is enforced by the LLM
         client's SYSTEM_BASE, so we just supply the steering."""
         parts = [skill.body or skill.description or skill.name]
-        srcs = skill.sources
-        if "sensors" in srcs:
-            parts.append("Your body senses right now: " + self._sensor_snapshot() + ".")
-        if "scan" in srcs:
-            parts.append("Your lidar reports: " + self._scan_summary() + ".")
+        seen = set()
+        for src in skill.sources:
+            key = SOURCE_ALIASES.get(src, src)
+            spec = SKILL_SOURCES.get(key)
+            if spec and key not in seen:                 # de-dupe aliases of the same source
+                seen.add(key)
+                template, provider = spec
+                parts.append(template.format(getattr(self, provider)()))
         parts.append("Your personality (0..1) is " + self.traits_phrase() + ".")
         parts.append("Reply with one short spoken line and a fitting mood.")
         return " ".join(p.strip() for p in parts if p and p.strip())
@@ -380,7 +454,7 @@ class CognitionCore:
                 self.log_decision(trigger, state, True, status="no-frame")
                 return {"error": "no camera frame"}
         reply = self.generate(self._skill_prompt(skill), image_jpeg=frame,
-                              trigger=trigger, state=state, camera=bool(frame))
+                              trigger=trigger, state=state, camera=bool(frame), prelude=True)
         return reply or {"error": "no reply"}
 
     def _do_topic_skill(self, skill, trigger, state):
@@ -440,7 +514,9 @@ class CognitionCore:
                 '"note": "<one short reason>"}. Propose only SMALL, justified nudges to a few '
                 "traits (omit ones you would not change); the value is a TARGET that gets "
                 "smoothed over time. No prose outside the JSON.")
-            user = (f"Current traits: {self.traits_phrase()}.\nRecent events:\n"
+            selfctx = (f"\nWho you have become: {self.self_narrative}"
+                       if self.self_narrative else "")
+            user = (f"Current traits: {self.traits_phrase()}.{selfctx}\nRecent events:\n"
                     f"{self.recent_events_text()}\n\nReflect and propose adjustments.")
             content = self.llm.complete(system, user, smart=True, json_object=True)
         finally:
@@ -456,7 +532,81 @@ class CognitionCore:
             return None
         self.log_decision("reflect", status="spoke", model=rmodel,
                           say=f"{obj.get('note','')} -> {traits}", ms=ms)
+        self._maybe_consolidate()                        # slow long-term identity drift
         return {"traits": traits, "registry": registry, "note": obj.get("note", "")}
+
+    # ---- long-term self-narrative (smart-LLM, durable) ----------------------
+    def _load_self_model(self):
+        """Read the persisted self-narrative (best-effort; '' if absent/unreadable)."""
+        try:
+            with open(self._self_model_path, encoding="utf-8") as f:
+                return str(json.load(f).get("narrative", "")).strip()
+        except Exception:
+            return ""
+
+    def _save_self_model(self):
+        try:
+            os.makedirs(os.path.dirname(self._self_model_path), exist_ok=True)
+            with open(self._self_model_path, "w", encoding="utf-8") as f:
+                json.dump({"narrative": self.self_narrative, "name": self.persona_name,
+                           "updated_at": int(time.time())}, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _maybe_consolidate(self):
+        """Every `consolidate_every`-th successful reflection, rewrite the self-narrative
+        (0 = never except on manual/meditation consolidate)."""
+        if not (self._self_model_enable and self._consolidate_every):
+            return
+        self._reflect_count += 1
+        if self._reflect_count % self._consolidate_every == 0:
+            self.consolidate()
+
+    def consolidate(self):
+        """The long-term tier (smart model): fold recent experience into a SHORT, durable,
+        first-person self-narrative — who the robot is becoming. Persisted across reboots and
+        folded into every spoken line's system prompt. Unlike the smoothed traits it does NOT
+        revert on a brain outage, so character compounds. Guarded + best-effort; returns the
+        new narrative or None."""
+        if not self._self_model_enable or self._consolidate_busy or not self.llm.available():
+            return None
+        self._consolidate_busy = True
+        t0 = time.monotonic()
+        try:
+            system = (
+                f"You maintain the evolving self-understanding of a small robot named "
+                f"{self.persona_name}. {(self.persona + ' ') if self.persona else ''}Given who "
+                "it has been and what it has recently done, write its CURRENT self-narrative: a "
+                "few first-person sentences about who it is becoming — its temperament, what it "
+                "cares about, how it tends to act. Change it only a LITTLE from the previous "
+                "narrative (gradual growth, not reinvention); keep what still fits. At most "
+                f"~{self._self_model_max // 6} words, plain prose, no lists. Output ONLY the "
+                "narrative text.")
+            user = (f"Previous self-narrative:\n{self.self_narrative or '(none yet)'}\n\n"
+                    f"Current traits (0..1): {self.traits_phrase()}\n\n"
+                    f"Recent experience:\n{self.recent_events_text()}\n\n"
+                    "Write the updated self-narrative.")
+            text = self.llm.complete(system, user, smart=True, json_object=False)
+        finally:
+            self._consolidate_busy = False
+        ms = int((time.monotonic() - t0) * 1000)
+        rmodel = self.llm.last_model or self.llm.smart_model
+        text = (text or "").strip()
+        if text.startswith(("{", "```")):                # model ignored "plain text" -> skip
+            text = ""
+        if not text:
+            self.log_decision("consolidate", status="no-reply", model=rmodel, ms=ms)
+            return None
+        self.self_narrative = text[: self._self_model_max]
+        self.llm.set_self_note(self.self_narrative)
+        self._save_self_model()
+        self.log_decision("consolidate", status="spoke", model=rmodel,
+                          say=self.self_narrative[:160], ms=ms)
+        return self.self_narrative
+
+    def get_self_model(self):
+        return {"enabled": self._self_model_enable, "narrative": self.self_narrative,
+                "path": self._self_model_path, "consolidate_every": self._consolidate_every}
 
     # ---- LLM settings (web-tunable; persisted by the adapter) ----------------
     def get_llm_settings(self):
