@@ -290,11 +290,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — copies `src/`+`scripts/`,
   colcon-builds (optionally `--packages-select`), then `stack.sh restart`. Creds via
   env (`NANO_PW`, `NANO_HOST`, `NANO_HOSTKEY`) — **never commit secrets**.
-  **`DEPLOY_SOUL=1`** additionally pushes the dev-made soul/bank
-  (`devstate/personality.json` + `phrases.json`) into the board's
-  `~/.local/state/nanobot/`. OFF by default — the robot evolves + persists its OWN
-  personality there, so a normal deploy must not clobber that drift; opt in only when
-  you mean to overwrite it (e.g. after `personality_creator.py`).
+  It also pushes the dev-made soul/bank (`devstate/personality.json` + `phrases.json`)
+  into the board's `~/.local/state/nanobot/` — **ON by default for now**
+  (`DEPLOY_SOUL=1`), which **overwrites** the robot's own persisted personality (discarding
+  any evolved trait drift). Set **`DEPLOY_SOUL=0`** to skip and keep the robot's evolved soul.
 - From Windows, remote shell is PuTTY `plink`/`pscp`. **`plink -m <localfile>` sends
   the file's text as the remote shell's argv**, so any `pkill -f`/`pgrep -f` (or a
   `/proc/*/cmdline` scan) whose pattern appears in the script will match and kill the
