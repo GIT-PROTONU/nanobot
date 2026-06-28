@@ -90,6 +90,9 @@ class MoodNode(Node):
             ("enrich_min_interval", 45.0),  # s, per-beat rate-limit on requests
             ("camera_beats", True),   # allow the autonomous camera ("looking") beat
             ("look_every", 4),        # camera beat every Nth idle beat (>=1)
+            # --- skill library: let the brain pick a capability (skills/*.md) on a beat ---
+            ("skills_enable", True),  # allow the autonomous "skill" beat (web_control selects)
+            ("skill_every", 6),       # a skill beat in place of every Nth body (musing) beat (>=1)
             # --- personality / evolution ---
             ("personality_path", ""),       # "" -> ~/.local/state/nanobot/personality.json
             ("smoothing_alpha", 0.1),       # exponential-smoothing rate for `evolve` (0..1)
@@ -119,6 +122,9 @@ class MoodNode(Node):
         self.enrich_min_interval = float(g("enrich_min_interval").value)
         self.camera_beats = bool(g("camera_beats").value)
         self.look_every = max(1, int(g("look_every").value))
+        self._skills_enable = bool(g("skills_enable").value)
+        self._skill_every = max(1, int(g("skill_every").value))
+        self._body_beat_n = 0          # counts body (musing) beats, for the skill cadence
         self.smoothing_alpha = float(g("smoothing_alpha").value)
         self.brain_timeout = float(g("brain_timeout").value)
         self._nudge_pickup_caution = float(g("nudge_pickup_caution").value)
@@ -270,6 +276,15 @@ class MoodNode(Node):
             if spec is not None:
                 self._deliver_pursuing(spec)
                 return
+        # Skill-beat upgrade (mirrors pursuing): every Nth body beat, hand off to web_control
+        # to PICK a capability from the skill library (skills/*.md) and perform it. Goals
+        # (pursuing) win the slot; skills come next; otherwise it's a plain musing beat.
+        if name == "musing" and self._skills_enable and not self._meditating:
+            self._body_beat_n += 1
+            if (self._body_beat_n % self._skill_every == 0
+                    and self._enrich_ready("skill")):
+                self._deliver_skill_beat()
+                return
         self._emit_face(beat.face)                 # offline-safe default, echo-tracked
         if not self._enrich_ready(name):
             return
@@ -305,6 +320,18 @@ class MoodNode(Node):
                "traits": dict(self._interp.context["traits"])}
         self.cog_pub.publish(String(data=json.dumps(req)))
         self._publish_experiments()                # stats moved (new assignment)
+
+    def _deliver_skill_beat(self):
+        """Fire a `skill` beat: show the offline-safe default face, then hand off to
+        web_control to pick a capability from the skill library and perform it. Like every
+        beat this is fire-and-forget — a slow/absent brain just leaves the default face."""
+        beat = BEATS.get("skill")
+        if beat is not None:
+            self._emit_face(beat.face)
+        self._beat_last["skill"] = time.monotonic()
+        req = {"beat": "skill", "state": "acting", "prompt": "", "camera": False,
+               "audio": False, "traits": dict(self._interp.context["traits"])}
+        self.cog_pub.publish(String(data=json.dumps(req)))
 
     # --- personality: load / evolve / heartbeat / publish / persist ----------
     def _personality_file(self):

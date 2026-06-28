@@ -42,29 +42,28 @@ import random
 import sys
 import threading
 import time
-from collections import deque
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
 sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 sys.path.insert(0, os.path.join(_ROOT, "src", "behavior"))   # ROS-free presence chart
 
-from web_control.tts import TtsEngine, VOICES, clamp        # noqa: E402
-from web_control.llm import LlmClient, MOODS, _extract_json  # noqa: E402
-from web_control.phrasebank import PhraseBank                # noqa: E402
+from web_control.tts import TtsEngine, clamp                 # noqa: E402
+from web_control.llm import LlmClient                        # noqa: E402
+from web_control.skills import resolve_skills_dir            # noqa: E402
+# The SAME cognition core the robot runs — one base to maintain (see cognition.py).
+from web_control.cognition import CognitionCore              # noqa: E402
 # The Purpose Engine + Horizon Planner are ROS-free, so the dev harness runs the real ones.
-from behavior.purpose import (default_purpose, merge_purpose,   # noqa: E402
+from behavior.purpose import (merge_purpose,                 # noqa: E402
                               reflect_purpose, summarize_experience)
 from behavior.planner import Planner                            # noqa: E402
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
-LOG_MAX = 50
 # Same decision-log file + JSON-line format the robot's web_server uses, so a dev run and
 # the real robot share one history (and it survives across runs). robot.yaml's
 # cognition_log_path overrides; "" falls back here.
 DEFAULT_COG_LOG = os.path.expanduser("~/.local/state/nanobot/cognition.log")
-TRAITS = ("curiosity", "extraversion", "caution", "playfulness")
 
 
 def _capture_webcam_jpeg(log=lambda m: print(m, file=sys.stderr)):
@@ -137,8 +136,10 @@ class DevState:
 
     def __init__(self, voice):
         cfg = _load_cfg("web_control")
+        bcfg = _load_cfg("behavior")
         self.personality = _load_personality()              # seed traits/registry/persona
         persona = self.personality.get("persona") or cfg.get("llm_persona", "")
+        name = self.personality.get("name", "Nano")
         self.tts = TtsEngine(default_voice=voice, on_word=self._on_word,
                              logger=lambda m: print(f"[tts] {m}", file=sys.stderr))
         self.llm = LlmClient(
@@ -152,39 +153,42 @@ class DevState:
             smart_max_per_hour=int(cfg.get("llm_smart_max_per_hour", 15)),
             vision_max_per_hour=int(cfg.get("llm_vision_max_per_hour", 10)),
             logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
-        self.settings = {"enabled": True, "model": cfg.get("llm_model", ""), "persona": persona}
-        self.history = []
-        self._busy = False
-        self._lock = threading.Lock()
-        # Decision log: persisted to the same JSON-line file the robot uses, and seeded
-        # back from it on start so history survives across dev runs (and is shared w/ robot).
-        self._cog_log_path = (cfg.get("cognition_log_path") or "").strip() or DEFAULT_COG_LOG
-        self._loglock = threading.Lock()
-        self._log = deque(self._load_cog_log(), maxlen=LOG_MAX)
+        # The SAME cognition core the robot runs (web_control.cognition) — one base to
+        # maintain. We give it dev adapters: face -> print, camera -> webcam, sensors ->
+        # synthetic, scan/actions -> unavailable (no ROS). The decision log + phrase bank +
+        # skills + reflection are all the real, shared code.
+        self.cog = CognitionCore(
+            llm=self.llm, tts=self.tts, persona=persona, persona_name=name,
+            traits=self.personality.get("traits"),
+            settings={"enabled": True, "model": cfg.get("llm_model", "")},
+            face=lambda m: print(f"\n[face] {m or 'dashboard'}", file=sys.stderr),
+            capture_frame=_capture_webcam_jpeg, sensor_snapshot=self._synth_snapshot,
+            sensor_signals=self._synth_signals, scan_summary=lambda: "no scan (dev harness)",
+            publish_action=lambda _a: (False, "no ROS on the dev harness — actions are robot-only"),
+            logger=lambda m: print(f"[cog] {m}", file=sys.stderr), persist_settings=None,
+            cog_log_path=(cfg.get("cognition_log_path") or "").strip() or DEFAULT_COG_LOG,
+            face_hold=0.0, bank_path=(cfg.get("phrasebank_path") or None),
+            bank_enable=bool(cfg.get("phrasebank_enable", True)),
+            bank_live_ratio=float(cfg.get("phrasebank_live_ratio", 0.2)),
+            bank_drift=float(cfg.get("phrasebank_drift", 0.6)),
+            bank_per_category=int(cfg.get("phrasebank_per_category", 6)),
+            skills_dir=resolve_skills_dir(cfg.get("skills_dir", "")),
+            skills_enable=bool(cfg.get("skills_enable", True)),
+            skills_allow_actions=bool(cfg.get("skills_allow_actions", False)))
         self._pending_evolve = None                         # reflection -> chart (drained by loop)
         self._lock_pe = threading.Lock()
-        self._busy_reflect = False
-        # Phrase bank: pre-generated body-reaction lines (same module + file the robot uses).
-        self._bank_enable = bool(cfg.get("phrasebank_enable", True))
-        self._bank_live_ratio = float(cfg.get("phrasebank_live_ratio", 0.2))
-        self._bank_drift = float(cfg.get("phrasebank_drift", 0.6))
-        self._bank_per_cat = int(cfg.get("phrasebank_per_category", 6))
-        self._bank = PhraseBank(path=(cfg.get("phrasebank_path") or None),
-                                logger=lambda m: print(f"[bank] {m}", file=sys.stderr))
-        self._traits = dict(self.personality.get("traits") or {})   # for bank regen signature
+        # Autonomous skill-beat cadence (mirrors mood_node: every Nth body beat -> a skill beat).
+        self._skills_enable = bool(bcfg.get("skills_enable", True))
+        self._skill_every = max(1, int(bcfg.get("skill_every", 6)))
+        self._body_beat_n = 0
         # --- Purpose Engine + Horizon Planner (the real ROS-free modules) -----
         # On the dev host there's no behaviour node, so we run the goal/reward layer here so
         # the web "🧠 Brain" card is fully exercisable: objective + reward weights, the
-        # pursuing beat, A/B variants + 👍/👎 reward, and meditation. The pursuing beat is
-        # camera+vision (like `looking`), so it shares the single webcam + the one-at-a-time
-        # LLM lock with the on-demand 📷 Look / 👁 Observe buttons — keep a real rate limit
-        # here (not 0) so autonomous pursuing doesn't starve those manual buttons.
-        bcfg = _load_cfg("behavior")
+        # pursuing beat, A/B variants + 👍/👎 reward, and meditation.
         self._meditating = False
         self._rng = random.Random()
         self._task = None                                   # current /task_current payload
-        self._purpose = merge_purpose(self._load_json(self._purpose_file()),
-                                      name=self.personality.get("name", "Nano"))
+        self._purpose = merge_purpose(self._load_json(self._purpose_file()), name=name)
         self._planner = None
         if bool(bcfg.get("purpose_enable", True)):
             self._planner = Planner(
@@ -196,245 +200,95 @@ class DevState:
         if not self.llm.available():
             print("[dev] ! No OPENROUTER_API_KEY set — the AI card will say 'unavailable'.",
                   file=sys.stderr)
-        self._bank_regen_check()                            # build/refresh the bank if needed
+        self.cog.bank_regen_check()                         # build/refresh the bank if needed
         # Lifecycle speech: greet on launch + a 1 Hz "AI offline" indicator (mirrors the
-        # robot). Remove the key to hear/see the offline line + sleepy face on the dev host.
+        # robot). Remove the key to hear/see the offline line on the dev host.
         self._dev_offline = None
-        t = threading.Timer(2.0, lambda: self._speak_lifecycle("greeting")); t.daemon = True
+        t = threading.Timer(2.0, lambda: self.cog.speak_lifecycle("greeting")); t.daemon = True
         t.start()
         threading.Thread(target=self._health_loop, daemon=True).start()
-
-    def _speak_lifecycle(self, category, face=None):
-        """Speak a pre-generated lifecycle line (greeting/farewell/restarting/offline),
-        offline-safe via the phrase bank's FALLBACK_LINES. Dev: prints the face, no OLED."""
-        try:
-            reply = self._bank.pick(None, name=self.personality.get("name", "Nano"),
-                                    category=category)
-        except Exception:
-            reply = None
-        say = reply["say"] if reply else ""
-        if face:
-            print(f"\n[face] {face}", file=sys.stderr)
-        if say and self.tts.available():
-            print(f"[life:{category}] ", end="", flush=True)
-            self.tts.say(say)
-        self._log_decision("life:" + category, status=("spoke" if say else "no-line"),
-                           model="phrasebank", say=say, mood=(face or ""))
-        return say
 
     def _health_loop(self):
         while True:
             time.sleep(1.0)
-            offline = bool(self.settings.get("enabled")) and not self.llm.available()
+            offline = bool(self.cog.settings.get("enabled")) and not self.llm.available()
             if offline != self._dev_offline:
                 prev = self._dev_offline
                 self._dev_offline = offline
                 if offline:
-                    self._speak_lifecycle("offline", face="sleepy")
+                    self.cog.speak_lifecycle("offline", face="sleepy")
                 elif prev:                                  # only if we WERE offline
                     print("\n[face] dashboard (LLM online)", file=sys.stderr)
-
-    def _bank_regen_check(self):
-        if self._bank_enable and self.llm.available():
-            self._bank.maybe_regenerate(self.llm, self.llm.persona, self._traits,
-                                        name=self.personality.get("name", "Nano"),
-                                        threshold=self._bank_drift,
-                                        per_category=self._bank_per_cat, background=True)
 
     @staticmethod
     def _synth_signals():
         """A plausible, slightly-random structured body snapshot (dev stand-in for the
-        robot's real sensors) — feeds both the phrase-bank classifier and the LLM snapshot."""
+        robot's real sensors) — the core's sensor_signals adapter."""
         return {"cpu": random.randint(8, 90), "mem": random.randint(28, 70),
                 "temp": random.randint(34, 64),
                 "moving": random.random() < 0.25,
                 "tilt": random.choice([2, 6, 14, 22, 30]),
                 "pickup": random.choice([0, 0, 0, 1, 2])}
 
-    def _bank_say(self, trigger, state=""):
-        """Try the cached phrase bank for a body-reaction line (instant/free/offline);
-        returns the reply dict if used (also speaks + logs), else None."""
-        if not self._bank_enable or random.random() < self._bank_live_ratio:
-            return None
-        reply = self._bank.pick(self._synth_signals())
-        if not reply:
-            return None
-        self._express(reply)
-        self._log_decision(trigger, state, False, status="bank", model="phrasebank",
-                           say=reply["say"], mood=reply["mood"], detail=reply["category"])
-        print(f"[bank] {reply['category']}: {reply['say']}", file=sys.stderr)
-        return reply
+    def _synth_snapshot(self):
+        """A synthetic plain-English body snapshot (the core's sensor_snapshot adapter)."""
+        sig = self._synth_signals()
+        body = ["being moved or jostled" if sig["moving"] else "physically still",
+                f"tilted ({sig['tilt']} degrees)" if sig["tilt"] > 10 else "sitting level",
+                {0: "resting on the ground", 1: "with one wheel off the ground",
+                 2: "lifted off the ground (being held)"}[sig["pickup"]]]
+        return (f"CPU load {sig['cpu']}%, memory {sig['mem']}% used, main board "
+                f"{sig['temp']} degrees C, " + ", ".join(body))
 
     def _on_word(self, w):
         print(w, end=" ", flush=True) if w else print()
 
-    # ---- decision log -------------------------------------------------------
-    def _load_cog_log(self):
-        """Seed the ring from the last LOG_MAX JSON lines on disk (same file the robot's
-        web_server writes), so dev runs keep history too. Best-effort -> [] on any problem."""
-        try:
-            with open(self._cog_log_path, encoding="utf-8") as f:
-                lines = f.readlines()[-LOG_MAX:]
-        except Exception:
-            return []
-        out = []
-        for ln in lines:
-            ln = ln.strip()
-            if ln:
-                try:
-                    out.append(json.loads(ln))
-                except Exception:
-                    pass
-        return out
-
-    def _log_decision(self, trigger, state="", camera=False, status="", model="",
-                      prompt="", say="", mood="", ms=0, detail=""):
-        entry = {"t": time.time(), "trigger": trigger, "state": state,
-                 "camera": bool(camera), "model": model, "prompt": (prompt or "")[:160],
-                 "say": say, "mood": mood, "status": status, "detail": detail, "ms": ms}
-        with self._loglock:
-            self._log.append(entry)
-        try:                                               # append as one JSON line (robot fmt)
-            os.makedirs(os.path.dirname(self._cog_log_path), exist_ok=True)
-            with open(self._cog_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
-        except Exception:
-            pass
-        return entry
-
+    # ---- cognition-core delegators (the shared LLM brain lives in cognition.py) ----
+    # The page's endpoints call these; all the logic is the same CognitionCore the robot runs.
     def get_cog_log(self):
-        with self._loglock:
-            return {"entries": list(self._log)[::-1]}
+        return self.cog.get_cog_log()
 
-    # ---- phrase bank --------------------------------------------------------
     def get_phrasebank(self):
-        s = self._bank.stats()
-        s["enabled"] = self._bank_enable
-        s["live_ratio"] = self._bank_live_ratio
-        s["needs_regen"] = self._bank.needs_regen(self.llm.persona, self._traits, self._bank_drift)
-        return s
+        return self.cog.get_phrasebank()
 
     def regenerate_phrasebank(self):
-        if not self.llm.available():
-            return {"error": "llm unavailable"}
-        self._bank.maybe_regenerate(self.llm, self.llm.persona, self._traits,
-                                    name=self.personality.get("name", "Nano"),
-                                    threshold=-1.0, per_category=self._bank_per_cat,
-                                    background=True)
-        return {"status": "regenerating"}
+        return self.cog.regenerate_phrasebank()
 
-    # ---- the same shapes web_server returns ----
     def llm_config(self):
-        s = dict(self.settings)
-        s.update(available=self.llm.available(), configured=self.llm.available(),
-                 model_effective=self.llm.model, smart_model=self.llm.smart_model,
-                 vision_model=self.llm.vision_model, free_model=self.llm.free_model,
-                 free_smart_model=self.llm.free_smart_model, moods=list(MOODS),
-                 rate_limits=self.llm.rate_limits())
-        return s
+        return self.cog.get_llm_settings()
 
     def update_llm_config(self, data):
-        for k in ("enabled", "model", "persona"):
-            if k in data:
-                self.settings[k] = data[k]
-        self.llm.configure(enabled=bool(self.settings["enabled"]),
-                          model=str(self.settings["model"] or ""),
-                          persona=str(self.settings["persona"] or ""))
-        return self.llm_config()
-
-    def _express(self, reply):
-        if reply and reply.get("mood") and reply["mood"] != "neutral":
-            print(f"\n[face] {reply['mood']}", file=sys.stderr)   # no OLED on a dev PC
-        if reply and reply.get("say") and self.tts.available():
-            print("speaking: ", end="", flush=True)
-            self.tts.say(reply["say"])
-
-    def _generate(self, prompt, history=None, image_jpeg=None, trigger="manual",
-                  state="", camera=False, smart=False):
-        """Blocking generate + express + log (matches web_server's guard + logging)."""
-        if not self.llm.available():
-            self._log_decision(trigger, state, camera, status="llm-unavailable")
-            return None
-        with self._lock:
-            if self._busy:
-                self._log_decision(trigger, state, camera, status="skipped-busy")
-                return None
-            self._busy = True
-        t0 = time.monotonic()
-        try:
-            reply = self.llm.generate(prompt, history=history, image_jpeg=image_jpeg,
-                                      smart=smart)
-        finally:
-            self._busy = False
-        model = self.llm.last_model or self.llm.model_for(smart=smart, image=bool(image_jpeg))
-        ms = int((time.monotonic() - t0) * 1000)
-        if reply:
-            self._express(reply)
-            self._log_decision(trigger, state, camera, status="spoke", model=model,
-                               prompt=prompt, say=reply["say"], mood=reply["mood"], ms=ms)
-        else:
-            self._log_decision(trigger, state, camera, status="no-reply", model=model,
-                               prompt=prompt, ms=ms)
-        return reply
-
-    def llm_look(self, trigger="look", state=""):
-        if not self.llm.can_call(image=True):           # capped: skip the webcam capture
-            self._log_decision(trigger, state, True, status="rate-limited")
-            return {"error": "vision hourly limit reached"}
-        frame = _capture_webcam_jpeg()
-        if frame is None:
-            self._log_decision(trigger, state, True, status="no-frame")
-            return {"error": "no webcam frame (install opencv-python? camera in use?)"}
-        print(f"[look] captured {len(frame)} byte webcam frame -> {self.llm.vision_model}",
-              file=sys.stderr)
-        prompt = ("This is the live view from your own camera. In character, say one short "
-                  "spoken line about what you can see in front of you right now, and pick "
-                  "a fitting mood.")
-        return self._generate(prompt, image_jpeg=frame, trigger=trigger, state=state, camera=True)
+        return self.cog.update_llm_settings(data)
 
     def llm_say(self, prompt):
-        prompt = (prompt or "").strip() or (
-            "Say one short, friendly, spontaneous line and pick a fitting mood.")
-        return self._generate(prompt, trigger="say")
-
-    def llm_observe(self, trigger="observe", state=""):
-        bank = self._bank_say(trigger, state)           # frequent -> prefer the cached bank
-        if bank:
-            return bank
-        # No ROS sensors on a dev PC, so synthesise a plausible snapshot (slightly random
-        # so it varies) — enough to test that the robot comments on its sensor state.
-        sig = self._synth_signals()
-        body = []
-        body.append("being moved or jostled" if sig["moving"] else "physically still")
-        body.append(f"tilted ({sig['tilt']} degrees)" if sig["tilt"] > 10 else "sitting level")
-        body.append({0: "resting on the ground", 1: "with one wheel off the ground",
-                     2: "lifted off the ground (being held)"}[sig["pickup"]])
-        snap = (f"CPU load {sig['cpu']}%, memory {sig['mem']}% used, main board "
-                f"{sig['temp']} degrees C, " + ", ".join(body))
-        print(f"[observe] (synthetic) {snap}", file=sys.stderr)
-        prompt = (f"Your own body's sensors report right now: {snap}. In character, say "
-                  "one short spoken line reacting to how you physically feel or what your "
-                  "sensors notice, and pick a fitting mood.")
-        return self._generate(prompt, trigger=trigger, state=state)
+        return self.cog.llm_say(prompt)
 
     def llm_chat(self, message):
-        message = (message or "").strip()
-        if not message:
-            return None
-        reply = self._generate(message, history=list(self.history), trigger="chat", smart=True)
-        if reply:
-            self.history += [{"role": "user", "content": message},
-                             {"role": "assistant", "content": reply["say"]}]
-            self.history = self.history[-8:]
-        return reply
+        return self.cog.llm_chat(message)
+
+    def llm_observe(self, trigger="observe", state=""):
+        return self.cog.llm_observe(trigger=trigger, state=state)
+
+    def llm_look(self, trigger="look", state=""):
+        return self.cog.llm_look(trigger=trigger, state=state)
+
+    def get_skills(self):
+        return self.cog.get_skills()
+
+    def reload_skills(self):
+        return self.cog.reload_skills()
+
+    def invoke_skill(self, name):
+        return self.cog.invoke_skill(name)
 
     # ---- statechart beat (used by --behavior) -------------------------------
     def fire_beat(self, name):
         """The chart's do_beat: run the matching enrichment in a worker thread (async,
         like the robot's fire-and-forget request) so the chart never waits on the LLM.
 
-        Goal-pursuit upgrade (mirrors mood_node._do_beat): the idle musing beat becomes a
-        `pursuing` beat whenever the planner has a verified task. Meditation pauses all beats."""
+        Goal-pursuit + skill upgrades (mirror mood_node._do_beat): the idle musing beat becomes
+        a `pursuing` beat when the planner has a verified task, else a `skill` beat every Nth
+        body beat. Meditation pauses all beats."""
         if self._meditating:
             print(f"\n[beat] {name} (paused — meditating)", file=sys.stderr)
             return
@@ -442,52 +296,32 @@ class DevState:
         spec = None
         if name == "musing" and self._planner is not None:
             spec = self._planner.next_task(self._world_state(), self._rng, now=time.monotonic())
+        skill_beat = False
+        if spec is None and name == "musing" and self._skills_enable:
+            self._body_beat_n += 1
+            skill_beat = self._body_beat_n % self._skill_every == 0
 
         def work():
             if spec is not None:
                 self._deliver_pursuing(spec)
+            elif skill_beat:
+                self.cog.run_skill_beat("acting")       # let the brain pick a skill (shared core)
             elif name == "looking":
-                self.llm_look(trigger="beat:looking", state="looking")
+                self.cog.llm_look(trigger="beat:looking", state="looking")
             else:
-                self.llm_observe(trigger="beat:musing", state="musing")
+                self.cog.llm_observe(trigger="beat:musing", state="musing")
         threading.Thread(target=work, daemon=True).start()
 
     def reflect(self, traits_dict):
-        """Deep/slow tier: read recent events + current traits, propose smoothed trait
-        drift, and stash it for the chart loop to apply (queueing on the interpreter from
-        this worker thread would race the loop's execute())."""
-        if self._busy_reflect:
-            return
-        self._busy_reflect = True
-        try:
-            tp = ", ".join(f"{k} {traits_dict.get(k, 0.5):.2f}" for k in TRAITS)
-            with self._loglock:
-                ev = "\n".join(f"- {e['trigger']} [{e['status']}] {e.get('say','')}".rstrip()
-                               for e in list(self._log)[-20:]) or "(no recent events)"
-            system = (
-                "You are the slow, reflective mind of a small robot named Nano. You review "
-                "what just happened and gently adjust its personality so it grows over time. "
-                "Traits are 0..1: curiosity, extraversion, caution, playfulness. Output ONLY "
-                'compact JSON: {"traits": {<trait>: <new target 0..1>}, "registry": '
-                '{optional}, "note": "<one short reason>"}. Propose only SMALL, justified '
-                "nudges to a few traits (omit ones you would not change); the value is a "
-                "TARGET that gets smoothed over time. No prose outside the JSON.")
-            user = f"Current traits: {tp}.\nRecent events:\n{ev}\n\nReflect and propose adjustments."
-            obj = _extract_json(self.llm.complete(system, user, smart=True, json_object=True) or "")
-            rmodel = self.llm.last_model or self.llm.smart_model
-            t = {k: max(0.0, min(1.0, float(obj["traits"][k]))) for k in TRAITS
-                 if isinstance(obj.get("traits"), dict) and k in obj["traits"]}
-            reg = obj.get("registry") if isinstance(obj.get("registry"), dict) else {}
-            if t or reg:
-                with self._lock_pe:
-                    self._pending_evolve = (t, reg)
-                self._log_decision("reflect", status="spoke", model=rmodel,
-                                   say=f"{obj.get('note','')} -> {t}")
-                print(f"\n[reflect] {obj.get('note','')} -> {t}", file=sys.stderr)
-            else:
-                self._log_decision("reflect", status="no-reply", model=rmodel)
-        finally:
-            self._busy_reflect = False
+        """Deep/slow tier: sync the chart's current traits into the core, run the (shared)
+        reflection, and stash the proposal for the chart loop to apply (queueing on the
+        interpreter from this worker thread would race the loop's execute())."""
+        self.cog.update_traits(traits_dict)
+        res = self.cog.reflect()                         # prompt/parse/log all in the shared core
+        if res:
+            with self._lock_pe:
+                self._pending_evolve = (res["traits"], res["registry"])
+            print(f"\n[reflect] {res.get('note','')} -> {res['traits']}", file=sys.stderr)
 
     def take_evolve(self):
         with self._lock_pe:
@@ -537,10 +371,9 @@ class DevState:
     def _run_purpose_reflection(self, force=False):
         if self._planner is None:
             return
-        with self._loglock:
-            entries = list(self._log)
+        entries = self.cog.get_cog_log()["entries"]
         new, changed = reflect_purpose(self._purpose, summarize_experience(entries),
-                                       dict(self._traits))
+                                       dict(self.cog.traits))
         self._purpose = new
         self._planner.set_objective(new["objective"]["id"])
         if changed or force:
@@ -561,18 +394,15 @@ class DevState:
             prompt += " " + spec["style_hint"]
         frame = None
         if spec["camera"] and self.llm.available():
-            if self._busy:        # a manual Look/Observe (or another beat) owns the LLM/camera
-                self._log_decision("beat:pursuing", "pursuing", True, status="skipped-busy")
-                return
             if not self.llm.can_call(image=True):
-                self._log_decision("beat:pursuing", "pursuing", True, status="rate-limited")
+                self.cog.log_decision("beat:pursuing", "pursuing", True, status="rate-limited")
                 return
             frame = _capture_webcam_jpeg()
             if frame is None:
-                self._log_decision("beat:pursuing", "pursuing", True, status="no-frame")
+                self.cog.log_decision("beat:pursuing", "pursuing", True, status="no-frame")
                 return
-        self._generate(prompt, image_jpeg=frame, trigger="beat:pursuing", state="pursuing",
-                       camera=bool(spec["camera"]))
+        self.cog.generate(prompt, image_jpeg=frame, trigger="beat:pursuing", state="pursuing",
+                          camera=bool(spec["camera"]))
 
     def brain_reward(self, data):
         """Mirror web_server.brain_reward: log + (contextual) credit the A/B arm + reflect so
@@ -587,8 +417,8 @@ class DevState:
         detail = scope
         if target:
             detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
-        self._log_decision("reward", status=status, detail=detail,
-                           say=("👍" if value > 0 else "👎" if value < 0 else "·"))
+        self.cog.log_decision("reward", status=status, detail=detail,
+                              say=("👍" if value > 0 else "👎" if value < 0 else "·"))
         if scope != "global" and self._planner is not None:
             self._planner.on_reward(value, target)
             self._save_experiments()
@@ -603,8 +433,8 @@ class DevState:
         if on:
             self._run_purpose_reflection(force=True)
             self._save_experiments()
-            self._bank_regen_check()
-        self._log_decision("meditate", status=("on" if on else "off"))
+            self.cog.bank_regen_check()
+        self.cog.log_decision("meditate", status=("on" if on else "off"))
         print(f"[meditate] {'on' if on else 'off'}", file=sys.stderr)
         return {"status": "ok", "meditating": on}
 
@@ -653,8 +483,8 @@ def run_behavior(state, idle_secs, reflect_secs):
         if ev:
             interp.queue(Event("evolve", traits=ev[0], registry=ev[1]))
             print(f"[behavior] traits now {dict(interp.context['traits'])}", file=sys.stderr)
-            state._traits = dict(interp.context["traits"])   # track soul for bank-regen
-            state._bank_regen_check()                        # refresh bank if it drifted too far
+            state.cog.update_traits(dict(interp.context["traits"]))  # track soul for bank-regen
+            state.cog.bank_regen_check()                     # refresh bank if it drifted too far
         try:
             interp.execute()
         except Exception as exc:
@@ -702,6 +532,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.get_cog_log())
         if p == "/llm/phrases":
             return self._json(self.state.get_phrasebank())
+        if p == "/skills":
+            return self._json(self.state.get_skills())
         if p == "/tts/config":
             return self._json(self.state.tts_config())
         # Brain readouts — the robot serves these over rosbridge (latched topics); the dev
@@ -740,6 +572,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.update_llm_config(self._body()))
         if p == "/llm/phrases/regenerate":
             return self._json(s.regenerate_phrasebank())
+        if p == "/skills/invoke":
+            name = (self._body().get("name") or "").strip()
+            if not name:
+                return self._text(400, "empty name")
+            return self._json(s.invoke_skill(name))
+        if p == "/skills/reload":
+            return self._json(s.reload_skills())
         if p == "/brain/reward":
             return self._json(s.brain_reward(self._body()))
         if p == "/brain/meditate":

@@ -48,6 +48,11 @@ BEATS = {
     "pursuing": Beat(
         face="focused", camera=True,
         prompt="Say one short spoken line as you {task} right now."),
+    # Skill beat: delivered in place of `musing` every Nth body beat. web_control PICKS a
+    # capability from the skill library (skills/*.md) and performs it, so the prompt/camera
+    # here are unused (the chosen skill supplies them); `face` is the offline default.
+    "skill": Beat(face="focused", camera=False,
+                  prompt="Choose and perform a fitting capability right now."),
 }
 
 # Personality schema + the frozen fail-safe baseline the heartbeat reverts to.

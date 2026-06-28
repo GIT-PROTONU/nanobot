@@ -13,28 +13,29 @@ mic are started only while a client is connected, so they cost nothing idle.
 `POST /tts` ({"voice","text"}) speaks a line via SVOX Pico (see tts) and streams
 its words to the OLED on /oled_word so they appear/disappear as they're said.
 """
+import array
 import functools
 import http.server
 import json
+import math
 import os
-import random
 import subprocess
 import threading
 import time
-from collections import deque
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from std_msgs.msg import Bool, Int32, String
-from geometry_msgs.msg import Vector3Stamped
+from std_msgs.msg import Bool, Int32, Float32, String
+from geometry_msgs.msg import Twist, Vector3Stamped
 
 from .mjpeg_camera import CameraStream
 from .mic_audio import AudioStream
 from .tts import TtsEngine, VOICES, clamp
-from .llm import LlmClient, MOODS
-from .phrasebank import PhraseBank
+from .llm import LlmClient
+from .skills import resolve_skills_dir
+from .cognition import CognitionCore
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
@@ -59,14 +60,22 @@ LLM_DEFAULTS = {
 # NOTE: the persona is NOT here — it's single-sourced from personality.json (written by
 # scripts/personality_creator.py, the same file the behaviour node loads), falling back to
 # the llm_persona param. So one run of the creator + a restart updates the whole character.
-LLM_HISTORY_MAX = 8          # chat turns kept for context (user+assistant messages)
-LLM_LOG_MAX = 50             # decision-log ring buffer length (also what the file tail loads)
-REFLECT_TRAITS = ("curiosity", "extraversion", "caution", "playfulness")  # personality axes
+# (Chat-history / log-ring sizes + the trait list now live in cognition.CognitionCore.)
 
 # SBC vitals for the spoken stats (same cheap /proc + thermal reads the OLED uses).
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
 STAT_PATH = "/proc/stat"
 MEMINFO_PATH = "/proc/meminfo"
+SCAN_FILE = "/dev/shm/nano_scan.bin"          # compact lidar blob (for the read-lidar skill)
+
+# The GATED "action tier" for topic-skills: the ONLY ROS topics a skill may publish, each
+# with a hard clamp. Anything else is refused. Motion is ALSO clamped reflexively by
+# slam_nav downstream, so a skill can never push the robot into an unsafe state. Builders
+# turn a skill's `value` into a ROS message; web_server only wires these when the
+# skills_allow_actions master switch is on. (topic -> relative ROS topic name.)
+SKILL_MOTION_LIN_MAX = 0.15                    # m/s   cap on a skill's commanded linear speed
+SKILL_MOTION_ANG_MAX = 0.8                     # rad/s cap on a skill's commanded yaw rate
+SKILL_MOTION_DUR_MAX = 3.0                     # s     cap on /cmd_vel drive time before auto-stop
 
 
 class WebServerNode(Node):
@@ -117,6 +126,12 @@ class WebServerNode(Node):
         self.declare_parameter("cognition_log_path", "")   # decision log; "" -> XDG state dir
         self.declare_parameter("reflect_enable", True)     # slow personality reflection
         self.declare_parameter("reflect_period", 600.0)    # s floor between reflections
+        # Skill library: a portable, self-documenting capability catalogue (skills/*.md).
+        # The brain can pick one on a `skill` beat + the web UI can invoke any of them. The
+        # gated action tier (topic-publishing skills) is OFF unless skills_allow_actions is on.
+        self.declare_parameter("skills_enable", True)      # load + offer the skill library
+        self.declare_parameter("skills_allow_actions", False)  # permit topic-publishing skills
+        self.declare_parameter("skills_dir", "")           # "" -> installed share / source skills/
         # Lifecycle speech + the persistent "AI offline" indicator (all offline-safe via the
         # phrase bank's FALLBACK_LINES, so they work with no key / no network).
         self.declare_parameter("startup_greeting", True)   # speak a greeting line on boot
@@ -172,55 +187,68 @@ class WebServerNode(Node):
         self._ping_seq = 0
         self.create_timer(1.0, self._publish_ping)
 
-        # ---- LLM personality (OpenRouter) ---------------------------------------
-        # Build the client (key from param or $OPENROUTER_API_KEY) + the /oled_face
-        # publisher it drives. Off the ROS critical path: a missing key / no network just
-        # makes it a no-op. Autonomous "chatter" is NOT driven here anymore — the Sismic
-        # behaviour chart is the single brain; it sends /cognition/request, which we
-        # execute below. We still serve the on-demand say/chat/observe/look endpoints.
+        # ---- Cognition core (shared, ROS-free) ----------------------------------
+        # ALL the LLM-personality logic lives in web_control.cognition.CognitionCore, shared
+        # verbatim with the dev harness (scripts/dev_webui.py) — one base to maintain. We build
+        # it here with ROS-backed adapters: face -> /oled_face, capture_frame -> webcam, sensors
+        # -> /proc+IMU, the gated action tier -> whitelisted publishers, persist -> llm.json. Off
+        # the ROS critical path: a missing key / no network just makes it a no-op. Autonomous
+        # chatter is NOT driven here — the Sismic chart sends /cognition/request, which _on_cog
+        # hands to the core. We still serve the on-demand say/chat/observe/look endpoints.
         self._llm_settings = self._load_llm_settings()
         self._persona = self._load_persona()           # single-sourced from personality.json
-        self._persona_name = self._load_persona_name() # the robot's name (for phrase bank)
-        self._llm = LlmClient(
-            enabled=self._llm_settings["enabled"],
-            api_key=g("llm_api_key").value,
+        self._persona_name = self._load_persona_name() # the robot's name (for the phrase bank)
+        self._face_pub = self.create_publisher(String, "oled_face", 10)
+        llm = LlmClient(
+            enabled=self._llm_settings["enabled"], api_key=g("llm_api_key").value,
             model=self._llm_settings["model"], base_url=g("llm_base_url").value,
             persona=self._persona, vision_model=g("llm_vision_model").value,
-            smart_model=g("llm_smart_model").value,
-            free_model=g("llm_free_model").value,
+            smart_model=g("llm_smart_model").value, free_model=g("llm_free_model").value,
             free_smart_model=g("llm_free_smart_model").value,
             vision_fallback_model=g("llm_vision_fallback_model").value,
             smart_max_per_hour=int(g("llm_smart_max_per_hour").value),
             vision_max_per_hour=int(g("llm_vision_max_per_hour").value),
             timeout=float(g("llm_timeout").value), max_tokens=int(g("llm_max_tokens").value),
             logger=self.get_logger().info)
-        self._llm_face_hold = float(g("llm_face_hold").value)
-        self._llm_history = deque(maxlen=LLM_HISTORY_MAX)
-        self._llm_lock = threading.Lock()              # serialise generate calls
-        self._llm_busy = False
-        self._face_pub = self.create_publisher(String, "oled_face", 10)
-        # Decision log (viewable in the web UI): a ring buffer backed by a file so it
-        # survives reboots. Seeded from the file tail on start.
-        self._log_lock = threading.Lock()
-        self._cog_log = deque(self._load_cog_log(), maxlen=LLM_LOG_MAX)
-        # Phrase bank: the frequent body-reaction lines, pre-generated + filled live.
-        self._bank_enable = bool(g("phrasebank_enable").value)
-        self._bank_live_ratio = float(g("phrasebank_live_ratio").value)
-        self._bank_drift = float(g("phrasebank_drift").value)
-        self._bank_per_cat = int(g("phrasebank_per_category").value)
-        self._bank = PhraseBank(path=(g("phrasebank_path").value or None),
-                                logger=self.get_logger().info)
-        # Statechart-driven enrichment requests: the behaviour node decides when/what,
-        # we execute (capture frame if asked, add sensors, generate, speak + emote).
+        # Gated action-tier publishers — only created when actions are permitted, so
+        # web_control doesn't appear as a /cmd_vel talker etc. while the tier is off.
+        self._skills_allow_actions = bool(g("skills_allow_actions").value)
+        self._skill_pubs = {}
+        if self._skills_allow_actions:
+            self._skill_pubs = {
+                "/led": self.create_publisher(Bool, "led", 10),
+                "/fan_pwm": self.create_publisher(Float32, "fan_pwm", 10),
+                "/lds_target_rpm": self.create_publisher(Float32, "lds_target_rpm", 10),
+                "/cmd_vel": self.create_publisher(Twist, "cmd_vel", 10),
+            }
+        self._cog = CognitionCore(
+            llm=llm, tts=self._tts, persona=self._persona, persona_name=self._persona_name,
+            settings=self._llm_settings,
+            face=lambda m: self._face_pub.publish(String(data=m)),
+            capture_frame=self._capture_frame, sensor_snapshot=self._sensor_snapshot,
+            sensor_signals=self._sensor_signals, scan_summary=self._scan_summary,
+            publish_action=self._publish_skill_action, logger=self.get_logger().info,
+            persist_settings=self._save_llm_settings,
+            cog_log_path=(g("cognition_log_path").value or ""),
+            face_hold=float(g("llm_face_hold").value),
+            bank_path=(g("phrasebank_path").value or None),
+            bank_enable=bool(g("phrasebank_enable").value),
+            bank_live_ratio=float(g("phrasebank_live_ratio").value),
+            bank_drift=float(g("phrasebank_drift").value),
+            bank_per_category=int(g("phrasebank_per_category").value),
+            skills_dir=resolve_skills_dir(g("skills_dir").value,
+                                          get_package_share_directory("web_control")),
+            skills_enable=bool(g("skills_enable").value),
+            skills_allow_actions=self._skills_allow_actions)
+        # Statechart-driven enrichment requests: the behaviour node decides when/what, the
+        # core executes (capture frame if asked, add sensors, generate, speak + emote).
         self.create_subscription(String, "cognition/request", self._on_cog, 10)
-        # Personality reflection (the "deep/slow" tier): read the current traits (latched
-        # from the behaviour node) + recent events, and propose smoothed trait drift back.
-        self._traits = {"curiosity": 0.5, "extraversion": 0.5, "caution": 0.6, "playfulness": 0.5}
+        # Reflection (deep/slow tier) scheduling + the persistent offline indicator. The WORK
+        # lives in the core; the node only schedules it and delivers the result (publishes the
+        # proposed evolve on /cognition/evolve, shows the offline face).
         self._reflect_busy = False
         self._reflect_next = time.monotonic() + float(g("reflect_period").value)
         self._was_picked = False
-        # Persistent "AI offline" indicator state (driven from the 1 Hz ping tick).
-        self._llm_fail_streak = 0        # consecutive failed real calls (network down w/ a key)
         self._llm_offline = None         # None=unknown, True=showing offline, False=online
         self._llm_offline_reassert = 0.0 # monotonic of last face re-assert while offline
         self._evolve_pub = self.create_publisher(String, "cognition/evolve", 10)
@@ -243,23 +271,15 @@ class WebServerNode(Node):
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
         self.get_logger().info(
-            f"llm: {'enabled' if self._llm.available() else 'idle (no key / disabled)'}"
-            f" model={self._llm.model}")
-        self._bank_regen_check()                        # build/refresh the bank if needed
+            f"llm: {'enabled' if self._cog.available() else 'idle (no key / disabled)'}"
+            f" model={self._cog.llm.model}")
+        self._cog.bank_regen_check()                    # build/refresh the bank if needed
         if bool(g("startup_greeting").value):
             # Say hello a few seconds after boot (once the OLED/TTS are up). Offline-safe via
             # the phrase bank's greeting fallback; the boot face is the behaviour node's job.
-            t = threading.Timer(3.0, lambda: self._speak_lifecycle("greeting"))
+            t = threading.Timer(3.0, lambda: self._cog.speak_lifecycle("greeting"))
             t.daemon = True
             t.start()
-
-    def _bank_regen_check(self):
-        """Regenerate the phrase bank in the background if it's empty or the soul has drifted
-        too far (no-op if disabled / LLM offline / drift small)."""
-        if self._bank_enable and self._llm.available():
-            self._bank.maybe_regenerate(self._llm, self._persona, self._traits,
-                                        name=self._persona_name, threshold=self._bank_drift,
-                                        per_category=self._bank_per_cat, background=True)
 
     def _publish_ping(self):
         self._ping_seq = (self._ping_seq + 1) & 0x7FFFFFFF
@@ -403,7 +423,10 @@ class WebServerNode(Node):
             pass
         return "Nano"
 
-    def _save_llm_settings(self):
+    def _save_llm_settings(self, settings):
+        """The core's `persist_settings` adapter: write the UI {enabled,model} to llm.json
+        (never the API key). Atomic via .tmp + rename."""
+        self._llm_settings = dict(settings)
         try:
             path = self._llm_settings_file()
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -414,81 +437,49 @@ class WebServerNode(Node):
         except Exception as exc:
             self.get_logger().warning(f"llm: could not persist settings ({exc})")
 
+    # --- cognition-core delegators (the shared LLM brain lives in cognition.py) ----
+    # These thin forwards are the node's public API for the HTTP handler; all the logic is in
+    # CognitionCore, shared verbatim with scripts/dev_webui.py (one base to maintain).
     def llm_available(self):
-        return self._llm.available()
+        return self._cog.available()
 
     def get_llm_settings(self):
-        s = dict(self._llm_settings)
-        s["available"] = self._llm.available()         # enabled AND a key is configured
-        s["configured"] = self._llm.available()
-        s["model_effective"] = self._llm.model
-        s["smart_model"] = self._llm.smart_model
-        s["vision_model"] = self._llm.vision_model
-        s["free_model"] = self._llm.free_model            # free primaries (paid models above are fallbacks)
-        s["free_smart_model"] = self._llm.free_smart_model
-        s["persona"] = self._persona              # read-only: single-sourced from personality.json
-        s["moods"] = list(MOODS)
-        s["rate_limits"] = self._llm.rate_limits()     # {tier: [used_last_hour, cap]}; 0 cap = off
-        return s
+        return self._cog.get_llm_settings()
 
     def update_llm_settings(self, data):
-        old = dict(self._llm_settings)
-        s = dict(old)
-        for k in LLM_DEFAULTS:
-            if k in data:
-                s[k] = data[k]
-        self._llm_settings = _sanitize_llm_settings(s)
-        self._save_llm_settings()
-        self._llm.configure(enabled=self._llm_settings["enabled"],
-                            model=self._llm_settings["model"])
-        return self.get_llm_settings()
-
-    # --- decision log (viewable in the web UI) -------------------------------
-    def _cog_log_file(self):
-        p = self.get_parameter("cognition_log_path").value
-        return p or os.path.expanduser("~/.local/state/nanobot/cognition.log")
-
-    def _load_cog_log(self):
-        """Seed the in-memory ring from the file's last LLM_LOG_MAX JSON lines, so the
-        web view shows history across reboots. Best-effort (returns [] on any problem)."""
-        try:
-            with open(self._cog_log_file()) as f:
-                lines = f.readlines()[-LLM_LOG_MAX:]
-        except Exception:
-            return []
-        out = []
-        for ln in lines:
-            ln = ln.strip()
-            if ln:
-                try:
-                    out.append(json.loads(ln))
-                except Exception:
-                    pass
-        return out
-
-    def _log_decision(self, trigger, state="", camera=False, status="", model="",
-                      prompt="", say="", mood="", ms=0, detail=""):
-        """Record one cognition decision (+ outcome) to the ring buffer and append it as
-        a JSON line to the log file. Log failures never block a decision."""
-        entry = {"t": time.time(), "trigger": trigger, "state": state,
-                 "camera": bool(camera), "model": model, "prompt": (prompt or "")[:160],
-                 "say": say, "mood": mood, "status": status, "detail": detail, "ms": ms}
-        with self._log_lock:
-            self._cog_log.append(entry)
-        try:
-            path = self._cog_log_file()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a") as f:
-                f.write(json.dumps(entry) + "\n")
-        except Exception:
-            pass
-        return entry
+        return self._cog.update_llm_settings(data)
 
     def get_cog_log(self):
-        with self._log_lock:
-            return {"entries": list(self._cog_log)[::-1]}   # newest first
+        return self._cog.get_cog_log()
 
-    # --- brain controls (reward + meditation) --------------------------------
+    def get_phrasebank(self):
+        return self._cog.get_phrasebank()
+
+    def regenerate_phrasebank(self):
+        return self._cog.regenerate_phrasebank()
+
+    def get_skills(self):
+        return self._cog.get_skills()
+
+    def reload_skills(self):
+        return self._cog.reload_skills()
+
+    def invoke_skill(self, name):
+        return self._cog.invoke_skill(name)
+
+    def llm_say(self, prompt=""):
+        return self._cog.llm_say(prompt)
+
+    def llm_chat(self, message):
+        return self._cog.llm_chat(message)
+
+    def llm_observe(self):
+        return self._cog.llm_observe()
+
+    def llm_look(self):
+        return self._cog.llm_look()
+
+    # --- brain controls (reward + meditation; ROS-side, logged via the core) ------
     def brain_reward(self, data):
         """Record a human reward and publish it for the behaviour node. Contextual reward
         (with a `target` echoed from /task_current) credits a specific A/B arm; global reward
@@ -503,8 +494,8 @@ class WebServerNode(Node):
         detail = scope
         if target:
             detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
-        self._log_decision("reward", status=status, detail=detail,
-                           say=("👍" if value > 0 else "👎" if value < 0 else "·"))
+        self._cog.log_decision("reward", status=status, detail=detail,
+                               say=("👍" if value > 0 else "👎" if value < 0 else "·"))
         self._reward_pub.publish(String(data=json.dumps(
             {"value": value, "scope": scope, "target": target})))
         return {"status": "ok", "value": value, "scope": scope}
@@ -518,26 +509,9 @@ class WebServerNode(Node):
         self._meditate_pub.publish(Bool(data=on))
         if on:
             self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
-            self._bank_regen_check()               # refresh the phrase bank (background)
-        self._log_decision("meditate", status=("on" if on else "off"))
+            self._cog.bank_regen_check()           # refresh the phrase bank (background)
+        self._cog.log_decision("meditate", status=("on" if on else "off"))
         return {"status": "ok", "meditating": on}
-
-    # --- phrase bank ---------------------------------------------------------
-    def get_phrasebank(self):
-        s = self._bank.stats()
-        s["enabled"] = self._bank_enable
-        s["live_ratio"] = self._bank_live_ratio
-        s["needs_regen"] = self._bank.needs_regen(self._persona, self._traits, self._bank_drift)
-        return s
-
-    def regenerate_phrasebank(self):
-        """Force a (background) regeneration regardless of drift — for the web UI button."""
-        if not self._llm.available():
-            return {"error": "llm unavailable"}
-        self._bank.maybe_regenerate(self._llm, self._persona, self._traits,
-                                    name=self._persona_name, threshold=-1.0,  # <0 => always
-                                    per_category=self._bank_per_cat, background=True)
-        return {"status": "regenerating"}
 
     # --- statechart enrichment executor (/cognition/request) -----------------
     def _on_cog(self, msg: String):
@@ -553,33 +527,92 @@ class WebServerNode(Node):
         prompt = str(req.get("prompt") or "")
         camera = bool(req.get("camera"))
         if isinstance(req.get("traits"), dict):        # freshest personality snapshot
-            self._traits.update({k: req["traits"][k] for k in REFLECT_TRAITS
-                                 if k in req["traits"]})
+            self._cog.update_traits(req["traits"])
         trigger = "beat:" + beat
-        if not self._llm.available():
-            self._log_decision(trigger, state, camera, status="llm-unavailable")
+        if not self._cog.available():
+            self._cog.log_decision(trigger, state, camera, status="llm-unavailable")
             return
-        threading.Thread(target=self._run_beat,
+        if beat == "skill":                            # let the brain pick a skill to perform
+            threading.Thread(target=self._cog.run_skill_beat,
+                             args=(state or "acting",), daemon=True).start()
+            return
+        threading.Thread(target=self._cog.run_beat,
                          args=(trigger, state, prompt, camera), daemon=True).start()
 
-    def _run_beat(self, trigger, state, prompt, camera):
-        frame = None
-        if camera:
-            if not self._llm.can_call(image=True):     # don't spin up the camera if capped
-                self._log_decision(trigger, state, camera, status="rate-limited")
-                return
-            frame = self._capture_frame()
-            if frame is None:
-                self._log_decision(trigger, state, camera, status="no-frame")
-                return
-        elif self._bank_say(trigger, state):           # frequent body beat -> cached line
-            return                                     # (free/instant/offline; no LLM call)
-        full = (prompt + " Your current personality (0..1) is " + self._traits_phrase()
-                + ", and your body senses: " + self._sensor_snapshot())
-        self._generate(full, image_jpeg=frame, trigger=trigger, state=state, camera=camera)
+    # --- action-tier publish + lidar summary (the core's ROS-backed adapters) ----
+    def _scan_summary(self):
+        """One plain-English line about the latest lidar scan: nearest range + rough bearing
+        (for the read-lidar skill). Reads the same /dev/shm blob the web map polls."""
+        try:
+            with open(SCAN_FILE, "rb") as f:
+                blob = f.read()
+            nl = blob.index(b"\n")
+            head = json.loads(blob[:nl])
+            n = int(head.get("n", 0))
+            ranges = array.array("f")
+            ranges.frombytes(blob[nl + 1:nl + 1 + 4 * n])
+        except Exception:
+            return "no scan available"
+        amin = float(head.get("amin", 0.0))
+        ainc = float(head.get("ainc", 0.0))
+        best = None
+        for i, r in enumerate(ranges):
+            if r == r and 0.05 < r < 1e6 and (best is None or r < best[0]):  # r==r: not NaN/inf
+                best = (r, amin + i * ainc)
+        if best is None:
+            return "nothing within range — open space all around"
+        dist, ang = best
+        d = (math.degrees(ang) + 360) % 360            # robot frame: 0 ahead, +90 left
+        where = ("ahead" if d < 45 or d >= 315 else "to your left" if d < 135
+                 else "behind you" if d < 225 else "to your right")
+        return "the nearest object is about %.2f m %s" % (dist, where)
 
-    def _traits_phrase(self):
-        return ", ".join(f"{k} {self._traits.get(k, 0.5):.2f}" for k in REFLECT_TRAITS)
+    def _publish_skill_action(self, action):
+        """The core's `publish_action` adapter: turn a skill's `action` into a clamped ROS
+        message on a whitelisted topic and publish it. Returns (ok, human-readable detail).
+        Never raises on bad input. (Gating + logging live in the core's _do_topic_skill.)"""
+        topic = str(action.get("topic") or "").strip()
+        pub = self._skill_pubs.get(topic)
+        if pub is None:
+            return False, "topic not whitelisted: " + (topic or "(none)")
+        val = action.get("value")
+        try:
+            if topic == "/led":
+                on = bool(val)
+                pub.publish(Bool(data=on))
+                off_after = action.get("off_after")
+                if on and off_after:                   # auto-revert the LED after a moment
+                    self._later(min(float(off_after), 10.0),
+                                lambda: pub.publish(Bool(data=False)))
+                return True, "/led=%s" % on
+            if topic == "/fan_pwm":
+                duty = clamp(float(val), 0.0, 1.0)
+                pub.publish(Float32(data=duty))
+                return True, "/fan_pwm=%.2f" % duty
+            if topic == "/lds_target_rpm":
+                rpm = clamp(float(val), 0.0, 400.0)
+                pub.publish(Float32(data=rpm))
+                return True, "/lds_target_rpm=%.0f" % rpm
+            if topic == "/cmd_vel":
+                v = val if isinstance(val, dict) else {}
+                lin = clamp(float(v.get("lin", 0.0)), -SKILL_MOTION_LIN_MAX, SKILL_MOTION_LIN_MAX)
+                ang = clamp(float(v.get("ang", 0.0)), -SKILL_MOTION_ANG_MAX, SKILL_MOTION_ANG_MAX)
+                dur = clamp(float(action.get("duration", 1.0)), 0.0, SKILL_MOTION_DUR_MAX)
+                tw = Twist()
+                tw.linear.x = lin
+                tw.angular.z = ang
+                pub.publish(tw)
+                self._later(dur, lambda: pub.publish(Twist()))   # always auto-stop
+                return True, "/cmd_vel lin=%.2f ang=%.2f for %.1fs" % (lin, ang, dur)
+        except (TypeError, ValueError) as exc:
+            return False, "bad value: %s" % exc
+        return False, "unhandled topic: " + topic
+
+    @staticmethod
+    def _later(delay, fn):
+        t = threading.Timer(max(0.0, float(delay)), fn)
+        t.daemon = True
+        t.start()
 
     def _on_traits(self, msg: String):
         try:
@@ -587,13 +620,12 @@ class WebServerNode(Node):
         except Exception:
             return
         if isinstance(data.get("traits"), dict):
-            self._traits.update({k: data["traits"][k] for k in REFLECT_TRAITS
-                                 if k in data["traits"]})
-            self._bank_regen_check()                    # soul moved -> refresh bank if too far
+            self._cog.update_traits(data["traits"])
+            self._cog.bank_regen_check()                # soul moved -> refresh bank if too far
 
-    # --- personality reflection (deep/slow tier) -----------------------------
+    # --- personality reflection (deep/slow tier): scheduled here, done by the core ----
     def _reflect_tick(self):
-        if not (self.get_parameter("reflect_enable").value and self._llm.available()):
+        if not (self.get_parameter("reflect_enable").value and self._cog.available()):
             return
         now = time.monotonic()
         picked = self._susp_l and self._susp_r
@@ -608,46 +640,19 @@ class WebServerNode(Node):
         self._reflect_next = now + period
         threading.Thread(target=self._reflect, daemon=True).start()
 
-    def _recent_events_text(self, n=25):
-        with self._log_lock:
-            entries = list(self._cog_log)[-n:]
-        lines = [f"- {e.get('trigger','')} [{e.get('status','')}] "
-                 f"{e.get('say') or e.get('detail') or ''}".rstrip() for e in entries]
-        return "\n".join(lines) or "(no recent events)"
-
     def _reflect(self):
+        """Run the core's reflection and DELIVER the proposal on /cognition/evolve (the
+        behaviour node smooths it into the live traits). The prompt/parse/log are in the core."""
         self._reflect_busy = True
-        t0 = time.monotonic()
         try:
-            system = (
-                "You are the slow, reflective mind of a small robot named Nano. You review "
-                "what just happened and gently adjust its personality so it grows over time. "
-                "Traits are 0..1: curiosity, extraversion, caution, playfulness. Output ONLY "
-                'compact JSON: {"traits": {<trait>: <new target 0..1>}, "registry": '
-                '{optional: {"musing"/"looking": {"priority":0..1,"enabled":bool}}}, '
-                '"note": "<one short reason>"}. Propose only SMALL, justified nudges to a few '
-                "traits (omit ones you would not change); the value is a TARGET that gets "
-                "smoothed over time. No prose outside the JSON.")
-            user = (f"Current traits: {self._traits_phrase()}.\nRecent events:\n"
-                    f"{self._recent_events_text()}\n\nReflect and propose adjustments.")
-            content = self._llm.complete(system, user, smart=True, json_object=True)
+            res = self._cog.reflect()
         finally:
             self._reflect_busy = False
-        ms = int((time.monotonic() - t0) * 1000)
-        obj = _extract_json(content or "")
-        traits = {k: clamp(obj["traits"][k] * 100, 0, 100) / 100.0
-                  for k in REFLECT_TRAITS
-                  if isinstance(obj.get("traits"), dict) and k in obj["traits"]}
-        registry = obj.get("registry") if isinstance(obj.get("registry"), dict) else {}
-        rmodel = self._llm.last_model or self._llm.smart_model
-        if not traits and not registry:
-            self._log_decision("reflect", status="no-reply", model=rmodel, ms=ms)
-            return
-        self._evolve_pub.publish(String(data=json.dumps({"traits": traits, "registry": registry})))
-        self._log_decision("reflect", status="spoke", model=rmodel,
-                           say=f"{obj.get('note','')} -> {traits}", ms=ms)
+        if res:
+            self._evolve_pub.publish(String(data=json.dumps(
+                {"traits": res["traits"], "registry": res["registry"]})))
 
-    # --- sensor snapshot (for "Observe") -------------------------------------
+    # --- sensor snapshot (the core's ROS-backed adapters) --------------------
     def _on_imu_web(self, msg: Vector3Stamped):     # x=|accel| m/s^2, y=|gyro| rad/s
         self._imu_accel, self._imu_gyro = msg.vector.x, msg.vector.y
         self._imu_at = time.monotonic()
@@ -720,35 +725,6 @@ class WebServerNode(Node):
         return {"cpu": cpu, "mem": mem, "temp": temp, "moving": moving,
                 "tilt": tilt, "pickup": pickup}
 
-    def _bank_say(self, trigger, state="", camera=False):
-        """Try the pre-generated phrase bank for a body-reaction line: classify the live
-        sensors, pick + fill a cached line, speak/emote it, log it. Returns the reply dict
-        if a line was used, else None (caller falls back to the live LLM). Honours the
-        live-LLM ratio (sometimes returns None on purpose so a fresh line gets generated)."""
-        if not self._bank_enable or camera:
-            return None
-        if random.random() < self._bank_live_ratio:     # occasionally go live for variety
-            return None
-        reply = self._bank.pick(self._sensor_signals())
-        if not reply:
-            return None
-        self._express(reply["mood"], reply["say"])
-        self._log_decision(trigger, state, camera, status="bank", model="phrasebank",
-                           say=reply["say"], mood=reply["mood"], detail=reply["category"])
-        return reply
-
-    def llm_observe(self):
-        """Build a sensor snapshot and have the robot comment on how it feels."""
-        bank = self._bank_say("observe")               # frequent -> prefer the cached bank
-        if bank:
-            return bank
-        snap = self._sensor_snapshot()
-        self.get_logger().info(f"llm observe: {snap}")
-        prompt = (f"Your own body's sensors report right now: {snap}. In character, say "
-                  "one short spoken line reacting to how you physically feel or what your "
-                  "sensors notice, and pick a fitting mood.")
-        return self._generate(prompt, trigger="observe")
-
     def _capture_frame(self, timeout=4.0):
         """Grab one JPEG from the webcam via the shared CameraStream (starts the camera
         if nobody's watching, stops it after). Returns bytes, or None if unavailable."""
@@ -767,58 +743,11 @@ class WebServerNode(Node):
         finally:
             self._cam.remove_viewer()
 
-    def llm_look(self):
-        """Capture a camera frame (+ the sensor snapshot) and have the robot comment on
-        what it SEES, via the vision model. Falls back to None if no frame is available."""
-        if not self._llm.can_call(image=True):         # capped: skip the capture entirely
-            self._log_decision("look", "", True, status="rate-limited")
-            return {"error": "vision hourly limit reached"}
-        frame = self._capture_frame()
-        if frame is None:
-            self.get_logger().warning("llm look: no camera frame")
-            self._log_decision("look", "", True, status="no-frame")
-            return {"error": "no camera frame"}
-        snap = self._sensor_snapshot()
-        self.get_logger().info(f"llm look: {len(frame)} byte frame; {snap}")
-        prompt = ("This is the live view from your own camera. Your body also senses: "
-                  f"{snap}. In character, say one short spoken line about what you can "
-                  "see in front of you right now, and pick a fitting mood.")
-        return self._generate(prompt, image_jpeg=frame, trigger="look", camera=True)
-
-    def _express(self, mood, say):
-        """Show a mood on /oled_face and speak the line. Optionally clear the face back
-        to the dashboard after llm_face_hold seconds (0 = leave it up like a manual mood)."""
-        if mood and mood != "neutral":
-            self._face_pub.publish(String(data=mood))
-            if self._llm_face_hold > 0:
-                t = threading.Timer(self._llm_face_hold,
-                                    lambda: self._face_pub.publish(String(data="")))
-                t.daemon = True
-                t.start()
-        if say and self._tts is not None and self._tts.available():
-            self._tts.say(say)
-
-    # --- lifecycle speech + persistent "AI offline" indicator ----------------
-    def _speak_lifecycle(self, category, face=None):
-        """Speak a pre-generated lifecycle line (greeting/farewell/restarting/offline) and
-        optionally set an OLED face. Offline-safe (phrase bank FALLBACK_LINES), best-effort."""
-        try:
-            reply = self._bank.pick(None, name=self._persona_name, category=category)
-        except Exception:
-            reply = None
-        say = reply["say"] if reply else ""
-        if face:
-            self._face_pub.publish(String(data=face))
-        if say and self._tts is not None and self._tts.available():
-            self._tts.say(say)
-        self._log_decision("life:" + category, status=("spoke" if say else "no-line"),
-                           model="phrasebank", say=say, mood=(face or ""))
-        return say
-
+    # --- lifecycle speech (offline-safe via the phrase bank, done by the core) ----
     def system_announce(self, action):
         """Speak the matching farewell/restart line just before a stack/board action."""
         cat = "farewell" if action in ("shutdown", "poweroff") else "restarting"
-        return self._speak_lifecycle(cat)
+        return self._cog.speak_lifecycle(cat)
 
     def _llm_health_tick(self):
         """Persistent 'AI offline' indicator: when the LLM is enabled but unreachable, show
@@ -829,12 +758,12 @@ class WebServerNode(Node):
         so its idle beats pause while we're offline."""
         if not self.get_parameter("llm_offline_indicator").value:
             return
-        if not bool(self._llm_settings.get("enabled")):
+        if not bool(self._cog.settings.get("enabled")):
             offline = False                            # LLM opted out -> presence runs normally
-        elif not self._llm.available():
+        elif not self._cog.available():
             offline = True                             # enabled but no key
         else:
-            offline = self._llm_fail_streak >= 2       # key present but calls keep failing
+            offline = self._cog.llm_fail_streak >= 2   # key present but calls keep failing
         face = str(self.get_parameter("offline_face").value or "sleepy")
         now = time.monotonic()
         if offline != self._llm_offline:
@@ -842,7 +771,7 @@ class WebServerNode(Node):
             self._llm_offline = offline
             if offline:
                 self.get_logger().warning("LLM unreachable - showing offline mood")
-                self._speak_lifecycle("offline", face=face)
+                self._cog.speak_lifecycle("offline", face=face)
                 self._llm_offline_reassert = now
             elif prev:                                     # only if we WERE showing offline
                 self.get_logger().info("LLM reachable again - clearing offline mood")
@@ -850,58 +779,6 @@ class WebServerNode(Node):
         elif offline and (now - self._llm_offline_reassert) > 20.0:
             self._llm_offline_reassert = now               # best-effort re-assert
             self._face_pub.publish(String(data=face))
-
-    def _generate(self, prompt, history=None, image_jpeg=None, trigger="manual",
-                  state="", camera=False, smart=False):
-        """Blocking generate + express, guarded so only one call runs at a time (the
-        board has little RAM/CPU and the API costs money). Records the decision + outcome
-        to the log. Returns the reply dict or None. Safe to call from any worker thread."""
-        if not self._llm.available():
-            self._log_decision(trigger, state, camera, status="llm-unavailable")
-            return None
-        with self._llm_lock:
-            if self._llm_busy:
-                self._log_decision(trigger, state, camera, status="skipped-busy")
-                return None
-            self._llm_busy = True
-        t0 = time.monotonic()
-        try:
-            reply = self._llm.generate(prompt, history=history, image_jpeg=image_jpeg,
-                                       smart=smart)
-        finally:
-            self._llm_busy = False
-        # the slug that actually answered (free primary or paid fallback), for the log
-        model = self._llm.last_model or self._llm.model_for(smart=smart, image=bool(image_jpeg))
-        ms = int((time.monotonic() - t0) * 1000)
-        if reply:
-            self._llm_fail_streak = 0                   # a real call succeeded -> online
-            self._express(reply["mood"], reply["say"])
-            self._log_decision(trigger, state, camera, status="spoke", model=model,
-                               prompt=prompt, say=reply["say"], mood=reply["mood"], ms=ms)
-        else:
-            self._llm_fail_streak += 1                  # feeds the persistent offline indicator
-            self._log_decision(trigger, state, camera, status="no-reply", model=model,
-                               prompt=prompt, ms=ms)
-        return reply
-
-    def llm_say(self, prompt=""):
-        """On-demand 'say something': a one-shot reaction (no chat history)."""
-        prompt = (prompt or "").strip() or (
-            "Say one short, friendly, spontaneous line out loud to whoever is near you "
-            "right now, and pick a fitting mood.")
-        return self._generate(prompt, trigger="say")
-
-    def llm_chat(self, message):
-        """Conversational turn: keeps a short rolling history so replies have context."""
-        message = (message or "").strip()
-        if not message:
-            return None
-        history = list(self._llm_history)
-        reply = self._generate(message, history=history, trigger="chat", smart=True)
-        if reply:                                      # remember the exchange for context
-            self._llm_history.append({"role": "user", "content": message})
-            self._llm_history.append({"role": "assistant", "content": reply["say"]})
-        return reply
 
     def _cpu_sample(self):
         try:
@@ -994,6 +871,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._respond_json(self._node.get_cog_log() if self._node else {"entries": []})
         if path == "/llm/phrases":
             return self._respond_json(self._node.get_phrasebank() if self._node else {})
+        if path == "/skills":
+            return self._respond_json(self._node.get_skills() if self._node else {"skills": []})
         if path == "/stream.mjpg":
             return self._stream_mjpeg()
         if path == "/audio.pcm":
@@ -1081,6 +960,23 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._respond(503, "no node")
             else:
                 self._respond_json(self._node.regenerate_phrasebank())
+        elif path == "/skills/invoke":
+            # Run one skill from the library now: {"name": "<skill>"}. Blocks on any LLM /
+            # express call (like the /llm/* endpoints) and returns the outcome.
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                name = (self._read_json().get("name") or "").strip()
+                if not name:
+                    self._respond(400, "empty name")
+                else:
+                    self._respond_json(self._node.invoke_skill(name))
+        elif path == "/skills/reload":
+            # Re-scan the skills directory so a freshly-added .md shows up without a restart.
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._node.reload_skills())
         elif path == "/brain/reward":
             # Reward the current behaviour: {"value":±1,"scope":"contextual"|"global","target"?}.
             if self._node is None:

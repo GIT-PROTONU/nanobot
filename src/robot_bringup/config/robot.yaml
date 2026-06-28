@@ -199,6 +199,12 @@ behavior:
     enrich_min_interval: 45.0 # s, per-beat rate-limit so a fast chart can't spam the API
     camera_beats: true        # allow the autonomous camera ("looking") beat at all
     look_every: 4             # camera beat every Nth idle beat (>=1); sensor beats between
+    # --- skill library: let the brain pick a capability (skills/*.md) on a beat ---
+    # Every Nth body (musing) beat becomes a "skill" beat: web_control picks the most fitting
+    # skill from the library and performs it. Goals (pursuing) take the slot first, then
+    # skills. The gated action tier is governed by web_control.skills_allow_actions (off).
+    skills_enable: true       # allow the autonomous skill beat (false = never auto-pick skills)
+    skill_every: 6            # a skill beat in place of every Nth musing beat (>=1)
     greet_face: "happy"       # "startup mood": OLED face shown at boot (the greeting beat)
     # --- personality / evolution ---
     # Traits (curiosity/extraversion/caution/playfulness) + the behaviour registry live in
@@ -338,3 +344,13 @@ web_control:
     llm_offline_indicator: true  # while the LLM is enabled but unreachable, show the offline
                                # face + speak the offline line (persists until it recovers)
     offline_face: "sleepy"     # OLED mood shown while the LLM brain is unreachable
+    # --- skill library (capabilities as self-documenting skills/*.md) ---
+    # Each .md under skills/ is one capability (frontmatter contract + a body the brain reads
+    # as "how"). The brain picks one on a "skill" beat (cadence in behavior: above) and the
+    # web UI's Skills panel can invoke any of them. Narrative skills (say/observe/look) are
+    # always safe; the gated "action tier" (topic-publishing skills, e.g. /led, /cmd_vel) only
+    # runs when BOTH the skill sets enabled:true AND skills_allow_actions is on here. Motion is
+    # still clamped reflexively by slam_nav, so a skill can never make the robot unsafe.
+    skills_enable: true        # load + offer the skill library
+    skills_allow_actions: false  # permit topic-publishing (physical) skills — OFF by default
+    skills_dir: ""             # "" = installed share (<pkg>/skills) or the source tree skills/

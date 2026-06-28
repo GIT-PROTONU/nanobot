@@ -129,6 +129,53 @@ The bank is `~/.local/state/nanobot/phrases.json`, shared by the robot and the d
 Inspect/force it: `GET /llm/phrases`, `POST /llm/phrases/regenerate`, or
 `python scripts/pregenerate_phrases.py [--show]`.
 
+## Skills — capabilities as self-documenting files
+
+Nano's capabilities live as a **portable library of Markdown files** (`src/web_control/skills/`,
+an [OpenClaw](https://github.com/)-style "SKILL.md" idea). Each `.md` is **one capability** —
+a machine-readable YAML frontmatter contract plus a human/LLM-readable body that explains the
+"how":
+
+```markdown
+---
+name: read-lidar
+description: Report the nearest obstacle from the lidar scan.
+trigger: when asked what's around or how close things are
+action: {kind: observe, sources: [scan]}
+---
+# Read LiDAR
+Report the nearest object and roughly which way it is, in one short spoken line…
+```
+
+Drop a new file in (then **Reload** in the UI or `POST /skills/reload`) and the robot gains a
+capability — *no code change*. `web_control/skills.py` just parses + indexes them
+(ROS-free, unit-tested like the rest); `web_server` executes.
+
+**Two tiers, matching the "garnish, never unsafe" rule:**
+
+| tier | `action.kind` | what it does |
+|---|---|---|
+| narrative (always safe) | `say` / `observe` / `look` | speaks a line steered by the body — optionally with the live sensor snapshot, a lidar scan summary, or a camera frame (vision) |
+| **gated action** | `topic` | publishes a **whitelisted, clamped** ROS message (`/led`, `/fan_pwm`, `/lds_target_rpm`, `/cmd_vel`) |
+
+An action skill runs **only** when it sets `enabled: true` **and** the node's
+`skills_allow_actions` master switch is on (**off by default**). Even then the value is clamped
+in `web_server`, and motion is clamped *again* reflexively by `slam_nav` — so a skill can never
+push the robot into an unsafe state. That's the same principle as traits-as-guards: the brain
+can reach for a capability, but physics/safety always wins.
+
+**Two ways a skill runs:**
+
+1. **Autonomously** — every `skill_every`-th idle body beat becomes a `skill` beat (an upgrade
+   of `musing`, just like `pursuing`). `web_server._run_skill_beat` shows the offered catalogue
+   (names + descriptions + triggers) to the *cheap* model, which **picks the most fitting one**
+   for the moment (or none), and Nano performs it.
+2. **On demand** — the web UI's "🛠 Skills" card lists every file with an *Invoke* button
+   (`GET /skills`, `POST /skills/invoke`, `POST /skills/reload`).
+
+Every invocation lands in the decision log as `skill:<name>`. `scripts/dev_webui.py` wires the
+same panel off-robot (narrative skills speak through your laptop; topic actions no-op, no ROS).
+
 ## On-demand interactions (you, not the chart)
 
 The web UI's "AI" card drives the manual paths, all in `web_control`:
@@ -229,8 +276,11 @@ is shared and survives restarts.
 `scripts/dev_webui.py --behavior` runs the *real* statechart on a real clock on a laptop,
 with the *real* LLM, mapping `musing`→synthetic sensors and `looking`→your webcam
 (`opencv-python`). So you can watch and hear the entire enriched loop — and read every
-decision — with no ROS and no hardware. It serves the real `web/index.html` and wires only
-the `/llm/*` + `/tts*` endpoints; telemetry/joystick/map show offline.
+decision — with no ROS and no hardware. It serves the real `web/index.html`, runs the **same
+`CognitionCore` the robot runs** (only the adapters differ — see *Where things live*), and
+wires the `/llm/*` + `/skills/*` + `/tts*` + brain endpoints; telemetry/joystick/map show
+offline. Because the brain is one shared base, what you test here is exactly what runs on the
+robot.
 
 ```bash
 set OPENROUTER_API_KEY=...        # or scripts/.openrouter_key (gitignored)
@@ -259,8 +309,10 @@ On Windows, `scripts/start-dev.ps1` finds a real Python, loads the key, and laun
 | Statechart (when) | `src/behavior/behavior/presence.py` (+ `test/`) |
 | ROS wrapper, fast-rule evolution | `src/behavior/behavior/mood_node.py` |
 | OpenRouter client (what) | `src/web_control/web_control/llm.py` |
+| **Cognition core** (execution, reflection, log — shared robot+dev) | `src/web_control/web_control/cognition.py` |
 | Pre-generated phrase bank | `src/web_control/web_control/phrasebank.py` (+ `scripts/pregenerate_phrases.py`) |
-| Cognition execution, reflection, decision log | `src/web_control/web_control/web_server.py` |
+| Skill library (capabilities) | `src/web_control/web_control/skills.py` + `src/web_control/skills/*.md` |
+| ROS node + adapters (face/sensors/actions) | `src/web_control/web_control/web_server.py` |
 | TTS | `src/web_control/web_control/tts.py` |
 | Face rendering | `src/oled_display/` |
 | Config (models, caps, beats, persona) | `src/robot_bringup/config/robot.yaml` |

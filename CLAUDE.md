@@ -56,6 +56,12 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     slow/absent LLM = a silent face-beat; the chart never waits. The per-beat convention
     (default face + prompt + camera flag) is the `BEATS` table in `presence.py`; add a beat
     = add a state calling `do_beat('name')` + a BEATS entry.
+  - **Skill beat (capability library).** Every `skill_every`-th body (`musing`) beat is
+    upgraded — like `pursuing` — into a **`skill` beat** (`mood_node._deliver_skill_beat`,
+    gated by `skills_enable`): a fire-and-forget `{beat:"skill",state:"acting"}` request that
+    `web_control` executes by **picking a capability** from the skill library and performing
+    it. Goals (`pursuing`) take the musing slot first, then skills, else a plain musing beat.
+    See the skill-library note under `web_control` and [[skill-library]].
   - **Parametric personality + evolution.** `traits` (curiosity/extraversion/caution/
     playfulness, 0..1) + a `registry` (musing/looking priority/enable/gates) live as mutable
     dicts in the Sismic context, seeded from `personality.json` (made by
@@ -169,11 +175,22 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     `--llm "prompt"` to run the full OpenRouter→speech pipeline (needs
     `OPENROUTER_API_KEY`). Pico level markup + German lingware are pico-only; the
     fallbacks speak plain text with native rate/volume. `scripts/dev_webui.py` serves
-    the **real `web/index.html`** on a dev PC (ROS-free stand-in for `web_server`) wiring
-    only `/llm/*`+`/tts*`, so the "AI · OpenRouter" card + Speak box can be tested in a
-    browser locally (telemetry/joystick/map show offline — no rosbridge). Reads the
-    persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`.
-- **LLM personality (OpenRouter)** lives in `web_control` (`llm.py`, ROS-free) — it
+    the **real `web/index.html`** on a dev PC (ROS-free stand-in for `web_server`) and runs
+    the **same `CognitionCore`** (so there's one base, not two — see below), wiring `/llm/*`,
+    `/skills/*`, `/tts*` + the brain card, so the AI/Skills/Brain cards + Speak box can be
+    tested in a browser locally (telemetry/joystick/map show offline — no rosbridge). Reads
+    the persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`.
+- **Cognition core (`cognition.py`, ROS-free).** ALL the LLM-personality *logic* — generate +
+  express, the say/chat/observe/look paths, the statechart beat executor, the skill library
+  invocation, the phrase bank, the decision log, slow reflection, lifecycle speech — lives in
+  ONE class, `CognitionCore`, shared verbatim by `web_server.py` (robot) and `dev_webui.py`
+  (dev). Each side only injects a few **adapters** (face→`/oled_face` vs print, capture_frame→
+  V4L2 vs webcam, sensors→`/proc`+IMU vs synthetic, the gated action tier→whitelisted
+  publishers vs no-op, persist→`llm.json` vs none) plus its own HTTP handler + ROS/sim
+  plumbing. So a new cognition feature is written **once**. The node/`DevState` keep only thin
+  one-line delegators for the handler. See [[llm-openrouter-personality]].
+- **LLM personality (OpenRouter)** — the *client* is `llm.py` (ROS-free); the orchestration is
+  `cognition.py` (above). It
   offloads "say something" / chat lines **plus the matching OLED expression** to a model
   on OpenRouter. `LlmClient.generate()` is a blocking stdlib-`urllib` POST (no SDK) that
   returns `{"say","mood"}`; the **mood is constrained to the OLED's four faces** +
@@ -234,6 +251,24 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     (`phrasebank_drift`) or the persona changes; `phrasebank_live_ratio` still sends a few
     beats live for freshness. Force/inspect: `scripts/pregenerate_phrases.py [--show]`,
     `GET /llm/phrases`, `POST /llm/phrases/regenerate`. Config: `phrasebank_*` in robot.yaml.
+- **Skill library** (`skills.py`, ROS-free + unit-tested; `src/web_control/skills/*.md`):
+  capabilities as **self-documenting markdown** (an OpenClaw-style "SKILL.md" port). Each
+  `.md` = one capability — YAML frontmatter contract (`name`/`description`/`trigger`/`action`)
+  + a Markdown body the brain reads as the "how". Drop a new file in (and `POST /skills/reload`)
+  to add a capability — no code change. `SkillLibrary` loads + indexes them; `web_server`
+  executes. **Two tiers:** *narrative* (`kind: say`/`observe`/`look` — speak a line steered by
+  the body, optionally with the sensor snapshot or a `read-lidar`-style `/dev/shm` scan summary
+  or a camera frame; routes through the same `_generate`/vision path) and a **gated *action*
+  tier** (`kind: topic` — publishes a **whitelisted, clamped** ROS msg: `/led`, `/fan_pwm`,
+  `/lds_target_rpm`, `/cmd_vel`). An action runs only when the skill sets `enabled: true` **AND**
+  `skills_allow_actions` (web_control param, **off by default**); motion stays clamped reflexively
+  by slam_nav, so a skill can never make the robot unsafe. **Two entry points:** autonomous (the
+  chart's `skill` beat → `_run_skill_beat` asks the cheap model to PICK one from the offered
+  catalogue → performs it) and on-demand (`GET /skills`, `POST /skills/invoke {name}`,
+  `POST /skills/reload`; web "🛠 Skills" card). Every invocation logs to the decision log as
+  `skill:<name>`. The dir resolves via `skills_dir` → share → source tree
+  (`resolve_skills_dir`); `dev_webui.py` wires the same panel off-robot (topic actions no-op
+  there, no ROS). See [[skill-library]].
 - **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
   Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
   so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`

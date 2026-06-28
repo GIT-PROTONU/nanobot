@@ -200,6 +200,13 @@
   .logrow .lt{color:var(--muted)}
   .logrow .ls{color:var(--muted)}
   .logrow .lm{color:var(--muted);font-size:10px}
+  .skills{margin-top:6px;display:flex;flex-direction:column;gap:6px}
+  .skillrow{display:flex;align-items:center;gap:10px;padding:6px 0;
+    border-bottom:1px solid var(--border)}
+  .skillrow .skmeta{flex:1;min-width:0}
+  .skillrow .skdesc{color:var(--muted);font-size:12px;margin-top:2px}
+  .skillrow .skinvoke{flex:0 0 auto;padding:5px 12px}
+  .skillrow.disabled{opacity:.55}
 </style>
 </head>
 <body class="no-tips">
@@ -354,6 +361,19 @@
               <summary>🧠 Decision log</summary>
               <div id="llmLog" class="log">…</div>
             </details>
+          </div>
+          <div class="card">
+            <h2>🛠 Skills · capabilities</h2>
+            <p class="hint" id="skillsStatus">loading…</p>
+            <div id="skillsList" class="skills"></div>
+            <div class="row">
+              <button id="skillsReload" class="btn grow">↻ Reload library</button>
+            </div>
+            <p class="hint">Each capability is a self-documenting <code>skills/*.md</code> file —
+              drop a new one in and <b>Reload</b> to add a skill, no code change. The brain also
+              picks one on its own on a <b>skill beat</b>. <b>Action</b> skills (move / LED) run
+              only when <code>skills_allow_actions</code> is enabled in <code>robot.yaml</code>;
+              motion stays clamped by <code>slam_nav</code>.</p>
           </div>
           <div class="card">
             <h2>🧠 Brain · purpose &amp; learning</h2>
@@ -1101,6 +1121,48 @@ if(llmLogDetails){
     if(llmLogDetails.open){ loadLlmLog(); llmLogTimer=setInterval(loadLlmLog,4000); }
   });
 }
+
+// ---- Skills · capability library ---- list skills/*.md, run one on demand, reload the
+// library. Each .md is a self-documenting capability; the brain also picks one autonomously
+// on a "skill" beat (logged in the decision log above). Narrative skills speak a line;
+// action skills (gated) publish a whitelisted ROS message.
+const SKILL_ICON={say:"💬",observe:"📟",look:"📷",topic:"⚙"};
+function fmtSkill(s){
+  const ic=SKILL_ICON[s.kind]||"•";
+  const gated=s.is_action && !s.enabled;            // an off-by-default action skill
+  const act=s.is_action?` <span class="lm">${s.topic||"action"}</span>`:"";
+  const tag=gated?` <span class="ls">disabled</span>`:"";
+  return `<div class="skillrow${gated?" disabled":""}"><div class="skmeta">`
+    +`<b>${ic} ${s.name}</b>${act}${tag}<div class="skdesc">${s.description||""}</div></div>`
+    +`<button class="btn skinvoke" data-name="${s.name}">Run</button></div>`;
+}
+function loadSkills(){
+  const box=$("skillsList"), st=$("skillsStatus"); if(!box||!st) return;
+  fetch("/skills").then(r=>r.ok?r.json():null).then(d=>{
+    if(!d){ st.textContent="unavailable"; box.innerHTML=""; return; }
+    if(d.enabled===false){ st.textContent="skills disabled"; box.innerHTML=""; return; }
+    const sk=d.skills||[];
+    st.textContent=`${sk.length} skill${sk.length===1?"":"s"} · action tier `
+      +(d.allow_actions?"on":"off");
+    box.innerHTML=sk.length?sk.map(fmtSkill).join(""):"<i>no skills found — add a .md to skills/</i>";
+    box.querySelectorAll(".skinvoke").forEach(b=>b.onclick=()=>invokeSkill(b.dataset.name));
+  }).catch(()=>{ st.textContent="offline"; });
+}
+function invokeSkill(name){
+  const st=$("skillsStatus"); if(st) st.textContent="running "+name+"…";
+  fetch("/skills/invoke",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name})})
+    .then(r=>r.ok?r.json():{error:"http "+r.status}).then(res=>{
+      if(res && (res.say!==undefined || res.mood!==undefined)) showReply(res);  // narrative
+      else { if(st) st.textContent=name+": "+(res.status||res.error||res.detail||"done");
+             loadLlmLog(); }
+    }).catch(()=>{ if(st) st.textContent="network error"; });
+}
+if($("skillsReload")) $("skillsReload").onclick=()=>{
+  const st=$("skillsStatus"); if(st) st.textContent="reloading…";
+  fetch("/skills/reload",{method:"POST"}).then(()=>loadSkills()).catch(()=>loadSkills());
+};
+loadSkills();
 
 // ---- Brain · purpose & learning ---- the Purpose Engine (goals + intrinsic reward) and
 // the Horizon Planner's A/B bandit live in the behaviour node and publish latched JSON on

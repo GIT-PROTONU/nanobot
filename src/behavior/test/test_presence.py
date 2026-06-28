@@ -72,9 +72,10 @@ def test_beats_rotate_sensor_then_camera():
     seq = _run_cycles(interp, clock, 4)
     assert seq == ["musing", "musing", "musing", "looking"]
     assert beats == seq                          # do_beat fired with the right names
-    # The chart rotates musing/looking; `pursuing` is a node-side upgrade of the musing
-    # beat (delivered by mood_node when the planner has a task), not a separate chart state.
-    assert set(BEATS) == {"musing", "looking", "pursuing"}
+    # The chart rotates musing/looking; `pursuing` (planner task) and `skill` (skill-library
+    # pick) are node-side upgrades of the musing beat delivered by mood_node, not separate
+    # chart states.
+    assert set(BEATS) == {"musing", "looking", "pursuing", "skill"}
 
 
 def test_meditate_pauses_beats_until_wake():

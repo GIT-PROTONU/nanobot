@@ -13,6 +13,9 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
         (os.path.join("share", package_name, "web"), glob("web/*")),
+        # The skill library (capabilities as self-documenting markdown). Installed under the
+        # package share so the node finds them; also resolvable from the source tree.
+        (os.path.join("share", package_name, "skills"), glob("skills/*.md")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
