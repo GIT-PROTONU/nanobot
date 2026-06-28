@@ -182,21 +182,30 @@ robot keeps its safe, alive base behaviour.
 
 ## Model tiers (and the cost caps)
 
-Three tiers, cheapest-first, in `llm.py` (`LlmClient.model_for(smart, image)` resolves the
-slug):
+Three tiers in `llm.py`, each **free-first**: every text tier tries one or more **free**
+OpenRouter models and only falls back to a **paid DeepSeek** model when *all* the free ones
+are over their (shared, ~daily / upstream) rate limit. So routine chatter costs nothing —
+you only pay when the free quota is exhausted.
 
-| Tier | Model (default) | Used for | Hourly cap |
+| Tier | Free primary (default, tried first) | Paid fallback | Used for |
 |---|---|---|---|
-| cheap text | `deepseek/deepseek-v4-flash` | musing, observe, say, beats | **uncapped** |
-| smart text | `deepseek/deepseek-v4-pro` | chat + reflection | `llm_smart_max_per_hour` (15) |
-| vision | `nvidia/nemotron-nano-12b-v2-vl:free` | looking + manual Look | `llm_vision_max_per_hour` (10) |
+| cheap text | `nemotron-3-nano-30b:free`, then `llama-3.3-70b:free` | `deepseek-v4-flash` | musing, observe, say, beats |
+| smart text | `nemotron-3-super-120b:free`, then `gpt-oss-120b:free` | `deepseek-v4-pro` | chat + reflection |
+| vision | `nemotron-nano-12b-v2-vl:free` | *(none — DeepSeek can't see; set `llm_vision_fallback_model` for one)* | looking + manual Look |
 
-The caps are a sliding 1-hour window per tier (`LlmClient`'s `can_call()` / `_rate_consume()`).
-Over-cap calls are skipped silently and logged as `rate-limited`; a rate-limited *look*
-doesn't even spin up the camera. The cheap model is never capped because it's the everyday
-workhorse. Set a cap to `0` for unlimited. All knobs live in `robot.yaml`
-(`web_control: llm_*`); the API key is read from `llm_api_key` or, when blank,
-`$OPENROUTER_API_KEY` (keep real keys out of the committed yaml).
+`_candidates(smart, image)` builds the ordered `(model, is_paid)` list (free fields are
+comma-separated lists, tried in order); `_chat()` tries each, **falling through to the next
+only on a rate/daily-limit error** (`429`/`402` or a limit-ish message) — any other failure
+stops. `last_model` records the slug that actually answered (shown in the decision log).
+
+**Hourly caps apply only to the PAID fallback** (a sliding 1-hour window per tier via
+`can_call()` / `_rate_consume()`). When the cap is hit, the paid model is skipped and the
+call stays silent (`rate-limited`); the free primary is never capped. `llm_smart_max_per_hour`
+(15) / `llm_vision_max_per_hour` (10), `0` = unlimited. All knobs live in `robot.yaml`
+(`web_control: llm_*`, incl. `llm_free_model` / `llm_free_smart_model`); the API key is read
+from `llm_api_key` or, when blank, `$OPENROUTER_API_KEY`. **Free `:free` slugs rotate and the
+popular ones get throttled — if a default stops responding, pick a current one from
+OpenRouter's `/models` API.**
 
 ## The decision log (observability)
 

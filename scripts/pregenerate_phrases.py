@@ -71,6 +71,8 @@ def main():
 
     llm = LlmClient(enabled=True, api_key="", model=cfg.get("llm_model", ""),
                     persona=persona, smart_model=cfg.get("llm_smart_model", ""),
+                    free_model=cfg.get("llm_free_model", ""),
+                    free_smart_model=cfg.get("llm_free_smart_model", ""),
                     logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
     if not llm.available():
         print("! No OPENROUTER_API_KEY (or llm_api_key) — cannot generate.", file=sys.stderr)

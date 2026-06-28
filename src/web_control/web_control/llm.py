@@ -34,11 +34,19 @@ from collections import deque
 # "" (dashboard) is never chosen by the model — clearing is the caller's job.
 MOODS = ("happy", "angry", "focused", "stress", "neutral")
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Cheap default text model used for *everything* except the smarter chat path: the
-# autonomous beats, observe, say, and the camera-look's text reasoning all run on this.
+# FREE-FIRST: each text tier tries one or more FREE OpenRouter models (comma-separated,
+# in order) and only falls back to the PAID DeepSeek model below when ALL the free ones are
+# over their (shared, ~daily / upstream) rate limit — so routine chatter costs nothing and
+# we only pay when the free quota is exhausted. Free `:free` slugs rotate and the popular
+# ones get upstream-throttled, so we list a couple per tier (verified working 2026-06-28);
+# pick current ones via OpenRouter's /models API if these stop responding.
+DEFAULT_FREE_MODEL = ("nvidia/nemotron-3-nano-30b-a3b:free,"
+                      "meta-llama/llama-3.3-70b-instruct:free")    # free, cheap tier
+DEFAULT_FREE_SMART_MODEL = ("nvidia/nemotron-3-super-120b-a12b:free,"
+                            "openai/gpt-oss-120b:free")            # free, smart/chat tier
+# PAID fallbacks (DeepSeek) — used only when the matching free model is rate-limited.
+# Cheap fallback: beats/observe/say/look-text. Smart fallback: chat + personality reflection.
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"        # any OpenRouter model id works
-# A slightly-better text model used ONLY for the conversational chat (generate(smart=True)),
-# where coherence over a back-and-forth matters more. Same family, ~5x the per-call cost.
 DEFAULT_SMART_MODEL = "deepseek/deepseek-v4-pro"
 # A *vision* (multimodal) model used only when an image is attached (the text models can't
 # see). DeepSeek has no vision model, so this stays a separate id. Free + verified working;
@@ -102,15 +110,24 @@ class LlmClient:
 
     def __init__(self, enabled=True, api_key="", model=None, base_url=None,
                  persona="", timeout=30.0, max_tokens=1024, vision_model=None,
-                 smart_model=None, smart_max_per_hour=0, vision_max_per_hour=0,
+                 smart_model=None, free_model=None, free_smart_model=None,
+                 vision_fallback_model=None, smart_max_per_hour=0, vision_max_per_hour=0,
                  logger=None):
         # Env wins when the explicit key is blank, so the secret can stay out of the
         # (version-controlled) robot.yaml entirely.
         self._key = (api_key or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
         self._enabled = bool(enabled)
-        self._model = (model or "").strip() or DEFAULT_MODEL
-        self._smart_model = (smart_model or "").strip() or DEFAULT_SMART_MODEL
+        self._model = (model or "").strip() or DEFAULT_MODEL          # paid cheap fallback
+        self._smart_model = (smart_model or "").strip() or DEFAULT_SMART_MODEL  # paid smart fallback
         self._vision_model = (vision_model or "").strip() or DEFAULT_VISION_MODEL
+        # Free primaries (tried before the paid fallbacks). "" disables free-first for that
+        # tier (then it goes straight to the paid model). vision is already a free model, so
+        # its (optional) fallback is empty by default — DeepSeek can't see.
+        self._free_model = "" if free_model == "" else ((free_model or "").strip() or DEFAULT_FREE_MODEL)
+        self._free_smart_model = ("" if free_smart_model == ""
+                                  else (free_smart_model or "").strip() or DEFAULT_FREE_SMART_MODEL)
+        self._vision_fallback = (vision_fallback_model or "").strip()
+        self._last_model = ""                              # slug that produced the last reply
         self._url = (base_url or "").strip() or DEFAULT_BASE_URL
         self._persona = (persona or "").strip()
         self._timeout = float(timeout) if timeout else 20.0
@@ -127,7 +144,8 @@ class LlmClient:
 
     # ---- config (web-tunable at runtime) ------------------------------------
     def configure(self, enabled=None, model=None, persona=None, api_key=None,
-                  vision_model=None, smart_model=None, smart_max_per_hour=None,
+                  vision_model=None, smart_model=None, free_model=None,
+                  free_smart_model=None, smart_max_per_hour=None,
                   vision_max_per_hour=None):
         if enabled is not None:
             self._enabled = bool(enabled)
@@ -137,6 +155,10 @@ class LlmClient:
             self._smart_model = smart_model.strip() or DEFAULT_SMART_MODEL
         if vision_model is not None:
             self._vision_model = vision_model.strip() or DEFAULT_VISION_MODEL
+        if free_model is not None:
+            self._free_model = free_model.strip()          # "" => paid-only for cheap tier
+        if free_smart_model is not None:
+            self._free_smart_model = free_smart_model.strip()
         if persona is not None:
             self._persona = persona.strip()
         if api_key is not None:
@@ -160,14 +182,18 @@ class LlmClient:
         return dq
 
     def can_call(self, smart=False, image=False):
-        """Peek whether a call on this tier is within its hourly cap, WITHOUT consuming a
-        slot. Lets a caller skip expensive prep (e.g. a webcam capture) when it would only
-        be rate-limited anyway. True for the uncapped cheap tier."""
+        """Peek (no slot consumed) whether SOME model for this tier is usable right now: a
+        free primary is always usable; the paid fallback is usable only under its hourly cap.
+        Lets a caller skip expensive prep (e.g. a webcam capture) only when even the fallback
+        is capped out. (With a free primary configured this is essentially always True.)"""
         tier = self._tier(smart, image)
-        if tier is None or self._max[tier] <= 0:
-            return True
-        with self._rate_lock:
-            return len(self._prune(tier, time.monotonic())) < self._max[tier]
+        for _model, is_paid in self._candidates(smart, image):
+            if not is_paid or self._max.get(tier, 0) <= 0:
+                return True
+            with self._rate_lock:
+                if len(self._prune(tier, time.monotonic())) < self._max[tier]:
+                    return True
+        return False
 
     def _rate_consume(self, tier):
         """Record a call against its hourly cap; return False (and record nothing) if it
@@ -200,11 +226,50 @@ class LlmClient:
     def vision_model(self):
         return self._vision_model
 
-    def model_for(self, smart=False, image=False):
-        """Which model a given call will use — handy for logging the decision."""
+    @property
+    def free_model(self):
+        return self._free_model
+
+    @property
+    def free_smart_model(self):
+        return self._free_smart_model
+
+    @property
+    def last_model(self):
+        """The slug that produced the most recent reply (free primary or paid fallback)."""
+        return self._last_model
+
+    @staticmethod
+    def _is_free(model):
+        return str(model).strip().lower().endswith(":free")
+
+    def _candidates(self, smart=False, image=False):
+        """Ordered (model, is_paid) to try for a call: the FREE model(s) first, the PAID
+        fallback last (used only when ALL the free ones are over their rate/daily limit).
+        The free fields may be comma-separated lists (tried in order). is_paid (slug ends in
+        ':free' => free) flags which entries count against the hourly cap. Deduped; a blank
+        free field => the paid model is the only candidate (no free-first for that tier)."""
+        def split(s):
+            return [x.strip() for x in str(s or "").split(",") if x.strip()]
         if image:
-            return self._vision_model
-        return self._smart_model if smart else self._model
+            models = split(self._vision_model) + split(self._vision_fallback)
+        elif smart:
+            models = split(self._free_smart_model) + [self._smart_model]
+        else:
+            models = split(self._free_model) + [self._model]
+        out, seen = [], set()
+        for m in models:
+            m = (m or "").strip()
+            if m and m not in seen:
+                seen.add(m)
+                out.append((m, not self._is_free(m)))
+        return out
+
+    def model_for(self, smart=False, image=False):
+        """The model a call will TRY FIRST (the free primary) — handy for logging intent.
+        Use `last_model` after a call for the one that actually answered."""
+        c = self._candidates(smart=smart, image=image)
+        return c[0][0] if c else self._model
 
     @property
     def persona(self):
@@ -227,10 +292,6 @@ class LlmClient:
         treats None as "stay silent". Never raises."""
         if not self.available():
             return None
-        tier = self._tier(smart=smart, image=bool(image_jpeg))
-        if not self._rate_consume(tier):
-            self._log(f"llm: {tier} hourly cap reached ({self._max[tier]}/h) — skipping")
-            return None
         system = SYSTEM_BASE + (("\n\n" + self._persona) if self._persona else "")
         messages = [{"role": "system", "content": system}]
         if history:
@@ -248,7 +309,7 @@ class LlmClient:
             messages.append({"role": "user", "content": str(prompt)})
 
         # JSON-object hint for text; skipped for vision (some multimodal models reject it).
-        content = self._chat(messages, self.model_for(smart=smart, image=bool(image_jpeg)),
+        content = self._chat(messages, smart=smart, image=bool(image_jpeg),
                              json_object=not image_jpeg)
         if content is None:
             return None
@@ -269,18 +330,44 @@ class LlmClient:
         hints the provider to emit a JSON object."""
         if not self.available():
             return None
-        tier = self._tier(smart=smart)
-        if not self._rate_consume(tier):
-            self._log(f"llm: {tier} hourly cap reached ({self._max[tier]}/h) — skipping")
-            return None
         messages = [{"role": "system", "content": str(system)},
                     {"role": "user", "content": str(user)}]
-        model = self._smart_model if smart else self._model
-        return self._chat(messages, model, max_tokens=max_tokens, json_object=json_object)
+        return self._chat(messages, smart=smart, max_tokens=max_tokens, json_object=json_object)
 
-    def _chat(self, messages, model, max_tokens=None, json_object=False):
-        """Low-level OpenRouter chat call. Returns the assistant message content (str) or
-        None. Never raises — logs + returns None on any HTTP/network/shape error."""
+    def _chat(self, messages, smart=False, image=False, max_tokens=None, json_object=False):
+        """Try the tier's models in order (free primary -> paid fallback), returning the
+        first reply. Falls through to the paid model ONLY when the free one is over its
+        rate/daily limit; any other failure (bad request, network, odd shape) stops and
+        returns None. The paid fallback is gated by the tier's hourly cap. Records the slug
+        that answered in `last_model`. Never raises."""
+        tier = self._tier(smart=smart, image=image)
+        candidates = self._candidates(smart=smart, image=image)
+        for model, is_paid in candidates:
+            if is_paid and not self._rate_consume(tier):
+                self._log(f"llm: {tier} paid cap reached ({self._max.get(tier, 0)}/h) "
+                          f"— not falling back to {model}")
+                break                                      # don't try the (capped) paid model
+            content, kind = self._call_one(messages, model, max_tokens=max_tokens,
+                                           json_object=json_object)
+            self._last_model = model
+            if content is not None:
+                return content
+            if kind != "ratelimit":
+                return None                                # not a quota issue -> no fallback
+            self._log(f"llm: {model} over rate/daily limit — trying fallback")
+        return None
+
+    @staticmethod
+    def _looks_ratelimited(text):
+        t = str(text or "").lower()
+        return any(s in t for s in ("rate limit", "rate-limit", "ratelimit", "quota",
+                                    "exhausted", "too many requests", "daily limit",
+                                    "per-day", "limit reached", "429"))
+
+    def _call_one(self, messages, model, max_tokens=None, json_object=False):
+        """One OpenRouter call to a SPECIFIC model. Returns (content, kind): (str, None) on
+        success; (None, "ratelimit") when the model is over its rate/daily limit (the caller
+        may fall back); (None, "other") on any other failure. Never raises."""
         payload = {
             "model": model,
             "messages": messages,
@@ -305,16 +392,25 @@ class LlmClient:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:200] if hasattr(exc, "read") else ""
-            self._log(f"llm: HTTP {exc.code} {detail}")
-            return None
+            kind = "ratelimit" if (exc.code in (429, 402) or self._looks_ratelimited(detail)) else "other"
+            self._log(f"llm: HTTP {exc.code} ({model}) {detail}")
+            return None, kind
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            self._log(f"llm: request failed ({exc})")     # offline / DNS / timeout
-            return None
+            self._log(f"llm: request failed ({model}: {exc})")     # offline / DNS / timeout
+            return None, "other"
         except Exception as exc:
-            self._log(f"llm: unexpected error ({exc})")
-            return None
+            self._log(f"llm: unexpected error ({model}: {exc})")
+            return None, "other"
+        # OpenRouter sometimes returns HTTP 200 with an error object (esp. for free models).
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"] if isinstance(data["error"], dict) else {"message": data["error"]}
+            msg = json.dumps(err)[:200]
+            kind = ("ratelimit" if (err.get("code") in (429, 402)
+                                    or self._looks_ratelimited(msg)) else "other")
+            self._log(f"llm: error body ({model}) {msg}")
+            return None, kind
         try:
-            return data["choices"][0]["message"]["content"]
+            return data["choices"][0]["message"]["content"], None
         except (KeyError, IndexError, TypeError):
-            self._log(f"llm: unexpected response shape: {str(data)[:200]}")
-            return None
+            self._log(f"llm: unexpected response shape ({model}): {str(data)[:200]}")
+            return None, "other"

@@ -177,12 +177,20 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   offloads "say something" / chat lines **plus the matching OLED expression** to a model
   on OpenRouter. `LlmClient.generate()` is a blocking stdlib-`urllib` POST (no SDK) that
   returns `{"say","mood"}`; the **mood is constrained to the OLED's four faces** +
-  `neutral` (coerced if the model strays). **Two text tiers:** `llm_model`
-  (`deepseek/deepseek-v4-flash`, cheap) for everything; `llm_smart_model`
-  (`deepseek/deepseek-v4-pro`, reasoning) only for chat (`generate(smart=True)`).
-  `LlmClient.model_for(smart,image)` resolves the slug; pro is a reasoning model so
-  `llm_max_tokens` is 1024 (too low → empty JSON = no-reply). `LlmClient.complete(system,
-  user,smart=,json_object=)` is a general (non-`{say,mood}`) call used by tools.
+  `neutral` (coerced if the model strays). **Two text tiers, each FREE-FIRST:** the cheap
+  tier (everything) and the smart tier (chat + reflection, `generate(smart=True)`) each try
+  one or more **free** OpenRouter models (`llm_free_model` / `llm_free_smart_model`, comma-
+  separated lists) and only fall back to the **paid DeepSeek** model (`llm_model` flash /
+  `llm_smart_model` pro) when *all* the free ones are rate-limited. `_candidates(smart,image)`
+  builds the ordered `(model,is_paid)` list; `_chat` tries each, **falling through only on a
+  rate/daily-limit error** (429/402/limit-ish msg, incl. 200-with-error bodies) — other
+  failures stop. `last_model` = the slug that answered (logged). **Hourly caps apply only to
+  the PAID fallback** (`llm_smart_max_per_hour` 15 / `llm_vision_max_per_hour` 10, 0=off; free
+  is never capped). Vision tier is already free (`llm_vision_model`); no DeepSeek vision
+  fallback (set `llm_vision_fallback_model` for a paid one). Free `:free` slugs rotate +
+  get throttled → swap via OpenRouter `/models` if a default stops working. pro/reasoning
+  models narrate so `llm_max_tokens` is 1024 (too low → empty JSON = no-reply).
+  `LlmClient.complete(system,user,smart=,json_object=)` is a general (non-`{say,mood}`) call.
   `scripts/personality_creator.py` (ROS-free) runs a short questionnaire through the smart
   model → writes `personality.json` ({name,persona,traits,registry}) + a robot.yaml snippet.
   **`POST /llm/observe`** is sensor-aware chatter: it builds a short plain-English snapshot

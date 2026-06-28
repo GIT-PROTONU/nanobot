@@ -92,9 +92,12 @@ class WebServerNode(Node):
         # The rest are seeded here and then web-tunable + persisted (see llm settings).
         self.declare_parameter("llm_enabled", False)
         self.declare_parameter("llm_api_key", "")          # "" -> $OPENROUTER_API_KEY
-        self.declare_parameter("llm_model", "")            # "" -> llm.DEFAULT_MODEL (cheap)
-        self.declare_parameter("llm_smart_model", "")      # "" -> llm.DEFAULT_SMART_MODEL (chat)
-        self.declare_parameter("llm_vision_model", "")     # "" -> llm.DEFAULT_VISION_MODEL
+        self.declare_parameter("llm_model", "")            # paid cheap fallback ("" -> DEFAULT_MODEL)
+        self.declare_parameter("llm_smart_model", "")      # paid smart fallback ("" -> DEFAULT_SMART_MODEL)
+        self.declare_parameter("llm_vision_model", "")     # "" -> llm.DEFAULT_VISION_MODEL (free)
+        self.declare_parameter("llm_free_model", "")       # FREE cheap primary ("" -> DEFAULT_FREE_MODEL)
+        self.declare_parameter("llm_free_smart_model", "") # FREE smart primary ("" -> DEFAULT_FREE_SMART_MODEL)
+        self.declare_parameter("llm_vision_fallback_model", "")  # optional PAID vision fallback ("" -> none)
         self.declare_parameter("llm_base_url", "")         # "" -> OpenRouter default
         self.declare_parameter("llm_persona", "")          # FALLBACK persona (when no personality.json)
         self.declare_parameter("personality_path", "")     # "" -> ~/.local/state/nanobot/personality.json
@@ -179,6 +182,9 @@ class WebServerNode(Node):
             model=self._llm_settings["model"], base_url=g("llm_base_url").value,
             persona=self._persona, vision_model=g("llm_vision_model").value,
             smart_model=g("llm_smart_model").value,
+            free_model=g("llm_free_model").value,
+            free_smart_model=g("llm_free_smart_model").value,
+            vision_fallback_model=g("llm_vision_fallback_model").value,
             smart_max_per_hour=int(g("llm_smart_max_per_hour").value),
             vision_max_per_hour=int(g("llm_vision_max_per_hour").value),
             timeout=float(g("llm_timeout").value), max_tokens=int(g("llm_max_tokens").value),
@@ -397,6 +403,8 @@ class WebServerNode(Node):
         s["model_effective"] = self._llm.model
         s["smart_model"] = self._llm.smart_model
         s["vision_model"] = self._llm.vision_model
+        s["free_model"] = self._llm.free_model            # free primaries (paid models above are fallbacks)
+        s["free_smart_model"] = self._llm.free_smart_model
         s["persona"] = self._persona              # read-only: single-sourced from personality.json
         s["moods"] = list(MOODS)
         s["rate_limits"] = self._llm.rate_limits()     # {tier: [used_last_hour, cap]}; 0 cap = off
@@ -573,12 +581,12 @@ class WebServerNode(Node):
                   for k in REFLECT_TRAITS
                   if isinstance(obj.get("traits"), dict) and k in obj["traits"]}
         registry = obj.get("registry") if isinstance(obj.get("registry"), dict) else {}
+        rmodel = self._llm.last_model or self._llm.smart_model
         if not traits and not registry:
-            self._log_decision("reflect", status="no-reply",
-                               model=self._llm.smart_model, ms=ms)
+            self._log_decision("reflect", status="no-reply", model=rmodel, ms=ms)
             return
         self._evolve_pub.publish(String(data=json.dumps({"traits": traits, "registry": registry})))
-        self._log_decision("reflect", status="spoke", model=self._llm.smart_model,
+        self._log_decision("reflect", status="spoke", model=rmodel,
                            say=f"{obj.get('note','')} -> {traits}", ms=ms)
 
     # --- sensor snapshot (for "Observe") -------------------------------------
@@ -751,7 +759,8 @@ class WebServerNode(Node):
                                        smart=smart)
         finally:
             self._llm_busy = False
-        model = self._llm.model_for(smart=smart, image=bool(image_jpeg))
+        # the slug that actually answered (free primary or paid fallback), for the log
+        model = self._llm.last_model or self._llm.model_for(smart=smart, image=bool(image_jpeg))
         ms = int((time.monotonic() - t0) * 1000)
         if reply:
             self._express(reply["mood"], reply["say"])

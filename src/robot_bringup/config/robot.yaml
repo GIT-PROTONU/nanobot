@@ -243,17 +243,26 @@ web_control:
     # systemd unit / your shell), which is used whenever this is blank. If you do paste
     # a key here, keep it out of git (it's your secret to guard).
     llm_api_key: ""            # "" -> $OPENROUTER_API_KEY
-    # Cheap text model used for EVERYTHING except chat: the autonomous beats, observe,
-    # say, and the camera-look's text reasoning. "" -> deepseek/deepseek-v4-flash.
-    llm_model: "deepseek/deepseek-v4-flash"
-    # Slightly-better text model used ONLY for the back-and-forth chat (where coherence
-    # matters more). Same family, ~5x the per-call cost. "" -> deepseek/deepseek-v4-pro.
-    llm_smart_model: "deepseek/deepseek-v4-pro"
-    # VISION model — used only by the "Look" button (camera frame -> what it sees). The
-    # text model above can't see images. "" -> nvidia/nemotron-nano-12b-v2-vl:free (a
-    # credit-free, rate-limited multimodal model, verified working). A paid multimodal
-    # model (Gemini/GPT/Claude vision id) gives sharper scene descriptions.
+    # FREE-FIRST routing: each text tier tries one or more FREE OpenRouter models (comma-
+    # separated, in order) and only falls back to the PAID DeepSeek model below when ALL the
+    # free ones are over their (shared, ~daily / upstream) rate limit. So routine chatter is
+    # free; you only pay when the free quota is exhausted. NOTE: `:free` slugs rotate and the
+    # popular ones get upstream-throttled — list a couple per tier; pick current free models
+    # from OpenRouter's /models API if these stop working. Set a free_* field to "" to disable
+    # free-first for that tier (then it goes straight to the paid model).
+    llm_free_model: "nvidia/nemotron-3-nano-30b-a3b:free,meta-llama/llama-3.3-70b-instruct:free"
+    llm_free_smart_model: "nvidia/nemotron-3-super-120b-a12b:free,openai/gpt-oss-120b:free"
+    # PAID DeepSeek fallbacks — used only when the matching free model is rate-limited.
+    # Cheap: beats/observe/say/look-text. Smart: chat + personality reflection (~5x cost).
+    llm_model: "deepseek/deepseek-v4-flash"     # paid cheap fallback
+    llm_smart_model: "deepseek/deepseek-v4-pro" # paid smart fallback
+    # VISION model — used only by the "Look" button (camera frame -> what it sees). The text
+    # models can't see. "" -> nvidia/nemotron-nano-12b-v2-vl:free (free, verified). DeepSeek
+    # has no vision model, so the vision tier has no DeepSeek fallback; set
+    # llm_vision_fallback_model to a PAID multimodal id (Gemini/GPT/Claude vision) if you
+    # want a fallback when the free vision model hits its daily limit.
     llm_vision_model: ""
+    llm_vision_fallback_model: ""   # optional PAID vision fallback ("" -> none, stay silent)
     llm_base_url: ""           # "" -> https://openrouter.ai/api/v1/chat/completions
     # FALLBACK in-character persona, layered on the base framing in llm.py. The persona is
     # single-sourced from personality.json (scripts/personality_creator.py) — this is used

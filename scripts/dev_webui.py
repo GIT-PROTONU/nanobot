@@ -131,6 +131,9 @@ class DevState:
             model=cfg.get("llm_model", ""), persona=persona,
             vision_model=cfg.get("llm_vision_model", ""),
             smart_model=cfg.get("llm_smart_model", ""),
+            free_model=cfg.get("llm_free_model", ""),
+            free_smart_model=cfg.get("llm_free_smart_model", ""),
+            vision_fallback_model=cfg.get("llm_vision_fallback_model", ""),
             smart_max_per_hour=int(cfg.get("llm_smart_max_per_hour", 15)),
             vision_max_per_hour=int(cfg.get("llm_vision_max_per_hour", 10)),
             logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
@@ -255,7 +258,8 @@ class DevState:
         s = dict(self.settings)
         s.update(available=self.llm.available(), configured=self.llm.available(),
                  model_effective=self.llm.model, smart_model=self.llm.smart_model,
-                 vision_model=self.llm.vision_model, moods=list(MOODS),
+                 vision_model=self.llm.vision_model, free_model=self.llm.free_model,
+                 free_smart_model=self.llm.free_smart_model, moods=list(MOODS),
                  rate_limits=self.llm.rate_limits())
         return s
 
@@ -292,7 +296,7 @@ class DevState:
                                       smart=smart)
         finally:
             self._busy = False
-        model = self.llm.model_for(smart=smart, image=bool(image_jpeg))
+        model = self.llm.last_model or self.llm.model_for(smart=smart, image=bool(image_jpeg))
         ms = int((time.monotonic() - t0) * 1000)
         if reply:
             self._express(reply)
@@ -389,17 +393,18 @@ class DevState:
                 "TARGET that gets smoothed over time. No prose outside the JSON.")
             user = f"Current traits: {tp}.\nRecent events:\n{ev}\n\nReflect and propose adjustments."
             obj = _extract_json(self.llm.complete(system, user, smart=True, json_object=True) or "")
+            rmodel = self.llm.last_model or self.llm.smart_model
             t = {k: max(0.0, min(1.0, float(obj["traits"][k]))) for k in TRAITS
                  if isinstance(obj.get("traits"), dict) and k in obj["traits"]}
             reg = obj.get("registry") if isinstance(obj.get("registry"), dict) else {}
             if t or reg:
                 with self._lock_pe:
                     self._pending_evolve = (t, reg)
-                self._log_decision("reflect", status="spoke", model=self.llm.smart_model,
+                self._log_decision("reflect", status="spoke", model=rmodel,
                                    say=f"{obj.get('note','')} -> {t}")
                 print(f"\n[reflect] {obj.get('note','')} -> {t}", file=sys.stderr)
             else:
-                self._log_decision("reflect", status="no-reply", model=self.llm.smart_model)
+                self._log_decision("reflect", status="no-reply", model=rmodel)
         finally:
             self._busy_reflect = False
 
