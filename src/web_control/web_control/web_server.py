@@ -136,13 +136,13 @@ class WebServerNode(Node):
         self.declare_parameter("skills_enable", True)      # load + offer the skill library
         self.declare_parameter("skills_allow_actions", False)  # permit topic-publishing skills
         self.declare_parameter("skills_dir", "")           # "" -> installed share / source skills/
-        # Skill workshop: meditation's experience-driven skill-synthesis loop (suggest -> check
-        # -> rehearse -> trial -> adopt/retire). Minted skills live in workshop_dir (a writable,
-        # deploy-synced "learned" area, separate from the committed catalogue).
-        self.declare_parameter("workshop_enable", True)        # mint/adapt skills while meditating
+        # Skill workshop: reflection mode's experience-driven skill-synthesis loop (suggest ->
+        # check -> rehearse -> trial -> adopt/retire). Minted skills live in workshop_dir (a
+        # writable, deploy-synced "learned" area, separate from the committed catalogue).
+        self.declare_parameter("workshop_enable", True)        # mint/adapt skills while reflecting
         self.declare_parameter("workshop_dir", "")             # "" -> ~/.local/state/nanobot/skills
         self.declare_parameter("workshop_path", "")            # ledger; "" -> XDG state dir
-        self.declare_parameter("workshop_rounds", 1)           # candidates proposed per meditation
+        self.declare_parameter("workshop_rounds", 1)           # candidates proposed per reflection
         self.declare_parameter("workshop_min_runs", 3)         # runs before a trial may adopt
         self.declare_parameter("workshop_retire_errors", 2)    # errors that retire a trial
         self.declare_parameter("workshop_retire_net_neg", 2)   # net 👎 that retire a trial
@@ -281,10 +281,13 @@ class WebServerNode(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, "cognition/traits", self._on_traits, latched)
         # Brain controls from the web UI (the behaviour node consumes these): human reward
-        # -> A/B bandit + reward shaping; meditation -> consolidation/sleep mode.
+        # -> A/B bandit + reward shaping; reflection mode -> consolidation + skill forging.
         self._reward_pub = self.create_publisher(String, "cognition/reward", 10)
-        self._meditate_pub = self.create_publisher(Bool, "meditate", latched)
-        self._meditating = False
+        self._reflect_pub = self.create_publisher(Bool, "reflect", latched)
+        self._reflecting = False
+        # The behaviour node can ask us to enter reflection mode on its own (long idle); we turn
+        # that request into the same brain_reflect() the web toggle calls, so there's one path.
+        self.create_subscription(Bool, "reflect_request", self._on_reflect_request, 10)
         # Sensor snapshot for the "Observe" feature (light: we just store the latest
         # value from each, with its arrival time for staleness). CPU/RAM/temp come from
         # the same cheap /proc reads the announcer uses; these add IMU + pick-up.
@@ -505,7 +508,7 @@ class WebServerNode(Node):
     def llm_look(self):
         return self._cog.llm_look()
 
-    # --- brain controls (reward + meditation; ROS-side, logged via the core) ------
+    # --- brain controls (reward + reflection mode; ROS-side, logged via the core) -
     def brain_reward(self, data):
         """Record a human reward and publish it for the behaviour node. Contextual reward
         (with a `target` echoed from /task_current) credits a specific A/B arm; global reward
@@ -530,13 +533,14 @@ class WebServerNode(Node):
             {"value": value, "scope": scope, "target": target})))
         return {"status": "ok", "value": value, "scope": scope}
 
-    def brain_meditate(self, data):
-        """Toggle meditation/consolidation. Publishes /meditate for the behaviour node (calm
-        face + paused beats + local purpose/A/B consolidation) and, on entry, kicks the LLM
-        reflection + phrase-bank regeneration here so the whole brain consolidates at once."""
+    def brain_reflect(self, data):
+        """Toggle reflection mode. Publishes /reflect for the behaviour node (calm face +
+        paused beats + local purpose/A/B consolidation) and, on entry, kicks the LLM reflection,
+        phrase-bank regeneration, and the skill workshop here so the whole brain consolidates +
+        forges a skill at once."""
         on = bool(data.get("on"))
-        self._meditating = on
-        self._meditate_pub.publish(Bool(data=on))
+        self._reflecting = on
+        self._reflect_pub.publish(Bool(data=on))
         if on:
             self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
             self._cog.bank_regen_check()           # refresh the phrase bank (background)
@@ -544,8 +548,16 @@ class WebServerNode(Node):
             # The skill workshop: mine experience -> mint/adapt a skill on trial (off-thread,
             # it makes several LLM calls). Sweeps the adopt/retire gate when it finishes.
             threading.Thread(target=self._cog.run_skill_workshop, daemon=True).start()
-        self._cog.log_decision("meditate", status=("on" if on else "off"))
-        return {"status": "ok", "meditating": on}
+        self._cog.log_decision("reflect_mode", status=("on" if on else "off"))
+        return {"status": "ok", "reflecting": on}
+
+    def _on_reflect_request(self, msg: Bool):
+        """The behaviour node asking us to enter/leave reflection mode autonomously (long idle).
+        Edge-triggered so a repeated request is a no-op; routes through the same brain_reflect()
+        the web toggle uses."""
+        on = bool(msg.data)
+        if on != self._reflecting:
+            self.brain_reflect({"on": on})
 
     def brain_workshop(self):
         return self._cog.get_workshop()
@@ -712,8 +724,8 @@ class WebServerNode(Node):
         if now < self._reflect_next or self._reflect_busy:
             return
         period = float(self.get_parameter("reflect_period").value)
-        if self._meditating:
-            period = min(period, 60.0)             # consolidate faster while meditating/charging
+        if self._reflecting:
+            period = min(period, 60.0)             # consolidate faster while reflecting/charging
         self._reflect_next = now + period
         threading.Thread(target=self._reflect, daemon=True).start()
 
@@ -1075,12 +1087,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._respond(503, "no node")
             else:
                 self._respond_json(self._node.brain_reward(self._read_json()))
-        elif path == "/brain/meditate":
-            # Toggle meditation/consolidation mode: {"on":bool}.
+        elif path == "/brain/reflect":
+            # Toggle reflection mode (consolidation + skill forging): {"on":bool}.
             if self._node is None:
                 self._respond(503, "no node")
             else:
-                self._respond_json(self._node.brain_meditate(self._read_json()))
+                self._respond_json(self._node.brain_reflect(self._read_json()))
         elif path == "/system/restart":
             # Restart the whole ROS stack. Detached + new session so it survives
             # do_down killing this very web server, then do_up brings it back.

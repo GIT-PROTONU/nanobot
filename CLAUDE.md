@@ -47,13 +47,19 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   **Expression-only — never publishes `/cmd_vel`.** The chart lives in `presence.py`
   (ROS-free, unit-tested offline: `pixi run python -m pytest src/behavior/test`); the node
   maps topics→events. No-op if sismic is missing or `behavior.enable:=false`.
-  - **`mood_node` is thin ROS glue; the orchestration is ROS-free in `brain.py`** —
-    mirroring how `web_control.cognition.CognitionCore` factored the LLM side. `PurposeBrain`
-    owns the Purpose Engine + Horizon Planner orchestration (beat-upgrade decisions, reflect,
-    reward, meditation, persist) and `Personality` owns the chart-context traits/evolution
-    (seed/evolve/heartbeat/persist); both announce state through injected adapters. The SAME
-    two classes run on the dev harness (`scripts/dev_webui.py`) — one base, not a robot/dev
-    copy. Unit-tested offline in `test/test_brain.py`. See [[llm-openrouter-personality]].
+  - **`mood_node` is thin ROS glue; ALL the ROS-free thinking is in `brain.py`** —
+    mirroring how `web_control.cognition.CognitionCore` factored the LLM side. `brain.py` is the
+    single behaviour-layer "brain" module: the **Purpose Engine** (objective + intrinsic-reward
+    weights, deterministic reflection — `default/merge/reflect_purpose`), the **Horizon Planner**
+    + A/B **bandit** (`decompose`/`verify`/`Planner`/`Bandit`), and the orchestration —
+    `PurposeBrain` (beat-upgrade decisions, reflect, reward, reflection mode, persist) +
+    `Personality` (chart-context traits/evolution: seed/evolve/heartbeat/persist). (The Purpose
+    Engine + Planner used to be separate `purpose.py`/`planner.py`; folded into `brain.py` to
+    keep the behaviour layer to three files — `brain.py` + `presence.py` + `mood_node.py`.) Both
+    classes announce state through injected adapters and run identically on the dev harness
+    (`scripts/dev_webui.py`) — one base, not a robot/dev copy. Unit-tested offline in
+    `test/test_brain.py` (+ `test_purpose.py`/`test_planner.py`, which now import from
+    `behavior.brain`). See [[llm-openrouter-personality]].
   - **The chart is also the single brain for autonomous LLM expression.** Its idle beats
     are *predefined states with offline default faces*: `musing` (sensors) every idle
     cycle, `looking` (camera) every `look_every`-th cycle (gated by `camera_beats`). On a
@@ -276,8 +282,9 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   `skill:<name>`. The dir resolves via `skills_dir` → share → source tree
   (`resolve_skills_dir`); `dev_webui.py` wires the same panel off-robot (topic actions no-op
   there, no ROS). See [[skill-library]].
-- **Skill workshop** (`skillsmith.py`, ROS-free + unit-tested): meditation is a **skill-synthesis
-  loop**, not just consolidation. On meditation entry `CognitionCore.run_skill_workshop()` runs
+- **Skill workshop** (`skillsmith.py`, ROS-free + unit-tested): **reflection mode** (formerly
+  "meditation") is a **skill-synthesis loop**, not just consolidation. On reflection entry
+  `CognitionCore.run_skill_workshop()` runs
   **suggest → check → rehearse → trial → adopt/retire**: the smart model mines the decision log
   (gaps / repeated `no-pick`/`stumped`) for ONE *new* or *adapted* capability, it's validated
   (`validate_candidate`: parse round-trip, kind whitelist, no name collision; action skills born
@@ -290,8 +297,24 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   👍/👎 reward is forwarded to the trial that last ran (`reward_trial_skill`). Manual override:
   `GET /skills/workshop` + `POST /skills/workshop/{keep,kill}` (web "🛠 Skills" card, 🧪 trials).
   `deploy.sh` pushes `devstate/skills/*.md` + `workshop.json` with the soul. Config: `workshop_*`
-  in robot.yaml. Runs identically on the dev harness (mints into `devstate/skills/`). See
-  [[meditation-skill-workshop]].
+  in robot.yaml. Runs identically on the dev harness (mints into `devstate/skills/`).
+  **The workshop is also an on-demand skill** — `skills/forge-skill.md` (`action.kind: workshop`,
+  a "meta" kind in `skills.py` that runs an internal routine, never a topic/narrative): invoke it
+  any time (web "🛠 Skills" / `POST /skills/invoke {name:"forge-skill"}`) to forge a skill outside
+  reflection mode. Meta skills are **excluded from autonomous skill-beat selection** (`offered()`),
+  so they only run when deliberately invoked. See [[meditation-skill-workshop]].
+- **Reflection mode** (renamed from "meditation"; topic `/reflect`, web `POST /brain/reflect`,
+  `🧘 Reflection mode` toggle, `PurposeBrain.set_reflecting`/`.reflecting`, chart state
+  `reflecting` + event `reflect`/`wake`). It pauses beats and consolidates (purpose/A/B/bank +
+  long-term self-narrative) **and** forges a skill (the workshop). **The robot enters it on its
+  own** after a long idle: `behavior.mood_node._auto_reflect` publishes `/reflect_request` (Bool)
+  on `reflect_auto_idle` s of continuous idle, runs `reflect_auto_secs`, then wakes (and exits
+  early if activity resumes); `web_control` mediates that request through the same `brain_reflect`
+  the web toggle uses (`_on_reflect_request`). Manual reflections (web toggle) are sticky and
+  never auto-woken. The dev harness drives the same loop time-based in `run_behavior`.
+- **Interaction fillers fire BEFORE the LLM call.** On a skill beat the instant "thinking"
+  prelude is spoken before the (slow) skill-pick `complete()` call, not after (so TTS feels
+  instant); the chosen skill then runs with `prelude=False` to avoid a double filler.
 - **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
   Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
   so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`

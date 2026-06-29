@@ -18,9 +18,9 @@ The **🧠 Brain card** (Speak tab) is fully wired here too: this harness runs t
 ROS-free `behavior.purpose` (Purpose Engine) + `behavior.planner` (Horizon Planner + A/B
 bandit), serves the readouts the robot publishes over rosbridge (`/purpose`,
 `/task_current`, `/experiments`) over plain HTTP (the page polls them when rosbridge is
-absent), and handles `/brain/reward` + `/brain/meditate`. So you can reward the current
+absent), and handles `/brain/reward` + `/brain/reflect`. So you can reward the current
 line (👍/👎 → the A/B bandit learns), watch the reward weights drift, and toggle
-meditation — all without the board. With `--behavior` the idle `musing` beat upgrades to a
+reflection mode — all without the board. With `--behavior` the idle `musing` beat upgrades to a
 `pursuing` beat (planner task → webcam observation), so 👍/👎 becomes *contextual* and
 credits the chosen variant. (All dev state — the personality "soul" + decision log + goal/
 reward state — persists to the project-local `devstate/` folder; delete it for a clean slate.)
@@ -205,7 +205,7 @@ class DevState:
         # --- Purpose Engine + Horizon Planner (the real ROS-free brain orchestration) -----
         # On the dev host there's no behaviour node, so we run the SAME PurposeBrain the robot
         # runs (behavior.brain) so the web "🧠 Brain" card is fully exercisable: objective +
-        # reward weights, the pursuing/skill beats, A/B variants + 👍/👎 reward, and meditation.
+        # reward weights, the pursuing/skill beats, A/B variants + 👍/👎 reward, and reflection.
         # Dev adapters: experience = the shared decision log; never picked up; no publishing
         # (the page polls the getters below over HTTP instead of latched topics).
         self._brain = PurposeBrain(
@@ -311,9 +311,9 @@ class DevState:
 
         Goal-pursuit + skill upgrades are decided by the shared PurposeBrain (exactly as on the
         robot): the idle musing beat becomes a `pursuing` beat when the planner has a verified
-        task, else a `skill` beat every Nth body beat. Meditation pauses all beats."""
-        if self._brain.meditating:
-            print(f"\n[beat] {name} (paused — meditating)", file=sys.stderr)
+        task, else a `skill` beat every Nth body beat. Reflection mode pauses all beats."""
+        if self._brain.reflecting:
+            print(f"\n[beat] {name} (paused — reflecting)", file=sys.stderr)
             return
         print(f"\n[beat] {name}", file=sys.stderr)
         spec = self._brain.next_pursuing(time.monotonic()) if name == "musing" else None
@@ -397,17 +397,18 @@ class DevState:
         print(f"[reward] {status} ({scope})", file=sys.stderr)
         return {"status": "ok", "value": value, "scope": scope}
 
-    def brain_meditate(self, data):
-        """Mirror web_server.brain_meditate: pause beats, consolidate (reflect + A/B + bank)."""
+    def brain_reflect(self, data):
+        """Mirror web_server.brain_reflect: pause beats, consolidate (reflect + A/B + bank) and
+        forge a skill (the workshop)."""
         on = bool(data.get("on"))
-        self._brain.set_meditating(on)                  # flag + (on entry) reflect + A/B finalize
+        self._brain.set_reflecting(on)                  # flag + (on entry) reflect + A/B finalize
         if on:
             self.cog.bank_regen_check()
             threading.Thread(target=self.cog.consolidate, daemon=True).start()  # long-term self
             threading.Thread(target=self.cog.run_skill_workshop, daemon=True).start()  # mint a skill
-        self.cog.log_decision("meditate", status=("on" if on else "off"))
-        print(f"[meditate] {'on' if on else 'off'}", file=sys.stderr)
-        return {"status": "ok", "meditating": self._brain.meditating}
+        self.cog.log_decision("reflect_mode", status=("on" if on else "off"))
+        print(f"[reflect] {'on' if on else 'off'}", file=sys.stderr)
+        return {"status": "ok", "reflecting": self._brain.reflecting}
 
     def brain_workshop(self):
         return self.cog.get_workshop()
@@ -439,6 +440,9 @@ def run_behavior(state, idle_secs, reflect_secs):
     b = _load_cfg("behavior")
     camera_beats = bool(b.get("camera_beats", True))
     look_every = int(b.get("look_every", 4))
+    auto_on = bool(b.get("reflect_auto_enable", True))   # autonomously drift into reflection mode
+    auto_idle = max(0.0, float(b.get("reflect_auto_idle", 1200.0)))
+    auto_secs = max(1.0, float(b.get("reflect_auto_secs", 120.0)))
     clock = SimulatedClock()
     clock.time = 0.0
     interp, _ = build_interpreter(
@@ -452,10 +456,25 @@ def run_behavior(state, idle_secs, reflect_secs):
           f"{camera_beats}, look_every={look_every}, reflect_secs={reflect_secs}. "
           f"Stop clicking and listen; watch the Decision log.", file=sys.stderr)
     t0 = last_reflect = last_purpose = time.monotonic()
+    next_auto = t0 + auto_idle                  # when to auto-enter reflection (dev: time-based)
+    auto_until = None                           # deadline of a self-started reflection (or None)
     while True:
         time.sleep(0.5)
         now = time.monotonic()
         clock.time = now - t0
+        # Autonomous reflection mode (parity with mood_node): the dev harness has no real
+        # activity signal, so it's purely time-based — enter every auto_idle s, run auto_secs.
+        if auto_on:
+            if auto_until is not None:
+                if now >= auto_until:
+                    state.brain_reflect({"on": False})
+                    auto_until = None
+                    next_auto = now + auto_idle
+                    interp.queue(Event("wake"))
+            elif not state._brain.reflecting and now >= next_auto:
+                state.brain_reflect({"on": True})
+                auto_until = now + auto_secs
+                interp.queue(Event("reflect"))
         if (now - last_purpose) > 30.0:        # local Purpose Engine: drift reward weights
             last_purpose = now
             state._brain.run_reflection()
@@ -567,8 +586,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.workshop_kill(self._body()))
         if p == "/brain/reward":
             return self._json(s.brain_reward(self._body()))
-        if p == "/brain/meditate":
-            return self._json(s.brain_meditate(self._body()))
+        if p == "/brain/reflect":
+            return self._json(s.brain_reflect(self._body()))
         if p == "/tts":
             d = self._body()
             text = (d.get("text") or "").strip()

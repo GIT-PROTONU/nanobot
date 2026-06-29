@@ -2,7 +2,7 @@
 
     pixi run python -m pytest src/web_control/test
 
-Covers the deterministic pieces of meditation's skill-synthesis loop: candidate render +
+Covers the deterministic pieces of reflection mode's skill-synthesis loop: candidate render +
 round-trip, the validation gate, and the trial ledger's adopt/retire decisions.
 """
 import os

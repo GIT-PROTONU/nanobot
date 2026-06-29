@@ -1,7 +1,8 @@
-"""Offline tests for the Horizon Planner + bandit (ROS-free). Run via pytest."""
+"""Offline tests for the Horizon Planner + bandit (ROS-free; folded into behavior.brain).
+Run via pytest."""
 import random
 
-from behavior.planner import decompose, verify, Bandit, Planner
+from behavior.brain import decompose, verify, Bandit, Planner
 
 
 def test_decompose_and_verify():

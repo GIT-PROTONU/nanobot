@@ -377,8 +377,8 @@
             <h2 style="margin-top:10px">🧪 Workshop · skills on trial</h2>
             <p class="hint" id="workshopStatus">loading…</p>
             <div id="workshopList" class="skills"></div>
-            <p class="hint">While <b>meditating</b> the robot mines its experience to invent or
-              improve a skill, then puts it on <b>trial</b>. A trial earns permanence on its own
+            <p class="hint">While in <b>reflection mode</b> the robot mines its experience to invent
+              or improve a skill, then puts it on <b>trial</b>. A trial earns permanence on its own
               after enough good runs + 👍 with no errors, or you can <b>Keep</b> / <b>Kill</b> it
               here. <b>Kill</b> deletes the trial file; <b>Keep</b> adopts it for good.</p>
           </div>
@@ -393,11 +393,12 @@
             </div>
             <p class="hint">Rewards the line it's saying <b>now</b> (trains the A/B test for that
               beat). With nothing being pursued it nudges the robot's <b>overall</b> taste.</p>
-            <label class="switch"><input type="checkbox" id="meditateOn"><span class="track"></span>
-              🧘 Meditation mode</label>
+            <label class="switch"><input type="checkbox" id="reflectOn"><span class="track"></span>
+              🧘 Reflection mode</label>
             <p class="hint">Pauses expression and <b>consolidates</b>: reflects on recent
-              experience, updates its purpose &amp; reward weights, picks the A/B winners and
-              regenerates its phrase bank. Meant for while it charges; manual toggle for now.</p>
+              experience, updates its purpose &amp; reward weights, picks the A/B winners,
+              regenerates its phrase bank, and <b>forges a skill</b> from what it learned. The
+              robot also enters this on its own after a long idle; manual toggle here too.</p>
             <details class="logbox">
               <summary>🧪 Experiments</summary>
               <div id="abLog" class="log">…</div>
@@ -1172,7 +1173,7 @@ if($("skillsReload")) $("skillsReload").onclick=()=>{
 };
 loadSkills();
 
-// ---- Workshop · skills on trial ---- meditation mints/adapts a skill from experience and
+// ---- Workshop · skills on trial ---- reflection mode mints/adapts a skill from experience and
 // puts it on trial; it auto-adopts after enough good runs + 👍 (no errors) or auto-retires on
 // errors/👎. Keep/Kill are the manual overrides (POST to web_control / the dev harness).
 function fmtTrial(t){
@@ -1197,10 +1198,10 @@ function loadWorkshop(){
     if(d.enabled===false){ st.textContent="workshop disabled"; box.innerHTML=""; return; }
     const tr=d.trials||[];
     const live=tr.filter(t=>t.status==="trial").length;
-    st.textContent=(d.busy?"meditating — proposing a skill… · ":"")
+    st.textContent=(d.busy?"reflecting — proposing a skill… · ":"")
       +`${live} on trial · ${tr.length} tracked`;
     box.innerHTML=tr.length?tr.map(fmtTrial).join("")
-      :"<i>none yet — meditate to invent one</i>";
+      :"<i>none yet — reflect to invent one</i>";
     box.querySelectorAll(".skkeep").forEach(b=>b.onclick=()=>workshopAct("keep",b.dataset.name));
     box.querySelectorAll(".skkill").forEach(b=>b.onclick=()=>workshopAct("kill",b.dataset.name));
   }).catch(()=>{ st.textContent="offline"; });
@@ -1215,7 +1216,7 @@ loadWorkshop();
 
 // ---- Brain · purpose & learning ---- the Purpose Engine (goals + intrinsic reward) and
 // the Horizon Planner's A/B bandit live in the behaviour node and publish latched JSON on
-// /purpose, /task_current, /experiments. Reward (👍/👎) + meditation POST to web_control,
+// /purpose, /task_current, /experiments. Reward (👍/👎) + reflection POST to web_control,
 // which logs + republishes them for the behaviour node. All narrative-only (no motion).
 let lastTask=null;
 function renderPurpose(s){
@@ -1252,9 +1253,9 @@ function sendReward(value){
 }
 if($("rewardUp")) $("rewardUp").onclick=()=>sendReward(1);
 if($("rewardDown")) $("rewardDown").onclick=()=>sendReward(-1);
-if($("meditateOn")) $("meditateOn").addEventListener("change",()=>{
-  fetch("/brain/meditate",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({on:$("meditateOn").checked})}).catch(()=>{});
+if($("reflectOn")) $("reflectOn").addEventListener("change",()=>{
+  fetch("/brain/reflect",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({on:$("reflectOn").checked})}).catch(()=>{});
 });
 // No-rosbridge fallback (the dev_webui harness): when not connected to rosbridge, poll the
 // brain readouts over plain HTTP. On the real robot these come over rosbridge (and the GETs

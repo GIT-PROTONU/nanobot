@@ -1,6 +1,6 @@
-"""Skill workshop — the pure (ROS-free) core of meditation's skill-synthesis loop.
+"""Skill workshop — the pure (ROS-free) core of reflection mode's skill-synthesis loop.
 
-During meditation the brain mines its own experience (the decision log) and proposes a
+During reflection the brain mines its own experience (the decision log) and proposes a
 **new or adapted** capability, checks it, rehearses it, and — if it survives — writes it
 into the skill library on **trial**. A trial skill is a normal, immediately-usable skill
 (see [[skill-library]]); the only difference is that this module tracks how it performs and
@@ -24,6 +24,7 @@ inert, never load-bearing.
 """
 import json
 import os
+import threading
 import time
 
 from .skills import KNOWN_KINDS, NARRATIVE_KINDS, _slug, parse_skill_text
@@ -157,9 +158,12 @@ class WorkshopState:
     def save(self):
         if not self.path:
             return
+        # The ledger is mutated from two threads — the background workshop (reflection) and the
+        # executor (a trial skill running / a reward). A per-thread temp name + atomic os.replace
+        # keeps concurrent writers from clobbering each other's file (no lock held over IO).
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            tmp = self.path + ".tmp"
+            tmp = "%s.%d.tmp" % (self.path, threading.get_ident())
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"skills": self.skills}, f, indent=2)
             os.replace(tmp, self.path)
@@ -250,6 +254,10 @@ class WorkshopState:
         return out
 
     # ---- readers ------------------------------------------------------------
+    def get(self, name):
+        """The raw record for a tracked skill (or None). Read-only — callers must not mutate."""
+        return self.skills.get(_slug(name))
+
     def status_of(self, name):
         rec = self.skills.get(_slug(name))
         return rec.get("status") if rec else None

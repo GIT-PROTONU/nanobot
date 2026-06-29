@@ -18,6 +18,57 @@ def _write(d, name, text):
     return p
 
 
+def test_add_file_and_remove(tmp_path):
+    d = str(tmp_path)
+    lib = SkillLibrary(d)                       # empty dir -> empty (but usable) library
+    assert len(lib) == 0
+    p = _write(d, "wiggle.md", """\
+        ---
+        name: wiggle
+        description: a little wiggle
+        action: {kind: say}
+        ---
+        # Wiggle
+        wiggle a bit
+    """)
+    sk = lib.add_file(p)                         # single-file add, no directory re-scan
+    assert sk is not None and sk.name == "wiggle"
+    assert lib.get("wiggle") is not None
+    assert lib.remove("Wiggle") is True         # slug-normalised
+    assert lib.get("wiggle") is None
+    assert lib.remove("wiggle") is False        # already gone
+
+
+def test_workshop_meta_kind(tmp_path):
+    d = str(tmp_path)
+    _write(d, "say-hi.md", """\
+        ---
+        name: say-hi
+        action: {kind: say}
+        ---
+        # Say hi
+        greet
+    """)
+    _write(d, "forge.md", """\
+        ---
+        name: forge
+        description: forge a skill
+        action: {kind: workshop}
+        ---
+        # Forge
+        run the workshop
+    """)
+    lib = SkillLibrary(d)
+    forge = lib.get("forge")
+    assert forge is not None and forge.kind == "workshop"
+    assert forge.is_meta is True and forge.is_action is False
+    assert forge.enabled is True                  # meta skills are always enabled (not gated)
+    # Meta skills are excluded from autonomous selection but still listed for manual invoke.
+    offered = {s.name for s in lib.offered(allow_actions=True)}
+    assert "forge" not in offered and "say-hi" in offered
+    assert "forge" in {s["name"] for s in lib.as_list()}
+
+
 def test_slug_normalisation():
     assert _slug("Read LiDAR") == "read-lidar"
     assert _slug("say_hello") == "say-hello"

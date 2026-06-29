@@ -1,6 +1,7 @@
-"""Offline tests for the Purpose Engine (ROS-free). Run: pixi run python -m pytest src/behavior/test"""
-from behavior.purpose import (default_purpose, merge_purpose, summarize_experience,
-                              reflect_purpose, REWARD_AXES, DEFAULT_OBJECTIVE)
+"""Offline tests for the Purpose Engine (ROS-free; folded into behavior.brain).
+Run: pixi run python -m pytest src/behavior/test"""
+from behavior.brain import (default_purpose, merge_purpose, summarize_experience,
+                            reflect_purpose, REWARD_AXES, DEFAULT_OBJECTIVE)
 
 
 def test_default_purpose_schema():

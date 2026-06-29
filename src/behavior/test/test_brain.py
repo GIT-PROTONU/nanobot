@@ -1,5 +1,5 @@
 """Offline tests for the ROS-free brain orchestration (behavior.brain): PurposeBrain (goal /
-reward / A-B / beat-upgrade / meditation) + Personality (chart-context evolution). All state
+reward / A-B / beat-upgrade / reflection mode) + Personality (chart-context evolution). All state
 IO is redirected to a tmp dir, so these never touch ~/.local/state.
 
 Run: pixi run python -m pytest src/behavior/test"""
@@ -33,11 +33,11 @@ def test_skill_beat_cadence(tmp_path):
     assert [b.take_skill_beat() for _ in range(6)] == [False, False, True, False, False, True]
 
 
-def test_skill_beat_paused_while_meditating(tmp_path):
+def test_skill_beat_paused_while_reflecting(tmp_path):
     b, _ = make_brain(tmp_path, skill_every=2)
-    b.meditating = True
+    b.reflecting = True
     assert b.take_skill_beat() is False          # paused: no count advances
-    b.meditating = False
+    b.reflecting = False
     assert [b.take_skill_beat() for _ in range(2)] == [False, True]   # counter started at 0
 
 
@@ -55,9 +55,9 @@ def test_next_pursuing_returns_spec_and_announces(tmp_path):
     assert pub["exp"]                            # moved A/B stats announced
 
 
-def test_next_pursuing_none_when_meditating_or_disabled(tmp_path):
+def test_next_pursuing_none_when_reflecting_or_disabled(tmp_path):
     b, _ = make_brain(tmp_path)
-    b.meditating = True
+    b.reflecting = True
     assert b.next_pursuing(now=100.0) is None
     off, _ = make_brain(tmp_path, enable=False)
     assert off.next_pursuing(now=100.0) is None
@@ -71,7 +71,7 @@ def test_next_pursuing_blocked_by_world_precondition(tmp_path):
     assert b.next_pursuing(now=100.0) is None
 
 
-# ---- PurposeBrain: reward + meditation ----------------------------------------
+# ---- PurposeBrain: reward + reflection mode ----------------------------------------
 def test_apply_reward_credits_last_arm(tmp_path):
     b, _ = make_brain(tmp_path)
     b.next_pursuing(now=100.0)                    # assigns an A/B arm
@@ -79,13 +79,13 @@ def test_apply_reward_credits_last_arm(tmp_path):
     assert b.apply_reward(1.0, None, scope="global") is False    # global is reward-shaping only
 
 
-def test_set_meditating_consolidates(tmp_path):
+def test_set_reflecting_consolidates(tmp_path):
     b, pub = make_brain(tmp_path)
-    assert b.set_meditating(True) is True         # changed
-    assert b.set_meditating(True) is False        # idempotent
-    assert b.meditating is True
+    assert b.set_reflecting(True) is True         # changed
+    assert b.set_reflecting(True) is False        # idempotent
+    assert b.reflecting is True
     assert pub["purpose"]                         # forced reflection announced the purpose
-    assert b.set_meditating(False) is True
+    assert b.set_reflecting(False) is True
 
 
 # ---- PurposeBrain: persistence ------------------------------------------------

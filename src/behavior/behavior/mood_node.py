@@ -1,16 +1,16 @@
 """Idle "feel alive" presence supervisor — the behaviour layer's ROS node.
 
-This is the ROS *glue* around the brain. The slow, declarative thinking lives in three
+This is the ROS *glue* around the brain. The slow, declarative thinking lives in two
 ROS-free modules so it can be unit-tested offline (`pixi run python -m pytest
 src/behavior/test`):
 
   * `presence.py` — the Sismic statechart (states + timed transitions + the personality
     context the guards read).
-  * `purpose.py` / `planner.py` — the Purpose Engine (goals + intrinsic reward) and the
-    Horizon Planner (task queue + A/B bandit).
-  * `brain.py` — the platform-agnostic *orchestration* of the above (`PurposeBrain`) and of
-    the chart-context personality (`Personality`). The SAME orchestration runs on the dev
-    web harness (`scripts/dev_webui.py`) via injected adapters, so there's one base, not two.
+  * `brain.py` — everything else, in one module: the Purpose Engine (goals + intrinsic
+    reward), the Horizon Planner (task queue + A/B bandit), and the platform-agnostic
+    *orchestration* of both (`PurposeBrain`) + the chart-context personality (`Personality`).
+    The SAME orchestration runs on the dev web harness (`scripts/dev_webui.py`) via injected
+    adapters, so there's one base, not two.
 
 This node just: parses params, builds the chart, maps raw ROS topics into the chart's
 semantic signals, and on each tick steps the chart and delegates to `PurposeBrain` /
@@ -26,9 +26,9 @@ semantic signals, and on each tick steps the chart and delegates to `PurposeBrai
 
 Consumes (all light std/geometry msgs): `/cmd_vel`, `/goal_pose`, `/oled_word`,
 `/oled_face` (to detect a manual/foreign mood vs our own echo), `/left|right_wheel_suspended`,
-`/cognition/evolve`, `/cognition/reward`, `/meditate`. Drives `/oled_face`,
-`/cognition/request`, and the latched `/cognition/traits` + `/purpose` + `/task_current` +
-`/experiments` readouts.
+`/cognition/evolve`, `/cognition/reward`, `/reflect`. Drives `/oled_face`,
+`/cognition/request`, `/reflect_request` (auto reflection-mode trigger), and the latched
+`/cognition/traits` + `/purpose` + `/task_current` + `/experiments` readouts.
 """
 import json
 import random
@@ -88,8 +88,12 @@ class MoodNode(Node):
             ("purpose_period", 600.0),      # s between purpose reflections (reads the decision log)
             ("pursue_min_interval", 180.0), # s, min gap between goal-pursuit ("pursuing") beats
             ("ab_epsilon", 0.2),            # A/B bandit exploration rate (0..1)
-            ("meditate_face", "focused"),   # OLED face shown while meditating/consolidating
+            ("reflect_face", "focused"),    # OLED face shown while in reflection mode
             ("greet_face", "happy"),        # OLED "startup mood" shown at boot (greeting)
+            # --- autonomous reflection mode: enter on long idle, run a fixed stretch, wake ---
+            ("reflect_auto_enable", True),  # let the robot enter reflection mode on its own
+            ("reflect_auto_idle", 1200.0),  # s of continuous idle before auto-entering reflection
+            ("reflect_auto_secs", 120.0),   # s a self-started reflection runs before auto-waking
             ("purpose_path", ""),           # "" -> ~/.local/state/nanobot/purpose.json
             ("experiments_path", ""),       # "" -> ~/.local/state/nanobot/experiments.json
             # The shared decision log written by web_control — the Purpose Engine's
@@ -106,8 +110,11 @@ class MoodNode(Node):
         self.enrich_min_interval = float(g("enrich_min_interval").value)
         self.camera_beats = bool(g("camera_beats").value)
         self.look_every = max(1, int(g("look_every").value))
-        self._meditate_face = str(g("meditate_face").value or "focused")
+        self._reflect_face = str(g("reflect_face").value or "focused")
         self._greet_face = str(g("greet_face").value or "happy")
+        self._reflect_auto_enable = bool(g("reflect_auto_enable").value)
+        self._reflect_auto_idle = max(0.0, float(g("reflect_auto_idle").value))
+        self._reflect_auto_secs = max(1.0, float(g("reflect_auto_secs").value))
 
         # --- signals updated by callbacks, read by the tick ---
         self._susp_l = False
@@ -119,12 +126,20 @@ class MoodNode(Node):
         # echo suppression so we don't mistake our OWN /oled_face for a foreign mood
         self._self_face = ("", -1e9)
         self._owns_face = False        # we currently have a non-empty face shown
+        # autonomous reflection mode: when did continuous idle begin, and (while WE started a
+        # reflection) when should it auto-wake. None deadline = no self-started reflection running.
+        self._idle_since = time.monotonic()
+        self._auto_reflect_deadline = None
 
         self.face_pub = self.create_publisher(String, "oled_face", 10)
         # Fire-and-forget enrichment requests for the beat states. web_control executes
         # them (LLM [+camera] -> TTS + mood); we never wait on the reply. Rate-limited
         # per beat via _beat_last so a fast-cycling chart can't spam the API.
         self.cog_pub = self.create_publisher(String, "cognition/request", 10)
+        # Ask web_control to run a reflection (consolidate + forge a skill). web_server turns
+        # this into the /reflect state command we (and it) act on, so there's one entry path
+        # for both the manual web toggle and this autonomous trigger.
+        self.reflect_req_pub = self.create_publisher(Bool, "reflect_request", 10)
         self._beat_last = {}
         # Latched readouts so late subscribers (slam_nav's motion clamp, web_control's
         # reflection, the web UI brain card) get them immediately; PurposeBrain/Personality
@@ -183,8 +198,9 @@ class MoodNode(Node):
         self.create_subscription(String, "cognition/evolve", self._on_evolve, 10)
         # Human reward (from the web UI via web_control) -> A/B bandit credit.
         self.create_subscription(String, "cognition/reward", self._on_reward, 10)
-        # Meditation/consolidation toggle (from the web UI via web_control).
-        self.create_subscription(Bool, "meditate", self._on_meditate, latched)
+        # Reflection-mode state command (from the web UI toggle or our own auto trigger,
+        # mediated by web_control).
+        self.create_subscription(Bool, "reflect", self._on_reflect, latched)
 
         if self._interp is not None:
             self.create_timer(1.0 / self.tick_rate, self._tick)
@@ -207,7 +223,7 @@ class MoodNode(Node):
                 camera_beats=self.camera_beats, look_every=self.look_every,
                 traits=self._personality.traits, registry=self._personality.registry,
                 alpha=float(g("smoothing_alpha").value), clock=self._clock,
-                meditate_face=self._meditate_face, greet_face=self._greet_face)
+                reflect_face=self._reflect_face, greet_face=self._greet_face)
             self._personality.attach(self._interp)
             self.get_logger().info(
                 f"behavior up: presence statechart (personality '{self._personality.name}', "
@@ -313,17 +329,17 @@ class MoodNode(Node):
         self._brain.apply_reward(r.get("value", 0), r.get("target"),
                                  scope=str(r.get("scope")))
 
-    def _on_meditate(self, msg: Bool):
-        """Toggle meditation/consolidation. While on, the chart shows a calm face and pauses
-        beats; the brain consolidates (reflect on purpose + finalize A/B winners). The LLM
-        reflection + phrase-bank regen run on the web_control side."""
+    def _on_reflect(self, msg: Bool):
+        """Enter/leave reflection mode. While on, the chart shows a calm face and pauses beats;
+        the brain consolidates (reflect on purpose + finalize A/B winners). The LLM reflection,
+        phrase-bank regen, and skill workshop run on the web_control side."""
         on = bool(msg.data)
-        if not self._brain.set_meditating(on, traits=self._personality.live_traits()):
+        if not self._brain.set_reflecting(on, traits=self._personality.live_traits()):
             return
         if self._interp is not None:
-            self._interp.queue(Event("meditate" if on else "wake"))
-        self.get_logger().info("meditating — consolidating brain (beats paused)" if on
-                               else "meditation ended — resuming presence")
+            self._interp.queue(Event("reflect" if on else "wake"))
+        self.get_logger().info("reflecting — consolidating brain + forging skills (beats paused)"
+                               if on else "reflection ended — resuming presence")
 
     # --- signal callbacks ----------------------------------------------------
     def _on_cmd(self, msg: Twist):
@@ -354,6 +370,30 @@ class MoodNode(Node):
     def _on_susp_r(self, msg: Bool):
         self._susp_r = bool(msg.data)
 
+    # --- autonomous reflection-mode trigger ----------------------------------
+    def _auto_reflect(self, now, stand):
+        """Let the robot drift into reflection mode on its own after a long idle stretch, run
+        it for a fixed duration, then wake. Best-effort + decoupled: we only publish a
+        /reflect_request (web_control mediates it into the /reflect state we then act on) and
+        manage our own request lifecycle — so a manual web toggle is never disturbed.
+
+        `_auto_reflect_deadline` is set only while WE started the current reflection; a manual
+        one leaves it None, so we never auto-wake the user's reflection."""
+        if not self._reflect_auto_enable:
+            return
+        if self._auto_reflect_deadline is not None:        # a self-started reflection is running
+            if now >= self._auto_reflect_deadline or stand:  # time's up, or activity resumed
+                self.reflect_req_pub.publish(Bool(data=False))
+                self._auto_reflect_deadline = None
+                self._idle_since = now
+            return
+        if self._brain.reflecting:                          # a manual reflection — leave it be
+            return
+        if not stand and (now - self._idle_since) >= self._reflect_auto_idle:
+            self.reflect_req_pub.publish(Bool(data=True))
+            self._auto_reflect_deadline = now + self._reflect_auto_secs
+            self.get_logger().info("idle a while — entering reflection mode on my own")
+
     # --- the periodic statechart step ----------------------------------------
     def _tick(self):
         now = time.monotonic()
@@ -364,12 +404,15 @@ class MoodNode(Node):
         speaking = self._speaking and (now - self._last_word_t) < self.speak_timeout
         active = (now - self._last_motion) < self.motion_hold
         stand = picked or manual or speaking or active
+        if stand:
+            self._idle_since = now                         # any activity resets the idle clock
 
         try:
-            # Meditation is a deliberate, sticky mode (only `wake` leaves it), so we skip the
+            self._auto_reflect(now, stand)                 # maybe enter/exit a self-started reflection
+            # Reflection is a deliberate, sticky mode (only `wake` leaves it), so we skip the
             # normal stand-down/resume arbitration while consolidating.
             dormant = "dormant" in self._interp.configuration
-            if not self._brain.meditating:
+            if not self._brain.reflecting:
                 if stand and not dormant:
                     # Hand the panel back. If we're standing down for *another writer*
                     # (pick-up / a manual web mood), stay silent — they own /oled_face and

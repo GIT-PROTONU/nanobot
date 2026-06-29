@@ -134,8 +134,8 @@ class CognitionCore:
             self.llm.set_self_note(self.self_narrative)
         self._reflect_count = 0
         self._consolidate_busy = False
-        # Skill workshop: meditation's experience-driven skill-synthesis loop (suggest -> check
-        # -> rehearse -> trial -> adopt/retire). The pure ledger + gate live in skillsmith.py;
+        # Skill workshop: reflection mode's experience-driven skill-synthesis loop (suggest ->
+        # check -> rehearse -> trial -> adopt/retire). The pure ledger + gate live in skillsmith.py;
         # this class owns the LLM steps + the .md file writes. A trial skill is a normal,
         # immediately-usable skill; the ledger just tracks whether it earns permanence.
         self._workshop_enable = bool(workshop_enable) and self.skills_enable
@@ -427,6 +427,11 @@ class CognitionCore:
         if not cat:
             self.log_decision("beat:skill", state, status="no-skills")
             return
+        # Say an instant "thinking" filler BEFORE the (slow) pick call, so the beat feels
+        # responsive instead of going silent while the model chooses. The chosen skill is then
+        # performed with prelude=False so we don't double up on fillers.
+        if self._prelude_enable and self.llm.available():
+            self._speak_prelude()
         system = ("You choose which ONE of a small robot's capabilities best fits this "
                   'moment, or none. Reply with ONLY compact JSON {"skill": "<name>"} using '
                   'an EXACT name from the list, or {"skill": ""} to do nothing. No prose.')
@@ -440,7 +445,7 @@ class CognitionCore:
                               model=(self.llm.last_model or self.llm.model),
                               detail=(content or "")[:80])
             return
-        self._invoke_skill(skill, trigger="skill:" + skill.name, state=state)
+        self._invoke_skill(skill, trigger="skill:" + skill.name, state=state, prelude=False)
 
     def _skill_prompt(self, skill):
         """The user-turn steering a narrative skill: its body + any requested live context
@@ -459,11 +464,15 @@ class CognitionCore:
         parts.append("Reply with one short spoken line and a fitting mood.")
         return " ".join(p.strip() for p in parts if p and p.strip())
 
-    def _invoke_skill(self, skill, trigger, state=""):
+    def _invoke_skill(self, skill, trigger, state="", prelude=True):
         """Perform a skill: narrative kinds generate+speak (optionally with a camera frame);
-        the gated `topic` kind publishes a whitelisted ROS message. Returns a status dict."""
+        the gated `topic` kind publishes a whitelisted ROS message; the `workshop` meta kind
+        runs the skill-synthesis loop. Returns a status dict. `prelude` controls the instant
+        "thinking" filler (set False when the caller already spoke one — e.g. the skill beat)."""
         if skill.is_action:
             return self._do_topic_skill(skill, trigger, state)
+        if skill.is_meta:                                # the workshop (skill-synthesis) skill
+            return self._do_workshop_skill(skill, trigger, state, prelude)
         frame = None
         if skill.camera:
             if not self.llm.can_call(image=True):
@@ -474,9 +483,20 @@ class CognitionCore:
                 self.log_decision(trigger, state, True, status="no-frame")
                 return {"error": "no camera frame"}
         reply = self.generate(self._skill_prompt(skill), image_jpeg=frame,
-                              trigger=trigger, state=state, camera=bool(frame), prelude=True)
+                              trigger=trigger, state=state, camera=bool(frame), prelude=prelude)
         self._note_trial_run(skill.name, ok=bool(reply))
         return reply or {"error": "no reply"}
+
+    def _do_workshop_skill(self, skill, trigger, state, prelude=True):
+        """Run the skill workshop on demand (the `workshop` meta kind). Speaks an instant
+        "thinking" filler first (TTS stays responsive), then runs the synthesis loop, which
+        makes its own LLM calls and logs each step. Returns the workshop's status dict."""
+        if prelude and self._prelude_enable and self.llm.available():
+            self._speak_prelude()
+        res = self.run_skill_workshop()
+        self.log_decision(trigger, state, status=res.get("status", ""), model="workshop",
+                          detail=json.dumps(res.get("rounds", ""))[:160])
+        return res
 
     def _do_topic_skill(self, skill, trigger, state):
         """Execute a gated topic-skill: publish a whitelisted, clamped message (+ an optional
@@ -499,9 +519,9 @@ class CognitionCore:
         self._note_trial_run(skill.name, ok=ok)
         return {"status": "acted" if ok else "error", "detail": detail, "name": skill.name}
 
-    # ---- skill workshop (meditation's self-improvement loop) ----------------
+    # ---- skill workshop (reflection mode's self-improvement loop) -----------
     def run_skill_workshop(self, rounds=None):
-        """Meditation's skill-synthesis loop: mine experience -> propose ONE new/adapted skill
+        """Reflection mode's skill-synthesis loop: mine experience -> propose ONE new/adapted skill
         -> deterministic check -> rehearse once -> smart-model critique -> commit on trial.
         Then sweep the gate so ripe trials adopt/retire. Best-effort + one-at-a-time guarded;
         a no-op without the LLM or with the workshop disabled. Returns a small status dict."""
@@ -540,13 +560,15 @@ class CognitionCore:
         path = self._write_skill_file(name, render_skill_md(spec))
         if not path:
             return {"status": "write-failed", "name": name}
-        self._skills.reload()                      # the candidate is now a live (rehearsable) skill
-        skill = self._skills.get(name)
+        skill = self._skills.add_file(path)        # make the candidate live (no full re-scan)
+        if skill is None:                          # shouldn't happen (validate round-tripped it)
+            self._delete_skill_file(path)
+            return {"status": "write-failed", "name": name}
         rehearsal = self._rehearse_skill(skill)
         verdict = self._critique_skill(spec, rehearsal)
         if not verdict.get("keep", True):
             self._delete_skill_file(path)
-            self._skills.reload()
+            self._skills.remove(name)
             self.log_decision("workshop:discard", status="critique", say=name,
                               detail=str(verdict.get("reason", ""))[:120])
             return {"status": "discarded", "name": name, "reason": verdict.get("reason")}
@@ -565,7 +587,7 @@ class CognitionCore:
         selfctx = (f" You have become: {self.self_narrative}." if self.self_narrative else "")
         system = (
             f"You are the quiet, self-improving mind of a small robot named "
-            f"{self.persona_name} during meditation. From its recent experience you invent ONE "
+            f"{self.persona_name} during reflection. From its recent experience you invent ONE "
             "small new capability, or improve an existing one, so it serves the people around "
             "it a little better. A capability is a short instruction the robot follows to speak "
             "or act. Reply ONLY compact JSON: "
@@ -586,7 +608,7 @@ class CognitionCore:
 
     def _rehearse_skill(self, skill):
         """Dry-run the candidate ONCE to get a real sample of its output, without speaking it
-        aloud (meditation stays calm). Narrative kinds get a text generation; an action kind
+        aloud (reflection stays calm). Narrative kinds get a text generation; an action kind
         is described, not published. Returns a {say,mood}-ish dict or None."""
         if skill is None:
             return None
@@ -621,7 +643,7 @@ class CognitionCore:
     # ---- trial bookkeeping: runs, reward, the adopt/retire gate --------------
     def _note_trial_run(self, name, ok=True):
         """Record one trial-skill invocation + apply the gate now (a clearly good/bad skill
-        needn't wait for the next meditation). No-op for untracked / non-trial skills."""
+        needn't wait for the next reflection). No-op for untracked / non-trial skills."""
         if not self._workshop.is_trial(name):
             return
         self._last_trial_skill = _slug(name)
@@ -656,7 +678,7 @@ class CognitionCore:
         """Graduate a trial to permanent. The .md already lives in the durable learned dir
         (deploy-synced like the soul/phrase bank), so adoption is just a status flip + log."""
         name = _slug(name)
-        rec = self._workshop.skills.get(name) or {}
+        rec = self._workshop.get(name) or {}
         self._workshop.keep(name)
         self.log_decision("workshop:adopt", status="adopted", say=name,
                           detail="runs=%s +%s/-%s" % (rec.get("runs"), rec.get("reward_pos"),
@@ -666,10 +688,10 @@ class CognitionCore:
         """Roll a trial back: delete its .md (the parent of an `adapt` is never touched) and
         drop the ledger record so the library stops offering it."""
         name = _slug(name)
-        rec = self._workshop.skills.get(name) or {}
+        rec = self._workshop.get(name) or {}
         self._delete_skill_file(rec.get("path", ""))
         self._workshop.forget(name)
-        self._skills.reload()
+        self._skills.remove(name)                   # drop from the index (no full re-scan)
         self.log_decision("workshop:retire", status="retired", say=name)
 
     # ---- workshop file IO + web API -----------------------------------------
@@ -795,7 +817,7 @@ class CognitionCore:
 
     def _maybe_consolidate(self):
         """Every `consolidate_every`-th successful reflection, rewrite the self-narrative
-        (0 = never except on manual/meditation consolidate)."""
+        (0 = never except on manual/reflection-mode consolidate)."""
         if not (self._self_model_enable and self._consolidate_every):
             return
         self._reflect_count += 1

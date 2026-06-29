@@ -225,10 +225,14 @@ behavior:
     # the web 👍/👎 reward. Both are deterministic + fully local (the LLM reflection above
     # still separately owns trait drift). Reflection reads the shared decision log.
     purpose_enable: true        # run the goal/reward + planner layer (false = pure presence)
-    purpose_period: 600.0       # s between purpose reflections (faster while meditating)
+    purpose_period: 600.0       # s between purpose reflections (faster while in reflection mode)
     pursue_min_interval: 180.0  # s, min gap between goal-pursuit ("pursuing") beats
     ab_epsilon: 0.2             # A/B bandit exploration rate (0..1; higher = explores more)
-    meditate_face: "focused"    # OLED face shown while meditating/consolidating
+    reflect_face: "focused"     # OLED face shown while in reflection mode
+    # Autonomous reflection mode: drift into it on a long idle, run a fixed stretch, then wake.
+    reflect_auto_enable: true   # let the robot enter reflection mode on its own
+    reflect_auto_idle: 1200.0   # s of continuous idle before auto-entering reflection
+    reflect_auto_secs: 120.0    # s a self-started reflection runs before auto-waking
     purpose_path: ""            # "" = ~/.local/state/nanobot/purpose.json
     experiments_path: ""        # "" = ~/.local/state/nanobot/experiments.json
     cognition_log_path: ""      # shared decision log (read-only); "" = ~/.local/state/nanobot/cognition.log
@@ -343,7 +347,7 @@ web_control:
     # never reverts on a brain outage like traits do) and folded into every spoken line's prompt.
     self_model_enable: true    # set false to freeze the long-term self-narrative
     self_model_path: ""        # "" -> XDG state dir (~/.local/state/nanobot/self_model.json)
-    consolidate_every: 6       # rewrite the narrative every Nth reflection (+ on meditation entry)
+    consolidate_every: 6       # rewrite the narrative every Nth reflection (+ on reflection-mode entry)
     # Interaction fillers so a slow/failed LLM call is never dead air: skills/beats speak an
     # instant "thinking" line (from the phrase bank) the moment the call starts, and a "stumped"
     # line if it comes back empty. Both are offline-safe (built-in fallback lines).
@@ -364,17 +368,17 @@ web_control:
     skills_enable: true        # load + offer the skill library
     skills_allow_actions: false  # permit topic-publishing (physical) skills — OFF by default
     skills_dir: ""             # "" = installed share (<pkg>/skills) or the source tree skills/
-    # Skill workshop: while meditating, the robot mines its own experience (decision log) to
+    # Skill workshop: while in reflection mode, the robot mines its own experience (decision log) to
     # propose ONE new or improved capability, checks + rehearses it, then puts it on TRIAL. A
     # trial is a normal, immediately-usable skill; it earns permanence (adopt) after enough good
     # runs + net-positive 👍 reward with no errors, or is rolled back (retire) on errors/👎. You
     # can also Keep/Kill any trial from the web "🛠 Skills" card. Minted skills live in
     # workshop_dir (a writable, deploy-synced "learned" area, separate from the committed
     # catalogue). Action-tier (topic) skills are still born disabled + gated by skills_allow_actions.
-    workshop_enable: true       # mint/adapt skills during meditation (false = meditation only consolidates)
+    workshop_enable: true       # mint/adapt skills in reflection mode (false = reflection only consolidates)
     workshop_dir: ""            # "" -> ~/.local/state/nanobot/skills (deploy-synced like the soul)
     workshop_path: ""           # trial ledger; "" -> ~/.local/state/nanobot/workshop.json
-    workshop_rounds: 1          # candidate skills proposed per meditation entry
+    workshop_rounds: 1          # candidate skills proposed per reflection-mode entry
     workshop_min_runs: 3        # successful runs before a trial may auto-adopt
     workshop_retire_errors: 2   # error count that auto-retires a trial
     workshop_retire_net_neg: 2  # net 👎 (down - up) that auto-retires a trial

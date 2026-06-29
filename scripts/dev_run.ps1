@@ -2,7 +2,7 @@
 .SYNOPSIS
   Run the FULL dev web UI on this PC, online (real OpenRouter LLM), with one command:
   autonomous behaviour beats + the Brain card (purpose / pursuing / A/B reward /
-  meditation) + the AI card + TTS - everything wired.
+  reflection mode) + the AI card + TTS - everything wired.
 
 .DESCRIPTION
   Loads the OpenRouter key from $env:OPENROUTER_API_KEY, or (if unset) from the gitignored

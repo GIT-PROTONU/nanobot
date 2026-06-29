@@ -29,6 +29,10 @@ Action kinds (the ``action.kind`` field):
                   when the skill sets ``enabled: true`` AND the node's
                   ``skills_allow_actions`` master switch is on. Motion is also clamped
                   reflexively by slam_nav, so this can never be load-bearing/unsafe.
+  - ``workshop``: run the skill workshop (the reflection-mode skill-synthesis loop) on
+                  demand — mine recent experience and forge ONE new/improved capability.
+                  A "meta" capability (it operates on the library itself); never auto-picked
+                  on a skill beat (that would mint constantly), only invoked deliberately.
 
 Everything degrades safely: a missing directory, a malformed file, or no PyYAML => that
 skill (or the whole library) is simply absent. The brain is a garnish, never load-bearing.
@@ -40,7 +44,10 @@ import re
 
 NARRATIVE_KINDS = ("say", "observe", "look")
 ACTION_KINDS = ("topic",)
-KNOWN_KINDS = NARRATIVE_KINDS + ACTION_KINDS
+# "Meta" kinds run an internal cognition routine rather than speaking or publishing. They're
+# always enabled (not gated like the topic tier) but excluded from autonomous selection.
+META_KINDS = ("workshop",)
+KNOWN_KINDS = NARRATIVE_KINDS + ACTION_KINDS + META_KINDS
 
 
 def _slug(name):
@@ -116,6 +123,11 @@ class Skill:
     def is_action(self):
         """A 'physical' (topic-publishing) skill, vs a pure narrative one."""
         return self.kind in ACTION_KINDS
+
+    @property
+    def is_meta(self):
+        """A 'meta' skill that runs an internal cognition routine (e.g. the workshop)."""
+        return self.kind in META_KINDS
 
     @property
     def camera(self):
@@ -213,6 +225,23 @@ class SkillLibrary:
 
     reload = load
 
+    def add_file(self, path):
+        """Parse ONE .md and add/replace it in the index, without re-scanning the directory.
+        Lets the workshop make a freshly-written candidate live cheaply (a full reload would
+        re-glob + re-parse the whole catalogue). Returns the Skill, or None on a parse failure."""
+        try:
+            sk = parse_skill_file(path)
+        except Exception as exc:
+            self._log("skills: failed to parse %s: %s" % (os.path.basename(path), exc))
+            return None
+        if sk is not None:
+            self.skills[sk.name] = sk
+        return sk
+
+    def remove(self, name):
+        """Drop a skill from the index (no file IO). Returns True if it was present."""
+        return self.skills.pop(_slug(name), None) is not None
+
     def __len__(self):
         return len(self.skills)
 
@@ -224,9 +253,10 @@ class SkillLibrary:
 
     def offered(self, allow_actions):
         """The skills the brain may pick autonomously: all narrative ones, plus enabled
-        action skills only when the node permits actions."""
+        action skills only when the node permits actions. Meta skills (the workshop) are
+        excluded — they're deliberate, on-demand only, never an autonomous skill-beat pick."""
         return [s for s in self.skills.values()
-                if not s.is_action or (allow_actions and s.enabled)]
+                if not s.is_meta and (not s.is_action or (allow_actions and s.enabled))]
 
     def catalogue(self, allow_actions):
         """The (name, description, trigger) list shown to the model for selection."""

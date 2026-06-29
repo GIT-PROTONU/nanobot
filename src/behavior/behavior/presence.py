@@ -89,10 +89,10 @@ statechart:
         action: apply_evolve(event.traits, event.registry)
       - event: brain_lost
         action: revert()
-      # Meditation/consolidation: from anywhere, drop into a calm "meditating" state that
-      # pauses the idle beats (the node consolidates the brain in the background) until `wake`.
-      - event: meditate
-        target: meditating
+      # Reflection mode: from anywhere, drop into a calm "reflecting" state that pauses the
+      # idle beats (the node consolidates the brain + forges skills in the background) until `wake`.
+      - event: reflect
+        target: reflecting
     states:
       - name: greeting
         on entry: face(greet_face)
@@ -148,8 +148,8 @@ statechart:
         transitions:
           - event: resume
             target: idle_life
-      - name: meditating
-        on entry: face(meditate_face)
+      - name: reflecting
+        on entry: face(reflect_face)
         transitions:
           - event: wake
             target: idle_life
@@ -159,7 +159,7 @@ statechart:
 def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
                       perform_secs=4.0, camera_beats=True, look_every=4,
                       traits=None, registry=None, alpha=0.1, clock=None,
-                      meditate_face="focused", greet_face="happy"):
+                      reflect_face="focused", greet_face="happy"):
     """Parse + validate the chart and return (interpreter, clock), already advanced into
     `greeting`. `traits`/`registry` seed the live personality (merged over the frozen
     defaults); `alpha` is the exponential-smoothing rate for `evolve`. The live dicts are
@@ -211,7 +211,7 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
         "beat_i": 0,
         "traits": live_traits,
         "registry": live_registry,
-        "meditate_face": str(meditate_face),
+        "reflect_face": str(reflect_face),
         "greet_face": str(greet_face),
     })
     interpreter.execute()        # run the initial step -> enter `greeting`

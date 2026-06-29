@@ -1,12 +1,27 @@
-"""The brain's ROS-free orchestration layer — shared by the robot and the dev harness.
+"""The brain — the behaviour layer's ROS-free thinking, in ONE module.
 
-This finishes the pattern `web_control.cognition.CognitionCore` started for the LLM side:
-the platform-agnostic *orchestration* of the Purpose Engine + Horizon Planner and of the
-chart-context personality lives here, in ONE place, so the robot behaviour node
-(`behavior.mood_node`) and the dev web harness (`scripts/dev_webui.py`) compose the same
-code instead of each re-implementing it (they used to, and were already drifting).
+This is the whole "what should I do" stack, kept out of the ROS node so it unit-tests offline:
 
-Like `CognitionCore`, everything platform-specific is injected as a tiny **adapter**:
+    pixi run python -m pytest src/behavior/test
+
+It holds, in order:
+  * the **Purpose Engine** — the slow teleological layer: the current *objective* + the
+    *intrinsic-reward* weights, drifted deterministically by reflecting on experience;
+  * the **Horizon Planner** + an online A/B **bandit** — turns the objective into a small task
+    queue, verifies each task against the world before narrating it, and learns which phrasing
+    earns reward;
+  * **PurposeBrain** — the orchestration of the two above (beat upgrades, reflection, reward,
+    reflection-mode consolidation, persistence);
+  * **Personality** — the Sismic-chart-context personality glue (seed load, evolve/heartbeat
+    events, latched publish + throttled persist).
+
+(The Purpose Engine + Planner used to live in their own `purpose.py` / `planner.py`; they were
+folded in here to make the behaviour layer fewer moving parts. The presence statechart stays in
+`presence.py` and the ROS glue in `mood_node.py`.)
+
+Like `web_control.cognition.CognitionCore`, the same orchestration runs on the robot node
+(`behavior.mood_node`) and the dev web harness (`scripts/dev_webui.py`); everything
+platform-specific is injected as a tiny **adapter**:
 
     PurposeBrain adapters (all optional):
       read_cog_log()          -> the recent decision-log entries (list of dicts)
@@ -17,12 +32,6 @@ Like `CognitionCore`, everything platform-specific is injected as a tiny **adapt
       publish_experiments(s)  -> announce the A/B experiment summary
       logger(msg)             -> log a line
 
-`Personality` wraps the Sismic-chart-context personality glue (seed load, evolve/heartbeat
-events, latched publish + throttled persist) used by the robot node. The pure modules it
-builds on — `presence` / `purpose` / `planner` — are untouched and still unit-tested offline:
-
-    pixi run python -m pytest src/behavior/test
-
 Everything here is deterministic + narrative-only: it never moves the robot.
 """
 import copy
@@ -31,8 +40,6 @@ import os
 import time
 
 from .presence import DEFAULT_TRAITS, DEFAULT_REGISTRY
-from .purpose import merge_purpose, reflect_purpose, summarize_experience
-from .planner import Planner
 
 # Sismic Event is only needed by Personality (interpreter-coupled). Imported defensively so
 # importing this module on a board without sismic still works (e.g. for PurposeBrain alone).
@@ -40,6 +47,327 @@ try:
     from sismic.model import Event
 except Exception:  # pragma: no cover - depends on env
     Event = None
+
+
+def clamp01(v, default=0.5):
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+# =============================================================================
+# Purpose Engine — the slow "identity / teleological" layer (was purpose.py).
+# Sits ABOVE the presence statechart. Owns the current objective + intrinsic-reward weights,
+# drifted by reflecting on the shared decision log through the lens of the personality traits.
+# Deterministic + fully local (no LLM on the critical path) and narrative-only — the reward
+# weights only bias which idle beat the planner narrates; it never moves the robot. Kept
+# separate from the LLM reflection: that owns *trait* drift, this owns *goals + reward weights*.
+# =============================================================================
+
+# The robot's standing "deep questions" — its identity prompt, folded into reflection.
+DEEP_QUESTIONS = [
+    "What in my surroundings has changed since I last looked?",
+    "Am I taking care of my body — heat, balance, rest?",
+]
+
+# Intrinsic-reward axes (0..1): how much the robot currently values each drive. The planner
+# reads these to decide what to narrate; reflect_purpose nudges them from experience.
+REWARD_AXES = ("curiosity", "social", "order", "rest")
+DEFAULT_REWARD = {"curiosity": 0.55, "social": 0.3, "order": 0.2, "rest": 0.4}
+
+# Objective catalogue (narrative-only). Each objective declares the reward axis it serves,
+# so human reward can shape the right drive. Start with one; add more as recipes grow.
+OBJECTIVES = {
+    "get_acquainted": {"text": "Get to know the space around me", "primary": "curiosity"},
+    # future: "stay_well" -> rest, "be_sociable" -> social, "keep_order" -> order
+}
+DEFAULT_OBJECTIVE = "get_acquainted"
+
+
+def default_purpose(name="Nano", now=None):
+    """The seed purpose state (also the JSON schema persisted to purpose.json)."""
+    now = time.time() if now is None else now
+    obj = OBJECTIVES[DEFAULT_OBJECTIVE]
+    return {
+        "identity": {"name": name, "deep_questions": list(DEEP_QUESTIONS)},
+        "objective": {"id": DEFAULT_OBJECTIVE, "text": obj["text"],
+                      "set_at": now, "horizon_secs": 86400.0},
+        "intrinsic_reward": dict(DEFAULT_REWARD),
+        "traits_signature": {},
+    }
+
+
+def merge_purpose(saved, name="Nano"):
+    """Merge a loaded purpose.json over the seed, tolerating partial/foreign files."""
+    base = default_purpose(name)
+    if not isinstance(saved, dict):
+        return base
+    if isinstance(saved.get("objective"), dict):
+        oid = saved["objective"].get("id")
+        if oid in OBJECTIVES:
+            base["objective"]["id"] = oid
+            base["objective"]["text"] = OBJECTIVES[oid]["text"]
+        for k in ("set_at", "horizon_secs"):
+            if isinstance(saved["objective"].get(k), (int, float)):
+                base["objective"][k] = float(saved["objective"][k])
+    if isinstance(saved.get("intrinsic_reward"), dict):
+        for k in REWARD_AXES:
+            if k in saved["intrinsic_reward"]:
+                base["intrinsic_reward"][k] = clamp01(saved["intrinsic_reward"][k],
+                                                      base["intrinsic_reward"][k])
+    if isinstance(saved.get("traits_signature"), dict):
+        base["traits_signature"] = dict(saved["traits_signature"])
+    return base
+
+
+def summarize_experience(entries):
+    """Roll up decision-log entries (list of dicts) into the counts the heuristic reads.
+    Tolerant of partial/foreign entries — anything unparseable is skipped.
+
+    Counts: how often the robot recently looked/observed and whether it 'landed' (spoke or
+    used a cached line), and the up/down human reward tally (logged by web_control)."""
+    s = {"observe": 0, "observe_ok": 0, "reward_up": 0, "reward_down": 0, "n": 0}
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        s["n"] += 1
+        trig = str(e.get("trigger", ""))
+        status = str(e.get("status", ""))
+        if trig in ("beat:pursuing", "beat:looking", "look", "observe", "beat:musing"):
+            s["observe"] += 1
+            if status in ("spoke", "bank"):
+                s["observe_ok"] += 1
+        elif trig == "reward":
+            if status == "up":
+                s["reward_up"] += 1
+            elif status == "down":
+                s["reward_down"] += 1
+    return s
+
+
+def reflect_purpose(purpose, experience, traits, alpha=0.15, now=None):
+    """Pure, deterministic heuristic. Returns (new_purpose, changed).
+
+    Eases the intrinsic-reward weights toward targets derived from recent experience and
+    personality, using the same exponential smoothing the presence chart uses for traits, so
+    the robot's "values" drift gently rather than jumping. Narrative-only."""
+    now = time.time() if now is None else now
+    new = copy.deepcopy(purpose)
+    rew = new["intrinsic_reward"]
+    targets = {}
+
+    # Sparse looking -> want MORE curiosity (go explore the room a bit more).
+    if experience.get("observe", 0) < 3:
+        targets["curiosity"] = max(rew.get("curiosity", 0.5), 0.7)
+
+    # Human reward shapes the drive the current objective serves (its "primary" axis).
+    up, down = experience.get("reward_up", 0), experience.get("reward_down", 0)
+    if up or down:
+        net = (up - down) / float(up + down)               # -1..1
+        prim = OBJECTIVES.get(new["objective"]["id"], {}).get("primary", "curiosity")
+        targets[prim] = clamp01(rew.get(prim, 0.5) + 0.3 * net)
+
+    # Personality colours rest: a more cautious robot values rest/quiet a little more.
+    targets["rest"] = clamp01(0.25 + 0.4 * traits.get("caution", 0.5))
+
+    changed = False
+    for k, tgt in targets.items():
+        old = rew.get(k, 0.5)
+        nv = round((1 - alpha) * old + alpha * clamp01(tgt), 4)
+        if abs(nv - old) > 1e-4:
+            rew[k] = nv
+            changed = True
+
+    sig = {k: round(clamp01(traits.get(k, 0.5)), 3) for k in ("curiosity", "caution")}
+    if sig != new.get("traits_signature"):
+        new["traits_signature"] = sig
+        changed = True
+    return new, changed
+
+
+# =============================================================================
+# Horizon Planner + online A/B bandit — the "strategy" layer (was planner.py).
+# Turns the Purpose Engine's objective into a small task queue, verifies each task's
+# preconditions against the world before narrating it (a light "predictive shadow" — no physics
+# sim, since this layer is narrative-only), and runs a local epsilon-greedy bandit that A/B-tests
+# *how* a task is narrated and learns from human reward. Deterministic (rng + clock injected).
+# =============================================================================
+
+# objective id -> ordered sub-tasks (the DAG; a flat list for the first slice).
+RECIPES = {
+    "get_acquainted": ["observe_surroundings"],
+}
+
+# task id -> how it's narrated (which beat / whether it wants the camera / a phrase to slot
+# into the prompt) + its precondition: a pure predicate over a world-state dict.
+TASKS = {
+    "observe_surroundings": {
+        "beat": "pursuing",
+        "camera": True,
+        "text": "look around and notice what's in the space",
+        # Don't narrate "seeing the room" while being carried, or with stale sensors.
+        "precond": lambda w: (not w.get("picked")) and bool(w.get("sensors_fresh", True)),
+    },
+}
+
+# A/B experiments. Each binds a task to a set of narration variants the bandit chooses among.
+# First experiment: terse vs playful phrasing of the observe line.
+DEFAULT_EXPERIMENTS = {
+    "pursuing_style": {
+        "task": "observe_surroundings",
+        "variants": {
+            "terse":   {"style_hint": "Keep it to a few plain, matter-of-fact words."},
+            "playful": {"style_hint": "Be playful and openly curious about it."},
+        },
+    },
+}
+
+
+def decompose(objective_id):
+    """Objective -> ordered task ids (the strategy layer's plan)."""
+    return list(RECIPES.get(objective_id, []))
+
+
+def verify(task_id, world):
+    """The 'predictive shadow': can this task be narrated right now? Returns (ok, reason)."""
+    t = TASKS.get(task_id)
+    if t is None:
+        return False, "unknown-task"
+    try:
+        ok = bool(t["precond"](world))
+    except Exception as exc:                       # a bad predicate must never crash the brain
+        return False, "precond-error:%s" % (exc,)
+    return (ok, "" if ok else "precondition-not-met")
+
+
+class Bandit:
+    """Epsilon-greedy multi-armed bandit over named experiments. Reward is in [-1, 1];
+    each arm tracks a running mean. State is plain JSON (persist/restore friendly)."""
+
+    def __init__(self, experiments=None, state=None, epsilon=0.2):
+        self.exp = copy.deepcopy(experiments or DEFAULT_EXPERIMENTS)
+        self.epsilon = float(epsilon)
+        # stats[exp_id][variant] = {"n": int, "mean": float}
+        self.stats = {eid: {v: {"n": 0, "mean": 0.0} for v in e["variants"]}
+                      for eid, e in self.exp.items()}
+        if isinstance(state, dict):
+            for eid, vs in (state.get("stats") or {}).items():
+                if eid in self.stats and isinstance(vs, dict):
+                    for v, st in vs.items():
+                        if v in self.stats[eid] and isinstance(st, dict):
+                            self.stats[eid][v] = {"n": int(st.get("n", 0)),
+                                                  "mean": float(st.get("mean", 0.0))}
+            if isinstance(state.get("epsilon"), (int, float)):
+                self.epsilon = float(state["epsilon"])
+
+    def assign(self, exp_id, rng):
+        """Pick a variant: explore (random) with prob epsilon, else exploit the best mean.
+        Ties broken deterministically (fewer trials, then name) so tests are stable."""
+        e = self.exp.get(exp_id)
+        if not e:
+            return None
+        variants = list(e["variants"])
+        if rng.random() < self.epsilon:
+            return rng.choice(variants)
+        st = self.stats[exp_id]
+        return max(variants, key=lambda v: (st[v]["mean"], -st[v]["n"], v))
+
+    def record(self, exp_id, variant, reward):
+        st = self.stats.get(exp_id, {}).get(variant)
+        if st is None:
+            return False
+        reward = max(-1.0, min(1.0, float(reward)))
+        st["n"] += 1
+        st["mean"] = round(st["mean"] + (reward - st["mean"]) / st["n"], 4)
+        return True
+
+    def winner(self, exp_id):
+        vs = self.stats.get(exp_id)
+        if not vs:
+            return None
+        return max(vs, key=lambda v: (vs[v]["mean"], vs[v]["n"], v))
+
+    def to_state(self):
+        return {"stats": copy.deepcopy(self.stats), "epsilon": self.epsilon}
+
+    def summary(self):
+        return {eid: {"variants": {v: dict(st) for v, st in vs.items()},
+                      "winner": self.winner(eid)}
+                for eid, vs in self.stats.items()}
+
+
+class Planner:
+    """The receding-horizon planner: holds the current objective's task queue + the bandit,
+    hands out the next verified task to narrate (rate-limited), and credits human reward back
+    to the A/B arm that produced the line."""
+
+    def __init__(self, objective_id="get_acquainted", experiments=None, state=None,
+                 epsilon=0.2, min_interval=120.0):
+        st = state or {}
+        self.objective = st.get("objective") or objective_id
+        self.bandit = Bandit(experiments, st.get("bandit"), epsilon=epsilon)
+        self.queue = list(st.get("queue") or decompose(self.objective))
+        self.min_interval = float(min_interval)
+        self._last_t = -1e9
+        self._i = 0
+        self.last_assignment = None        # {exp, variant, task} of the most recent narration
+
+    def set_objective(self, objective_id):
+        if objective_id and objective_id != self.objective:
+            self.objective = objective_id
+            self.queue = decompose(objective_id)
+            self._i = 0
+
+    def _exp_for(self, task_id):
+        for eid, e in self.bandit.exp.items():
+            if e.get("task") == task_id:
+                return eid
+        return None
+
+    def next_task(self, world, rng, now=0.0):
+        """Pick the next verified task to narrate, assign it an A/B variant, and return its
+        narration spec — or None when nothing's due (rate-limited) or eligible (no task
+        verifies). Tasks that fail verification are left in the queue (a real DAG would log +
+        reorder); the rotation still advances so a later cycle can try a different one."""
+        if not self.queue:
+            self.queue = decompose(self.objective)
+        if not self.queue or (now - self._last_t) < self.min_interval:
+            return None
+        n = len(self.queue)
+        for _ in range(n):
+            task_id = self.queue[self._i % n]
+            self._i += 1
+            ok, _reason = verify(task_id, world)
+            if not ok:
+                continue
+            self._last_t = now
+            t = TASKS[task_id]
+            exp_id = self._exp_for(task_id)
+            variant = self.bandit.assign(exp_id, rng) if exp_id else None
+            hint = ""
+            if variant is not None:
+                hint = self.bandit.exp[exp_id]["variants"][variant].get("style_hint", "")
+            self.last_assignment = {"exp": exp_id, "variant": variant, "task": task_id}
+            return {"task": task_id, "beat": t["beat"], "camera": bool(t["camera"]),
+                    "text": t["text"], "exp": exp_id, "variant": variant, "style_hint": hint}
+        return None
+
+    def on_reward(self, value, target=None):
+        """Credit a human reward to the A/B arm that produced the narrated line. `target`
+        (echoed from /task_current) pins the exact exp+variant; else use the last one."""
+        tgt = target if isinstance(target, dict) else self.last_assignment
+        if not tgt:
+            return False
+        return self.bandit.record(tgt.get("exp"), tgt.get("variant"), value)
+
+    def to_state(self):
+        return {"objective": self.objective, "queue": self.queue,
+                "bandit": self.bandit.to_state()}
+
+    def summary(self):
+        return {"objective": self.objective, "queue": self.queue,
+                "experiments": self.bandit.summary(), "last": self.last_assignment}
 
 
 def _state_path(explicit, default_name):
@@ -121,7 +449,7 @@ def load_personality(path, *, with_defaults=True, logger=None):
 class PurposeBrain:
     """The slow "identity / strategy" layer: owns the Purpose Engine state + the Horizon
     Planner, decides when an idle beat upgrades to a goal-pursuit or a skill, reflects on
-    experience, credits human reward to the A/B bandit, and consolidates while meditating.
+    experience, credits human reward to the A/B bandit, and consolidates while reflecting.
 
     Pure + deterministic (rng/clock injected). It never executes a beat — it only DECIDES
     (returns specs) and announces state through the injected publish adapters; the node turns
@@ -153,7 +481,7 @@ class PurposeBrain:
         self._publish_task = publish_task or (lambda _p: None)
         self._publish_experiments = publish_experiments or (lambda _s: None)
         # runtime state
-        self.meditating = False
+        self.reflecting = False
         self.task = {}                 # last pursued-task payload (the dev /task_current readout)
         self._body_beat_n = 0          # counts body (musing) beats, for the skill cadence
         self._reflect_last = 0.0       # monotonic of the last purpose reflection
@@ -178,13 +506,13 @@ class PurposeBrain:
     def world_state(self):
         """The light world snapshot the planner verifies a task against (narrative-only)."""
         return {"picked": bool(self._picked()), "sensors_fresh": True,
-                "meditating": self.meditating}
+                "reflecting": self.reflecting}
 
     # ---- beat upgrades (decisions; the node executes them) ------------------
     def next_pursuing(self, now):
         """If a goal-pursuit beat is due, return its narration spec (and announce the task +
-        moved A/B stats); else None. Eligible only while enabled and not meditating."""
-        if not (self.enable and self._planner is not None) or self.meditating:
+        moved A/B stats); else None. Eligible only while enabled and not reflecting."""
+        if not (self.enable and self._planner is not None) or self.reflecting:
             return None
         spec = self._planner.next_task(self.world_state(), self._rng, now=now)
         if spec is None:
@@ -197,8 +525,8 @@ class PurposeBrain:
 
     def take_skill_beat(self):
         """Advance the skill-beat cadence and report whether THIS body beat is a skill beat.
-        Only counts while skills are enabled and we're not meditating (matches the chart)."""
-        if not (self.skills_enable and not self.meditating):
+        Only counts while skills are enabled and we're not reflecting (matches the chart)."""
+        if not (self.skills_enable and not self.reflecting):
             return False
         self._body_beat_n += 1
         return self._body_beat_n % self._skill_every == 0
@@ -211,7 +539,7 @@ class PurposeBrain:
             prompt = prompt + " " + spec["style_hint"]
         return prompt
 
-    # ---- reflection / reward / meditation -----------------------------------
+    # ---- purpose reflection / reward / reflection mode ----------------------
     def run_reflection(self, traits=None, force=False):
         """Reflect on recent experience (the shared log) + traits -> drift the intrinsic-reward
         weights + keep the planner's objective in sync. Deterministic, local. Returns whether
@@ -241,13 +569,13 @@ class PurposeBrain:
             return True
         return False
 
-    def set_meditating(self, on, traits=None):
-        """Enter/leave meditation. On entry, consolidate the local brain (reflect on purpose +
+    def set_reflecting(self, on, traits=None):
+        """Enter/leave reflection. On entry, consolidate the local brain (reflect on purpose +
         finalize the A/B winners). Returns True iff the flag changed."""
         on = bool(on)
-        if on == self.meditating:
+        if on == self.reflecting:
             return False
-        self.meditating = on
+        self.reflecting = on
         if on:
             self.run_reflection(traits, force=True)
             self.finalize_experiments()
@@ -266,9 +594,9 @@ class PurposeBrain:
 
     def tick(self, now):
         """Slow loop (driven off the node's tick): reflect on the period (faster while
-        meditating) and republish the latched readouts on a heartbeat for late subscribers."""
+        reflecting) and republish the latched readouts on a heartbeat for late subscribers."""
         if self.enable and self._planner is not None:
-            period = 30.0 if self.meditating else self._reflect_period
+            period = 30.0 if self.reflecting else self._reflect_period
             if (now - self._reflect_last) >= period:
                 self._reflect_last = now
                 self.run_reflection()

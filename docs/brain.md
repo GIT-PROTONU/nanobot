@@ -176,10 +176,12 @@ can reach for a capability, but physics/safety always wins.
 Every invocation lands in the decision log as `skill:<name>`. `scripts/dev_webui.py` wires the
 same panel off-robot (narrative skills speak through your laptop; topic actions no-op, no ROS).
 
-## The workshop — Nano invents its own skills while meditating
+## The workshop — Nano invents its own skills in reflection mode
 
-Meditation isn't just a calm pause + consolidation; it's a **self-improvement loop** that can
-mint *new* capabilities. When you toggle meditation on, alongside the usual reflect/consolidate,
+Reflection mode (formerly "meditation") isn't just a calm pause + consolidation; it's a
+**self-improvement loop** that can mint *new* capabilities. When reflection turns on — via the web
+toggle, the `forge-skill` capability, or **automatically after a long idle** (the behaviour node
+publishes `/reflect_request`; see `reflect_auto_*`) — alongside the usual reflect/consolidate,
 `CognitionCore.run_skill_workshop()` runs a bounded **suggest → check → rehearse → trial → adopt**
 cycle (the pure pieces are in `web_control/skillsmith.py`, unit-tested offline):
 
