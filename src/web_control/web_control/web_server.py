@@ -581,6 +581,7 @@ class WebServerNode(Node):
         state = str(req.get("state") or "")
         prompt = str(req.get("prompt") or "")
         camera = bool(req.get("camera"))
+        audio = bool(req.get("audio"))
         if isinstance(req.get("traits"), dict):        # freshest personality snapshot
             self._cog.update_traits(req["traits"])
         trigger = "beat:" + beat
@@ -592,7 +593,7 @@ class WebServerNode(Node):
                              args=(state or "acting",), daemon=True).start()
             return
         threading.Thread(target=self._cog.run_beat,
-                         args=(trigger, state, prompt, camera), daemon=True).start()
+                         args=(trigger, state, prompt, camera, audio), daemon=True).start()
 
     # --- action-tier publish + lidar summary (the core's ROS-backed adapters) ----
     def _scan_summary(self):

@@ -60,23 +60,31 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     (`scripts/dev_webui.py`) — one base, not a robot/dev copy. Unit-tested offline in
     `test/test_brain.py` (+ `test_purpose.py`/`test_planner.py`, which now import from
     `behavior.brain`). See [[llm-openrouter-personality]].
-  - **The chart is also the single brain for autonomous LLM expression.** Its idle beats
-    are *predefined states with offline default faces*: `musing` (sensors) every idle
-    cycle, `looking` (camera) every `look_every`-th cycle (gated by `camera_beats`). On a
-    beat the node shows the default face immediately AND (if `enrich_enable`) fires a
-    **fire-and-forget** `/cognition/request` (JSON `{beat,state,prompt,camera}`) that
-    `web_control` executes asynchronously (LLM line + optional camera + mood). A
-    slow/absent LLM = a silent face-beat; the chart never waits. The per-beat convention
-    (default face + prompt + camera flag) is the `BEATS` table in `presence.py`; add a beat
-    = add a state calling `do_beat('name')` + a BEATS entry.
+  - **The chart is also the single brain for autonomous LLM expression — and the idle mix is
+    dynamic + self-learning.** Each idle cycle the chart enters ONE `performing` state that asks
+    the injected `pick_beat()` (pure `choose_beat` in `presence.py`) to choose a beat by a
+    **priority-weighted, novelty-aware, trait-gated lottery** over the *enabled* registry beats:
+    `musing` (sensors), `looking` (camera), `wondering` (a deep-question musing), `listening`
+    (reacts to the mic). Each beat's `priority` is its base weight and is **evolvable** (LLM
+    reflection nudges it), an optional `trait` scales the weight by a live personality axis, and
+    the most-recent beat is down-weighted (`HABITUATION`) so behaviour stays varied — so the
+    robot *learns* which beats to favour and the mix shifts with mood/reward. (`look_every` is
+    retired; the camera cadence is now `looking`'s learnable priority/trait.) On a beat the node
+    shows the default face immediately AND (if `enrich_enable`) fires a **fire-and-forget**
+    `/cognition/request` (JSON `{beat,state,prompt,camera,audio}`) that `web_control` executes
+    asynchronously (LLM line + optional camera/mic + mood). A slow/absent LLM = a silent
+    face-beat; the chart never waits. **Add a beat = one `BEATS` row + one `DEFAULT_REGISTRY`
+    row** (face/camera/audio/prompt + priority/needs/trait); no chart surgery.
   - **Skill beat (capability library).** Every `skill_every`-th body (`musing`) beat is
     upgraded — like `pursuing` — into a **`skill` beat** (`mood_node._deliver_skill_beat`,
     gated by `skills_enable`): a fire-and-forget `{beat:"skill",state:"acting"}` request that
     `web_control` executes by **picking a capability** from the skill library and performing
-    it. Goals (`pursuing`) take the musing slot first, then skills, else a plain musing beat.
-    See the skill-library note under `web_control` and [[skill-library]].
+    it. Goals (`pursuing`) take the `musing` slot first, then skills, else the chosen beat
+    (musing/looking/wondering/listening). See the skill-library note under `web_control` and
+    [[skill-library]].
   - **Parametric personality + evolution.** `traits` (curiosity/extraversion/caution/
-    playfulness, 0..1) + a `registry` (musing/looking priority/enable/gates) live as mutable
+    playfulness, 0..1) + a `registry` (per-beat priority/enable/needs/trait for
+    musing/looking/wondering/listening) live as mutable
     dicts in the Sismic context, seeded from `personality.json` (made by
     `scripts/personality_creator.py`, persisted as they drift). Guards read them (curiosity
     gates the camera beat; extraversion scales the idle cadence; registry can demote beats),

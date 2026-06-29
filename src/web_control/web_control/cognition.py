@@ -336,9 +336,11 @@ class CognitionCore:
                              camera=True, prelude=True)
 
     # ---- statechart beat executor (the chart's /cognition/request) ----------
-    def run_beat(self, trigger, state, prompt, camera):
-        """Execute one enrichable beat: capture a frame if asked (else try the cached phrase
-        bank for a body line), add the live sensors + personality, generate + express."""
+    def run_beat(self, trigger, state, prompt, camera, audio=False):
+        """Execute one enrichable beat: capture a frame if asked (else, for a non-audio body
+        beat, try the cached phrase bank), add the live sensors + personality (+ what the mic
+        hears for an `audio` beat), generate + express. An audio beat always goes live (the
+        cached bank isn't sound-aware)."""
         frame = None
         if camera:
             if not self.llm.can_call(image=True):       # don't spin up the camera if capped
@@ -348,10 +350,12 @@ class CognitionCore:
             if frame is None:
                 self.log_decision(trigger, state, camera, status="no-frame")
                 return
-        elif self.bank_say(trigger, state):             # frequent body beat -> cached line
+        elif not audio and self.bank_say(trigger, state):  # frequent body beat -> cached line
             return                                       # (free/instant/offline; no LLM call)
         full = (prompt + " Your current personality (0..1) is " + self.traits_phrase()
                 + ", and your body senses: " + self._sensor_snapshot())
+        if audio:
+            full += " Through your microphone you hear: " + self._audio_summary() + "."
         self.generate(full, image_jpeg=frame, trigger=trigger, state=state, camera=camera,
                       prelude=True)
 
@@ -770,12 +774,16 @@ class CognitionCore:
             system = (
                 "You are the slow, reflective mind of a small robot named Nano. You review "
                 "what just happened and gently adjust its personality so it grows over time. "
-                "Traits are 0..1: curiosity, extraversion, caution, playfulness. Output ONLY "
-                'compact JSON: {"traits": {<trait>: <new target 0..1>}, "registry": '
-                '{optional: {"musing"/"looking": {"priority":0..1,"enabled":bool}}}, '
-                '"note": "<one short reason>"}. Propose only SMALL, justified nudges to a few '
-                "traits (omit ones you would not change); the value is a TARGET that gets "
-                "smoothed over time. No prose outside the JSON.")
+                "Traits are 0..1: curiosity, extraversion, caution, playfulness. You may also "
+                "retune how often each idle behaviour fires by nudging its registry priority "
+                "(0..1 base weight) — the beats are: musing (react to its body/sensors), looking "
+                "(use the camera), wondering (a curious deep thought), listening (react to "
+                "sounds). Favour what recently earned reward / fit the moment, ease off what "
+                'fell flat. Output ONLY compact JSON: {"traits": {<trait>: <new target 0..1>}, '
+                '"registry": {optional: {"<beat>": {"priority":0..1,"enabled":bool}}}, '
+                '"note": "<one short reason>"}. Propose only SMALL, justified nudges (omit what '
+                "you would not change); each value is a TARGET that gets smoothed over time. No "
+                "prose outside the JSON.")
             selfctx = (f"\nWho you have become: {self.self_narrative}"
                        if self.self_narrative else "")
             user = (f"Current traits: {self.traits_phrase()}.{selfctx}\nRecent events:\n"

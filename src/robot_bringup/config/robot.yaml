@@ -191,14 +191,19 @@ behavior:
     motion_hold: 1.2          # s after the last motion still counted as "active"
     speak_timeout: 5.0        # s without an /oled_word before "not speaking" again
     # --- LLM enrichment of the idle beats (additive; the chart is the single brain) ---
-    # On an enrichable beat the node shows a predefined face immediately AND (if enabled)
-    # fires a fire-and-forget /cognition/request that web_control executes asynchronously
-    # (LLM line + optional camera + mood). Best-effort: a slow/absent LLM = silent face
-    # beat. web_control.llm_enabled is the real master switch (no spoken lines without it).
-    enrich_enable: true       # publish /cognition/request on the musing/looking beats
+    # Each idle cycle the chart picks ONE beat via a priority-weighted, novelty-aware lottery
+    # over the enabled registry beats — musing (sensors), looking (camera), wondering (a deep-
+    # question musing), listening (reacts to the mic). The per-beat weights (priority) live in
+    # personality.json's registry and are LEARNABLE (LLM reflection nudges them), so the idle
+    # mix drifts with the robot's mood/reward. On a beat the node shows a predefined face
+    # immediately AND (if enabled) fires a fire-and-forget /cognition/request that web_control
+    # executes asynchronously (LLM line + optional camera/mic + mood). Best-effort: a slow/absent
+    # LLM = a silent face beat. web_control.llm_enabled is the real master switch.
+    enrich_enable: true       # publish /cognition/request on the idle beats
     enrich_min_interval: 45.0 # s, per-beat rate-limit so a fast chart can't spam the API
     camera_beats: true        # allow the autonomous camera ("looking") beat at all
-    look_every: 4             # camera beat every Nth idle beat (>=1); sensor beats between
+    look_every: 4             # DEPRECATED (ignored): camera cadence is now the looking beat's
+                              # learnable priority/trait in the registry, not a fixed every-Nth
     # --- skill library: let the brain pick a capability (skills/*.md) on a beat ---
     # Every Nth body (musing) beat becomes a "skill" beat: web_control picks the most fitting
     # skill from the library and performs it. Goals (pursuing) take the slot first, then

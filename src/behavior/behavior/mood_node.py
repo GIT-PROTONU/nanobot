@@ -223,7 +223,8 @@ class MoodNode(Node):
                 camera_beats=self.camera_beats, look_every=self.look_every,
                 traits=self._personality.traits, registry=self._personality.registry,
                 alpha=float(g("smoothing_alpha").value), clock=self._clock,
-                reflect_face=self._reflect_face, greet_face=self._greet_face)
+                reflect_face=self._reflect_face, greet_face=self._greet_face,
+                rng=random.Random())          # the idle-beat lottery (priority-weighted)
             self._personality.attach(self._interp)
             self.get_logger().info(
                 f"behavior up: presence statechart (personality '{self._personality.name}', "
@@ -255,10 +256,11 @@ class MoodNode(Node):
         this beat isn't rate-limited — fires a fire-and-forget /cognition/request for
         web_control to enrich asynchronously (LLM line + camera + mood). Never blocks.
 
-        The idle `musing` beat is upgraded by the brain: to a `pursuing` beat when the Horizon
-        Planner has a verified task, else to a `skill` beat every Nth body beat — that's how the
-        Purpose/Planner/skill layers reach expression. Goals win the slot, then skills, else a
-        plain musing beat."""
+        The `musing` body beat (the chooser's highest-priority default) is upgraded by the
+        brain: to a `pursuing` beat when the Horizon Planner has a verified task, else to a
+        `skill` beat every Nth body beat — that's how the Purpose/Planner/skill layers reach
+        expression. Goals win the slot, then skills, else the plain beat (which may be any of
+        the chooser's picks: musing/looking/wondering/listening)."""
         beat = BEATS.get(name)
         if beat is None:
             return
@@ -275,7 +277,7 @@ class MoodNode(Node):
             return
         self._beat_last[name] = time.monotonic()
         req = {"beat": name, "state": name, "prompt": beat.prompt,
-               "camera": bool(beat.camera), "audio": False,
+               "camera": bool(beat.camera), "audio": bool(beat.audio),
                # carry the current personality so the executor can colour the line
                "traits": self._personality.live_traits()}
         self.cog_pub.publish(String(data=json.dumps(req)))

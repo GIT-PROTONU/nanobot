@@ -44,18 +44,25 @@ fires off an LLM request that may never come back — and nothing breaks either 
 
 ## The statechart: idle "beats"
 
-When Nano is genuinely idle (nobody driving it, no goal, no manual command), the chart
-cycles through states. The interesting two are *enrichable beats*:
+When Nano is genuinely idle (nobody driving it, no goal, no manual command), each idle cycle
+the chart enters one `performing` state and a **lottery** (`choose_beat`) picks ONE *enrichable
+beat* to fire:
 
-| Beat | Sense | Model used | When |
+| Beat | Sense | Model used | Gated on |
 |---|---|---|---|
-| `musing` | its own body (CPU, RAM, temp, IMU tilt, pick-up) | cheap text | every idle cycle |
-| `looking` | the camera | vision | every Nth cycle, **only if curious enough** |
+| `musing` | its own body (CPU, RAM, temp, IMU tilt, pick-up) | cheap text | — (always eligible) |
+| `looking` | the camera | vision | curiosity (+ `camera_beats`) |
+| `wondering` | a curious "deep question" about itself / the room | cheap text | curiosity |
+| `listening` | what the microphone hears | cheap text | extraversion |
 
-The cadence/gating knobs (`look_every`, `camera_beats`, idle timing) live in `robot.yaml`
-under `behavior:`. There are also **reflexes** — `greeting`, `resting`, `dormant`, and
-pick-up reactions. These are deterministic and **not under the brain's control** (see
-below).
+The lottery is **priority-weighted, novelty-aware, and trait-scaled**: each beat has a base
+`priority` in the registry, the weight is scaled up by a live personality trait, and the beat
+that just ran is down-weighted so behaviour stays varied. The priorities are **learnable** —
+LLM reflection nudges them (and the traits), so the idle mix drifts toward what earns reward.
+That makes idle behaviour dynamic and self-learning rather than a fixed cadence (the old
+`look_every` knob is retired). `camera_beats` + idle timing still live in `robot.yaml` under
+`behavior:`. There are also **reflexes** — `greeting`, `resting`, `dormant`, `reflecting`, and
+pick-up reactions. These are deterministic and **not under the brain's control** (see below).
 
 When the chart enters a beat, two things happen *independently*:
 
@@ -66,9 +73,9 @@ When the chart enters a beat, two things happen *independently*:
    moved on.
 
 That fire-and-forget split is the whole trick. The "feel alive" behaviour is guaranteed;
-the LLM cleverness is a bonus layered on top. To add a beat: add a state that calls
-`do_beat('name')` plus a `BEATS` entry (default face + prompt + camera flag) in
-`presence.py`.
+the LLM cleverness is a bonus layered on top. To add a beat: one `BEATS` row (default face +
+prompt + camera/audio flags) plus one `DEFAULT_REGISTRY` row (priority + optional needs/trait)
+in `presence.py` — the lottery picks it up automatically, no chart surgery.
 
 ## A single beat, end to end
 

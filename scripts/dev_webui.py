@@ -56,6 +56,7 @@ from web_control.cognition import CognitionCore              # noqa: E402
 # The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Horizon
 # Planner), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
 from behavior.brain import PurposeBrain                      # noqa: E402
+from behavior.presence import BEATS                          # noqa: E402  (beat table)
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
@@ -310,24 +311,26 @@ class DevState:
         like the robot's fire-and-forget request) so the chart never waits on the LLM.
 
         Goal-pursuit + skill upgrades are decided by the shared PurposeBrain (exactly as on the
-        robot): the idle musing beat becomes a `pursuing` beat when the planner has a verified
-        task, else a `skill` beat every Nth body beat. Reflection mode pauses all beats."""
+        robot): the `musing` body beat becomes a `pursuing` beat when the planner has a verified
+        task, else a `skill` beat every Nth body beat; otherwise the chosen beat
+        (musing/looking/wondering/listening) runs through the shared `run_beat` — the same path
+        web_server._on_cog uses, so the new beats' prompts + audio are exercised here too.
+        Reflection mode pauses all beats."""
         if self._brain.reflecting:
             print(f"\n[beat] {name} (paused — reflecting)", file=sys.stderr)
             return
         print(f"\n[beat] {name}", file=sys.stderr)
         spec = self._brain.next_pursuing(time.monotonic()) if name == "musing" else None
         skill_beat = name == "musing" and spec is None and self._brain.take_skill_beat()
+        beat = BEATS.get(name)
 
         def work():
             if spec is not None:
                 self._deliver_pursuing(spec)
             elif skill_beat:
                 self.cog.run_skill_beat("acting")       # let the brain pick a skill (shared core)
-            elif name == "looking":
-                self.cog.llm_look(trigger="beat:looking", state="looking")
-            else:
-                self.cog.llm_observe(trigger="beat:musing", state="musing")
+            elif beat is not None:
+                self.cog.run_beat("beat:" + name, name, beat.prompt, beat.camera, beat.audio)
         threading.Thread(target=work, daemon=True).start()
 
     def reflect(self, traits_dict):
