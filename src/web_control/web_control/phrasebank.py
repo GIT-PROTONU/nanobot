@@ -17,6 +17,12 @@ dev harness / a CLI. It leans on `LlmClient` only for the one-off pre-generation
     traits moved more than a threshold in total), `needs_regen()` is True and the caller
     re-runs `generate()` in the background — so the bank keeps sounding like who Nano has
     become, without regenerating on every tiny nudge.
+  * **Incremental growth**: separately from full regeneration, the bank *grows over time*.
+    `maybe_grow()` (rate-limited, called from the reflection / "learning" moment) asks the
+    LLM for a few BRAND-NEW lines for the most under-filled situation and *appends* the
+    non-duplicates (up to a per-category cap) — so the same offline-triggerable situations
+    keep gaining fresh variety the more Nano runs, without throwing away what it already has.
+    Growth only happens while the soul is stable (a drifted soul triggers a full regen first).
 
 The bank is a JSON file (default ~/.local/state/nanobot/phrases.json), shared by the robot
 (`web_server`) and the dev harness (`dev_webui.py`).
@@ -63,6 +69,12 @@ CATEGORIES = {
                   "Thinking, Wait) — said out loud the instant it starts working",
     "stumped":    "it tried to think of something to say but its mind came up blank this time, "
                   "and it shrugs the lost thought off lightly",
+    # --- camera peek: a SHORT line spoken the INSTANT before it points its camera and takes a
+    # snapshot, so it always announces that it's looking (never silently peeks). Said out loud
+    # the moment the camera is used, in parallel with the capture/vision call.
+    "peeking":    "it is about to point its camera and take a quick look at what is in front of "
+                  "it. Reply with ONE short spoken line announcing that it's taking a look (e.g. "
+                  "Let me see, Peeking now, Taking a look) — said out loud the instant it looks",
 }
 # Built-in last-resort lines for the lifecycle categories, used when the bank has no entry for
 # them yet (e.g. it was never generated because the LLM has never been online). Offline-safe.
@@ -86,6 +98,11 @@ FALLBACK_LINES = {
     "stumped":    [{"say": "Hmm, my mind went blank there.", "mood": "neutral"},
                    {"say": "I lost my train of thought.", "mood": "neutral"},
                    {"say": "Sorry, the words escaped me.", "mood": "neutral"}],
+    # The peek line must be SHORT (spoken in parallel with the capture, before the vision reply).
+    "peeking":    [{"say": "Let me take a look.", "mood": "focused"},
+                   {"say": "Peeking now...", "mood": "focused"},
+                   {"say": "Let me see...", "mood": "focused"},
+                   {"say": "Having a look around.", "mood": "focused"}],
 }
 # Lifecycle categories are picked by name, never by classify().
 LIFECYCLE_CATEGORIES = tuple(FALLBACK_LINES.keys())
@@ -146,6 +163,18 @@ def _fill(template, vars_):
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
+def soul_system(persona, traits, name="Nano"):
+    """The shared system prompt describing Nano's spoken voice + the placeholder contract.
+    Used by both full (re)generation and incremental growth so they share one voice."""
+    traitline = ", ".join(f"{k} {float((traits or {}).get(k, 0.5)):.2f}" for k in SIG_TRAITS)
+    return (
+        f"You write short spoken one-liners for a small mobile robot named {name}. "
+        f"{(persona + ' ') if persona else ''}Its personality on a 0..1 scale is: "
+        f"{traitline}. Lines are spoken aloud through a tiny speaker: brief and natural "
+        "to hear (at most ~20 words, no emoji, no markdown, no stage directions). "
+        + PLACEHOLDER_HELP)
+
+
 def signature(persona, traits):
     """A compact fingerprint of the 'soul' a bank was generated for: a hash of the persona
     text + the (rounded) trait vector. Drift is measured against the stored traits."""
@@ -190,6 +219,7 @@ class PhraseBank:
             cats = self._data.get("categories", {})
             return {"signature": self._data.get("signature"),
                     "generated_at": self._data.get("generated_at", 0),
+                    "grown_at": self._data.get("grown_at", 0),
                     "counts": {k: len(v) for k, v in cats.items()},
                     "total": sum(len(v) for v in cats.values())}
 
@@ -267,13 +297,7 @@ class PhraseBank:
         if llm is None or not llm.available():
             self._log("phrasebank: LLM unavailable — cannot generate")
             return False
-        traitline = ", ".join(f"{k} {float((traits or {}).get(k, 0.5)):.2f}" for k in SIG_TRAITS)
-        system = (
-            f"You write short spoken one-liners for a small mobile robot named {name}. "
-            f"{(persona + ' ') if persona else ''}Its personality on a 0..1 scale is: "
-            f"{traitline}. Lines are spoken aloud through a tiny speaker: brief and natural "
-            "to hear (at most ~20 words, no emoji, no markdown, no stage directions). "
-            + PLACEHOLDER_HELP)
+        system = soul_system(persona, traits, name)
         new_cats = {}
         for cat, desc in CATEGORIES.items():
             user = (
@@ -318,6 +342,103 @@ class PhraseBank:
             try:
                 self._log("phrasebank: soul drifted / empty — regenerating…")
                 self.generate(llm, persona, traits, name=name, per_category=per_category)
+            finally:
+                self._regen_busy = False
+        if background:
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            work()
+        return True
+
+    # ---- incremental growth -------------------------------------------------
+    @staticmethod
+    def _norm(text):
+        """Normalise a line for duplicate detection: lowercase, collapse whitespace, drop
+        edge punctuation. Two lines that differ only in casing / trailing '.' are 'the same'."""
+        return re.sub(r"\s+", " ", str(text or "").strip().lower()).strip(" .!?,")
+
+    def grow(self, llm, persona, traits, name="Nano", batch=3, max_per_category=24,
+             categories=None):
+        """Incrementally ADD new, distinct lines to the most under-filled offline category,
+        growing the bank over time instead of regenerating it wholesale. Picks the category
+        with the fewest lines still below `max_per_category`, asks the LLM for `batch` fresh
+        lines that AVOID the ones already cached (passed in the prompt), and appends the
+        non-duplicates (capped). Returns (category, n_added) or None (LLM down / every
+        category full / nothing usable). Best-effort: leaves the bank intact on failure, but
+        always stamps `grown_at` so a failing/idle attempt doesn't hammer the LLM."""
+        if llm is None or not llm.available():
+            return None
+        cats_src = list(categories) if categories else list(CATEGORIES.keys())
+        with self._lock:
+            existing = self._data.get("categories", {}) or {}
+            below = [(len(existing.get(c) or []), i, c) for i, c in enumerate(cats_src)
+                     if len(existing.get(c) or []) < max_per_category]
+            if not below:
+                return None
+            below.sort()                                  # fewest lines first; ties -> reg. order
+            cat = below[0][2]
+            have = [str(e.get("say", "")) for e in (existing.get(cat) or [])]
+        desc = CATEGORIES.get(cat, cat)
+        system = soul_system(persona, traits, name)
+        avoid = "\n".join(f"- {h}" for h in have[-12:])   # show the most recent to steer away
+        user = (
+            f"Situation: {desc}.\n"
+            + (f"{name} already says these lines here — do NOT repeat or lightly reword "
+               f"them:\n{avoid}\n\n" if avoid else "")
+            + f"Write {batch} BRAND-NEW in-character spoken lines for this SAME situation, "
+            "each clearly different from any above (fresh wording and a fresh angle). For "
+            "each, pick a mood (face) from exactly: " + ", ".join(MOODS) + ". Reply with "
+            'ONLY compact JSON: {"lines": [{"say": "...", "mood": "..."}, ...]}.')
+        lines = []
+        for _ in range(3):                                # free models are flaky / return []
+            raw = llm.complete(system, user, smart=True, json_object=True)
+            lines = self._parse_lines(raw)
+            if lines:
+                break
+            time.sleep(1.5)
+        added = 0
+        with self._lock:
+            cats = dict(self._data.get("categories", {}))
+            pool = list(cats.get(cat) or [])
+            seen = {self._norm(e.get("say", "")) for e in pool}
+            for ln in lines:
+                if len(pool) >= max_per_category:
+                    break
+                key = self._norm(ln.get("say", ""))
+                if not key or key in seen:                # skip blanks + duplicates
+                    continue
+                seen.add(key)
+                pool.append(ln)
+                added += 1
+            if added:
+                cats[cat] = pool
+                self._data["categories"] = cats
+            self._data["grown_at"] = int(time.time())     # always stamp -> period gate resets
+            self._save()
+        if added:
+            self._log(f"phrasebank: grew {cat} +{added} ({len(pool)}/{max_per_category})")
+        return (cat, added) if added else None
+
+    def maybe_grow(self, llm, persona, traits, name="Nano", period=1800.0, batch=3,
+                   max_per_category=24, drift_threshold=0.6, background=True):
+        """Grow the bank by one category at most once per `period` seconds. No-op if a
+        regen/grow is already running, the soul has drifted (a full regen should run first so
+        we don't accrete old-voice lines), or the period hasn't elapsed since the last grow /
+        generation. Runs in a daemon thread when background=True. One growth at a time."""
+        if self._regen_busy:
+            return False
+        if self.needs_regen(persona, traits, drift_threshold):
+            return False
+        with self._lock:
+            last = float(self._data.get("grown_at") or self._data.get("generated_at") or 0)
+        if (time.time() - last) < float(period):
+            return False
+
+        def work():
+            self._regen_busy = True
+            try:
+                self.grow(llm, persona, traits, name=name, batch=batch,
+                          max_per_category=max_per_category)
             finally:
                 self._regen_busy = False
         if background:

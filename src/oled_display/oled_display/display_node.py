@@ -84,7 +84,7 @@ LDS_TIMEOUT_S = 3.0    # /lds_hz a few Hz
 
 BLINK_DUR = 0.16       # seconds for one eyelid close+open
 # "sleepy" = the AI-offline mood: closed/content eyes + a slow rising "z z z" (see _sleepy).
-KNOWN_MOODS = ("happy", "angry", "focused", "stress", "sleepy")
+KNOWN_MOODS = ("happy", "angry", "focused", "stress", "sleepy", "looking")
 
 # Eye geometry, sized to fill a 128x64 panel. The inner gap is 2*(EYE_DX-EYE_W);
 # EYE_DX=37 / EYE_W=20 → a 34 px gap between the eyes with ~7 px edge margins, so
@@ -453,7 +453,8 @@ class DisplayNode(Node):
             else:
                 self._gtx = random.uniform(-3.0, 3.0)
                 self._gty = random.uniform(-3.0, 3.0)
-            lo, hi = (0.6, 1.8) if self.face_mood == "focused" else (1.0, 3.0)
+            # "focused" + "looking" both scan actively, so they retarget the gaze fastest.
+            lo, hi = (0.6, 1.8) if self.face_mood in ("focused", "looking") else (1.0, 3.0)
             self._next_gaze = now + random.uniform(lo, hi)
 
         # Happy: a recurring crescent "smile" beat keeps it lively between glances.
@@ -517,6 +518,17 @@ class DisplayNode(Node):
         eh = max(3, int(EYE_H * 0.6 * self._open))
         draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
         self._pupil(draw, cx, cy, eh, px, py, 5, max(2, eh - 3))
+
+    def _looking_eye(self, draw, cx, cy, px, py):
+        """Looking / 'peeking' eye: a wide, alert round white with a dark pupil that darts
+        actively to the sides — the searching, taking-a-look expression shown while the camera
+        is in use. Distinct from `focused` (which squints) — here the eyes are wide open."""
+        if self._open < 0.25:
+            draw.line((cx - EYE_W, cy, cx + EYE_W, cy), fill=255)
+            return
+        eh = max(2, int(EYE_H * self._open))
+        draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
+        self._pupil(draw, cx, cy, eh, px, py, 6, 8)
 
     def _sleepy(self, draw, zc):
         """Sleepy / 'AI offline' face: two closed, content eyes (downward arcs) and a slow
@@ -594,6 +606,9 @@ class DisplayNode(Node):
             elif self.face_mood == "focused":
                 self._focused_eye(draw, lcx, cy, px, py)
                 self._focused_eye(draw, rcx, cy, px, py)
+            elif self.face_mood == "looking":
+                self._looking_eye(draw, lcx, cy, px, py)
+                self._looking_eye(draw, rcx, cy, px, py)
             else:                                  # happy
                 self._happy_eye(draw, lcx, cy, px, py, smiling)
                 self._happy_eye(draw, rcx, cy, px, py, smiling)

@@ -112,7 +112,7 @@ class LlmClient:
                  persona="", timeout=30.0, max_tokens=1024, vision_model=None,
                  smart_model=None, free_model=None, free_smart_model=None,
                  vision_fallback_model=None, smart_max_per_hour=0, vision_max_per_hour=0,
-                 logger=None):
+                 hard_deadline=45.0, logger=None):
         # Env wins when the explicit key is blank, so the secret can stay out of the
         # (version-controlled) robot.yaml entirely.
         self._key = (api_key or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
@@ -135,6 +135,13 @@ class LlmClient:
         # empty until the first consolidation. Long-term identity drift, vs the volatile traits.
         self._self_note = ""
         self._timeout = float(timeout) if timeout else 20.0
+        # HARD wall-clock cap on a single call. urlopen's `timeout` is only a per-socket-operation
+        # timeout, so a gateway that trickles keep-alive bytes (OpenRouter's free tier does this
+        # while a model is queued) never trips it and a call can hang for ~2 min — holding the
+        # caller's one-at-a-time guard and starving every other beat. A watchdog abandons the call
+        # past this deadline. Kept comfortably above the slowest real reflection (~25 s).
+        self._hard_deadline = max(float(hard_deadline) if hard_deadline else 45.0,
+                                  self._timeout + 5.0)
         self._max_tokens = int(max_tokens) if max_tokens else 160
         self._log = logger or (lambda *_: None)
         # Hourly caps on the *expensive* tiers so autonomous beats/reflection can't run up
@@ -397,20 +404,37 @@ class LlmClient:
             "HTTP-Referer": "https://github.com/nanobot",
             "X-Title": "Nano robot",
         })
-        try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:200] if hasattr(exc, "read") else ""
-            kind = "ratelimit" if (exc.code in (429, 402) or self._looks_ratelimited(detail)) else "other"
-            self._log(f"llm: HTTP {exc.code} ({model}) {detail}")
+        # Run the blocking request on a worker thread and enforce a HARD wall-clock deadline on
+        # top of the per-socket timeout (see _hard_deadline). If the deadline passes we abandon
+        # the call (return "other"); the orphan thread dies on its own when its socket read
+        # finally times out, and it touches only local `result`, so it can't corrupt anything.
+        result = {}
+
+        def _do_request():
+            try:
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    result["data"] = json.loads(resp.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as exc:
+                result["http"] = (exc.code, exc.read().decode("utf-8", "replace")[:200]
+                                  if hasattr(exc, "read") else "")
+            except Exception as exc:                    # URLError / TimeoutError / OSError / parse
+                result["err"] = exc
+
+        worker = threading.Thread(target=_do_request, daemon=True)
+        worker.start()
+        worker.join(self._hard_deadline)
+        if worker.is_alive():
+            self._log(f"llm: hard deadline {self._hard_deadline:.0f}s exceeded ({model}) — abandoned")
+            return None, "other"
+        if "http" in result:
+            code, detail = result["http"]
+            kind = "ratelimit" if (code in (429, 402) or self._looks_ratelimited(detail)) else "other"
+            self._log(f"llm: HTTP {code} ({model}) {detail}")
             return None, kind
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            self._log(f"llm: request failed ({model}: {exc})")     # offline / DNS / timeout
+        if "err" in result:
+            self._log(f"llm: request failed ({model}: {result['err']})")  # offline / DNS / timeout
             return None, "other"
-        except Exception as exc:
-            self._log(f"llm: unexpected error ({model}: {exc})")
-            return None, "other"
+        data = result.get("data")
         # OpenRouter sometimes returns HTTP 200 with an error object (esp. for free models).
         if isinstance(data, dict) and data.get("error"):
             err = data["error"] if isinstance(data["error"], dict) else {"message": data["error"]}

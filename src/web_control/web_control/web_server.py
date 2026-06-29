@@ -111,7 +111,8 @@ class WebServerNode(Node):
         self.declare_parameter("llm_persona", "")          # FALLBACK persona (when no personality.json)
         self.declare_parameter("personality_path", "")     # "" -> ~/.local/state/nanobot/personality.json
         self.declare_parameter("llm_face_hold", 10.0)      # s to hold an LLM mood (0=keep)
-        self.declare_parameter("llm_timeout", 20.0)        # s HTTP timeout per call
+        self.declare_parameter("llm_timeout", 20.0)        # s HTTP timeout per call (per-socket-op)
+        self.declare_parameter("llm_hard_deadline", 45.0)  # s HARD wall-clock cap per call (anti-hang)
         self.declare_parameter("llm_max_tokens", 160)      # cap reply length
         self.declare_parameter("llm_smart_max_per_hour", 15)   # hourly cap on pro/smart text (0=off)
         self.declare_parameter("llm_vision_max_per_hour", 10)  # hourly cap on camera/vision (0=off)
@@ -122,6 +123,10 @@ class WebServerNode(Node):
         self.declare_parameter("phrasebank_live_ratio", 0.2)   # P(use live LLM anyway for variety)
         self.declare_parameter("phrasebank_drift", 0.6)        # trait drift that triggers regen
         self.declare_parameter("phrasebank_per_category", 6)   # lines generated per situation
+        self.declare_parameter("phrasebank_grow_enable", True)    # add fresh offline lines over time
+        self.declare_parameter("phrasebank_grow_period", 1800.0)  # min seconds between growth attempts
+        self.declare_parameter("phrasebank_grow_max", 24)         # per-category cap growth fills to
+        self.declare_parameter("phrasebank_grow_batch", 3)        # new lines requested per growth call
         self.declare_parameter("llm_settings_path", "")    # "" -> XDG state dir
         self.declare_parameter("cognition_log_path", "")   # decision log; "" -> XDG state dir
         self.declare_parameter("reflect_enable", True)     # slow personality reflection
@@ -129,7 +134,16 @@ class WebServerNode(Node):
         self.declare_parameter("self_model_enable", True)  # durable smart-LLM self-narrative
         self.declare_parameter("self_model_path", "")      # "" -> XDG state dir
         self.declare_parameter("consolidate_every", 6)     # rewrite the self-narrative every Nth reflect
+        # Trait trajectory: durable (timestamp, traits) snapshots so reflection/consolidation can
+        # reason about HOW the personality has drifted, not just the latest events.
+        self.declare_parameter("trait_history_enable", True)
+        self.declare_parameter("trait_history_path", "")      # "" -> XDG state dir
+        self.declare_parameter("trait_history_period", 3600.0)  # min s between snapshots
+        self.declare_parameter("trait_history_max", 336)        # snapshots kept (>=8)
+        self.declare_parameter("trait_history_window", 604800.0)  # s trend looks back over (7d)
         self.declare_parameter("prelude_enable", True)     # instant "thinking" filler + "stumped" on fail
+        self.declare_parameter("camera_announce", True)    # ALWAYS speak a "peeking" line before any camera use
+        self.declare_parameter("camera_face", "looking")   # OLED face shown during the peek ("" = none)
         # Skill library: a portable, self-documenting capability catalogue (skills/*.md).
         # The brain can pick one on a `skill` beat + the web UI can invoke any of them. The
         # gated action tier (topic-publishing skills) is OFF unless skills_allow_actions is on.
@@ -223,6 +237,7 @@ class WebServerNode(Node):
             smart_max_per_hour=int(g("llm_smart_max_per_hour").value),
             vision_max_per_hour=int(g("llm_vision_max_per_hour").value),
             timeout=float(g("llm_timeout").value), max_tokens=int(g("llm_max_tokens").value),
+            hard_deadline=float(g("llm_hard_deadline").value),
             logger=self.get_logger().info)
         # Gated action-tier publishers — only created when actions are permitted, so
         # web_control doesn't appear as a /cmd_vel talker etc. while the tier is off.
@@ -251,6 +266,10 @@ class WebServerNode(Node):
             bank_live_ratio=float(g("phrasebank_live_ratio").value),
             bank_drift=float(g("phrasebank_drift").value),
             bank_per_category=int(g("phrasebank_per_category").value),
+            bank_grow_enable=bool(g("phrasebank_grow_enable").value),
+            bank_grow_period=float(g("phrasebank_grow_period").value),
+            bank_grow_max=int(g("phrasebank_grow_max").value),
+            bank_grow_batch=int(g("phrasebank_grow_batch").value),
             skills_dir=resolve_skills_dir(g("skills_dir").value,
                                           get_package_share_directory("web_control")),
             skills_enable=bool(g("skills_enable").value),
@@ -258,7 +277,14 @@ class WebServerNode(Node):
             self_model_enable=bool(g("self_model_enable").value),
             self_model_path=(g("self_model_path").value or None),
             consolidate_every=int(g("consolidate_every").value),
+            trait_history_enable=bool(g("trait_history_enable").value),
+            trait_history_path=(g("trait_history_path").value or None),
+            trait_history_period=float(g("trait_history_period").value),
+            trait_history_max=int(g("trait_history_max").value),
+            trait_history_window=float(g("trait_history_window").value),
             prelude_enable=bool(g("prelude_enable").value),
+            camera_announce=bool(g("camera_announce").value),
+            camera_face=str(g("camera_face").value or ""),
             workshop_enable=bool(g("workshop_enable").value),
             workshop_dir=(g("workshop_dir").value or ""),
             workshop_path=(g("workshop_path").value or None),
@@ -543,7 +569,8 @@ class WebServerNode(Node):
         self._reflect_pub.publish(Bool(data=on))
         if on:
             self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
-            self._cog.bank_regen_check()           # refresh the phrase bank (background)
+            self._cog.bank_regen_check()           # refresh the phrase bank if the soul drifted
+            self._cog.bank_grow_check()            # else grow it: add fresh offline lines (background)
             threading.Thread(target=self._cog.consolidate, daemon=True).start()  # long-term self
             # The skill workshop: mine experience -> mint/adapt a skill on trial (off-thread,
             # it makes several LLM calls). Sweeps the adopt/retire gate when it finishes.
@@ -740,7 +767,8 @@ class WebServerNode(Node):
             self._reflect_busy = False
         if res:
             self._evolve_pub.publish(String(data=json.dumps(
-                {"traits": res["traits"], "registry": res["registry"]})))
+                {"traits": res["traits"], "registry": res["registry"],
+                 "drives": res.get("drives", {})})))
 
     # --- sensor snapshot (the core's ROS-backed adapters) --------------------
     def _on_imu_web(self, msg: Vector3Stamped):     # x=|accel| m/s^2, y=|gyro| rad/s

@@ -69,6 +69,27 @@ def test_workshop_meta_kind(tmp_path):
     assert "forge" in {s["name"] for s in lib.as_list()}
 
 
+def test_phrases_meta_kind(tmp_path):
+    d = str(tmp_path)
+    _write(d, "grow-phrases.md", """\
+        ---
+        name: grow-phrases
+        description: grow my phrase bank
+        action: {kind: phrases}
+        ---
+        # Grow phrases
+        add fresh lines
+    """)
+    lib = SkillLibrary(d)
+    sk = lib.get("grow-phrases")
+    assert sk is not None and sk.kind == "phrases"
+    assert sk.is_meta is True and sk.is_action is False
+    assert sk.enabled is True                      # meta skills are always enabled (not gated)
+    # Like the workshop, excluded from autonomous picks but still manually invokable / listed.
+    assert "grow-phrases" not in {s.name for s in lib.offered(allow_actions=True)}
+    assert "grow-phrases" in {s["name"] for s in lib.as_list()}
+
+
 def test_slug_normalisation():
     assert _slug("Read LiDAR") == "read-lidar"
     assert _slug("say_hello") == "say-hello"

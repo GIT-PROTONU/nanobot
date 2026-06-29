@@ -163,6 +163,8 @@ class DevState:
             vision_fallback_model=cfg.get("llm_vision_fallback_model", ""),
             smart_max_per_hour=int(cfg.get("llm_smart_max_per_hour", 15)),
             vision_max_per_hour=int(cfg.get("llm_vision_max_per_hour", 10)),
+            timeout=float(cfg.get("llm_timeout", 20.0)),
+            hard_deadline=float(cfg.get("llm_hard_deadline", 45.0)),
             logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
         # The SAME cognition core the robot runs (web_control.cognition) — one base to
         # maintain. We give it dev adapters: face -> print, camera -> webcam, sensors ->
@@ -185,13 +187,24 @@ class DevState:
             bank_live_ratio=float(cfg.get("phrasebank_live_ratio", 0.2)),
             bank_drift=float(cfg.get("phrasebank_drift", 0.6)),
             bank_per_category=int(cfg.get("phrasebank_per_category", 6)),
+            bank_grow_enable=bool(cfg.get("phrasebank_grow_enable", True)),
+            bank_grow_period=float(cfg.get("phrasebank_grow_period", 1800.0)),
+            bank_grow_max=int(cfg.get("phrasebank_grow_max", 24)),
+            bank_grow_batch=int(cfg.get("phrasebank_grow_batch", 3)),
             skills_dir=resolve_skills_dir(cfg.get("skills_dir", "")),
             skills_enable=bool(cfg.get("skills_enable", True)),
             skills_allow_actions=bool(cfg.get("skills_allow_actions", False)),
             self_model_enable=bool(cfg.get("self_model_enable", True)),
             self_model_path=(cfg.get("self_model_path") or "").strip() or _dev_state("self_model.json"),
             consolidate_every=int(cfg.get("consolidate_every", 6)),
+            trait_history_enable=bool(cfg.get("trait_history_enable", True)),
+            trait_history_path=(cfg.get("trait_history_path") or "").strip() or _dev_state("trait_history.json"),
+            trait_history_period=float(cfg.get("trait_history_period", 3600.0)),
+            trait_history_max=int(cfg.get("trait_history_max", 336)),
+            trait_history_window=float(cfg.get("trait_history_window", 604800.0)),
             prelude_enable=bool(cfg.get("prelude_enable", True)),
+            camera_announce=bool(cfg.get("camera_announce", True)),
+            camera_face=str(cfg.get("camera_face", "looking")),
             # The skill workshop mints/adapts skills into a project-local "learned" dir so you
             # can see them in the repo (deploy carries devstate/ to the board, like the soul).
             workshop_enable=bool(cfg.get("workshop_enable", True)),
@@ -341,8 +354,9 @@ class DevState:
         res = self.cog.reflect()                         # prompt/parse/log all in the shared core
         if res:
             with self._lock_pe:
-                self._pending_evolve = (res["traits"], res["registry"])
-            print(f"\n[reflect] {res.get('note','')} -> {res['traits']}", file=sys.stderr)
+                self._pending_evolve = (res["traits"], res["registry"], res.get("drives", {}))
+            print(f"\n[reflect] {res.get('note','')} -> {res['traits']} "
+                  f"{res.get('drives') or ''}", file=sys.stderr)
 
     def take_evolve(self):
         with self._lock_pe:
@@ -407,6 +421,7 @@ class DevState:
         self._brain.set_reflecting(on)                  # flag + (on entry) reflect + A/B finalize
         if on:
             self.cog.bank_regen_check()
+            self.cog.bank_grow_check()                  # grow the bank: add fresh offline lines
             threading.Thread(target=self.cog.consolidate, daemon=True).start()  # long-term self
             threading.Thread(target=self.cog.run_skill_workshop, daemon=True).start()  # mint a skill
         self.cog.log_decision("reflect_mode", status=("on" if on else "off"))
@@ -454,6 +469,9 @@ def run_behavior(state, idle_secs, reflect_secs):
         greet_secs=1.0, idle_secs=idle_secs, perform_secs=4.0,
         camera_beats=camera_beats, look_every=look_every,
         traits=state.personality.get("traits"), registry=state.personality.get("registry"),
+        drives=state.personality.get("drives"),
+        attend_secs=float(b.get("attend_secs", 2.0)), feel_secs=float(b.get("feel_secs", 2.5)),
+        attend_face=str(b.get("attend_face", "looking")),
         alpha=float(b.get("smoothing_alpha", 0.1)), clock=clock)
     print(f"[behavior] statechart running — idle_secs={idle_secs}, camera_beats="
           f"{camera_beats}, look_every={look_every}, reflect_secs={reflect_secs}. "
@@ -483,8 +501,10 @@ def run_behavior(state, idle_secs, reflect_secs):
             state._brain.run_reflection()
         ev = state.take_evolve()               # apply reflection drift (queued single-threaded)
         if ev:
-            interp.queue(Event("evolve", traits=ev[0], registry=ev[1]))
-            print(f"[behavior] traits now {dict(interp.context['traits'])}", file=sys.stderr)
+            interp.queue(Event("evolve", traits=ev[0], registry=ev[1],
+                               drives=(ev[2] if len(ev) > 2 else {})))
+            print(f"[behavior] traits now {dict(interp.context['traits'])}; "
+                  f"drives {dict(interp.context['drives'])}", file=sys.stderr)
             state.cog.update_traits(dict(interp.context["traits"]))  # track soul for bank-regen
             state.cog.bank_regen_check()                     # refresh bank if it drifted too far
         try:

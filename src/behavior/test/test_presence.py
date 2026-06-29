@@ -24,7 +24,8 @@ pytest.importorskip("sismic")  # skip cleanly if sismic isn't installed
 from sismic.clock import SimulatedClock  # noqa: E402
 from sismic.model import Event  # noqa: E402
 from behavior.presence import (build_interpreter, choose_beat, BEATS,  # noqa: E402
-                               DEFAULT_TRAITS, DEFAULT_REGISTRY)
+                               DEFAULT_TRAITS, DEFAULT_REGISTRY, DEFAULT_DRIVES,
+                               drive_prob)
 
 GREET, IDLE, PERFORM = 1.0, 2.0, 1.0
 
@@ -233,3 +234,93 @@ def test_brain_lost_reverts_to_seeded_baseline():
     assert interp.context["traits"]["curiosity"] == 0.9  # back to the SEEDED baseline,
     assert interp.context["traits"]["caution"] == 0.2    # not the generic defaults
     assert interp.context["registry"]["looking"]["enabled"] is True
+
+
+# ---- LLM-steerable drives: energy / focus / introspection / mood ----
+
+def _build_drives(drives=None, attend_secs=0.5, feel_secs=0.5, traits=None, seed=0):
+    """A chart seeded with the new `drives`. Short attend/feel holds so cycles fit the stepper."""
+    faces, beats = [], []
+    clock = SimulatedClock()
+    interp, _ = build_interpreter(
+        faces.append, do_beat=beats.append, greet_secs=GREET, idle_secs=IDLE,
+        perform_secs=PERFORM, drives=drives, traits=traits, attend_secs=attend_secs,
+        feel_secs=feel_secs, clock=clock, rng=random.Random(seed))
+    return interp, clock, faces, beats
+
+
+def _advance(interp, clock, total, dt=0.25):
+    """Step the chart forward by `total` seconds in small increments (so the new sub-states,
+    whose holds are < a cycle, are actually entered/left)."""
+    end = clock.time + total
+    while clock.time < end:
+        clock.time = round(clock.time + dt, 6)
+        interp.execute()
+
+
+def test_drive_prob_is_off_at_or_below_half():
+    assert drive_prob(0.5, 0.6) == 0.0 and drive_prob(0.3, 0.6) == 0.0   # neutral / low = never
+    assert drive_prob(1.0, 0.6) == 0.6                                   # full = the ceiling
+    assert 0.0 < drive_prob(0.75, 0.6) < 0.6                             # halfway up = partway
+
+
+def test_default_drives_keep_classic_behaviour():
+    # At the 0.5 default every new state is OFF: no attending face, no feeling face, no bursts.
+    interp, clock, faces, beats = _build_drives({})
+    _step(interp, clock, GREET + 0.1)
+    _advance(interp, clock, 60)
+    assert "looking" not in faces                 # attend_face never shown (focus 0.5 = off)
+    assert set(faces) <= {"happy", ""}            # only greeting + dashboard faces
+    assert beats                                  # beats still fire normally
+
+
+def test_high_focus_perks_up_into_attending():
+    interp, clock, faces, beats = _build_drives({"focus": 1.0}, seed=1)
+    _step(interp, clock, GREET + 0.1)
+    _advance(interp, clock, 60)
+    assert "looking" in faces                     # the alert attend_face was shown
+    assert beats                                  # ...and a beat still follows the perk-up
+
+
+def test_mood_drives_the_feeling_face():
+    interp, clock, faces, beats = _build_drives({"mood": "stress"}, seed=0)
+    _step(interp, clock, GREET + 0.1)
+    _advance(interp, clock, 30)
+    assert "stress" in faces                      # the baseline mood is worn between beats
+
+
+def test_high_energy_chains_more_beats():
+    def n_beats(energy, seed):
+        interp, clock, _f, beats = _build_drives({"energy": energy}, seed=seed)
+        _step(interp, clock, GREET + 0.1)
+        _advance(interp, clock, 60)
+        return len(beats)
+    # High energy = faster cadence + energetic bursts -> strictly more beats than the neutral one.
+    assert n_beats(1.0, 3) > n_beats(0.5, 3)
+
+
+def test_evolve_smooths_drives_and_sets_mood():
+    interp, _clk, _f, _b = _build_drives({})                 # energy starts 0.5, alpha 0.1
+    interp.queue(Event("evolve", traits={}, registry={},
+                       drives={"energy": 1.0, "mood": "focused"}))
+    interp.execute()
+    assert abs(interp.context["drives"]["energy"] - 0.55) < 1e-6   # 0.5 -> 0.55 (smoothed)
+    assert interp.context["drives"]["mood"] == "focused"          # categorical: set directly
+
+
+def test_brain_lost_reverts_drives():
+    interp, _clk, _f, _b = _build_drives({})
+    interp.queue(Event("evolve", traits={}, registry={},
+                       drives={"energy": 1.0, "mood": "stress"}))
+    interp.execute()
+    interp.queue(Event("brain_lost"))
+    interp.execute()
+    assert interp.context["drives"]["energy"] == 0.5             # back to seed
+    assert interp.context["drives"]["mood"] == ""                # mood tint cleared too
+
+
+def test_invalid_mood_face_is_ignored():
+    interp, _clk, _f, _b = _build_drives({})
+    interp.queue(Event("evolve", traits={}, registry={}, drives={"mood": "ecstatic"}))
+    interp.execute()
+    assert interp.context["drives"]["mood"] == ""               # unknown face whitelisted out

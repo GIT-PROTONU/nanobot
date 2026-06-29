@@ -95,9 +95,28 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     from **fast rules** (pickup→caution, in mood_node) OR **slow LLM reflection**
     (`web_control`, pro model reads the decision log on `reflect_period` + on events →
     `/cognition/evolve`). A `brain_lost` heartbeat (`brain_timeout` with no evolve) reverts to
-    the **seeded baseline** (not generic defaults). Reflexes (`greeting`/`resting`/`dormant`/
+    the **seeded baseline** (not generic defaults). **INVARIANT: `brain_timeout` MUST stay well
+    above `reflect_period`** — it's a process-death failsafe, and if it's shorter than the gap
+    between reflections the chart reverts accumulated drift during normal quiet, so the robot can
+    never "become its own" (this bit us once: 90 < 600). Reflexes (`greeting`/`resting`/`dormant`/
     pickup) are NOT in the registry, so the brain can never disable them. See the
     llm-openrouter-personality memory.
+  - **LLM-steerable `drives` (new expressive axes + new chart states).** Beyond the 4 traits, a
+    third Sismic-context dict `drives` gives the LLM *more kinds* of influence (not just weights):
+    `energy`/`focus`/`introspection` (0..1) + a categorical `mood` face. They ride the **same
+    `evolve` event** as traits (same guardrails: clamped, smoothed by `smoothing_alpha`, reverted
+    on `brain_lost`, seeded from + persisted to `personality.json`) and are **expression-only**.
+    Each drives NEW chart structure: `energy`→idle cadence + an *energetic burst* (`performing`
+    self-loops to chain a 2nd beat); `focus`→a brief alert **`attending`** perk-up state before a
+    beat (`attend_face`/`attend_secs`); `mood`→a **`feeling`** state that wears the face between
+    beats (`feel_secs`); `introspection`→scales `reflect_auto_idle` in mood_node. **0.5 is the
+    neutral "off" point** (`drive_prob`): at default the new states never fire, so behaviour is
+    unchanged until the LLM pushes a drive >0.5. The post-beat / perk-up choice is decided ONCE on
+    state entry (where the rng is rolled) so the competing eventless guards stay mutually exclusive
+    (Sismic errors on simultaneously-enabled non-orthogonal transitions). `cognition.reflect` may
+    propose `drives`; `mood_node`/`dev_webui` carry them through evolve; `robot.yaml` has
+    `attend_face`/`attend_secs`/`feel_secs`. Regenerate the chart diagram with
+    `scripts/export_statechart_puml.py` (→ `docs/presence.puml`).
 - `sensor_hub` — **runs `imu_driver` + `sys_monitor` + `wheel_odometry` + `lds_driver_py`
   in ONE process** (one executor) to save ~100+ MB RAM on the 1 GB board. Same node
   names/topics/params/services — purely an packaging change. `stack.sh` launches this
@@ -261,6 +280,13 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     into the ring buffer on start, so it survives reboots. **Both `web_server` (robot) and
     `scripts/dev_webui.py` (dev) write the same file/format**, so history is shared. See the
     llm-openrouter-personality memory.
+  - **Trait trajectory** (`cognition.record_trait_snapshot`/`trait_trend_text`,
+    `trait_history.json`): a durable log of `(timestamp, traits)` snapshots so the robot can reason
+    about **how it has drifted over time**, not just react to the last few events. Sampled (≤ once
+    per `trait_history_period`) during reflection; `trait_trend_text()` summarises the change over
+    the trailing `trait_history_window` (e.g. `curiosity 0.50 -> 0.68 (rising)`) and is folded into
+    the `reflect()` + `consolidate()` prompts, so the self-narrative grows from a real trajectory.
+    Deploy-synced like the soul. Config: `trait_history_*` in robot.yaml; readout `get_trait_history`.
   - **Phrase bank** (`phrasebank.py`): the most frequent lines — the body-reaction beats
     (`musing`/`observe`) — are **pre-generated** instead of hitting the LLM every idle cycle.
     A batch of in-character lines per *situation* (picked_up/hot/busy/idle/… classified from
@@ -270,8 +296,17 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     (`~/.local/state/nanobot/phrases.json`) stores the persona+traits **signature** it was
     made with and **auto-regenerates in the background** when the soul drifts too far
     (`phrasebank_drift`) or the persona changes; `phrasebank_live_ratio` still sends a few
-    beats live for freshness. Force/inspect: `scripts/pregenerate_phrases.py [--show]`,
-    `GET /llm/phrases`, `POST /llm/phrases/regenerate`. Config: `phrasebank_*` in robot.yaml.
+    beats live for freshness. **It also grows over time** (`PhraseBank.grow`/`maybe_grow`,
+    `CognitionCore.bank_grow_check`): each reflection (`brain_reflect` entry) it *appends* a
+    few BRAND-NEW LLM lines to the most under-filled offline situation (deduped, up to
+    `phrasebank_grow_max`) — so the offline-triggerable lines keep gaining variety without
+    discarding what's there. Growth only runs while the soul is stable (a drifted soul
+    regenerates first) and is rate-limited by `phrasebank_grow_period`. **Growth is also an
+    on-demand `phrases` meta skill** — `skills/grow-phrases.md` (`CognitionCore.grow_phrasebank`,
+    parallel to `forge-skill`): invoke it any time to add lines now (bypasses the period gate,
+    blocks on the LLM); excluded from autonomous skill-beat picks like the workshop. Force/
+    inspect: `scripts/pregenerate_phrases.py [--show]`, `GET /llm/phrases`,
+    `POST /llm/phrases/regenerate`. Config: `phrasebank_*` in robot.yaml.
 - **Skill library** (`skills.py`, ROS-free + unit-tested; `src/web_control/skills/*.md`):
   capabilities as **self-documenting markdown** (an OpenClaw-style "SKILL.md" port). Each
   `.md` = one capability — YAML frontmatter contract (`name`/`description`/`trigger`/`action`)
@@ -310,7 +345,9 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   a "meta" kind in `skills.py` that runs an internal routine, never a topic/narrative): invoke it
   any time (web "🛠 Skills" / `POST /skills/invoke {name:"forge-skill"}`) to forge a skill outside
   reflection mode. Meta skills are **excluded from autonomous skill-beat selection** (`offered()`),
-  so they only run when deliberately invoked. See [[meditation-skill-workshop]].
+  so they only run when deliberately invoked. (`grow-phrases` — `action.kind: phrases` — is the
+  other meta skill: on-demand phrase-bank growth, see the phrase-bank note above.) See
+  [[meditation-skill-workshop]].
 - **Reflection mode** (renamed from "meditation"; topic `/reflect`, web `POST /brain/reflect`,
   `🧘 Reflection mode` toggle, `PurposeBrain.set_reflecting`/`.reflecting`, chart state
   `reflecting` + event `reflect`/`wake`). It pauses beats and consolidates (purpose/A/B/bank +

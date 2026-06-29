@@ -218,11 +218,25 @@ behavior:
     # lines, and (via /cognition/traits) nudge slam_nav's motion thresholds. Evolution is
     # smoothed; if the cognitive layer goes quiet for brain_timeout the chart reverts to the
     # seeded baseline. With no personality.json it uses the built-in defaults.
+    # NOTE: brain_timeout is a PROCESS-DEATH failsafe, so it MUST stay well above reflect_period
+    # — otherwise normal quiet between reflections reverts accumulated drift and the robot can
+    # never "become its own" (it snaps back to the seed every brain_timeout seconds).
     personality_path: ""      # "" = ~/.local/state/nanobot/personality.json
-    smoothing_alpha: 0.1      # exponential-smoothing rate for trait `evolve` (0..1; small=slow)
-    brain_timeout: 90.0       # s without an /cognition/evolve before reverting to baseline
+    smoothing_alpha: 0.25     # exponential-smoothing rate for trait `evolve` (0..1; small=slow)
+    brain_timeout: 1800.0     # s without an /cognition/evolve before reverting to baseline (>> reflect_period)
     nudge_pickup_caution: 0.92  # fast rule: being picked up eases caution toward this
     nudge_pickup_playful: 0.3   #            and playfulness toward this (startled)
+    # --- LLM-steerable "drives" (new expressive axes beyond the 4 traits) ---
+    # The slow reflection can also nudge four DRIVES via the same /cognition/evolve event (same
+    # guardrails: clamped 0..1, smoothed by smoothing_alpha, reverted on brain_lost, expression-
+    # only). They are seeded from personality.json (like traits) and drive new chart states:
+    #   energy        -> idle cadence + an "energetic burst" (chain a 2nd beat)
+    #   focus         -> a brief alert "attending" perk-up before a beat (attend_face/attend_secs)
+    #   introspection -> scales reflect_auto_idle (how soon it drifts into reflection)
+    #   mood          -> a baseline face briefly worn in the "feeling" state between beats (feel_secs)
+    attend_face: "looking"      # OLED face for the focus-driven "attending" perk-up
+    attend_secs: 2.0            # s the alert "attending" pause holds before the beat fires
+    feel_secs: 2.5              # s the baseline-mood "feeling" state holds after a beat
     # --- Purpose Engine + Horizon Planner (goals/reward + A/B; narrative-only) ---
     # The slow "identity" layer owns the robot's objective + intrinsic-reward weights; the
     # "strategy" layer turns that into a verified task it narrates as a "pursuing" beat (an
@@ -230,13 +244,13 @@ behavior:
     # the web 👍/👎 reward. Both are deterministic + fully local (the LLM reflection above
     # still separately owns trait drift). Reflection reads the shared decision log.
     purpose_enable: true        # run the goal/reward + planner layer (false = pure presence)
-    purpose_period: 600.0       # s between purpose reflections (faster while in reflection mode)
+    purpose_period: 240.0       # s between purpose reflections (faster while in reflection mode; local+free)
     pursue_min_interval: 180.0  # s, min gap between goal-pursuit ("pursuing") beats
     ab_epsilon: 0.2             # A/B bandit exploration rate (0..1; higher = explores more)
     reflect_face: "focused"     # OLED face shown while in reflection mode
     # Autonomous reflection mode: drift into it on a long idle, run a fixed stretch, then wake.
     reflect_auto_enable: true   # let the robot enter reflection mode on its own
-    reflect_auto_idle: 1200.0   # s of continuous idle before auto-entering reflection
+    reflect_auto_idle: 600.0    # s of continuous idle before auto-entering reflection
     reflect_auto_secs: 120.0    # s a self-started reflection runs before auto-waking
     purpose_path: ""            # "" = ~/.local/state/nanobot/purpose.json
     experiments_path: ""        # "" = ~/.local/state/nanobot/experiments.json
@@ -314,6 +328,11 @@ web_control:
                                # (0 = leave it up like a manual mood until cleared)
     llm_timeout: 30.0          # s HTTP timeout per OpenRouter call (reasoning models
                                # can be slow; the default Nemotron especially)
+    llm_hard_deadline: 45.0    # s HARD wall-clock cap per call. urlopen's timeout is only
+                               # per-socket-op, so a gateway that trickles keep-alive bytes
+                               # (free vision tier when queued) can hang a call ~2 min and
+                               # starve every beat via the one-at-a-time guard. A watchdog
+                               # abandons the call past this. Keep > the slowest reflection.
     llm_max_tokens: 1024       # cap on the reply length. Kept generous because reasoning
                                # models (e.g. the smart chat model deepseek-v4-pro) spend
                                # tokens thinking before emitting the JSON — too low and the
@@ -337,6 +356,14 @@ web_control:
     phrasebank_drift: 0.6       # summed trait change (0..4) that triggers a regeneration
     phrasebank_per_category: 8  # lines pre-generated per situation (9 body + 4 lifecycle:
                                 # greeting/farewell/restarting/offline, used at those moments)
+    # Incremental growth: on top of full regeneration, the bank grows over time — each
+    # reflection it appends a few BRAND-NEW lines (LLM) to the most under-filled situation,
+    # so the offline-triggerable lines keep gaining variety. Only grows while the soul is
+    # stable (a drifted soul regenerates instead). Rate-limited by phrasebank_grow_period.
+    phrasebank_grow_enable: true
+    phrasebank_grow_period: 1800.0  # min seconds between growth attempts (1 category each)
+    phrasebank_grow_max: 24         # per-category cap that growth fills up to
+    phrasebank_grow_batch: 3        # new lines requested per growth call
     llm_settings_path: ""      # enable/model/persona persist here (NOT the key).
                                # "" = ~/.local/state/nanobot/llm.json
     # Decision log: every cognition decision (+ outcome / skip reason) is appended here
@@ -346,17 +373,31 @@ web_control:
     # recent decision log + current traits and proposes smoothed trait drift on
     # /cognition/evolve. Runs on the reflect_period floor + sooner on notable events (pickup).
     reflect_enable: true       # set false to freeze the personality (no autonomous drift)
-    reflect_period: 600.0      # s floor between reflections (keeps the pro-model cost bounded)
+    reflect_period: 240.0      # s floor between reflections (free-first; paid fallback stays hourly-capped)
     # Long-term self-narrative (the slowest tier): the smart model folds accumulated experience
     # into a short, first-person "who I'm becoming" paragraph that's persisted (survives reboots,
     # never reverts on a brain outage like traits do) and folded into every spoken line's prompt.
     self_model_enable: true    # set false to freeze the long-term self-narrative
     self_model_path: ""        # "" -> XDG state dir (~/.local/state/nanobot/self_model.json)
-    consolidate_every: 6       # rewrite the narrative every Nth reflection (+ on reflection-mode entry)
+    consolidate_every: 2       # rewrite the narrative every Nth reflection (+ on reflection-mode entry)
+    # Trait trajectory: a durable log of (timestamp, traits) snapshots so reflection + the
+    # self-narrative can reason about HOW the personality has drifted over time ("curiosity
+    # 0.50 -> 0.68 rising"), not just react to the latest events. Deploy-synced like the soul.
+    trait_history_enable: true    # log trait snapshots + feed the trend into reflect/consolidate
+    trait_history_path: ""        # "" -> XDG state dir (~/.local/state/nanobot/trait_history.json)
+    trait_history_period: 3600.0  # min seconds between snapshots (sampled during reflection)
+    trait_history_max: 336        # snapshots kept (>=8; 336 ~= 2 weeks hourly)
+    trait_history_window: 604800.0  # s the trend summary looks back over (default 7 days)
     # Interaction fillers so a slow/failed LLM call is never dead air: skills/beats speak an
     # instant "thinking" line (from the phrase bank) the moment the call starts, and a "stumped"
     # line if it comes back empty. Both are offline-safe (built-in fallback lines).
     prelude_enable: true       # false = silent during/after slow LLM calls (old behaviour)
+    # Camera announce: ALWAYS speak a short "peeking/seeing" line the instant the camera is used
+    # (before ANY frame capture — looking/pursuing beats, camera skills, the web Look button), so
+    # the robot never looks silently. Independent of prelude_enable; offline-safe (phrase bank).
+    camera_announce: true      # false = capture silently (no pre-look line)
+    camera_face: "looking"     # OLED face shown the instant the camera is used (the wide,
+                               # scanning "peeking" eyes); "" = leave the face unchanged
     # Lifecycle speech + the persistent "AI offline" indicator. All offline-safe (the phrase
     # bank ships built-in fallback lines), so they work with no key / no network.
     startup_greeting: true     # speak a greeting line a few seconds after boot

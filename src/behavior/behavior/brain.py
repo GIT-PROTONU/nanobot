@@ -39,7 +39,7 @@ import json
 import os
 import time
 
-from .presence import DEFAULT_TRAITS, DEFAULT_REGISTRY
+from .presence import DEFAULT_TRAITS, DEFAULT_REGISTRY, DEFAULT_DRIVES
 
 # Sismic Event is only needed by Personality (interpreter-coupled). Imported defensively so
 # importing this module on a board without sismic still works (e.g. for PurposeBrain alone).
@@ -427,9 +427,9 @@ def load_personality(path, *, with_defaults=True, logger=None):
     returned (the dev harness lets build_interpreter fill the gaps). Best-effort."""
     if with_defaults:
         base = {"name": "Nano", "persona": "", "traits": dict(DEFAULT_TRAITS),
-                "registry": copy.deepcopy(DEFAULT_REGISTRY)}
+                "registry": copy.deepcopy(DEFAULT_REGISTRY), "drives": dict(DEFAULT_DRIVES)}
     else:
-        base = {"name": "Nano", "persona": "", "traits": {}, "registry": {}}
+        base = {"name": "Nano", "persona": "", "traits": {}, "registry": {}, "drives": {}}
     saved = load_json(path, logger=logger)
     if isinstance(saved, dict):
         for k in ("name", "persona"):
@@ -437,6 +437,8 @@ def load_personality(path, *, with_defaults=True, logger=None):
                 base[k] = saved[k]
         if isinstance(saved.get("traits"), dict):
             base["traits"].update(saved["traits"])
+        if isinstance(saved.get("drives"), dict):
+            base["drives"].update(saved["drives"])
         if isinstance(saved.get("registry"), dict):
             if with_defaults:
                 for n, patch in saved["registry"].items():
@@ -669,11 +671,21 @@ class Personality:
     def registry(self):
         return self.data["registry"]
 
+    @property
+    def drives(self):
+        return self.data["drives"]
+
     def live_traits(self):
         """The current live traits from the chart context (the seed before the chart is up)."""
         if self._interp is not None:
             return dict(self._interp.context["traits"])
         return dict(self.data["traits"])
+
+    def live_drives(self):
+        """The current live drives (energy/focus/introspection/mood) from the chart context."""
+        if self._interp is not None:
+            return dict(self._interp.context["drives"])
+        return dict(self.data["drives"])
 
     # ---- evolution events ---------------------------------------------------
     def on_evolve(self, payload):
@@ -683,7 +695,8 @@ class Personality:
         if self._interp is None or Event is None:
             return False
         self._interp.queue(Event("evolve", traits=payload.get("traits") or {},
-                                 registry=payload.get("registry") or {}))
+                                 registry=payload.get("registry") or {},
+                                 drives=payload.get("drives") or {}))
         self._last_brain = time.monotonic()
         came_back = self._brain_lost
         self._brain_lost = False
@@ -695,7 +708,7 @@ class Personality:
         if self._interp is None or Event is None:
             return None
         if picked and not self._was_picked:                # being handled -> warier, less playful
-            self._interp.queue(Event("evolve", registry={}, traits={
+            self._interp.queue(Event("evolve", registry={}, drives={}, traits={
                 "caution": self._nudge_caution, "playfulness": self._nudge_playful}))
         self._was_picked = picked
         if (self._heartbeat_enable and not self._brain_lost
@@ -711,9 +724,9 @@ class Personality:
         if self._interp is None:
             return
         ctx = self._interp.context
-        snap = (dict(ctx["traits"]), copy.deepcopy(ctx["registry"]))
+        snap = (dict(ctx["traits"]), copy.deepcopy(ctx["registry"]), dict(ctx["drives"]))
         if snap != self._last_pub:
-            self._publish({"traits": snap[0], "registry": snap[1]})
+            self._publish({"traits": snap[0], "registry": snap[1], "drives": snap[2]})
             self._last_pub = snap
             self._dirty = True
         if self._dirty and (now - self._last_save) > self._save_period:
@@ -727,4 +740,5 @@ class Personality:
             ctx = self._interp.context
             self.data["traits"] = dict(ctx["traits"])
             self.data["registry"] = copy.deepcopy(ctx["registry"])
+            self.data["drives"] = dict(ctx["drives"])
         save_json(self.path, self.data, logger=self._log)

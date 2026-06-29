@@ -1,0 +1,44 @@
+@startuml
+title Nano presence
+state "presence" as presence {
+  presence : **evolve** / apply_evolve(event.traits, event.registry, getattr(event, 'drives', {}))
+  presence : **brain_lost** / revert()
+  [*] --> greeting
+  presence --> reflecting : reflect
+  state "reflecting" as reflecting {
+    reflecting : **entry** / face(reflect_face)
+    reflecting --> idlelife : wake
+  }
+  state "dormant" as dormant {
+    dormant --> idlelife : resume
+  }
+  state "idle_life" as idlelife {
+    [*] --> resting
+    idlelife --> dormant : standdown
+    state "feeling" as feeling {
+      feeling : **entry** / face(drives['mood'])
+      feeling --> resting : [after(feel_secs)]
+    }
+    state "performing" as performing {
+      performing : **entry** / do_beat(pick_beat()); decide_next()
+      performing --> performing : [after(perform_secs) and next_step() == 'burst']
+      performing --> feeling : [after(perform_secs) and next_step() == 'feel']
+      performing --> resting : [after(perform_secs) and next_step() == 'rest']
+    }
+    state "attending" as attending {
+      attending : **entry** / face(attend_face)
+      attending --> performing : [after(attend_secs)]
+    }
+    state "resting" as resting {
+      resting : **entry** / face(''); decide_attend()
+      resting --> attending : [after(idle_secs * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and attend_next()]
+      resting --> performing : [after(idle_secs * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and not attend_next()]
+    }
+  }
+  state "greeting" as greeting {
+    greeting : **entry** / face(greet_face)
+    greeting --> idlelife : [after(greet_secs)]
+    greeting --> dormant : standdown
+  }
+}
+@enduml

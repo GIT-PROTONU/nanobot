@@ -33,6 +33,10 @@ Action kinds (the ``action.kind`` field):
                   demand — mine recent experience and forge ONE new/improved capability.
                   A "meta" capability (it operates on the library itself); never auto-picked
                   on a skill beat (that would mint constantly), only invoked deliberately.
+  - ``phrases`` : grow the offline phrase bank on demand — add a few BRAND-NEW in-character
+                  lines (LLM) to the most under-filled situation. Like ``workshop`` it's a
+                  self-improvement "meta" kind (operates on the robot's own state, not picked
+                  autonomously); the same growth runs by itself during reflection mode.
 
 Everything degrades safely: a missing directory, a malformed file, or no PyYAML => that
 skill (or the whole library) is simply absent. The brain is a garnish, never load-bearing.
@@ -46,7 +50,7 @@ NARRATIVE_KINDS = ("say", "observe", "look")
 ACTION_KINDS = ("topic",)
 # "Meta" kinds run an internal cognition routine rather than speaking or publishing. They're
 # always enabled (not gated like the topic tier) but excluded from autonomous selection.
-META_KINDS = ("workshop",)
+META_KINDS = ("workshop", "phrases")
 KNOWN_KINDS = NARRATIVE_KINDS + ACTION_KINDS + META_KINDS
 
 

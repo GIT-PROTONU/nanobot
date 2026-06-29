@@ -39,6 +39,10 @@ from .skills import SkillLibrary, _slug
 from .skillsmith import WorkshopState, render_skill_md, validate_candidate
 
 REFLECT_TRAITS = ("curiosity", "extraversion", "caution", "playfulness")  # personality axes
+# New LLM-steerable expressive DRIVES (above the 4 traits) the chart exposes — see
+# behavior/presence.py. Kept as plain strings here so web_control never imports the behavior pkg.
+REFLECT_DRIVES = ("energy", "focus", "introspection")     # 0..1 scalars, smoothed in the chart
+DRIVE_MOODS = ("", "happy", "angry", "focused", "stress", "neutral", "looking", "sleepy")  # idle tint
 LLM_HISTORY_MAX = 8          # chat turns kept for context (user+assistant messages)
 LLM_LOG_MAX = 50             # decision-log ring buffer length (also what the file tail loads)
 
@@ -70,10 +74,15 @@ class CognitionCore:
                  publish_action=None,
                  logger=None, persist_settings=None, cog_log_path="", face_hold=10.0,
                  bank_path=None, bank_enable=True, bank_live_ratio=0.2, bank_drift=0.6,
-                 bank_per_category=8, skills_dir="", skills_enable=True,
+                 bank_per_category=8, bank_grow_enable=True, bank_grow_period=1800.0,
+                 bank_grow_max=24, bank_grow_batch=3, skills_dir="", skills_enable=True,
                  skills_allow_actions=False, self_model_path=None, self_model_enable=True,
-                 consolidate_every=6, self_model_max_chars=600, prelude_enable=True,
-                 prelude_face="focused", workshop_enable=True, workshop_path=None,
+                 consolidate_every=6, self_model_max_chars=600,
+                 trait_history_path=None, trait_history_enable=True,
+                 trait_history_period=3600.0, trait_history_max=336,
+                 trait_history_window=604800.0, prelude_enable=True,
+                 prelude_face="focused", camera_announce=True, camera_face="looking",
+                 workshop_enable=True, workshop_path=None,
                  workshop_dir="", workshop_rounds=1, workshop_min_runs=3,
                  workshop_retire_errors=2, workshop_retire_net_neg=2):
         self.llm = llm
@@ -110,6 +119,11 @@ class CognitionCore:
         self._bank_live_ratio = float(bank_live_ratio)
         self._bank_drift = float(bank_drift)
         self._bank_per_cat = int(bank_per_category)
+        # incremental growth: occasionally add fresh offline lines instead of only regenerating
+        self._bank_grow_enable = bool(bank_grow_enable)
+        self._bank_grow_period = float(bank_grow_period)
+        self._bank_grow_max = int(bank_grow_max)
+        self._bank_grow_batch = int(bank_grow_batch)
         self._bank = PhraseBank(path=bank_path, logger=self._log)
         self.skills_enable = bool(skills_enable)
         self.skills_allow_actions = bool(skills_allow_actions)
@@ -134,6 +148,19 @@ class CognitionCore:
             self.llm.set_self_note(self.self_narrative)
         self._reflect_count = 0
         self._consolidate_busy = False
+        # Trait trajectory: a small, durable log of (timestamp, traits) snapshots so the robot
+        # can reason about HOW it has changed, not just react to the last few events. Sampled at
+        # most once per `trait_history_period`; `trait_trend_text()` summarises the drift over the
+        # trailing `trait_history_window` and is folded into reflect()/consolidate() prompts so
+        # the self-narrative grows from a real trajectory ("curiosity 0.50 -> 0.68"). Deploy-synced
+        # like the soul (lives in the XDG state dir / devstate on the harness).
+        self._trait_hist_enable = bool(trait_history_enable)
+        self._trait_hist_period = max(60.0, float(trait_history_period))
+        self._trait_hist_max = max(8, int(trait_history_max))
+        self._trait_hist_window = max(self._trait_hist_period, float(trait_history_window))
+        self._trait_hist_path = trait_history_path or os.path.expanduser(
+            "~/.local/state/nanobot/trait_history.json")
+        self._trait_hist = self._load_trait_history()
         # Skill workshop: reflection mode's experience-driven skill-synthesis loop (suggest ->
         # check -> rehearse -> trial -> adopt/retire). The pure ledger + gate live in skillsmith.py;
         # this class owns the LLM steps + the .md file writes. A trial skill is a normal,
@@ -151,6 +178,13 @@ class CognitionCore:
         # instead of dead air. Both pull from the phrase bank (offline-safe FALLBACK_LINES).
         self._prelude_enable = bool(prelude_enable)
         self._prelude_face = str(prelude_face or "")
+        # Camera announce: ALWAYS speak a short "peeking/seeing" line the instant the camera is
+        # used (before any capture), so the robot never looks silently. Independent of the
+        # thinking-prelude (on even when prelude is off); the only off switch is this flag.
+        # The peek moment also shows the dedicated "looking" OLED face (the wide, scanning eyes)
+        # — matching the chart's camera-beat default face for the non-chart paths too.
+        self._camera_announce = bool(camera_announce)
+        self._camera_face = str(camera_face or "")
 
     def available(self):
         return self.llm.available()
@@ -162,6 +196,67 @@ class CognitionCore:
 
     def traits_phrase(self):
         return ", ".join(f"{k} {self.traits.get(k, 0.5):.2f}" for k in REFLECT_TRAITS)
+
+    # ---- trait trajectory (self-knowledge: how it has changed over time) -----
+    def _load_trait_history(self):
+        """Read the persisted (timestamp, traits) snapshots. Best-effort: [] on any problem."""
+        try:
+            with open(self._trait_hist_path, encoding="utf-8") as f:
+                data = json.load(f)
+            snaps = data.get("snapshots") if isinstance(data, dict) else data
+            return [s for s in snaps if isinstance(s, dict) and "traits" in s][-self._trait_hist_max:]
+        except Exception:
+            return []
+
+    def _save_trait_history(self):
+        try:
+            os.makedirs(os.path.dirname(self._trait_hist_path), exist_ok=True)
+            tmp = self._trait_hist_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"snapshots": self._trait_hist}, f, indent=1)
+            os.replace(tmp, self._trait_hist_path)
+        except Exception as exc:
+            self._log(f"trait history: save failed ({exc})")
+
+    def record_trait_snapshot(self, force=False):
+        """Append the current live traits to the trajectory log, at most once per period (or
+        `force`). Caps the ring to trait_history_max. Cheap + best-effort; the input to
+        trait_trend_text(). No-op when disabled."""
+        if not self._trait_hist_enable:
+            return False
+        now = time.time()
+        last = self._trait_hist[-1]["t"] if self._trait_hist else 0.0
+        if not force and (now - float(last or 0.0)) < self._trait_hist_period:
+            return False
+        self._trait_hist.append({"t": now,
+                                 "traits": {k: round(float(self.traits.get(k, 0.5)), 3)
+                                            for k in REFLECT_TRAITS}})
+        del self._trait_hist[:-self._trait_hist_max]
+        self._save_trait_history()
+        return True
+
+    def trait_trend_text(self, min_delta=0.04):
+        """A compact, human-readable summary of how the traits have drifted over the trailing
+        window — e.g. "curiosity 0.50 -> 0.68 (rising), caution 0.60 -> 0.44 (easing)". Compares
+        the current values to the oldest snapshot still inside the window. Returns "" when there
+        isn't enough history or nothing moved meaningfully, so prompts can omit it cleanly."""
+        if not self._trait_hist_enable or len(self._trait_hist) < 2:
+            return ""
+        now = time.time()
+        in_window = [s for s in self._trait_hist if (now - float(s.get("t", 0))) <= self._trait_hist_window]
+        base = (in_window or self._trait_hist)[0].get("traits", {})
+        parts = []
+        for k in REFLECT_TRAITS:
+            old, new = float(base.get(k, 0.5)), float(self.traits.get(k, 0.5))
+            if abs(new - old) >= min_delta:
+                word = "rising" if new > old else "easing"
+                parts.append(f"{k} {old:.2f} -> {new:.2f} ({word})")
+        return "; ".join(parts)
+
+    def get_trait_history(self):
+        """Web/diagnostic readout: the raw snapshots (oldest first) + the current trend line."""
+        return {"enabled": self._trait_hist_enable, "snapshots": list(self._trait_hist),
+                "trend": self.trait_trend_text()}
 
     # ---- decision log -------------------------------------------------------
     def _load_cog_log(self):
@@ -239,6 +334,28 @@ class CognitionCore:
             self._face(self._prelude_face)              # immediate visual "I'm on it"
         if self.tts is not None and self.tts.available():
             self.tts.say(reply["say"])
+
+    def _speak_peek(self):
+        """Speak an instant 'peeking/seeing' line the moment the camera is used — ALWAYS spoken
+        before a frame is captured so the robot never looks silently. Non-blocking (tts.say runs
+        on a worker thread), so it plays in parallel with the capture + vision call and the real
+        vision line barges in when it lands. Offline-safe via the phrase bank FALLBACK_LINES."""
+        if self._camera_face:
+            self._face(self._camera_face)               # immediate "looking" eyes
+        reply = self._pick_filler("peeking")
+        if not (reply and reply.get("say")):
+            return
+        if self.tts is not None and self.tts.available():
+            self.tts.say(reply["say"])
+
+    def _capture_announced(self):
+        """Capture one camera frame, ALWAYS announcing the peek first (when enabled). The single
+        chokepoint every camera path goes through (beats, skills, /llm/look), so the 'say a
+        seeing line before looking' rule holds everywhere — not just the chart-driven beats.
+        Returns the JPEG bytes or None."""
+        if self._camera_announce:
+            self._speak_peek()
+        return self._capture_frame()
 
     def _speak_stumped(self, state=""):
         """When an attempted call comes back empty, say a light 'lost the thought' line from
@@ -323,7 +440,7 @@ class CognitionCore:
         if not self.llm.can_call(image=True):           # capped: skip the capture entirely
             self.log_decision(trigger, state, True, status="rate-limited")
             return {"error": "vision hourly limit reached"}
-        frame = self._capture_frame()
+        frame = self._capture_announced()               # speak the peek line, then capture
         if frame is None:
             self.log_decision(trigger, state, True, status="no-frame")
             return {"error": "no camera frame"}
@@ -332,8 +449,9 @@ class CognitionCore:
         prompt = ("This is the live view from your own camera. Your body also senses: "
                   f"{snap}. In character, say one short spoken line about what you can "
                   "see in front of you right now, and pick a fitting mood.")
+        # prelude=False: the peek line already covered the "I'm on it" filler, so don't double up.
         return self.generate(prompt, image_jpeg=frame, trigger=trigger, state=state,
-                             camera=True, prelude=True)
+                             camera=True, prelude=False)
 
     # ---- statechart beat executor (the chart's /cognition/request) ----------
     def run_beat(self, trigger, state, prompt, camera, audio=False):
@@ -346,7 +464,7 @@ class CognitionCore:
             if not self.llm.can_call(image=True):       # don't spin up the camera if capped
                 self.log_decision(trigger, state, camera, status="rate-limited")
                 return
-            frame = self._capture_frame()
+            frame = self._capture_announced()           # speak the peek line, then capture
             if frame is None:
                 self.log_decision(trigger, state, camera, status="no-frame")
                 return
@@ -356,8 +474,10 @@ class CognitionCore:
                 + ", and your body senses: " + self._sensor_snapshot())
         if audio:
             full += " Through your microphone you hear: " + self._audio_summary() + "."
+        # Camera beats already spoke the peek line; only the non-camera (audio) beat needs the
+        # generic "thinking" prelude.
         self.generate(full, image_jpeg=frame, trigger=trigger, state=state, camera=camera,
-                      prelude=True)
+                      prelude=not camera)
 
     # ---- phrase bank --------------------------------------------------------
     def bank_say(self, trigger, state="", camera=False):
@@ -384,10 +504,23 @@ class CognitionCore:
                                         name=self.persona_name, threshold=self._bank_drift,
                                         per_category=self._bank_per_cat, background=True)
 
+    def bank_grow_check(self):
+        """Grow the phrase bank over time: occasionally add a few fresh offline lines via the
+        LLM to the most under-filled situation (background, rate-limited inside the bank).
+        No-op if disabled / LLM offline / the soul drifted (a full regen runs instead)."""
+        if self._bank_enable and self._bank_grow_enable and self.llm.available():
+            self._bank.maybe_grow(self.llm, self.persona, self.traits,
+                                  name=self.persona_name, period=self._bank_grow_period,
+                                  batch=self._bank_grow_batch,
+                                  max_per_category=self._bank_grow_max,
+                                  drift_threshold=self._bank_drift, background=True)
+
     def get_phrasebank(self):
         s = self._bank.stats()
         s["enabled"] = self._bank_enable
         s["live_ratio"] = self._bank_live_ratio
+        s["grow_enable"] = self._bank_grow_enable
+        s["grow_max"] = self._bank_grow_max
         s["needs_regen"] = self._bank.needs_regen(self.persona, self.traits, self._bank_drift)
         return s
 
@@ -399,6 +532,22 @@ class CognitionCore:
                                     name=self.persona_name, threshold=-1.0,  # <0 => always
                                     per_category=self._bank_per_cat, background=True)
         return {"status": "regenerating"}
+
+    def grow_phrasebank(self):
+        """On-demand phrase-bank growth (the `phrases` meta skill + a manual trigger): add a
+        few fresh offline lines to the most under-filled situation NOW, blocking on the LLM
+        (like the workshop). Calls `grow()` directly, so it bypasses the inter-grow period
+        gate; the new lines match the CURRENT soul. Returns a small status dict."""
+        if not self._bank_enable:
+            return {"error": "phrasebank disabled"}
+        if not self.llm.available():
+            return {"error": "llm unavailable"}
+        res = self._bank.grow(self.llm, self.persona, self.traits, name=self.persona_name,
+                              batch=self._bank_grow_batch, max_per_category=self._bank_grow_max)
+        if not res:
+            return {"status": "full-or-empty"}
+        cat, added = res
+        return {"status": "grew", "category": cat, "added": added}
 
     # ---- skill library ------------------------------------------------------
     def get_skills(self):
@@ -475,19 +624,23 @@ class CognitionCore:
         "thinking" filler (set False when the caller already spoke one — e.g. the skill beat)."""
         if skill.is_action:
             return self._do_topic_skill(skill, trigger, state)
-        if skill.is_meta:                                # the workshop (skill-synthesis) skill
+        if skill.is_meta:                                # self-improvement (operates on own state)
+            if skill.kind == "phrases":                  # grow the offline phrase bank
+                return self._do_phrases_skill(skill, trigger, state, prelude)
             return self._do_workshop_skill(skill, trigger, state, prelude)
         frame = None
         if skill.camera:
             if not self.llm.can_call(image=True):
                 self.log_decision(trigger, state, True, status="rate-limited")
                 return {"error": "vision hourly limit reached"}
-            frame = self._capture_frame()
+            frame = self._capture_announced()           # speak the peek line, then capture
             if frame is None:
                 self.log_decision(trigger, state, True, status="no-frame")
                 return {"error": "no camera frame"}
-        reply = self.generate(self._skill_prompt(skill), image_jpeg=frame,
-                              trigger=trigger, state=state, camera=bool(frame), prelude=prelude)
+        # A camera skill already spoke the peek line — suppress the generic "thinking" prelude.
+        reply = self.generate(self._skill_prompt(skill), image_jpeg=frame, trigger=trigger,
+                              state=state, camera=bool(frame),
+                              prelude=(prelude and not skill.camera))
         self._note_trial_run(skill.name, ok=bool(reply))
         return reply or {"error": "no reply"}
 
@@ -500,6 +653,18 @@ class CognitionCore:
         res = self.run_skill_workshop()
         self.log_decision(trigger, state, status=res.get("status", ""), model="workshop",
                           detail=json.dumps(res.get("rounds", ""))[:160])
+        return res
+
+    def _do_phrases_skill(self, skill, trigger, state, prelude=True):
+        """Grow the offline phrase bank on demand (the `phrases` meta kind). Speaks an instant
+        "thinking" filler first (TTS stays responsive), then blocks on the growth LLM call and
+        logs the outcome. Same routine that runs by itself during reflection mode."""
+        if prelude and self._prelude_enable and self.llm.available():
+            self._speak_prelude()
+        res = self.grow_phrasebank()
+        self.log_decision(trigger, state, status=res.get("status") or res.get("error", ""),
+                          model="phrasebank",
+                          detail=f"{res.get('category', '')}+{res.get('added', '')}")
         return res
 
     def _do_topic_skill(self, skill, trigger, state):
@@ -770,6 +935,7 @@ class CognitionCore:
             return None
         self._reflect_busy = True
         t0 = time.monotonic()
+        self.record_trait_snapshot()                     # log where the traits are right now
         try:
             system = (
                 "You are the slow, reflective mind of a small robot named Nano. You review "
@@ -779,14 +945,22 @@ class CognitionCore:
                 "(0..1 base weight) — the beats are: musing (react to its body/sensors), looking "
                 "(use the camera), wondering (a curious deep thought), listening (react to "
                 "sounds). Favour what recently earned reward / fit the moment, ease off what "
-                'fell flat. Output ONLY compact JSON: {"traits": {<trait>: <new target 0..1>}, '
+                "fell flat. You may ALSO steer four expressive 'drives': energy (0..1, overall "
+                "restlessness — paces how often it stirs and may chain an extra beat), focus "
+                "(0..1, how readily it perks up alert and pays attention), introspection (0..1, "
+                "how soon it drifts into quiet reflection when idle), and mood (a baseline idle "
+                "face it briefly wears between beats, one of: happy, focused, neutral, looking, "
+                'or "" for none). Output ONLY compact JSON: {"traits": {<trait>: <0..1>}, '
                 '"registry": {optional: {"<beat>": {"priority":0..1,"enabled":bool}}}, '
-                '"note": "<one short reason>"}. Propose only SMALL, justified nudges (omit what '
-                "you would not change); each value is a TARGET that gets smoothed over time. No "
-                "prose outside the JSON.")
+                '"drives": {optional: {"energy":0..1,"focus":0..1,"introspection":0..1,'
+                '"mood":"<face or empty>"}}, "note": "<one short reason>"}. Propose only SMALL, '
+                "justified nudges (omit what you would not change); each 0..1 value is a TARGET "
+                "that gets smoothed over time. No prose outside the JSON.")
             selfctx = (f"\nWho you have become: {self.self_narrative}"
                        if self.self_narrative else "")
-            user = (f"Current traits: {self.traits_phrase()}.{selfctx}\nRecent events:\n"
+            trend = self.trait_trend_text()
+            trendctx = f"\nHow you have been drifting lately: {trend}." if trend else ""
+            user = (f"Current traits: {self.traits_phrase()}.{selfctx}{trendctx}\nRecent events:\n"
                     f"{self.recent_events_text()}\n\nReflect and propose adjustments.")
             content = self.llm.complete(system, user, smart=True, json_object=True)
         finally:
@@ -796,14 +970,20 @@ class CognitionCore:
         traits = {k: clamp01(obj["traits"][k]) for k in REFLECT_TRAITS
                   if isinstance(obj.get("traits"), dict) and k in obj["traits"]}
         registry = obj.get("registry") if isinstance(obj.get("registry"), dict) else {}
+        odr = obj.get("drives") if isinstance(obj.get("drives"), dict) else {}
+        drives = {k: clamp01(odr[k]) for k in REFLECT_DRIVES if k in odr}
+        if isinstance(odr.get("mood"), str) and odr["mood"] in DRIVE_MOODS:
+            drives["mood"] = odr["mood"]                  # categorical idle tint (whitelisted)
         rmodel = self.llm.last_model or self.llm.smart_model
-        if not traits and not registry:
+        if not traits and not registry and not drives:
             self.log_decision("reflect", status="no-reply", model=rmodel, ms=ms)
             return None
         self.log_decision("reflect", status="spoke", model=rmodel,
-                          say=f"{obj.get('note','')} -> {traits}", ms=ms)
+                          say=f"{obj.get('note','')} -> {traits}{(' '+str(drives)) if drives else ''}",
+                          ms=ms)
         self._maybe_consolidate()                        # slow long-term identity drift
-        return {"traits": traits, "registry": registry, "note": obj.get("note", "")}
+        return {"traits": traits, "registry": registry, "drives": drives,
+                "note": obj.get("note", "")}
 
     # ---- long-term self-narrative (smart-LLM, durable) ----------------------
     def _load_self_model(self):
@@ -842,6 +1022,7 @@ class CognitionCore:
             return None
         self._consolidate_busy = True
         t0 = time.monotonic()
+        self.record_trait_snapshot()                     # capture the trajectory point too
         try:
             system = (
                 f"You maintain the evolving self-understanding of a small robot named "
@@ -852,10 +1033,13 @@ class CognitionCore:
                 "narrative (gradual growth, not reinvention); keep what still fits. At most "
                 f"~{self._self_model_max // 6} words, plain prose, no lists. Output ONLY the "
                 "narrative text.")
+            trend = self.trait_trend_text()
+            trendline = f"How your personality has drifted over time: {trend}\n\n" if trend else ""
             user = (f"Previous self-narrative:\n{self.self_narrative or '(none yet)'}\n\n"
                     f"Current traits (0..1): {self.traits_phrase()}\n\n"
+                    f"{trendline}"
                     f"Recent experience:\n{self.recent_events_text()}\n\n"
-                    "Write the updated self-narrative.")
+                    "Reflect on how you have changed, and write the updated self-narrative.")
             text = self.llm.complete(system, user, smart=True, json_object=False)
         finally:
             self._consolidate_busy = False

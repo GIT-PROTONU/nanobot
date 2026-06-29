@@ -40,7 +40,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, String
 from geometry_msgs.msg import Twist, PoseStamped
 
-from .presence import build_interpreter, BEATS
+from .presence import build_interpreter, BEATS, clamp01
 from .brain import PurposeBrain, Personality
 
 # Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
@@ -90,6 +90,10 @@ class MoodNode(Node):
             ("ab_epsilon", 0.2),            # A/B bandit exploration rate (0..1)
             ("reflect_face", "focused"),    # OLED face shown while in reflection mode
             ("greet_face", "happy"),        # OLED "startup mood" shown at boot (greeting)
+            # --- LLM-steerable drives (energy/focus/introspection/mood): new expressive states ---
+            ("attend_face", "looking"),     # OLED face for the focus-driven "attending" perk-up
+            ("attend_secs", 2.0),           # s the alert "attending" pause holds before a beat
+            ("feel_secs", 2.5),             # s the baseline-mood "feeling" state holds after a beat
             # --- autonomous reflection mode: enter on long idle, run a fixed stretch, wake ---
             ("reflect_auto_enable", True),  # let the robot enter reflection mode on its own
             ("reflect_auto_idle", 1200.0),  # s of continuous idle before auto-entering reflection
@@ -222,9 +226,13 @@ class MoodNode(Node):
                 perform_secs=float(g("perform_secs").value),
                 camera_beats=self.camera_beats, look_every=self.look_every,
                 traits=self._personality.traits, registry=self._personality.registry,
+                drives=self._personality.drives,
                 alpha=float(g("smoothing_alpha").value), clock=self._clock,
                 reflect_face=self._reflect_face, greet_face=self._greet_face,
-                rng=random.Random())          # the idle-beat lottery (priority-weighted)
+                attend_face=str(g("attend_face").value or "looking"),
+                attend_secs=float(g("attend_secs").value),
+                feel_secs=float(g("feel_secs").value),
+                rng=random.Random())          # the idle-beat lottery + burst/attend gates
             self._personality.attach(self._interp)
             self.get_logger().info(
                 f"behavior up: presence statechart (personality '{self._personality.name}', "
@@ -391,7 +399,12 @@ class MoodNode(Node):
             return
         if self._brain.reflecting:                          # a manual reflection — leave it be
             return
-        if not stand and (now - self._idle_since) >= self._reflect_auto_idle:
+        # The LLM's `introspection` drive biases how readily the robot drifts into reflection:
+        # high introspection shortens the idle threshold, low lengthens it (the "chart-level urge"
+        # to pause and consolidate). Clamped to a sane band so it can't reflect constantly.
+        intro = clamp01(self._personality.live_drives().get("introspection", 0.4))
+        threshold = self._reflect_auto_idle * (1.5 - intro)
+        if not stand and (now - self._idle_since) >= threshold:
             self.reflect_req_pub.publish(Bool(data=True))
             self._auto_reflect_deadline = now + self._reflect_auto_secs
             self.get_logger().info("idle a while — entering reflection mode on my own")
