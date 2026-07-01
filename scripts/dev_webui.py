@@ -58,7 +58,7 @@ _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
 sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 sys.path.insert(0, os.path.join(_ROOT, "src", "behavior"))   # ROS-free presence chart
 
-from web_control.tts import TtsEngine, clamp                 # noqa: E402
+from web_control.tts import TtsEngine, VOICES, clamp                 # noqa: E402
 from web_control.llm import LlmClient                        # noqa: E402
 from web_control.skills import resolve_skills_dir            # noqa: E402
 from web_control.jsonio import read_json, write_json         # noqa: E402  (atomic dev-state I/O)
@@ -148,6 +148,19 @@ SENSOR_FIELDS = {
 DEFAULT_SENSORS = {"cpu": 25, "mem": 45, "disk": 50, "temp": 48, "esp_temp": 44.0,
                    "imu_hz": 15.0, "roll": 6.0, "pitch": -2.0, "lds_hz": 0.0,
                    "moving": False, "tilt": 6, "pickup": 0, "esp_alive": True}
+
+# Persisted TTS settings (same defaults as the robot so the dev harness behaves identically).
+SETTINGS_DEFAULTS = {
+    "voice": "en-US",
+    "volume": 100,
+    "speed": 100,
+    "pitch": 100,
+    "announce": False,
+    "announce_interval": 30,
+}
+ANNOUNCE_MIN = 5
+ANNOUNCE_MAX = 3600
+TTS_SETTINGS_FILE = _dev_state("tts.json")
 
 
 def _coerce_sensor(val, spec):
@@ -245,6 +258,13 @@ class DevState:
         name = self._personality.name
         self.tts = TtsEngine(default_voice=voice, on_word=self._on_word,
                              logger=lambda m: print(f"[tts] {m}", file=sys.stderr))
+        # Persisted live settings (same as the robot: voice/volume/speed/pitch +
+        # periodic stats announcer), loaded from memory/tts.json so they survive a
+        # dev-harness restart. The announce schedule piggy-backs on _health_loop.
+        self._settings = self._load_tts_settings()
+        self._apply_tts_settings()
+        self._cpu_prev = self._cpu_sample()
+        self._announce_next = time.monotonic() + float(self._settings["announce_interval"])
         # Seed the web-tunable LLM settings from robot.yaml, then let any persisted UI changes
         # (memory/llm.json) win — so a model id picked in the browser sticks across restarts.
         llm_settings = {
@@ -362,6 +382,7 @@ class DevState:
     def _health_loop(self):
         while True:
             time.sleep(1.0)
+            self._announce_tick()
             offline = bool(self.cog.settings.get("enabled")) and not self.llm.available()
             if offline != self._dev_offline:
                 prev = self._dev_offline
@@ -449,6 +470,131 @@ class DevState:
         # robot streams these on /oled_word); "" hands the panel back to the face/dashboard.
         self.oled_word = w or ""
         print(w, end=" ", flush=True) if w else print()
+
+    # ---- TTS settings (persisted, same as the robot) ------------------------
+
+    def _tts_settings_file(self):
+        return TTS_SETTINGS_FILE
+
+    def _load_tts_settings(self):
+        s = dict(SETTINGS_DEFAULTS)
+        s["voice"] = self.tts.voice or "en-US"
+        saved = read_json(self._tts_settings_file())
+        if isinstance(saved, dict):
+            s.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULTS})
+        return self._sanitize_settings(s)
+
+    def _save_tts_settings(self):
+        write_json(self._tts_settings_file(), self._settings)
+
+    def _apply_tts_settings(self):
+        s = self._settings
+        self.tts.configure(voice=s["voice"], volume=s["volume"],
+                           speed=s["speed"], pitch=s["pitch"])
+
+    def get_tts_settings(self):
+        return dict(self._settings)
+
+    def update_tts_settings(self, data):
+        old = self._settings
+        s = dict(old)
+        for k in SETTINGS_DEFAULTS:
+            if k in data:
+                s[k] = data[k]
+        self._settings = self._sanitize_settings(s)
+        self._save_tts_settings()
+        self._apply_tts_settings()
+        if self._settings["announce"] and (
+                not old["announce"]
+                or self._settings["announce_interval"] != old["announce_interval"]):
+            self._cpu_prev = self._cpu_sample()
+            self._announce_next = time.monotonic() + float(self._settings["announce_interval"])
+        return self._settings
+
+    @staticmethod
+    def _sanitize_settings(s):
+        out = dict(SETTINGS_DEFAULTS)
+        out.update(s)
+        out["voice"] = out["voice"] if out["voice"] in VOICES else SETTINGS_DEFAULTS["voice"]
+        out["volume"] = clamp(out["volume"], 0, 500)
+        out["speed"] = clamp(out["speed"], 20, 500)
+        out["pitch"] = clamp(out["pitch"], 50, 200)
+        out["announce"] = bool(out["announce"])
+        out["announce_interval"] = clamp(out["announce_interval"], ANNOUNCE_MIN, ANNOUNCE_MAX)
+        return out
+
+    # ---- periodic spoken system stats (matches the robot's announce) ---------
+
+    def _announce_tick(self):
+        if not self._settings["announce"]:
+            return
+        now = time.monotonic()
+        if now < self._announce_next:
+            return
+        self._announce_next = now + float(self._settings["announce_interval"])
+        self.announce_now()
+
+    def announce_now(self):
+        if not self.tts.available():
+            return
+        text = self._compose_stats(self._cpu_percent(), self._mem_percent(),
+                                   self._cpu_temp())
+        if text:
+            self.tts.say(text)
+
+    def _compose_stats(self, cpu, mem, temp):
+        de = self._settings["voice"].startswith("de")
+        parts = []
+        if cpu == cpu:
+            parts.append(f"Prozessor {cpu:.0f} Prozent" if de else f"C P U {cpu:.0f} percent")
+        if mem == mem:
+            parts.append(f"Arbeitsspeicher {mem:.0f} Prozent" if de else f"RAM {mem:.0f} percent")
+        if temp == temp:
+            parts.append(f"Temperatur {temp:.0f} Grad" if de else f"Temperature {temp:.0f} degrees")
+        if not parts:
+            return "Keine Daten" if de else "No data"
+        return ". ".join(parts)
+
+    def _cpu_sample(self):
+        try:
+            with open("/proc/stat") as f:
+                parts = [int(x) for x in f.readline().split()[1:]]
+            idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+            return idle, sum(parts)
+        except Exception:
+            return None
+
+    def _cpu_percent(self):
+        cur = self._cpu_sample()
+        pct = float("nan")
+        if cur and self._cpu_prev:
+            di, dt = cur[0] - self._cpu_prev[0], cur[1] - self._cpu_prev[1]
+            if dt > 0:
+                pct = 100.0 * (1.0 - di / dt)
+        self._cpu_prev = cur
+        return pct
+
+    def _mem_percent(self):
+        try:
+            tot = avail = 0
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        tot = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1])
+                    if tot and avail:
+                        break
+            return 100.0 * (tot - avail) / tot if tot else float("nan")
+        except Exception:
+            return float("nan")
+
+    def _cpu_temp(self):
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                return int(f.read().strip()) / 1000.0
+        except Exception:
+            return float("nan")
 
     def oled_state(self):
         """The exact inputs the physical OLED renders from, for the web UI's client-side mirror.
@@ -631,10 +777,6 @@ class DevState:
 
     def workshop_kill(self, data):
         return self.cog.kill_skill(str(data.get("name", "")))
-
-    def tts_config(self):
-        return {"voice": self.tts.voice, "volume": 100, "speed": 100, "pitch": 100,
-                "announce": False, "announce_interval": 30}
 
 
 def run_behavior(state, idle_secs, reflect_secs):
@@ -845,7 +987,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if p == "/skills/workshop":
             return self._json(self.state.brain_workshop())
         if p == "/tts/config":
-            return self._json(self.state.tts_config())
+            return self._json(self.state.get_tts_settings())
         if p == "/oled/state":
             return self._json(self.state.oled_state())
         if p == "/dev/sensors":
@@ -923,15 +1065,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             s.tts.say(text, voice=(d.get("voice") or None))
             return self._text(200, "speaking")
         if p == "/tts/config":
-            d = self._body()
-            s.tts.configure(voice=d.get("voice"),
-                            volume=d.get("volume"), speed=d.get("speed"), pitch=d.get("pitch"))
-            return self._json(s.tts_config())
+            return self._json(self.state.update_tts_settings(self._body()))
         if p == "/tts/stop":
             s.tts.stop()
             return self._text(200, "stopped")
         if p == "/tts/announce":
-            return self._text(503, "no stats on the dev harness")
+            if not s.tts.available():
+                return self._text(503, "tts unavailable")
+            s.announce_now()
+            return self._text(200, "announcing")
         return self._text(404, "not found")
 
     def log_message(self, *a):

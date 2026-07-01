@@ -293,9 +293,23 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
     in the node, so it **keeps running after every browser closes** and resumes after
     a reboot. `POST /tts/announce` says it once now. CPU/RAM/temp come from the same
     cheap `/proc` + thermal reads the OLED uses; phrasing follows the selected voice.
+- **Known pico2wave bug + workaround**: Both the custom-built (ihuguet/picotts fork)
+    and the official (`libttspico-utils` / `libttspico0t64`) versions of pico2wave have
+    a bug where text longer than ~24 characters produces exactly 97792 frames (6.11
+    seconds) of garbled audio output. `_synth_pico` in `tts.py` works around this by
+    splitting text into ~20-character chunks at word boundaries, synthesizing each
+    chunk separately via pico2wave, trimming leading/trailing silence (threshold 20
+    out of 32768), and concatenating the clean audio into a single WAV. Short phrases
+    (≤20 chars) take the fast path — one pico2wave call, no overhead.
+    `_resolve_bin` checks `/usr/bin` before `/usr/local/bin` so the official Debian
+    package wins over a potentially-broken custom build. The `espeak-ng` backend is
+    also available as a Linux fallback (no text-length bug, used when pico2wave is
+    absent). On the dev PC, install the official pico with:
+    `sudo apt-get install libttspico-utils libttspico-data` — this provides a working
+    `/usr/bin/pico2wave`.
   - **Cross-platform TTS for dev testing**: `tts.py` is ROS-free and auto-selects a
-    backend — the robot's `pico2wave`+`aplay` if present, else **Windows SAPI** (via
-    PowerShell `System.Speech`) or macOS `say`. So `scripts/dev_tts_test.py` (no ROS)
+  backend — the robot's `pico2wave`+`aplay` if present, else `espeak-ng` on Linux,
+  Windows SAPI (via PowerShell `System.Speech`) or macOS `say`. So `scripts/dev_tts_test.py` (no ROS)
     speaks a line on a dev PC: `python scripts/dev_tts_test.py "hi"`, or
     `--llm "prompt"` to run the full OpenRouter→speech pipeline (needs
     `OPENROUTER_API_KEY`). Pico level markup + German lingware are pico-only; the

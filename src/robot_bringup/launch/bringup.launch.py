@@ -28,6 +28,7 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -43,7 +44,7 @@ def generate_launch_description():
     rviz = LaunchConfiguration("rviz")
     web = LaunchConfiguration("web")
 
-    robot_description = Command(["xacro ", xacro_path])
+    robot_description = ParameterValue(Command(["xacro ", xacro_path]), value_type=str)
 
     return LaunchDescription([
         DeclareLaunchArgument("sim", default_value="false",
@@ -76,6 +77,7 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([
                 FindPackageShare("web_control"), "launch", "web.launch.py"])),
+            launch_arguments={"params": params}.items(),
             condition=IfCondition(web),
         ),
 

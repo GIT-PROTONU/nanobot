@@ -34,8 +34,10 @@ there's no extra processing or ALSA-mixer dependency. `configure()` sets them an
 the current voice; the web layer persists those across reboots (see web_server).
 """
 import contextlib
+import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -71,9 +73,12 @@ def clamp(v, lo, hi):
 def _clean(text):
     """Make user text safe to both speak and (optionally) wrap in Pico markup, and
     keep the spoken words identical to what the OLED shows. Drops the three markup-
-    significant chars (< > &) — not meaningful to speak anyway — and collapses
-    whitespace so the karaoke word split is clean."""
-    t = (text or "").replace("<", " ").replace(">", " ").replace("&", " ")
+    significant chars (< > &) and common markdown/non-speech symbols (* _ ` ~ # |
+    $ \\ [ ] { }) — not meaningful to speak anyway — and collapses whitespace so
+    the karaoke word split is clean."""
+    t = (text or "")
+    for ch in ("<", ">", "&", "*", "_", "`", "~", "#", "|", "$", "\\", "[", "]", "{", "}"):
+        t = t.replace(ch, " ")
     return " ".join(t.split())
 
 
@@ -87,6 +92,7 @@ class TtsEngine:
         # even though it's installed in /usr/local/bin. "" here means "not found".
         self._pico = _resolve_bin(pico_bin or "pico2wave")
         self._aplay = _resolve_bin("aplay")
+        self._espeak = _resolve_bin("espeak-ng")
         self._device = device or None                 # aplay -D target; None = ALSA default
         self._enabled = bool(enabled)
         self._on_word = on_word or (lambda _w: None)
@@ -116,9 +122,12 @@ class TtsEngine:
 
     def _pick_backend(self):
         """Choose the backend by what's installed (pico preferred — it's the only one
-        with the German lingware + level markup + ALSA device targeting)."""
+        with the German lingware + level markup + ALSA device targeting). Falls back to
+        espeak-ng on Linux when pico is absent."""
         if self._pico and self._aplay:
             return "pico"
+        if platform.system() == "Linux" and self._espeak and self._aplay:
+            return "espeak"
         if platform.system() == "Windows" and self._ps:
             return "sapi"
         if platform.system() == "Darwin" and self._say:
@@ -149,19 +158,10 @@ class TtsEngine:
         return self._voice
 
     def _ssml(self, text):
-        """Add Pico's volume/speed/pitch level markup, but ONLY for a level that's
-        actually changed from the 100% default. At all-default this returns the text
-        untouched, so the common case is vanilla pico2wave (the clearest, most-tested
-        path) with no markup to misparse. The text has already had the markup-special
-        chars stripped (see _clean), so nothing here needs escaping."""
-        out = text
-        if self._speed != 100:
-            out = f'<speed level="{self._speed}">{out}</speed>'
-        if self._pitch != 100:
-            out = f'<pitch level="{self._pitch}">{out}</pitch>'
-        if self._volume != 100:
-            out = f'<volume level="{self._volume}">{out}</volume>'
-        return out
+        """Pico2wave does not support SSML (confirmed — it speaks SSML tags as
+        literal text), so this is a no-op. The volume/speed/pitch settings are
+        stored and respected by non-pico backends that handle them natively."""
+        return text
 
     # ---- public API ----------------------------------------------------------
     def say(self, text, voice=None):
@@ -221,6 +221,8 @@ class TtsEngine:
         try:
             if self._backend == "pico":
                 return self._synth_pico(voice, text)
+            if self._backend == "espeak":
+                return self._synth_espeak(voice, text, levels)
             if self._backend == "sapi":
                 return self._synth_sapi(voice, text, levels)
             if self._backend == "say":
@@ -229,11 +231,81 @@ class TtsEngine:
             self._log(f"tts: synth failed ({exc})")
         return 0.0
 
+    def _chunk_text(self, text, max_chars=20):
+        """Split text at word boundaries so each chunk is <= max_chars characters.
+        pico2wave has a bug where text longer than ~24 characters produces garbled
+        audio, so we keep each chunk safely under that threshold."""
+        words = text.split()
+        chunks = []
+        cur = []
+        cur_len = 0
+        for w in words:
+            add = len(w) + (1 if cur else 0)
+            if cur_len + add > max_chars and cur:
+                chunks.append(" ".join(cur))
+                cur = [w]
+                cur_len = len(w)
+            else:
+                cur.append(w)
+                cur_len += add
+        if cur:
+            chunks.append(" ".join(cur))
+        return chunks
+
     def _synth_pico(self, voice, text):
-        subprocess.run([self._pico, "-l", voice, "-w", WAV_PATH, text],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=20, check=True)
-        return self._wav_duration()
+        """Synthesize text with pico2wave, splitting into ~20-char chunks to work around
+        a bug in the Pico engine where texts longer than ~24 characters produce 6+ seconds
+        of garbled audio. Each chunk is synthesized separately and the WAVs are concatenated
+        into WAV_PATH."""
+        try:
+            os.remove(WAV_PATH)
+        except FileNotFoundError:
+            pass
+        chunks = self._chunk_text(text)
+        if len(chunks) == 1:
+            subprocess.run([self._pico, "-l", voice, "-w", WAV_PATH, chunks[0]],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=20, check=True)
+            return self._wav_duration()
+        temp_dir = tempfile.mkdtemp(prefix="nano_tts_")
+        try:
+            total_frames = 0
+            framerate = None
+            chunk_wavs = []
+            for i, chunk in enumerate(chunks):
+                wav = os.path.join(temp_dir, f"chunk_{i}.wav")
+                subprocess.run([self._pico, "-l", voice, "-w", wav, chunk],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=20, check=True)
+                chunk_wavs.append(wav)
+            out_data = bytearray()
+            for wav in chunk_wavs:
+                with contextlib.closing(wave.open(wav, "rb")) as w:
+                    if framerate is None:
+                        framerate = w.getframerate()
+                    raw = w.readframes(w.getnframes())
+                samples = memoryview(raw).cast("h")
+                lo = next((i for i, s in enumerate(samples) if abs(s) > 20), 0)
+                hi = next((len(samples) - i for i, s in enumerate(reversed(samples)) if abs(s) > 20), 0)
+                if hi > lo:
+                    out_data.extend(raw[lo * 2:hi * 2])
+            with contextlib.closing(wave.open(WAV_PATH, "wb")) as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(framerate or 16000)
+                out.writeframes(bytes(out_data))
+                total_frames = out.getnframes()
+            return total_frames / float(framerate or 16000)
+        finally:
+            for wav in chunk_wavs:
+                try:
+                    os.remove(wav)
+                except Exception:
+                    pass
+            try:
+                os.rmdir(temp_dir)
+            except Exception:
+                pass
 
     def _synth_sapi(self, voice, text, levels):
         """Windows SAPI via PowerShell System.Speech → WAV. Text + tunables are passed
@@ -278,11 +350,33 @@ class TtsEngine:
                        timeout=30, check=True)
         return self._wav_duration()
 
+    def _espeak_voice(self, voice):
+        """Map pico-style voice codes to espeak-ng -v values."""
+        return {"en-US": "en-us", "en-GB": "en-gb", "de-DE": "de"}.get(voice, "en-us")
+
+    def _synth_espeak(self, voice, text, levels):
+        """Linux espeak-ng → 16-bit WAV. Speed maps to words/min (~175 default, clamped
+        80..600 via the -s flag — espeak understands 80..450 so we cap there but keep the
+        clamp range wide for consistency with other backends)."""
+        _volume, speed, _pitch = levels
+        cmd = [self._espeak, "-w", WAV_PATH,
+               "-v", self._espeak_voice(voice)]
+        if speed != 100:
+            wpm = clamp(175 * speed / 100.0, 80, 450)
+            cmd += ["-s", str(int(wpm))]
+        if _volume != 100:
+            amp = clamp(_volume // 2, 0, 100)
+            cmd += ["-a", str(int(amp))]
+        cmd.append(text)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=30, check=True)
+        return self._wav_duration()
+
     def _spawn_player(self):
         """Start (and return) a killable process playing WAV_PATH on the active
         backend, or None if there's no player. WAV_PATH is a fixed constant, so
         embedding it in the PowerShell command is safe (no user input)."""
-        if self._backend == "pico":
+        if self._backend in ("pico", "espeak"):
             cmd = [self._aplay, "-q"]
             if self._device:
                 cmd += ["-D", self._device]
@@ -356,15 +450,15 @@ def _wait_until(stop, deadline):
 
 def _resolve_bin(binary):
     """Absolute path to an executable: the given path if it's absolute + runnable,
-    else found on PATH, else in the usual install dirs (systemd/pixi PATH can be
-    minimal). Returns "" if not found anywhere."""
+    else found on PATH, else in the usual install dirs (preferring /usr/bin over
+    /usr/local/bin so the official distribution packages win over custom builds).
+    Returns "" if not found anywhere."""
     if os.path.isabs(binary):
         return binary if os.access(binary, os.X_OK) else ""
-    found = shutil.which(binary)
-    if found:
-        return found
-    for d in ("/usr/local/bin", "/usr/bin", "/bin"):
+    # Check /usr/bin first so official packages (e.g. libttspico-utils) win
+    # over self-built/custom binaries in /usr/local/bin which may be broken.
+    for d in ("/usr/bin", "/bin", "/usr/local/bin"):
         cand = os.path.join(d, binary)
         if os.access(cand, os.X_OK):
             return cand
-    return ""
+    return shutil.which(binary) or ""
