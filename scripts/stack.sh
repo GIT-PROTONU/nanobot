@@ -100,6 +100,12 @@ PY
   # /dev/shm/nano_map.bin for the web map panel. Started last (needs scan + odom flowing).
   pgrep -f 'slam_nav/lib/slam_nav' >/dev/null \
     || launch nav "$own/slam_nav/lib/slam_nav/nav_node --ros-args --params-file $PARAMS"
+  # Republishes the /dev/shm/nano_map.bin blob above as a real nav_msgs/OccupancyGrid on
+  # /map. /dev/shm is per-machine RAM, so this MUST run on the board (not the dev PC) for
+  # a remote RViz (robot_bringup/launch/visualize.launch.py, over the shared zenoh graph)
+  # to see the map. Cheap (one rclpy node, no Gazebo deps) — always safe to run.
+  pgrep -f 'sim_hardware/lib/sim_hardware/map_bridge_node' >/dev/null \
+    || launch map "$own/sim_hardware/lib/sim_hardware/map_bridge_node --ros-args --params-file $PARAMS"
 }
 
 # Node path substrings match whether launched directly or via ros2 run/launch.
@@ -109,6 +115,7 @@ PY
 # kept here too so `down`/`restart` also sweeps up stragglers from a pre-merge deploy.
 NODE_PATS=(
   'slam_nav/lib/slam_nav'
+  'sim_hardware/lib/sim_hardware/map_bridge_node'
   'sensor_hub/lib/sensor_hub'
   'lds_driver_py/lib/lds_driver_py'
   'wheel_odometry/lib/wheel_odometry'
@@ -156,7 +163,8 @@ status() {
            "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
            "behavior:behavior/lib/behavior" \
            "sensors:sensor_hub/lib/sensor_hub" \
-           "nav:slam_nav/lib/slam_nav"; do
+           "nav:slam_nav/lib/slam_nav" \
+           "map:sim_hardware/lib/sim_hardware/map_bridge_node"; do
     if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi
   done
 }

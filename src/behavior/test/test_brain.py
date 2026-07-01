@@ -49,9 +49,9 @@ def test_skill_beat_off_when_disabled(tmp_path):
 def test_next_pursuing_returns_spec_and_announces(tmp_path):
     b, pub = make_brain(tmp_path)
     spec = b.next_pursuing(now=100.0)
-    assert spec is not None and spec["task"] == "observe_surroundings"
-    assert b.task["task"] == "observe_surroundings"
-    assert pub["task"] and pub["task"][-1]["task"] == "observe_surroundings"
+    assert spec is not None and spec["task"] == "get_acquainted"
+    assert b.task["task"] == "get_acquainted"
+    assert pub["task"] and pub["task"][-1]["task"] == "get_acquainted"
     assert pub["exp"]                            # moved A/B stats announced
 
 

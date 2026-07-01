@@ -146,6 +146,9 @@ oled_display:
     refresh_rate: 1.0         # Hz (clock shows HH:MM:SS; 1 Hz keeps seconds live)
     show_ip: true             # show the wlan/eth IP so you can find the web UI
     rotate: 2                 # 90° steps; 2 = 180° — panel is mounted upside-down
+    idle_face: neutral        # resting face shown between beats (the face is the default screen)
+    dashboard: false          # boot default: false = show the face; true = pin the status panel
+    show_words: true          # boot default: show TTS karaoke words (false keeps the face up)
 
 # ---- BWT901CL 9-axis IMU (WitMotion, USB-serial via CH340) ------------------
 imu_driver:
@@ -160,6 +163,30 @@ imu_driver:
     web_rate: 15.0            # Hz; /imu/web (|accel|,|gyro|,rate) summary for the UI so
                               # the browser need not subscribe to the full /imu/data rate
     output_rate_hz: 0         # 0 = device streams at publish_rate; >0 pins it
+
+# ---- Dev-PC-only: Gazebo hardware stand-in (see bringup.launch.py sim:=true) ------------
+# Not launched on the board. Replaces lds_driver/imu_driver's hardware reads with Gazebo
+# Sim + ros_gz_bridge; sim_bridge converts the bridged joint/imu/scan topics into the
+# exact contracts the real hardware nodes publish (see sim_hardware/sim_bridge_node.py).
+sim_bridge:
+  ros__parameters:
+    ticks_per_rev: 1440       # MUST match wheel_odometry.ticks_per_rev above
+    left_wheel_joint: "left_wheel_joint"
+    right_wheel_joint: "right_wheel_joint"
+    invert_left: false
+    invert_right: false
+    esp_temp: 34.0            # constant "healthy" synthetic board telemetry
+    lds_rpm: 300.0
+    lds_hz: 5.0
+    heartbeat_rate: 1.0       # Hz
+
+# Republishes slam_nav's /dev/shm/nano_map.bin as nav_msgs/OccupancyGrid on /map, for
+# RViz. Useful on the real robot too (not sim-specific) -- see sim_hardware/map_bridge_node.py.
+map_bridge:
+  ros__parameters:
+    map_file: "/dev/shm/nano_map.bin"
+    frame_id: "odom"          # matches slam_nav seeding its pose straight from /odom
+    publish_rate: 2.0         # Hz
 
 # ---- Board health monitor -> diagnostic_msgs/DiagnosticArray on /diagnostics -
 sys_monitor:
@@ -202,8 +229,6 @@ behavior:
     enrich_enable: true       # publish /cognition/request on the idle beats
     enrich_min_interval: 45.0 # s, per-beat rate-limit so a fast chart can't spam the API
     camera_beats: true        # allow the autonomous camera ("looking") beat at all
-    look_every: 4             # DEPRECATED (ignored): camera cadence is now the looking beat's
-                              # learnable priority/trait in the registry, not a fixed every-Nth
     # --- skill library: let the brain pick a capability (skills/*.md) on a beat ---
     # Every Nth body (musing) beat becomes a "skill" beat: web_control picks the most fitting
     # skill from the library and performs it. Goals (pursuing) take the slot first, then
@@ -222,6 +247,11 @@ behavior:
     # — otherwise normal quiet between reflections reverts accumulated drift and the robot can
     # never "become its own" (it snaps back to the seed every brain_timeout seconds).
     personality_path: ""      # "" = ~/.local/state/nanobot/personality.json
+    # Hand-editable overrides, both optional (best-effort: absent/malformed falls back to the
+    # built-in defaults in presence.py, never crashes the node). See memory/presence_chart.yaml
+    # and memory/beats.json on the dev harness for the editable copies.
+    chart_path: ""             # "" = ~/.local/state/nanobot/presence_chart.yaml (sismic statechart)
+    beats_path: ""             # "" = ~/.local/state/nanobot/beats.json (per-beat face/camera/audio/prompt)
     smoothing_alpha: 0.25     # exponential-smoothing rate for trait `evolve` (0..1; small=slow)
     brain_timeout: 1800.0     # s without an /cognition/evolve before reverting to baseline (>> reflect_period)
     nudge_pickup_caution: 0.92  # fast rule: being picked up eases caution toward this
@@ -237,7 +267,7 @@ behavior:
     attend_face: "looking"      # OLED face for the focus-driven "attending" perk-up
     attend_secs: 2.0            # s the alert "attending" pause holds before the beat fires
     feel_secs: 2.5              # s the baseline-mood "feeling" state holds after a beat
-    # --- Purpose Engine + Horizon Planner (goals/reward + A/B; narrative-only) ---
+    # --- Purpose Engine + Pursuit driver (goals/reward + A/B; narrative-only) ---
     # The slow "identity" layer owns the robot's objective + intrinsic-reward weights; the
     # "strategy" layer turns that into a verified task it narrates as a "pursuing" beat (an
     # upgrade of the idle musing beat) and A/B-tests how the line is phrased, learning from
@@ -294,18 +324,13 @@ web_control:
     # popular ones get upstream-throttled — list a couple per tier; pick current free models
     # from OpenRouter's /models API if these stop working. Set a free_* field to "" to disable
     # free-first for that tier (then it goes straight to the paid model).
-    llm_free_model: "nvidia/nemotron-3-nano-30b-a3b:free,meta-llama/llama-3.3-70b-instruct:free"
-    llm_free_smart_model: "nvidia/nemotron-3-super-120b-a12b:free,openai/gpt-oss-120b:free"
-    # PAID DeepSeek fallbacks — used only when the matching free model is rate-limited.
-    # Cheap: beats/observe/say/look-text. Smart: chat + personality reflection (~5x cost).
-    llm_model: "deepseek/deepseek-v4-flash"     # paid cheap fallback
-    llm_smart_model: "deepseek/deepseek-v4-pro" # paid smart fallback
-    # VISION model — used only by the "Look" button (camera frame -> what it sees). The text
-    # models can't see. "" -> nvidia/nemotron-nano-12b-v2-vl:free (free, verified). DeepSeek
-    # has no vision model, so the vision tier has no DeepSeek fallback; set
-    # llm_vision_fallback_model to a PAID multimodal id (Gemini/GPT/Claude vision) if you
-    # want a fallback when the free vision model hits its daily limit.
-    llm_vision_model: ""
+    llm_free_model: "deepseek/deepseek-v4-flash"
+    llm_free_smart_model: "deepseek/deepseek-v4-flash"
+    # PAID fallbacks — used only when the matching free model is rate-limited.
+    llm_model: "deepseek/deepseek-v4-flash"
+    llm_smart_model: "deepseek/deepseek-v4-flash"
+    # VISION model — used only by the "Look" button (camera frame -> what it sees).
+    llm_vision_model: "deepseek/deepseek-v4-flash"
     llm_vision_fallback_model: ""   # optional PAID vision fallback ("" -> none, stay silent)
     llm_base_url: ""           # "" -> https://openrouter.ai/api/v1/chat/completions
     # FALLBACK in-character persona, layered on the base framing in llm.py. The persona is
@@ -428,3 +453,20 @@ web_control:
     workshop_min_runs: 3        # successful runs before a trial may auto-adopt
     workshop_retire_errors: 2   # error count that auto-retires a trial
     workshop_retire_net_neg: 2  # net 👎 (down - up) that auto-retires a trial
+    # Closing the trial loop on an autonomous robot (rarely gets an explicit 👍): a trial that
+    # simply runs cleanly this many times with no 👎 auto-adopts on its own; a trial that lingers
+    # past trial_ttl seconds without earning adoption is rolled back; and each skill beat exercises
+    # a freshly forged trial with probability trial_bias (the model picker rarely lands on a new
+    # skill, so this is how a trial accrues the runs the gate needs).
+    workshop_adopt_quiet_runs: 5  # clean runs (no 👎) that auto-adopt without praise (>= min_runs)
+    workshop_trial_ttl: 172800.0  # s a trial may linger before stale-rollback (0 = no TTL)
+    workshop_trial_bias: 0.5      # P(a skill beat runs a due trial instead of an LLM pick)
+    # Skill likes: a human can 👍 a skill (repeatably) in the web "Skills" card to make the brain
+    # FAVOUR it. The like count is a per-skill weight in the autonomous skill-beat lottery (the
+    # more likes, the more often it's performed). Durable + deploy-synced like the soul/bank.
+    skill_likes_path: ''          # 👍 likes ledger; '' -> ~/.local/state/nanobot/skill_likes.json
+    skill_like_bias: 0.6          # P(a skill beat picks a liked skill by weight, else an LLM pick)
+    # Reflection mode speaks its conclusions aloud: a short bookend line as it turns inward /
+    # surfaces, plus a one-liner each time it actually concludes something (a refined sense of
+    # self, a freshly forged skill, a trial adopted/retired). false = reflect silently.
+    reflect_announce: true

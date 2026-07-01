@@ -1,6 +1,13 @@
 """Status OLED for the SSD1306 (I2C) via luma.oled. Two display modes:
 
-DASHBOARD (default) — a compact status panel:
+FACE is the **default** idle screen — the panel "feels alive" by showing the eyes
+whenever nothing else owns it (the behaviour layer drives the mood; between beats the
+panel rests on `idle_face`). The status DASHBOARD is shown only while it is **pinned**
+(`/oled_dashboard` True, from the web UI's Dashboard toggle). TTS karaoke words take over
+the panel only while `show_words` is on (`/oled_show_words`); with it off, speech keeps
+the face up. See `_effective_mood` for the arbitration.
+
+DASHBOARD (pinned) — a compact status panel:
 
     ┌───────────────────────────────┐
     │ NANOBOT              12:34:56  │  header bar (inverted): brand + clock
@@ -8,8 +15,8 @@ DASHBOARD (default) — a compact status panel:
     │ ───────────────────────────── │
     │ ESP  ●  39C          CPU 23%   │  left col: subsystems (● online/○ off);
     │ IMU  ●  50Hz         RAM 61%   │  right col: SBC vitals (temp/CPU%/RAM%)
-    │ LDS  ○  off                    │  CPU = busy %, RAM = used % (web UI's
-    └───────────────────────────────┘  cpu_percent / mem_percent)
+    │ LDS  ○  off         R+2 P-1    │  CPU = busy %, RAM = used %; R/P = IMU
+    └───────────────────────────────┘  roll/pitch tilt in degrees (when alive)
 
 FACE — cute animated robot eyes that blink and glance around, used to express a
 mood. Enabled from the web UI by publishing a mood name on /oled_face (empty
@@ -30,11 +37,16 @@ Data sources (all lightweight — no heavy message is deserialized per frame):
     /esp32_heartbeat (Int32)          → ESP32 liveness
     /esp32_temp      (Float32)        → ESP32 temperature
     /imu/web   (Vector3Stamped) z=measured /imu/data Hz → IMU liveness + rate
+    /imu/euler (Vector3Stamped) x=roll y=pitch (deg)    → dashboard tilt readout
     /lds_hz          (Float32)        → LDS valid-frame rate (0/stale = offline)
     /oled_text       (String)         → optional brand override (web UI textbox)
-    /oled_face       (String)         → mood name / "" for dashboard (web UI)
+    /oled_face       (String)         → mood name / "" for the resting idle face (web UI)
+    /oled_dashboard  (Bool)           → pin the status dashboard always (web UI toggle; default
+                                        off = show the face)
+    /oled_show_words (Bool)           → show TTS karaoke words on the panel (web UI toggle;
+                                        default on; off keeps the face up while speaking)
     /oled_word       (String)         → one TTS word at a time, shown big+centred while
-                                        speaking; "" returns to the dashboard (web_control)
+                                        speaking; "" returns to the face/dashboard (web_control)
     /sys/class/thermal/thermal_zone0/temp → SBC CPU temp (cached file read)
     /proc/stat                        → SBC CPU busy % (delta-sampled file read)
     /proc/meminfo                     → SBC RAM used % (cached file read)
@@ -52,7 +64,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32, Int32, String
+from std_msgs.msg import Bool, Float32, Int32, String
 from geometry_msgs.msg import Vector3Stamped
 
 try:
@@ -85,6 +97,12 @@ LDS_TIMEOUT_S = 3.0    # /lds_hz a few Hz
 BLINK_DUR = 0.16       # seconds for one eyelid close+open
 # "sleepy" = the AI-offline mood: closed/content eyes + a slow rising "z z z" (see _sleepy).
 KNOWN_MOODS = ("happy", "angry", "focused", "stress", "sleepy", "looking")
+# A face can be a plain mood ("looking") OR a compound "shape:emotion" ("looking:happy"): the
+# SHAPE (left) sets the eye geometry (the action — what the robot is doing), the EMOTION accent
+# (right) is a small overlay drawn ON TOP (how it feels). This composes N shapes x M emotions
+# from N+M pieces — see _draw_face / _accent_overlay. A plain mood draws exactly as before, so
+# every legacy single mood is byte-identical (the accent path is purely additive).
+ACCENT_MOODS = KNOWN_MOODS         # any known mood may also be used as an emotion accent
 
 # Eye geometry, sized to fill a 128x64 panel. The inner gap is 2*(EYE_DX-EYE_W);
 # EYE_DX=37 / EYE_W=20 → a 34 px gap between the eyes with ~7 px edge margins, so
@@ -116,6 +134,11 @@ class DisplayNode(Node):
             ("anim_fps", 20.0),    # face animation tick rate (only ticks while in face mode;
                                    # safely under the ~26 fps i2c-0@400kHz flush ceiling)
             ("rotate", 0),         # screen rotation in 90° steps; 2 = 180° (upside-down mount)
+            # The face is the default idle screen; `idle_face` is the resting mood worn between
+            # beats (when /oled_face is ""). The dashboard is shown only while pinned.
+            ("idle_face", "neutral"),     # resting face when no mood/beat is active
+            ("dashboard", False),         # boot default for the dashboard pin (web toggle overrides)
+            ("show_words", True),         # boot default for showing TTS karaoke words
         ])
         g = self.get_parameter
         self.show_ip = g("show_ip").value
@@ -125,12 +148,22 @@ class DisplayNode(Node):
         # Latest telemetry — written by callbacks, read by the render timer. The
         # *_at fields are monotonic arrival times used to decide liveness.
         self.text = ""                  # optional brand override from the web UI
-        self.face_mood = ""             # "" = dashboard; else a mood name
+        self.face_mood = ""             # raw mood requested on /oled_face ("" = no active mood)
+        self.face_accent = ""           # emotion accent from a compound "shape:emotion" request
+        self.idle_face = str(g("idle_face").value or "neutral")  # resting face between beats
+        self.pin_dashboard = bool(g("dashboard").value)   # True = show the dashboard always
+        self.show_words = bool(g("show_words").value)     # True = TTS words take over the panel
+        # The EFFECTIVE mood actually rendered: "" means the dashboard, else a face. Derived from
+        # face_mood + idle_face + the dashboard pin in _recompute_mood (the single arbiter).
+        self._mood = ""
+        self._accent = ""               # effective emotion accent overlaid on the shape
         self.speak_word = ""            # current TTS word (karaoke); "" = not speaking
         self.esp_temp = float("nan")
         self.esp_at = -1e9
         self.imu_hz = 0.0
         self.imu_at = -1e9
+        self.imu_roll = 0.0             # /imu/euler roll  (deg) — dashboard tilt readout
+        self.imu_pitch = 0.0            # /imu/euler pitch (deg)
         self.lds_hz = 0.0
         self.lds_at = -1e9
 
@@ -181,18 +214,22 @@ class DisplayNode(Node):
         self.create_subscription(Int32, "esp32_heartbeat", self._on_esp_beat, 10)
         self.create_subscription(Float32, "esp32_temp", self._on_esp_temp, 10)
         self.create_subscription(Vector3Stamped, "imu/web", self._on_imu_web, 10)
+        self.create_subscription(Vector3Stamped, "imu/euler", self._on_imu_euler, 10)
         self.create_subscription(Float32, "lds_hz", self._on_lds_hz, 10)
         self.create_subscription(String, "oled_text", self._on_text, 10)
         self.create_subscription(String, "oled_face", self._on_face, 10)
+        self.create_subscription(Bool, "oled_dashboard", self._on_dashboard, 10)
+        self.create_subscription(Bool, "oled_show_words", self._on_show_words, 10)
         self.create_subscription(String, "oled_word", self._on_word, 10)
         self.create_subscription(String, "oled_system", self._on_system, 10)
 
-        # Dashboard ticks slowly; the face has its own faster timer that stays
-        # cancelled (no wakeups) until a mood is selected.
+        # Dashboard ticks slowly; the face has its own faster timer that runs while a face is
+        # shown (the default) and is cancelled (no wakeups) only while the dashboard is pinned.
         self.create_timer(1.0 / g("refresh_rate").value, self._dashboard_tick)
         self._face_timer = self.create_timer(1.0 / max(1.0, g("anim_fps").value),
                                              self._face_tick)
         self._face_timer.cancel()
+        self._recompute_mood()          # seed the effective mood (face by default) + face timer
 
     # ---- subscriptions (record value + arrival time only) ----
     def _on_text(self, msg: String):
@@ -200,16 +237,45 @@ class DisplayNode(Node):
         self.get_logger().info(f"OLED brand set to {msg.data!r}")
 
     def _on_face(self, msg: String):
-        mood = msg.data.strip().lower()
-        if mood in ("", "off", "dashboard", "none"):
-            new = ""
+        raw = msg.data.strip().lower()
+        if raw in ("", "off", "dashboard", "none"):
+            self.face_mood = ""           # no active mood -> fall back to the resting idle face
+            self.face_accent = ""
         else:
-            new = mood if mood in KNOWN_MOODS else "neutral"
-        if new == self.face_mood:
+            # Compound "shape:emotion" — the action shape (left) carries the emotion accent
+            # (right). A plain mood has no accent and renders exactly as before.
+            shape, _, accent = raw.partition(":")
+            self.face_mood = shape if shape in KNOWN_MOODS else "neutral"
+            self.face_accent = accent if accent in ACCENT_MOODS and accent != self.face_mood else ""
+        self._recompute_mood()
+
+    def _on_dashboard(self, msg: Bool):
+        """Web UI Dashboard toggle: pin the status dashboard always (True) or show the face
+        (False, the default)."""
+        self.pin_dashboard = bool(msg.data)
+        self._recompute_mood()
+
+    def _on_show_words(self, msg: Bool):
+        """Web UI 'show spoken text' toggle. Off keeps the face up while speaking; if turned off
+        mid-speech, drop the current word now and hand the panel back."""
+        self.show_words = bool(msg.data)
+        if not self.show_words and self.speak_word:
+            self.speak_word = ""
+            self._resume_after_word()
+
+    def _recompute_mood(self):
+        """Derive the EFFECTIVE mood from the dashboard pin + the requested/idle face, and
+        start/stop the face animation timer on a face<->dashboard transition. "" = dashboard.
+        The single place face vs dashboard is decided, so every owner stays consistent."""
+        new = "" if self.pin_dashboard else (self.face_mood or self.idle_face)
+        # The emotion accent rides only an actively-requested mood — the resting idle face is plain.
+        new_acc = "" if (self.pin_dashboard or not self.face_mood) else self.face_accent
+        if new == self._mood and new_acc == self._accent:
             return
-        was_face = bool(self.face_mood)
-        self.face_mood = new
-        if new and not was_face:          # entering face mode: re-seed animation
+        was_face = bool(self._mood)
+        self._mood = new
+        self._accent = new_acc
+        if new and not was_face:          # entering face mode: re-seed the animation
             now = time.monotonic()
             self._anim_t = now
             self._open = 1.0
@@ -223,9 +289,27 @@ class DisplayNode(Node):
             self._smile_until = 0.0
             self._face_sig = None
             self._face_timer.reset()
-        elif not new and was_face:        # back to dashboard: stop the face timer
+        elif not new and was_face:        # dashboard pinned: stop the face timer, redraw now
             self._face_timer.cancel()
-        self.get_logger().info(f"OLED mode: {self.face_mood or 'dashboard'}")
+            self._dashboard_tick()
+        else:                             # face -> different face/accent: redraw with the new mood
+            self._face_sig = None
+        label = f"{self._mood}:{self._accent}" if self._accent else (self._mood or "dashboard")
+        self.get_logger().info(f"OLED mode: {label}")
+
+    def _has(self, mood):
+        """True if `mood` is in play as either the base shape OR the emotion accent. Lets the
+        animation cadence + draw paths treat "looking:happy" as both looking AND happy."""
+        return self._mood == mood or self._accent == mood
+
+    def _resume_after_word(self):
+        """Hand the panel back after a karaoke word ends (or is suppressed): reseed the face if
+        one is up, else redraw the dashboard immediately."""
+        if self._mood:                    # resume the face cleanly on the next tick
+            self._anim_t = time.monotonic()
+            self._face_sig = None
+        else:
+            self._dashboard_tick()        # redraw the dashboard immediately
 
     def _on_word(self, msg: String):
         """TTS karaoke: web_control streams one word at a time as it's spoken. A word
@@ -235,16 +319,12 @@ class DisplayNode(Node):
         if self._sys:                       # a shutdown/restart screen owns the panel
             return
         word = msg.data.strip()
-        if word:
+        if word and self.show_words:        # karaoke disabled -> ignore, keep the face up
             self.speak_word = word
             self._draw_word(word)
         elif self.speak_word:
             self.speak_word = ""
-            if self.face_mood:              # resume the face cleanly on the next tick
-                self._anim_t = time.monotonic()
-                self._face_sig = None
-            else:
-                self._dashboard_tick()      # redraw the dashboard immediately
+            self._resume_after_word()
 
     def _on_system(self, msg: String):
         """Web UI sends 'restart' (ROS stack) / 'reboot' (whole SBC) / 'shutdown' the
@@ -274,6 +354,10 @@ class DisplayNode(Node):
     def _on_imu_web(self, msg: Vector3Stamped):
         self.imu_hz = msg.vector.z          # z = measured /imu/data publish rate
         self.imu_at = time.monotonic()
+
+    def _on_imu_euler(self, msg: Vector3Stamped):
+        self.imu_roll = msg.vector.x        # roll/pitch (deg) for the dashboard tilt readout
+        self.imu_pitch = msg.vector.y       # (yaw=z drifts on a magless IMU, so it's not shown)
 
     def _on_lds_hz(self, msg: Float32):
         self.lds_hz = msg.data
@@ -347,7 +431,7 @@ class DisplayNode(Node):
         draw.text((48, y), value, font=self.font, fill=255)
 
     def _dashboard_tick(self):
-        if not self.device or self.face_mood or self.speak_word or self._sys:
+        if not self.device or self._mood or self.speak_word or self._sys:
             return                                           # face/speech/system owns it
         now = time.monotonic()
         esp_up = (now - self.esp_at) < ESP_TIMEOUT_S
@@ -389,6 +473,13 @@ class DisplayNode(Node):
                 s = f"{'CPU' if y == 28 else 'RAM'} {val:.0f}%"
                 draw.text((max(0, W - 3 - self._text_w(s)), y), s, font=self.font, fill=255)
 
+            # IMU tilt (right column, row 52 — beside the LDS row): roll/pitch in degrees.
+            # Right-aligned like the vitals above; only shown while the IMU is alive. No
+            # degree glyph (the default font lacks it — matches the "47C" temp style).
+            if imu_up:
+                tilt = f"R{self.imu_roll:+.0f} P{self.imu_pitch:+.0f}"
+                draw.text((max(0, W - 3 - self._text_w(tilt)), 52), tilt, font=self.font, fill=255)
+
     # ---- TTS karaoke (one word, big + centred) ----
     def _draw_word(self, word):
         """Render a single word as large as it'll fit, centred on the panel. The
@@ -429,7 +520,7 @@ class DisplayNode(Node):
                 if self._double:             # occasional cute double-blink
                     self._double = False
                     self._next_blink = now + 0.18
-                elif self.face_mood == "focused":   # an intent stare blinks rarely
+                elif self._has("focused"):   # an intent (focused) stare blinks rarely
                     self._next_blink = now + random.uniform(5.0, 9.0)
                     self._double = False
                 else:
@@ -453,12 +544,13 @@ class DisplayNode(Node):
             else:
                 self._gtx = random.uniform(-3.0, 3.0)
                 self._gty = random.uniform(-3.0, 3.0)
-            # "focused" + "looking" both scan actively, so they retarget the gaze fastest.
-            lo, hi = (0.6, 1.8) if self.face_mood in ("focused", "looking") else (1.0, 3.0)
+            # "focused" + "looking" both scan actively, so they retarget the gaze fastest —
+            # whether it's the base shape or the emotion accent.
+            lo, hi = (0.6, 1.8) if (self._has("focused") or self._has("looking")) else (1.0, 3.0)
             self._next_gaze = now + random.uniform(lo, hi)
 
-        # Happy: a recurring crescent "smile" beat keeps it lively between glances.
-        if self.face_mood == "happy" and now >= self._next_smile:
+        # Happy (base OR accent): a recurring crescent "smile" beat keeps it lively between glances.
+        if self._has("happy") and now >= self._next_smile:
             self._smile_until = now + 0.45
             self._next_smile = now + random.uniform(3.0, 7.0)
         k = min(1.0, dt * 6.0)
@@ -481,33 +573,67 @@ class DisplayNode(Node):
         if sparkle:
             draw.ellipse((pcx - pw + 1, pcy - ph + 1, pcx - pw + 4, pcy - ph + 4), fill=255)
 
+    def _smile_eye(self, draw, cx, cy):
+        """The happy upward crescent (^_^) — a white blob with a black bite from below. Used
+        for the native happy face AND as the happy *accent* (folds any shape into a smile on a
+        blink / the recurring smile beat), so the two stay pixel-identical."""
+        top, bot = cy - 16, cy + 10
+        draw.ellipse((cx - EYE_W, top, cx + EYE_W, bot), fill=255)
+        draw.ellipse((cx - EYE_W, top + 8, cx + EYE_W, bot + 8), fill=0)  # upward crescent
+
     def _happy_eye(self, draw, cx, cy, px, py, smiling):
         """Happy eye: big round white + a sparkly pupil that looks around; folds to
         an upward crescent (^_^) on the recurring smile beat or a blink."""
         if smiling or self._open < 0.3:
-            top, bot = cy - 16, cy + 10
-            draw.ellipse((cx - EYE_W, top, cx + EYE_W, bot), fill=255)
-            draw.ellipse((cx - EYE_W, top + 8, cx + EYE_W, bot + 8), fill=0)  # upward crescent
+            self._smile_eye(draw, cx, cy)
             return
         eh = max(2, int(EYE_H * self._open))
         draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
         self._pupil(draw, cx, cy, eh, px, py, 7, 9, sparkle=True)
 
+    def _brow(self, draw, cx, cy, inner, eh):
+        """A slanted scowl brow cut deepest on the *inner* side (toward the nose) for the
+        classic \\ / look. Drawn last so it sits over the pupil. Used by the native angry face
+        AND as the angry *accent* over any shape. `inner` is +1 for the left eye, -1 for right."""
+        x_in = cx + inner * (EYE_W + 2)        # inner edge (deep cut)
+        x_out = cx - inner * (EYE_W + 2)        # outer edge (shallow cut)
+        brow = int(eh * 1.1)
+        draw.polygon([(x_out, cy - eh - 3), (x_in, cy - eh - 3),
+                      (x_in, cy - eh + brow), (x_out, cy - eh + 3)], fill=0)
+
+    def _droop(self, draw, cx, cy):
+        """A heavy upper eyelid (black wedge from the top) — the sleepy *accent* over any shape:
+        leaves only a lower sliver of the eye, so the robot looks drowsy without going fully
+        closed like the standalone `sleepy` mood."""
+        eh = max(2, int(EYE_H * self._open))
+        draw.rectangle((cx - EYE_W - 1, cy - eh - 1, cx + EYE_W + 1, cy + int(eh * 0.35)), fill=0)
+
     def _angry_eye(self, draw, cx, cy, inner, px, py):
-        """Angry eye: a tall white with a darting pupil and a slanted brow cut
-        deepest on the *inner* side (toward the nose) for the classic \\ / scowl.
-        `inner` is +1 for the left eye (inner edge to the right), -1 for the right."""
+        """Angry eye: a tall white with a darting pupil and a slanted brow (see _brow)."""
         eh = max(2, int(EYE_H * self._open))
         if self._open < 0.25:
             draw.line((cx - EYE_W, cy, cx + EYE_W, cy), fill=255)
             return
         draw.ellipse((cx - EYE_W, cy - eh, cx + EYE_W, cy + eh), fill=255)
         self._pupil(draw, cx, cy, eh, px, py, 6, 7)       # harsh, no glint
-        x_in = cx + inner * (EYE_W + 2)        # inner edge (deep cut)
-        x_out = cx - inner * (EYE_W + 2)        # outer edge (shallow cut)
-        brow = int(eh * 1.1)                    # drawn last -> brow sits over the pupil
-        draw.polygon([(x_out, cy - eh - 3), (x_in, cy - eh - 3),
-                      (x_in, cy - eh + brow), (x_out, cy - eh + 3)], fill=0)
+        self._brow(draw, cx, cy, inner, eh)               # drawn last -> brow over the pupil
+
+    def _accent_overlay(self, draw, lcx, rcx, cy):
+        """Draw the emotion accent ON TOP of an already-drawn base shape (the "meta" layer):
+        angry -> scowl brows, sleepy -> heavy lids. The happy accent is handled earlier (it folds
+        the whole eye to a smile crescent on a blink / smile beat, see _face_tick). focused /
+        looking / neutral accents contribute cadence only (faster gaze / rare blink, in
+        _anim_update) and need no overlay. Skipped when the accent equals the base shape."""
+        a = self._accent
+        if not a or a == self._mood:
+            return
+        if a == "angry":
+            eh = max(2, int(EYE_H * self._open))
+            self._brow(draw, lcx, cy, +1, eh)
+            self._brow(draw, rcx, cy, -1, eh)
+        elif a == "sleepy":
+            self._droop(draw, lcx, cy)
+            self._droop(draw, rcx, cy)
 
     def _focused_eye(self, draw, cx, cy, px, py):
         """Focused eye: a narrowed (squinted) white with a dark pupil that darts
@@ -557,21 +683,21 @@ class DisplayNode(Node):
         draw.ellipse((bx - 9, by - 9, bx + 9, by + 9), outline=255)
 
     def _face_tick(self):
-        if not self.device or not self.face_mood or self.speak_word or self._sys:
+        if not self.device or not self._mood or self.speak_word or self._sys:
             return
         now = time.monotonic()
         self._anim_update(now)
         self._frame += 1
 
         W, H = self.width, self.height
-        if self.face_mood == "stress":
+        if self._mood == "stress":
             # No dirty-check: force a flush every frame (max load).
             self._face_sig = ("stress", self._frame)
             with canvas(self.device) as draw:
                 self._stress(draw)
             return
 
-        if self.face_mood == "sleepy":
+        if self._mood == "sleepy":
             # Mostly static (cheap) closed eyes + a slowly cycling "z z z". Shown while the
             # LLM brain is unreachable, so it can sit up for a long time at ~no cost.
             zc = int(now * 1.2) % 3 + 1              # 1..3 z's, ~1.2 Hz cycle
@@ -591,27 +717,34 @@ class DisplayNode(Node):
         px = int(round(self._gxf * 3.0))
         py = int(round(self._gyf * 2.5))
         openq = int(round(self._open * 8))
-        smiling = self.face_mood == "happy" and now < self._smile_until
+        smiling = self._has("happy") and now < self._smile_until
 
-        # Dirty-check: only redraw/flush when the picture actually changes.
-        sig = (self.face_mood, openq, px, py, smiling)
+        # Dirty-check: only redraw/flush when the picture actually changes (accent included).
+        sig = (self._mood, self._accent, openq, px, py, smiling)
         if sig == self._face_sig:
             return
         self._face_sig = sig
 
         with canvas(self.device) as draw:
-            if self.face_mood == "angry":
+            # Happy (base OR accent) folds the whole eye into a smile crescent on the smile beat
+            # or a blink — so "looking:happy" periodically beams, not just the native happy face.
+            if self._has("happy") and (smiling or self._open < 0.3):
+                self._smile_eye(draw, lcx, cy)
+                self._smile_eye(draw, rcx, cy)
+                return
+            if self._mood == "angry":
                 self._angry_eye(draw, lcx, cy, +1, px, py)
                 self._angry_eye(draw, rcx, cy, -1, px, py)
-            elif self.face_mood == "focused":
+            elif self._mood == "focused":
                 self._focused_eye(draw, lcx, cy, px, py)
                 self._focused_eye(draw, rcx, cy, px, py)
-            elif self.face_mood == "looking":
+            elif self._mood == "looking":
                 self._looking_eye(draw, lcx, cy, px, py)
                 self._looking_eye(draw, rcx, cy, px, py)
-            else:                                  # happy
+            else:                                  # happy / neutral (calm open eyes)
                 self._happy_eye(draw, lcx, cy, px, py, smiling)
                 self._happy_eye(draw, rcx, cy, px, py, smiling)
+            self._accent_overlay(draw, lcx, rcx, cy)   # emotion overlay on top of the shape
 
     # ---- shutdown ----
     def _shutdown_screen(self):

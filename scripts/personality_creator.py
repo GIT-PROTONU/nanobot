@@ -9,7 +9,7 @@ and gets back a coherent personality. The point of using the smart model is that
 it a few sliders + a sentence and it fills in a rich, consistent character — the
 questionnaire stays short, the result is useful.
 
-    set OPENROUTER_API_KEY first, then:
+    set OPENROUTER_API_KEY first (or drop it in memory/openrouter_key), then:
     python scripts/personality_creator.py                 # interactive
     python scripts/personality_creator.py --out my.json
     # non-interactive (answers piped, one per line):
@@ -30,10 +30,28 @@ sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 from web_control.llm import LlmClient, _extract_json      # noqa: E402
 
 TRAITS = ("curiosity", "extraversion", "caution", "playfulness")
-# Dev tooling keeps its state in the project-local devstate/ folder (visible/editable in the
+# Dev tooling keeps its state in the project-local memory/ folder (visible/editable in the
 # repo, the same place scripts/dev_webui.py reads its "soul" from). Override with --out; copy
 # the result to the board's ~/.local/state/nanobot/personality.json to give the robot this soul.
-DEFAULT_OUT = os.path.join(_ROOT, "devstate", "personality.json")
+DEFAULT_OUT = os.path.join(_ROOT, "memory", "personality.json")
+
+
+def _load_openrouter_key():
+    """$OPENROUTER_API_KEY wins; else load it from a one-line memory/openrouter_key file
+    (gitignored) so this can be run without exporting the env var every session."""
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        return
+    for path in (os.path.join(_ROOT, "memory", "openrouter_key"),
+                 os.path.join(_HERE, ".openrouter_key")):
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                os.environ["OPENROUTER_API_KEY"] = key
+            return
+
+
+_load_openrouter_key()
 
 DESIGNER_SYSTEM = (
     "You design the initial personality for Nano, a small expressive mobile robot that "

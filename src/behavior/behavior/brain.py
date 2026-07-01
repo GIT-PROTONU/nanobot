@@ -7,15 +7,14 @@ This is the whole "what should I do" stack, kept out of the ROS node so it unit-
 It holds, in order:
   * the **Purpose Engine** — the slow teleological layer: the current *objective* + the
     *intrinsic-reward* weights, drifted deterministically by reflecting on experience;
-  * the **Horizon Planner** + an online A/B **bandit** — turns the objective into a small task
-    queue, verifies each task against the world before narrating it, and learns which phrasing
-    earns reward;
+  * the **Pursuit** driver + an online A/B **bandit** — narrates the active objective when its
+    precondition holds (rate-limited), and learns which phrasing earns reward;
   * **PurposeBrain** — the orchestration of the two above (beat upgrades, reflection, reward,
     reflection-mode consolidation, persistence);
   * **Personality** — the Sismic-chart-context personality glue (seed load, evolve/heartbeat
     events, latched publish + throttled persist).
 
-(The Purpose Engine + Planner used to live in their own `purpose.py` / `planner.py`; they were
+(The Purpose Engine + Pursuit used to live in their own `purpose.py` / `planner.py`; they were
 folded in here to make the behaviour layer fewer moving parts. The presence statechart stays in
 `presence.py` and the ROS glue in `mood_node.py`.)
 
@@ -61,7 +60,7 @@ def clamp01(v, default=0.5):
 # Sits ABOVE the presence statechart. Owns the current objective + intrinsic-reward weights,
 # drifted by reflecting on the shared decision log through the lens of the personality traits.
 # Deterministic + fully local (no LLM on the critical path) and narrative-only — the reward
-# weights only bias which idle beat the planner narrates; it never moves the robot. Kept
+# weights only bias which objective the robot pursues; it never moves the robot. Kept
 # separate from the LLM reflection: that owns *trait* drift, this owns *goals + reward weights*.
 # =============================================================================
 
@@ -71,18 +70,46 @@ DEEP_QUESTIONS = [
     "Am I taking care of my body — heat, balance, rest?",
 ]
 
-# Intrinsic-reward axes (0..1): how much the robot currently values each drive. The planner
-# reads these to decide what to narrate; reflect_purpose nudges them from experience.
+# Intrinsic-reward axes (0..1): how much the robot currently values each drive. reflect_purpose
+# nudges them from experience; an objective's `axis` says which drive its reward shapes.
 REWARD_AXES = ("curiosity", "social", "order", "rest")
 DEFAULT_REWARD = {"curiosity": 0.55, "social": 0.3, "order": 0.2, "rest": 0.4}
 
-# Objective catalogue (narrative-only). Each objective declares the reward axis it serves,
-# so human reward can shape the right drive. Start with one; add more as recipes grow.
+# Objective catalogue (narrative-only). Each objective is self-contained — its human-facing
+# text, the intrinsic-reward `axis` it serves (so human reward shapes the right drive), and how
+# it's pursued: the `beat` it narrates through, whether it wants the `camera`, the `narrate`
+# line phrase, a `precond` predicate over the light world snapshot (so e.g. it won't narrate
+# "seeing the room" while being carried), and the A/B phrasing `variants` (name -> style hint)
+# the bandit learns from reward. One objective for now; add a row to grow the repertoire.
 OBJECTIVES = {
-    "get_acquainted": {"text": "Get to know the space around me", "primary": "curiosity"},
+    "get_acquainted": {
+        "text": "Get to know the space around me",
+        "axis": "curiosity",
+        "beat": "pursuing",
+        "camera": True,
+        "narrate": "look around and notice what's in the space",
+        "precond": lambda w: (not w.get("picked")) and bool(w.get("sensors_fresh", True)),
+        "variants": {
+            "terse":   "Keep it to a few plain, matter-of-fact words.",
+            "playful": "Be playful and openly curious about it.",
+        },
+    },
     # future: "stay_well" -> rest, "be_sociable" -> social, "keep_order" -> order
 }
 DEFAULT_OBJECTIVE = "get_acquainted"
+
+
+def precond_ok(objective, world):
+    """The objective's narrative-only precondition over the light world snapshot ("can I pursue
+    this right now?"). Missing predicate = always ok; a bad predicate must never crash the
+    brain, so any exception reads as not-ok."""
+    fn = (objective or {}).get("precond")
+    if fn is None:
+        return True
+    try:
+        return bool(fn(world))
+    except Exception:
+        return False
 
 
 def default_purpose(name="Nano", now=None):
@@ -165,7 +192,7 @@ def reflect_purpose(purpose, experience, traits, alpha=0.15, now=None):
     up, down = experience.get("reward_up", 0), experience.get("reward_down", 0)
     if up or down:
         net = (up - down) / float(up + down)               # -1..1
-        prim = OBJECTIVES.get(new["objective"]["id"], {}).get("primary", "curiosity")
+        prim = OBJECTIVES.get(new["objective"]["id"], {}).get("axis", "curiosity")
         targets[prim] = clamp01(rew.get(prim, 0.5) + 0.3 * net)
 
     # Personality colours rest: a more cautious robot values rest/quiet a little more.
@@ -187,94 +214,49 @@ def reflect_purpose(purpose, experience, traits, alpha=0.15, now=None):
 
 
 # =============================================================================
-# Horizon Planner + online A/B bandit — the "strategy" layer (was planner.py).
-# Turns the Purpose Engine's objective into a small task queue, verifies each task's
-# preconditions against the world before narrating it (a light "predictive shadow" — no physics
-# sim, since this layer is narrative-only), and runs a local epsilon-greedy bandit that A/B-tests
-# *how* a task is narrated and learns from human reward. Deterministic (rng + clock injected).
+# Pursuit driver + online A/B bandit — the "strategy" layer (was planner.py).
+# Narrates the active objective when its precondition holds (rate-limited), and runs a local
+# epsilon-greedy bandit that A/B-tests *how* it's phrased and learns from human reward.
+# Deterministic (rng + clock injected), narrative-only. (This used to be a receding-horizon
+# "Horizon Planner" with a per-objective task DAG — decompose/verify/queue — but with the
+# objectives flat and single-task there was nothing to schedule, so it collapsed to this.)
 # =============================================================================
-
-# objective id -> ordered sub-tasks (the DAG; a flat list for the first slice).
-RECIPES = {
-    "get_acquainted": ["observe_surroundings"],
-}
-
-# task id -> how it's narrated (which beat / whether it wants the camera / a phrase to slot
-# into the prompt) + its precondition: a pure predicate over a world-state dict.
-TASKS = {
-    "observe_surroundings": {
-        "beat": "pursuing",
-        "camera": True,
-        "text": "look around and notice what's in the space",
-        # Don't narrate "seeing the room" while being carried, or with stale sensors.
-        "precond": lambda w: (not w.get("picked")) and bool(w.get("sensors_fresh", True)),
-    },
-}
-
-# A/B experiments. Each binds a task to a set of narration variants the bandit chooses among.
-# First experiment: terse vs playful phrasing of the observe line.
-DEFAULT_EXPERIMENTS = {
-    "pursuing_style": {
-        "task": "observe_surroundings",
-        "variants": {
-            "terse":   {"style_hint": "Keep it to a few plain, matter-of-fact words."},
-            "playful": {"style_hint": "Be playful and openly curious about it."},
-        },
-    },
-}
-
-
-def decompose(objective_id):
-    """Objective -> ordered task ids (the strategy layer's plan)."""
-    return list(RECIPES.get(objective_id, []))
-
-
-def verify(task_id, world):
-    """The 'predictive shadow': can this task be narrated right now? Returns (ok, reason)."""
-    t = TASKS.get(task_id)
-    if t is None:
-        return False, "unknown-task"
-    try:
-        ok = bool(t["precond"](world))
-    except Exception as exc:                       # a bad predicate must never crash the brain
-        return False, "precond-error:%s" % (exc,)
-    return (ok, "" if ok else "precondition-not-met")
 
 
 class Bandit:
-    """Epsilon-greedy multi-armed bandit over named experiments. Reward is in [-1, 1];
-    each arm tracks a running mean. State is plain JSON (persist/restore friendly)."""
+    """Epsilon-greedy multi-armed bandit over each objective's A/B phrasing variants. Reward is
+    in [-1, 1]; each arm tracks a running mean. State is plain JSON (persist/restore friendly)."""
 
-    def __init__(self, experiments=None, state=None, epsilon=0.2):
-        self.exp = copy.deepcopy(experiments or DEFAULT_EXPERIMENTS)
+    def __init__(self, objectives=None, state=None, epsilon=0.2):
+        cat = objectives or OBJECTIVES
+        # variants[obj_id] = [variant names]; stats[obj_id][variant] = {"n": int, "mean": float}
+        self.variants = {oid: list((o.get("variants") or {})) for oid, o in cat.items()}
         self.epsilon = float(epsilon)
-        # stats[exp_id][variant] = {"n": int, "mean": float}
-        self.stats = {eid: {v: {"n": 0, "mean": 0.0} for v in e["variants"]}
-                      for eid, e in self.exp.items()}
+        self.stats = {oid: {v: {"n": 0, "mean": 0.0} for v in vs}
+                      for oid, vs in self.variants.items()}
         if isinstance(state, dict):
-            for eid, vs in (state.get("stats") or {}).items():
-                if eid in self.stats and isinstance(vs, dict):
+            for oid, vs in (state.get("stats") or {}).items():
+                if oid in self.stats and isinstance(vs, dict):
                     for v, st in vs.items():
-                        if v in self.stats[eid] and isinstance(st, dict):
-                            self.stats[eid][v] = {"n": int(st.get("n", 0)),
+                        if v in self.stats[oid] and isinstance(st, dict):
+                            self.stats[oid][v] = {"n": int(st.get("n", 0)),
                                                   "mean": float(st.get("mean", 0.0))}
             if isinstance(state.get("epsilon"), (int, float)):
                 self.epsilon = float(state["epsilon"])
 
-    def assign(self, exp_id, rng):
+    def assign(self, obj_id, rng):
         """Pick a variant: explore (random) with prob epsilon, else exploit the best mean.
         Ties broken deterministically (fewer trials, then name) so tests are stable."""
-        e = self.exp.get(exp_id)
-        if not e:
+        variants = self.variants.get(obj_id)
+        if not variants:
             return None
-        variants = list(e["variants"])
         if rng.random() < self.epsilon:
             return rng.choice(variants)
-        st = self.stats[exp_id]
+        st = self.stats[obj_id]
         return max(variants, key=lambda v: (st[v]["mean"], -st[v]["n"], v))
 
-    def record(self, exp_id, variant, reward):
-        st = self.stats.get(exp_id, {}).get(variant)
+    def record(self, obj_id, variant, reward):
+        st = self.stats.get(obj_id, {}).get(variant)
         if st is None:
             return False
         reward = max(-1.0, min(1.0, float(reward)))
@@ -282,8 +264,8 @@ class Bandit:
         st["mean"] = round(st["mean"] + (reward - st["mean"]) / st["n"], 4)
         return True
 
-    def winner(self, exp_id):
-        vs = self.stats.get(exp_id)
+    def winner(self, obj_id):
+        vs = self.stats.get(obj_id)
         if not vs:
             return None
         return max(vs, key=lambda v: (vs[v]["mean"], vs[v]["n"], v))
@@ -292,66 +274,48 @@ class Bandit:
         return {"stats": copy.deepcopy(self.stats), "epsilon": self.epsilon}
 
     def summary(self):
-        return {eid: {"variants": {v: dict(st) for v, st in vs.items()},
-                      "winner": self.winner(eid)}
-                for eid, vs in self.stats.items()}
+        return {oid: {"variants": {v: dict(st) for v, st in vs.items()},
+                      "winner": self.winner(oid)}
+                for oid, vs in self.stats.items()}
 
 
-class Planner:
-    """The receding-horizon planner: holds the current objective's task queue + the bandit,
-    hands out the next verified task to narrate (rate-limited), and credits human reward back
-    to the A/B arm that produced the line."""
+class Pursuit:
+    """Drives the single active objective: when it's due (rate-limited) and its precondition
+    holds, return its narration spec — choosing an A/B phrasing variant the bandit learns from
+    human reward — and credit reward back to the arm that produced a line."""
 
-    def __init__(self, objective_id="get_acquainted", experiments=None, state=None,
+    def __init__(self, objective_id=DEFAULT_OBJECTIVE, objectives=None, state=None,
                  epsilon=0.2, min_interval=120.0):
         st = state or {}
+        self.cat = objectives or OBJECTIVES
         self.objective = st.get("objective") or objective_id
-        self.bandit = Bandit(experiments, st.get("bandit"), epsilon=epsilon)
-        self.queue = list(st.get("queue") or decompose(self.objective))
+        self.bandit = Bandit(self.cat, st.get("bandit"), epsilon=epsilon)
         self.min_interval = float(min_interval)
         self._last_t = -1e9
-        self._i = 0
         self.last_assignment = None        # {exp, variant, task} of the most recent narration
 
     def set_objective(self, objective_id):
         if objective_id and objective_id != self.objective:
             self.objective = objective_id
-            self.queue = decompose(objective_id)
-            self._i = 0
-
-    def _exp_for(self, task_id):
-        for eid, e in self.bandit.exp.items():
-            if e.get("task") == task_id:
-                return eid
-        return None
 
     def next_task(self, world, rng, now=0.0):
-        """Pick the next verified task to narrate, assign it an A/B variant, and return its
-        narration spec — or None when nothing's due (rate-limited) or eligible (no task
-        verifies). Tasks that fail verification are left in the queue (a real DAG would log +
-        reorder); the rotation still advances so a later cycle can try a different one."""
-        if not self.queue:
-            self.queue = decompose(self.objective)
-        if not self.queue or (now - self._last_t) < self.min_interval:
+        """If the active objective is due and its precondition holds, assign an A/B variant and
+        return its narration spec; else None (rate-limited, unknown objective, or precondition
+        not met — e.g. being carried). `exp`/`task` echo the objective id so the web reward
+        target round-trips back to the right arm."""
+        obj = self.cat.get(self.objective)
+        if obj is None or (now - self._last_t) < self.min_interval:
             return None
-        n = len(self.queue)
-        for _ in range(n):
-            task_id = self.queue[self._i % n]
-            self._i += 1
-            ok, _reason = verify(task_id, world)
-            if not ok:
-                continue
-            self._last_t = now
-            t = TASKS[task_id]
-            exp_id = self._exp_for(task_id)
-            variant = self.bandit.assign(exp_id, rng) if exp_id else None
-            hint = ""
-            if variant is not None:
-                hint = self.bandit.exp[exp_id]["variants"][variant].get("style_hint", "")
-            self.last_assignment = {"exp": exp_id, "variant": variant, "task": task_id}
-            return {"task": task_id, "beat": t["beat"], "camera": bool(t["camera"]),
-                    "text": t["text"], "exp": exp_id, "variant": variant, "style_hint": hint}
-        return None
+        if not precond_ok(obj, world):
+            return None
+        self._last_t = now
+        variant = self.bandit.assign(self.objective, rng)
+        hint = (obj.get("variants") or {}).get(variant, "") if variant is not None else ""
+        self.last_assignment = {"exp": self.objective, "variant": variant,
+                                "task": self.objective}
+        return {"task": self.objective, "beat": obj["beat"], "camera": bool(obj["camera"]),
+                "text": obj["narrate"], "exp": self.objective, "variant": variant,
+                "style_hint": hint}
 
     def on_reward(self, value, target=None):
         """Credit a human reward to the A/B arm that produced the narrated line. `target`
@@ -362,11 +326,10 @@ class Planner:
         return self.bandit.record(tgt.get("exp"), tgt.get("variant"), value)
 
     def to_state(self):
-        return {"objective": self.objective, "queue": self.queue,
-                "bandit": self.bandit.to_state()}
+        return {"objective": self.objective, "bandit": self.bandit.to_state()}
 
     def summary(self):
-        return {"objective": self.objective, "queue": self.queue,
+        return {"objective": self.objective,
                 "experiments": self.bandit.summary(), "last": self.last_assignment}
 
 
@@ -449,8 +412,8 @@ def load_personality(path, *, with_defaults=True, logger=None):
 
 
 class PurposeBrain:
-    """The slow "identity / strategy" layer: owns the Purpose Engine state + the Horizon
-    Planner, decides when an idle beat upgrades to a goal-pursuit or a skill, reflects on
+    """The slow "identity / strategy" layer: owns the Purpose Engine state + the Pursuit
+    driver, decides when an idle beat upgrades to a goal-pursuit or a skill, reflects on
     experience, credits human reward to the A/B bandit, and consolidates while reflecting.
 
     Pure + deterministic (rng/clock injected). It never executes a beat — it only DECIDES
@@ -490,9 +453,9 @@ class PurposeBrain:
         self._pub_hb = 0.0             # monotonic of the last latched republish
         self._purpose = merge_purpose(load_json(self._purpose_path, logger=self._log),
                                       name=name)
-        self._planner = None
+        self._pursuit = None
         if self.enable:
-            self._planner = Planner(
+            self._pursuit = Pursuit(
                 objective_id=self._purpose["objective"]["id"],
                 state=load_json(self._experiments_path, logger=self._log),
                 epsilon=float(epsilon), min_interval=float(pursue_min_interval))
@@ -503,10 +466,10 @@ class PurposeBrain:
         return self._purpose
 
     def summary(self):
-        return self._planner.summary() if self._planner is not None else {"experiments": {}}
+        return self._pursuit.summary() if self._pursuit is not None else {"experiments": {}}
 
     def world_state(self):
-        """The light world snapshot the planner verifies a task against (narrative-only)."""
+        """The light world snapshot the pursuit checks its precondition against (narrative-only)."""
         return {"picked": bool(self._picked()), "sensors_fresh": True,
                 "reflecting": self.reflecting}
 
@@ -514,9 +477,9 @@ class PurposeBrain:
     def next_pursuing(self, now):
         """If a goal-pursuit beat is due, return its narration spec (and announce the task +
         moved A/B stats); else None. Eligible only while enabled and not reflecting."""
-        if not (self.enable and self._planner is not None) or self.reflecting:
+        if not (self.enable and self._pursuit is not None) or self.reflecting:
             return None
-        spec = self._planner.next_task(self.world_state(), self._rng, now=now)
+        spec = self._pursuit.next_task(self.world_state(), self._rng, now=now)
         if spec is None:
             return None
         self.task = {"task": spec["task"], "exp": spec["exp"], "variant": spec["variant"],
@@ -544,15 +507,15 @@ class PurposeBrain:
     # ---- purpose reflection / reward / reflection mode ----------------------
     def run_reflection(self, traits=None, force=False):
         """Reflect on recent experience (the shared log) + traits -> drift the intrinsic-reward
-        weights + keep the planner's objective in sync. Deterministic, local. Returns whether
+        weights + keep the pursuit's objective in sync. Deterministic, local. Returns whether
         the purpose changed; persists + announces it when it did (or on `force`)."""
-        if self._planner is None:
+        if self._pursuit is None:
             return False
         traits = traits if traits is not None else dict(self._traits_snapshot())
         exp = summarize_experience(self._read_cog_log())
         new, changed = reflect_purpose(self._purpose, exp, traits)
         self._purpose = new
-        self._planner.set_objective(new["objective"]["id"])
+        self._pursuit.set_objective(new["objective"]["id"])
         if changed or force:
             self._publish_purpose(self._purpose)
             self.save_purpose()
@@ -562,10 +525,10 @@ class PurposeBrain:
         """Credit a human reward to the A/B arm that produced the narrated line (contextual).
         Global reward shapes the intrinsic-reward weights via the log on the next reflection.
         Returns whether an arm was credited; persists + announces the moved stats when so."""
-        if self._planner is None or str(scope) == "global":
+        if self._pursuit is None or str(scope) == "global":
             return False
         tgt = target if isinstance(target, dict) else None
-        if self._planner.on_reward(value, tgt):
+        if self._pursuit.on_reward(value, tgt):
             self.save_experiments()
             self._publish_experiments(self.summary())
             return True
@@ -585,9 +548,9 @@ class PurposeBrain:
 
     def finalize_experiments(self):
         """Log the current A/B winners and persist + announce the experiment stats."""
-        if self._planner is None:
+        if self._pursuit is None:
             return
-        summ = self._planner.summary()
+        summ = self._pursuit.summary()
         winners = ", ".join(f"{eid}->{e['winner']}"
                             for eid, e in summ["experiments"].items())
         self._log(f"A/B winners: {winners or '(none)'}")
@@ -597,7 +560,7 @@ class PurposeBrain:
     def tick(self, now):
         """Slow loop (driven off the node's tick): reflect on the period (faster while
         reflecting) and republish the latched readouts on a heartbeat for late subscribers."""
-        if self.enable and self._planner is not None:
+        if self.enable and self._pursuit is not None:
             period = 30.0 if self.reflecting else self._reflect_period
             if (now - self._reflect_last) >= period:
                 self._reflect_last = now
@@ -612,8 +575,8 @@ class PurposeBrain:
         save_json(self._purpose_path, self._purpose, logger=self._log)
 
     def save_experiments(self):
-        if self._planner is not None:
-            save_json(self._experiments_path, self._planner.to_state(), logger=self._log)
+        if self._pursuit is not None:
+            save_json(self._experiments_path, self._pursuit.to_state(), logger=self._log)
 
     def save(self):
         self.save_purpose()

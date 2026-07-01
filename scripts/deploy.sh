@@ -5,7 +5,7 @@
 #
 #   NANO_PW=<pw> scripts/deploy.sh                # rebuild everything (KEEPS the robot's evolved soul)
 #   NANO_PW=<pw> scripts/deploy.sh oled_display   # rebuild only these packages
-#   DEPLOY_SOUL=1 NANO_PW=<pw> scripts/deploy.sh  # ALSO overwrite the board's soul with devstate/
+#   DEPLOY_SOUL=1 NANO_PW=<pw> scripts/deploy.sh  # ALSO overwrite the board's soul with memory/
 #
 # Creds come from the environment so nothing secret lands in the repo:
 #   NANO_PW (required), NANO_HOST, NANO_HOSTKEY, PLINK, PSCP.
@@ -23,33 +23,35 @@ SEL=""; [ $# -gt 0 ] && SEL="--packages-select $*"
 echo ">> pushing src/ + scripts/ to $HOST"
 "$PSCP" -batch -pw "$PW" -hostkey "$HK" -r src scripts "$HOST:/home/ibster/Nano/"
 
-# Push the dev-made "soul" (personality.json) + phrase bank (phrases.json) from the project-local
-# devstate/ folder onto the board. OFF by default (DEPLOY_SOUL=0) so the robot KEEPS the
-# personality it has evolved on its own — that drift is the whole point of letting it become its
-# own. Opt in with DEPLOY_SOUL=1 to OVERWRITE the board's persisted soul with whatever you
-# crafted in devstate/ (e.g. a fresh personality_creator.py seed); this discards the robot's
+# Push the dev-made "soul" (personality.json) + phrase bank (phrases.json) + hand-editable
+# data (presence_chart.yaml, beats.json) from the project-local memory/ folder onto the board.
+# OFF by default (DEPLOY_SOUL=0) so the robot KEEPS the personality it has evolved on its own —
+# that drift is the whole point of letting it become its own. Opt in with DEPLOY_SOUL=1 to
+# OVERWRITE the board's persisted soul with whatever you crafted in memory/ (e.g. a fresh
+# personality_creator.py seed, or a hand-edited chart/beat table); this discards the robot's
 # accumulated trait drift. The board regenerates the phrase bank itself when the soul/persona
 # changes, so phrases.json is only ever a warm-start.
 if [ "${DEPLOY_SOUL:-0}" = "1" ]; then
-  echo ">> pushing devstate/ soul + phrase bank to $HOST:$STATE_DIR (DEPLOY_SOUL=1)"
+  echo ">> pushing memory/ soul + phrase bank to $HOST:$STATE_DIR (DEPLOY_SOUL=1)"
   "$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" "mkdir -p $STATE_DIR"
   pushed=0
-  for f in personality.json phrases.json workshop.json trait_history.json self_model.json; do
-    if [ -f "devstate/$f" ]; then
-      "$PSCP" -batch -pw "$PW" -hostkey "$HK" "devstate/$f" "$HOST:$STATE_DIR/$f"
-      echo "   copied devstate/$f"
+  for f in personality.json phrases.json workshop.json trait_history.json self_model.json \
+           skill_likes.json presence_chart.yaml beats.json; do
+    if [ -f "memory/$f" ]; then
+      "$PSCP" -batch -pw "$PW" -hostkey "$HK" "memory/$f" "$HOST:$STATE_DIR/$f"
+      echo "   copied memory/$f"
       pushed=1
     fi
   done
-  # Skills the dev harness minted in its workshop (devstate/skills/*.md) -> the board's writable
+  # Skills the dev harness minted in its workshop (memory/skills/*.md) -> the board's writable
   # learned dir, so deploy carries them alongside the soul/bank + the workshop.json ledger.
-  if [ -d "devstate/skills" ] && ls devstate/skills/*.md >/dev/null 2>&1; then
+  if [ -d "memory/skills" ] && ls memory/skills/*.md >/dev/null 2>&1; then
     "$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" "mkdir -p $STATE_DIR/skills"
-    "$PSCP" -batch -pw "$PW" -hostkey "$HK" devstate/skills/*.md "$HOST:$STATE_DIR/skills/"
-    echo "   copied devstate/skills/*.md"
+    "$PSCP" -batch -pw "$PW" -hostkey "$HK" memory/skills/*.md "$HOST:$STATE_DIR/skills/"
+    echo "   copied memory/skills/*.md"
     pushed=1
   fi
-  [ "$pushed" = 0 ] && echo "   (nothing in devstate/ to push — run personality_creator.py first)"
+  [ "$pushed" = 0 ] && echo "   (nothing in memory/ to push — run personality_creator.py first)"
 fi
 
 echo ">> build + restart on board"

@@ -28,11 +28,14 @@ __pycache__/
 .nano-deploy.env
 .nano-askpass.sh
 
-# local OpenRouter key for the dev web UI (never commit)
+# local OpenRouter key for the dev web UI (never commit). Lives in memory/openrouter_key
+# now (already covered by the /memory/* rule below); this old path is kept only as a
+# back-compat fallback the dev scripts still check.
 scripts/.openrouter_key
 
-# dev web UI (scripts/dev_webui.py) runtime state — the "soul" + logs + goal/reward state.
-# Volatile + drifts, so kept out of git; the folder stays (see devstate/.gitkeep). To version
-# a hand-made personality anyway: git add -f devstate/personality.json
-/devstate/*
-!/devstate/.gitkeep
+# dev web UI (scripts/dev_webui.py) runtime state — the "soul" + logs + goal/reward state
+# + the local OpenRouter key (memory/openrouter_key, one line, never committed).
+# Volatile + drifts, so kept out of git; the folder stays (see memory/.gitkeep). To version
+# a hand-made personality anyway: git add -f memory/personality.json
+/memory/*
+!/memory/.gitkeep

@@ -7,14 +7,15 @@
 $ErrorActionPreference = "Stop"
 $root   = Split-Path -Parent $PSScriptRoot          # repo root (scripts\ -> ..)
 $script = Join-Path $PSScriptRoot "dev_webui.py"
-$keyFile = Join-Path $PSScriptRoot ".openrouter_key"
+$keyFile = Join-Path $root "memory\openrouter_key"
+if (-not (Test-Path $keyFile)) { $keyFile = Join-Path $PSScriptRoot ".openrouter_key" }
 
-# --- API key: prefer the environment, else the gitignored scripts\.openrouter_key ---
+# --- API key: prefer the environment, else the gitignored memory\openrouter_key file ---
 if (-not $env:OPENROUTER_API_KEY) {
     if (Test-Path $keyFile) {
         $env:OPENROUTER_API_KEY = (Get-Content $keyFile -Raw).Trim()
     } else {
-        Write-Warning "No OPENROUTER_API_KEY and no scripts\.openrouter_key - the AI card will show 'unavailable' (TTS still works)."
+        Write-Warning "No OPENROUTER_API_KEY and no memory\openrouter_key - the AI card will show 'unavailable' (TTS still works)."
     }
 }
 
@@ -35,7 +36,7 @@ if (-not $py) { throw "No real Python found. Install Python 3.12 from python.org
 # Empty/drifted bank -> every body beat goes LIVE -> single-flight guard skips the rest ->
 # silences + "no lines (kept old)" spam. --if-needed is a no-op when current and never blocks.
 $pregen = Join-Path $PSScriptRoot "pregenerate_phrases.py"
-Write-Host "Checking phrase bank (devstate\phrases.json)..." -ForegroundColor Cyan
+Write-Host "Checking phrase bank (memory\phrases.json)..." -ForegroundColor Cyan
 & $py $pregen "--if-needed"
 
 # default to the full enriched-behaviour loop unless the caller passes their own flags

@@ -31,6 +31,17 @@ The robot can **speak** (English + German). Added 2026-06-24.
   = say once. The check **piggy-backs on the existing 1 Hz ESP-ping timer** (no extra
   wakeup); disabled = one dict lookup. It interrupts whatever's playing + takes over the
   OLED each interval (by design).
+- **TWO unrelated sources speak temperature/state — don't confuse them:**
+  (1) the **periodic stats announcer** above (`_announce_tick`→`announce_now`→`_compose_stats`
+  in `web_server.py`) — deterministic raw `/proc` readout ("Temperature 47 degrees"), fixed
+  `announce_interval`, NO LLM/personality. **Reflection cannot change its rate** — it's a plain
+  timer in the ROS node, independent of the statechart/brain/traits/drives. Only the `announce`
+  toggle + interval slider affect it.
+  (2) the **in-character body-reaction beats** (`musing`/`observe`) — phrase-bank or LLM lines
+  like "its board's running hot ({temp}°C)", chosen by the beat lottery. **Reflection CAN make
+  these more/less frequent**: slow LLM reflection's `evolve` nudges the `musing` beat priority
+  /gating trait, and during reflection mode beats are paused (so it says them less right then).
+  See [[llm-openrouter-personality]], [[meditation-skill-workshop]].
 - **Audio out = the SBC's INTERNAL H5 analog codec** (user's choice, not USB). Needs the
   `analog-codec` overlay (now in `deploy/sbc-setup.sh`) AND un-muting — the codec boots
   **muted**. `deploy/enable-h5-audio.sh` un-mutes all playback controls, writes

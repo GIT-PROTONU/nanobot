@@ -1,0 +1,170 @@
+<?xml version="1.0"?>
+<!--
+Minimal diff-drive model for RViz (RobotModel/TF) + Gazebo Sim (sim:=true).
+
+Dimensions/frame names are pulled from robot.yaml / the real driver nodes so the sim
+matches the physical robot's numbers, not arbitrary ones:
+  - wheel_radius=0.0335, wheel_separation=0.16  (wheel_odometry / motor_control)
+  - frame "laser"    (lds_driver_py's frame_id, also slam_nav's scan_topic frame)
+  - frame "imu_link" (imu_driver's frame_id)
+  - frame "base_link"/"odom" (wheel_odometry's base_frame/odom_frame)
+
+Gazebo Sim (gz-sim) plugins used: DiffDrive (subscribes /cmd_vel, drives the wheel
+joints; its OWN odometry/TF output is intentionally left unbridged; wheel_odometry is
+the real odometry source, fed via sim_hardware/sim_bridge_node.py converting wheel joint
+angle -> /wheel_ticks), JointStatePublisher (wheel angles, bridged then converted to
+ticks), a gpu_lidar sensor on laser_link (-> /scan), and an imu sensor on imu_link
+(-> /imu). See src/robot_bringup/config/gz_bridge.yaml for the ros_gz_bridge wiring.
+-->
+<robot name="nano" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:property name="pi" value="3.14159265359"/>
+  <xacro:property name="wheel_radius" value="0.0335"/>
+  <xacro:property name="wheel_separation" value="0.16"/>
+  <xacro:property name="wheel_width" value="0.022"/>
+  <xacro:property name="base_len" value="0.20"/>
+  <xacro:property name="base_wid" value="0.15"/>
+  <xacro:property name="base_height" value="0.09"/>
+  <xacro:property name="base_ground_clearance" value="0.045"/>
+
+  <material name="body_grey"><color rgba="0.55 0.55 0.58 1"/></material>
+  <material name="wheel_black"><color rgba="0.1 0.1 0.1 1"/></material>
+
+  <link name="base_footprint"/>
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="${base_len} ${base_wid} ${base_height}"/></geometry>
+      <material name="body_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="${base_len} ${base_wid} ${base_height}"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.6"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.003" iyz="0" izz="0.003"/>
+    </inertial>
+  </link>
+
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${base_ground_clearance + base_height/2}" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:macro name="wheel" params="prefix y_sign">
+    <link name="${prefix}_wheel_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry>
+        <material name="wheel_black"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.05"/>
+        <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00003"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_wheel_joint" type="continuous">
+      <parent link="base_link"/>
+      <child link="${prefix}_wheel_link"/>
+      <origin xyz="0 ${y_sign * wheel_separation/2} ${-base_ground_clearance - base_height/2 + wheel_radius}" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+  </xacro:macro>
+  <xacro:wheel prefix="left" y_sign="1"/>
+  <xacro:wheel prefix="right" y_sign="-1"/>
+
+  <!-- Frictionless caster so the robot doesn't tip on 3 contact points -->
+  <link name="caster_link">
+    <visual><geometry><sphere radius="0.012"/></geometry></visual>
+    <collision><geometry><sphere radius="0.012"/></geometry></collision>
+    <inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+  </link>
+  <joint name="caster_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="caster_link"/>
+    <origin xyz="${base_len/2 - 0.02} 0 ${-base_ground_clearance - base_height/2 + 0.012}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="laser_link">
+    <visual><geometry><cylinder radius="0.025" length="0.03"/></geometry></visual>
+  </link>
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser_link"/>
+    <origin xyz="0 0 ${base_height/2 + 0.02}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============================ Gazebo Sim ============================ -->
+  <gazebo>
+    <plugin filename="gz-sim-diff-drive-system" name="gz::sim::systems::DiffDrive">
+      <left_joint>left_wheel_joint</left_joint>
+      <right_joint>right_wheel_joint</right_joint>
+      <wheel_separation>${wheel_separation}</wheel_separation>
+      <wheel_radius>${wheel_radius}</wheel_radius>
+      <!-- Absolute (leading "/") topic names throughout so they don't get namespaced
+           under the spawned model name; keeps gz_bridge.yaml's topic list predictable. -->
+      <topic>/cmd_vel</topic>
+      <!-- deliberately NOT bridged: wheel_odometry (fed via sim_bridge_node's synthetic
+           /wheel_ticks) is the real odometry source, matching the robot. -->
+      <odom_topic>/gz_odom_unused</odom_topic>
+      <tf_topic>/gz_tf_unused</tf_topic>
+    </plugin>
+    <plugin filename="gz-sim-joint-state-publisher-system"
+            name="gz::sim::systems::JointStatePublisher">
+      <joint_name>left_wheel_joint</joint_name>
+      <joint_name>right_wheel_joint</joint_name>
+      <topic>/joint_states_gz</topic>
+    </plugin>
+  </gazebo>
+
+  <gazebo reference="laser_link">
+    <sensor name="lidar" type="gpu_lidar">
+      <topic>/scan</topic>
+      <update_rate>10</update_rate>
+      <always_on>true</always_on>
+      <visualize>false</visualize>
+      <lidar>
+        <scan>
+          <horizontal>
+            <samples>360</samples>
+            <min_angle>0.0</min_angle>
+            <max_angle>6.26573</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.12</min>
+          <max>6.0</max>
+          <resolution>0.01</resolution>
+        </range>
+      </lidar>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="imu_link">
+    <sensor name="imu" type="imu">
+      <topic>/imu</topic>
+      <update_rate>100</update_rate>
+      <always_on>true</always_on>
+    </sensor>
+  </gazebo>
+
+  <gazebo>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+  </gazebo>
+</robot>

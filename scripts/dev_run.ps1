@@ -6,8 +6,9 @@
 
 .DESCRIPTION
   Loads the OpenRouter key from $env:OPENROUTER_API_KEY, or (if unset) from the gitignored
-  scripts\.openrouter_key file (one line - NEVER committed; it's in .gitignore). Then launches
-  scripts\dev_webui.py with --behavior. Extra args pass straight through to dev_webui.py.
+  memory\openrouter_key file (one line - NEVER committed; memory\ is in .gitignore). Then
+  launches scripts\dev_webui.py with --behavior. Extra args pass straight through to
+  dev_webui.py.
 
 .EXAMPLE
   scripts\dev_run.ps1                 # full stack, beats every ~15 s
@@ -20,20 +21,22 @@ $ErrorActionPreference = "Stop"
 $scriptsDir = $PSScriptRoot
 $root = Split-Path -Parent $scriptsDir
 
-# --- 1. Resolve the OpenRouter key (env first, then the local gitignored file) ----------
+# --- 1. Resolve the OpenRouter key (env first, then memory\openrouter_key, then the old
+#        scripts\.openrouter_key location for back-compat) -------------------------------
 $key = $env:OPENROUTER_API_KEY
 $keySrc = "env:OPENROUTER_API_KEY"
 if ([string]::IsNullOrWhiteSpace($key)) {
-    $keyFile = Join-Path $scriptsDir ".openrouter_key"
+    $keyFile = Join-Path $root "memory\openrouter_key"
+    if (-not (Test-Path $keyFile)) { $keyFile = Join-Path $scriptsDir ".openrouter_key" }
     if (Test-Path $keyFile) {
         $key = (Get-Content -Raw -Encoding ascii $keyFile).Trim()
-        $keySrc = "scripts\.openrouter_key"
+        $keySrc = $keyFile.Substring($root.Length + 1)
     }
 }
 if ([string]::IsNullOrWhiteSpace($key)) {
     Write-Host "No OpenRouter key found." -ForegroundColor Red
-    Write-Host "  Put your key (one line) in:  $($scriptsDir)\.openrouter_key" -ForegroundColor Yellow
-    Write-Host "  or set the OPENROUTER_API_KEY env var first. (.openrouter_key is gitignored.)"
+    Write-Host "  Put your key (one line) in:  $root\memory\openrouter_key" -ForegroundColor Yellow
+    Write-Host "  or set the OPENROUTER_API_KEY env var first. (memory\ is gitignored.)"
     exit 1
 }
 $env:OPENROUTER_API_KEY = $key
@@ -59,13 +62,13 @@ if (-not $py) {
 }
 
 # --- 2.5 Ensure the phrase bank exists / is current -------------------------------------
-# An empty or drifted devstate\phrases.json makes every body beat fall through to a slow
+# An empty or drifted memory\phrases.json makes every body beat fall through to a slow
 # LIVE LLM call; the single-flight guard then logs the next beats 'skipped-busy' -> long
 # silences and "phrasebank: ... no lines (kept old)" spam. Build it once here if needed.
 # '--if-needed' is a no-op when the bank is current and NEVER blocks startup (warns + exits 0
 # on a missing key / failed build; the runtime can still regenerate in the background).
 $pregen = Join-Path $scriptsDir "pregenerate_phrases.py"
-Write-Host "Checking phrase bank (devstate\phrases.json)..." -ForegroundColor Cyan
+Write-Host "Checking phrase bank (memory\phrases.json)..." -ForegroundColor Cyan
 & $py $pregen "--if-needed"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  (phrase-bank pre-build skipped/failed - continuing; runtime will retry)" -ForegroundColor Yellow

@@ -51,7 +51,7 @@ beat* to fire:
 | Beat | Sense | Model used | Gated on |
 |---|---|---|---|
 | `musing` | its own body (CPU, RAM, temp, IMU tilt, pick-up) | cheap text | — (always eligible) |
-| `looking` | the camera | vision | curiosity (+ `camera_beats`) |
+| `looking` | the camera | vision | curiosity (+ `camera_beats`, + the LLM being usable right now) |
 | `wondering` | a curious "deep question" about itself / the room | cheap text | curiosity |
 | `listening` | what the microphone hears | cheap text | extraversion |
 
@@ -64,6 +64,15 @@ That makes idle behaviour dynamic and self-learning rather than a fixed cadence 
 `behavior:`. There are also **reflexes** — `greeting`, `resting`, `dormant`, `reflecting`, and
 pick-up reactions. These are deterministic and **not under the brain's control** (see below).
 
+**The lottery also stops offering camera beats when there's no LLM to look for.** `web_control`
+publishes a latched `cognition/llm_ready` (enabled + a key configured — a mere network blip is
+handled separately by the offline-face standdown, which already pauses ALL beats) that
+`mood_node` ANDs with the `camera_beats` admin toggle (`MoodNode._camera_beats_ok`) and feeds
+into the chooser as a live callable, so `looking` simply isn't a candidate while the LLM is off
+— not just silently dropped after the fact. The dev harness (`scripts/dev_webui.py`) mirrors
+this in-process (`state.llm.available()`), and `CognitionCore.run_beat` re-checks
+`llm.available()` before ever touching the camera, as a defensive backstop.
+
 When the chart enters a beat, two things happen *independently*:
 
 1. It **immediately** shows a sensible default face (offline-safe — works with no internet).
@@ -75,7 +84,11 @@ When the chart enters a beat, two things happen *independently*:
 That fire-and-forget split is the whole trick. The "feel alive" behaviour is guaranteed;
 the LLM cleverness is a bonus layered on top. To add a beat: one `BEATS` row (default face +
 prompt + camera/audio flags) plus one `DEFAULT_REGISTRY` row (priority + optional needs/trait)
-in `presence.py` — the lottery picks it up automatically, no chart surgery.
+in `presence.py` — the lottery picks it up automatically, no chart surgery. Both are also
+hand-editable without touching code: `memory/beats.json` layers over `BEATS`, and
+`memory/presence_chart.yaml` can override the Sismic graph itself — either falls back to the
+bundled default if missing or broken, so a bad edit degrades gracefully instead of disabling
+the behaviour layer.
 
 ## A single beat, end to end
 
@@ -213,7 +226,7 @@ cycle (the pure pieces are in `web_control/skillsmith.py`, unit-tested offline):
 
 So the brain doesn't just *use* skills — over time, guided by what actually pleased people, it
 **grows new ones and prunes the duds**, and the survivors become a permanent part of who it is.
-The same loop runs on the dev harness (skills land in `devstate/skills/`), so you can watch it
+The same loop runs on the dev harness (skills land in `memory/skills/`), so you can watch it
 invent a capability in a browser with no robot.
 
 ## On-demand interactions (you, not the chart)
@@ -323,7 +336,7 @@ offline. Because the brain is one shared base, what you test here is exactly wha
 robot.
 
 ```bash
-set OPENROUTER_API_KEY=...        # or scripts/.openrouter_key (gitignored)
+set OPENROUTER_API_KEY=...        # or memory/openrouter_key (gitignored)
 python scripts/dev_webui.py --behavior        # autonomous enriched beats
 python scripts/dev_webui.py --behavior --idle-secs 10   # faster beats
 ```

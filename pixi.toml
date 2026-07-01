@@ -51,6 +51,24 @@ pkg-config = "*"
 pyserial = "*"          # serial access for the LDS (lds_driver_py) + IMU (imu_driver)
 smbus2 = "*"            # I2C for the PCA9685 driver
 
+# --- Dev-PC-only: Gazebo simulation + RViz (see scripts/sim_run.sh) ---------------
+# linux-64 ONLY (a [target.*] section, not [dependencies]) so none of this ever
+# resolves onto the board (linux-aarch64) — same "don't bloat the 1 GB/7 GB board"
+# discipline as the rust/clang ban above. `ros-humble-ros-base` (used for
+# everyone, incl. the board) deliberately excludes RViz/Gazebo. Note this is
+# Gazebo SIM (formerly "Ignition", via ros_gz) not Gazebo Classic:
+# robostack-staging doesn't cleanly ship gazebo_ros_pkgs for Humble, but DOES
+# ship ros-gz-* (verified against the anaconda.org API) — also the
+# actively-maintained upstream path now that Gazebo Classic is EOL.
+[target.linux-64.dependencies]
+ros-humble-rviz2 = "*"
+ros-humble-ros-gz-sim = "*"
+ros-humble-ros-gz-bridge = "*"
+ros-humble-ros-gz-image = "*"
+ros-humble-xacro = "*"
+ros-humble-robot-state-publisher = "*"
+ros-humble-joint-state-publisher = "*"
+
 [pypi-dependencies]
 luma-oled = "*"         # SSD1306 OLED over I2C
 # (gpiod removed: wheel encoders now decode on the ESP32 coprocessor, not GPIO.)
@@ -69,8 +87,17 @@ build = "bash scripts/build.sh"
 # rmw_zenoh needs its router running for discovery. Start it (own terminal / service).
 zenohd = "ros2 run rmw_zenoh_cpp rmw_zenohd"
 
-# Bring up the full robot. Sources the local overlay on top of the conda ROS env.
-bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup robot.launch.py'", depends-on = ["build"] }
+# Bring up the full robot (real hardware; ros2-launch debug alternative to stack.sh,
+# which is what actually runs in production — see robot_bringup/launch/bringup.launch.py).
+bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup bringup.launch.py'", depends-on = ["build"] }
+
+# Dev-PC-only: the same node graph as `bringup`, but with lds_driver_py/imu_driver/the
+# ESP32 replaced by Gazebo Sim + sim_hardware, plus RViz. See scripts/sim_run.sh.
+sim = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup bringup.launch.py sim:=true rviz:=true'", depends-on = ["build"] }
+
+# Dev-PC-only: RViz watching the REAL robot live over the shared zenoh graph (robot runs
+# its own stack.sh unchanged) -- NOT a simulation. See scripts/rviz_remote.sh.
+visualize = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup visualize.launch.py'", depends-on = ["build"] }
 
 # Web control page + rosbridge only (handy for UI dev). Web UI on :8080, ws on :9090.
 web = { cmd = "bash -c 'source install/setup.bash && ros2 launch web_control web.launch.py'", depends-on = ["build"] }

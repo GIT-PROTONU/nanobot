@@ -9,7 +9,7 @@ generated once (here), then runtime just classifies the sensors, picks a line, a
 the live values ({temp}/{cpu}/{tilt}/…). Re-run this when you change the persona/traits, or
 just let the stack auto-regenerate when the personality drifts too far.
 
-    set OPENROUTER_API_KEY first, then:
+    set OPENROUTER_API_KEY first (or drop it in memory/openrouter_key), then:
     python scripts/pregenerate_phrases.py            # regenerate from robot.yaml + personality.json
     python scripts/pregenerate_phrases.py --show     # just print the current bank, don't generate
     python scripts/pregenerate_phrases.py --if-needed # regenerate ONLY if missing/drifted (else no-op)
@@ -32,9 +32,27 @@ from web_control.llm import LlmClient                       # noqa: E402
 from web_control.phrasebank import PhraseBank, CATEGORIES   # noqa: E402
 
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
-# Dev tooling keeps its state in the project-local devstate/ folder (same as dev_webui.py),
+# Dev tooling keeps its state in the project-local memory/ folder (same as dev_webui.py),
 # so the soul + phrase bank are visible/editable in the repo. A robot.yaml *_path override wins.
-DEV_STATE_DIR = os.path.join(_ROOT, "devstate")
+DEV_STATE_DIR = os.path.join(_ROOT, "memory")
+
+
+def _load_openrouter_key():
+    """$OPENROUTER_API_KEY wins; else load it from a one-line memory/openrouter_key file
+    (gitignored) so this can be run without exporting the env var every session."""
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        return
+    for path in (os.path.join(DEV_STATE_DIR, "openrouter_key"),
+                 os.path.join(_HERE, ".openrouter_key")):
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                os.environ["OPENROUTER_API_KEY"] = key
+            return
+
+
+_load_openrouter_key()
 
 
 def _cfg(section):

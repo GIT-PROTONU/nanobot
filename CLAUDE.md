@@ -27,17 +27,30 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 ## Layout (`src/`)
 - `robot_msgs` — custom interfaces (ament_cmake).
 - `robot_bringup` — launch files + **the single config `config/robot.yaml`** (all
-  ports/pins/rates live here).
+  ports/pins/rates live here). `launch/bringup.launch.py` is the one node graph shared
+  by the real robot and the Gazebo dev-sim (`sim:=true`/`rviz:=true` args) — see
+  "Dev/prod ROS parity + Gazebo sim" below. Also holds the URDF (`urdf/nano.urdf.xacro`),
+  the Gazebo world (`worlds/nano_room.sdf`), the `ros_gz_bridge` topic map
+  (`config/gz_bridge.yaml`) and the RViz config (`rviz/nano.rviz`).
 - `lds_driver_py` — **the LDS driver in use** (rclpy, publishes `/scan`; also writes a
   compact scan blob to `/dev/shm/nano_scan.bin` for the web UI — see `web_control` below).
+  The blob writer is `scan_blob.write_scan_blob`, shared with `sim_hardware` so the
+  Gazebo dev-sim writes byte-identical blobs.
 - `lds_driver` — **abandoned** Rust/r2r LDS node; does NOT build against this
   RoboStack. Kept for reference only. **Do not try to build it** (see below).
-- `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32) into `/odom`+TF;
-  no longer reads GPIO.
+- `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32, or from `sim_hardware` in
+  Gazebo dev-sim) into `/odom`+TF; no longer reads GPIO.
 - `motor_control` — **retired** (PCA9685 path). The ESP32 owns `/cmd_vel`→motors;
-  not launched by `stack.sh`/`robot.launch.py`. Kept for the optional PCA9685
+  not launched by `stack.sh`/`bringup.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
+- `sim_hardware` — **dev-PC-only**, not built/launched on the board (linux-aarch64). Two
+  nodes used only by `bringup.launch.py sim:=true`: `sim_bridge_node` re-publishes
+  Gazebo's bridged `/joint_states_sim` + `/imu` + `/scan` as the exact contracts the real
+  lidar/IMU/ESP32 publish (`/wheel_ticks`, `/imu/euler`+`/imu/web`, the scan blob), plus
+  synthetic ESP32 board telemetry; `map_bridge_node` republishes `slam_nav`'s
+  `/dev/shm/nano_map.bin` blob as a real `nav_msgs/OccupancyGrid` on `/map` for RViz
+  (useful on the real robot too, not sim-specific).
 - `behavior` — **behaviour layer (Sismic statechart)**. *Human-readable overview of the
   whole brain (statechart + LLM + traits/evolution + model caps + decision log):
   [`docs/brain.md`](docs/brain.md); the bullets below are the terse engineering summary.*
@@ -50,11 +63,11 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   - **`mood_node` is thin ROS glue; ALL the ROS-free thinking is in `brain.py`** —
     mirroring how `web_control.cognition.CognitionCore` factored the LLM side. `brain.py` is the
     single behaviour-layer "brain" module: the **Purpose Engine** (objective + intrinsic-reward
-    weights, deterministic reflection — `default/merge/reflect_purpose`), the **Horizon Planner**
-    + A/B **bandit** (`decompose`/`verify`/`Planner`/`Bandit`), and the orchestration —
+    weights, deterministic reflection — `default/merge/reflect_purpose`), the **Pursuit** driver
+    + A/B **bandit** (`OBJECTIVES`/`precond_ok`/`Pursuit`/`Bandit`), and the orchestration —
     `PurposeBrain` (beat-upgrade decisions, reflect, reward, reflection mode, persist) +
     `Personality` (chart-context traits/evolution: seed/evolve/heartbeat/persist). (The Purpose
-    Engine + Planner used to be separate `purpose.py`/`planner.py`; folded into `brain.py` to
+    Engine + Pursuit used to be separate `purpose.py`/`planner.py`; folded into `brain.py` to
     keep the behaviour layer to three files — `brain.py` + `presence.py` + `mood_node.py`.) Both
     classes announce state through injected adapters and run identically on the dev harness
     (`scripts/dev_webui.py`) — one base, not a robot/dev copy. Unit-tested offline in
@@ -74,7 +87,14 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     `/cognition/request` (JSON `{beat,state,prompt,camera,audio}`) that `web_control` executes
     asynchronously (LLM line + optional camera/mic + mood). A slow/absent LLM = a silent
     face-beat; the chart never waits. **Add a beat = one `BEATS` row + one `DEFAULT_REGISTRY`
-    row** (face/camera/audio/prompt + priority/needs/trait); no chart surgery.
+    row** (face/camera/audio/prompt + priority/needs/trait); no chart surgery. Both the beat
+    templates and the chart itself are also **hand-editable without touching code**: `BEATS` is
+    layered with an optional `memory/beats.json` (`presence.merge_beats`, robot-side
+    `beats_path` param) and the Sismic graph itself can be overridden with
+    `memory/presence_chart.yaml` (`presence.load_chart_yaml`/`_build_statechart`, robot-side
+    `chart_path` param) — either falls back to the bundled Python default if absent or broken,
+    so an edit can never take the presence layer offline. `scripts/export_statechart_puml.py`
+    renders whichever chart is active.
   - **Skill beat (capability library).** Every `skill_every`-th body (`musing`) beat is
     upgraded — like `pursuing` — into a **`skill` beat** (`mood_node._deliver_skill_beat`,
     gated by `skills_enable`): a fire-and-forget `{beat:"skill",state:"acting"}` request that
@@ -163,7 +183,9 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   `build-lds`/`build-all`** — the Rust node and its toolchain are intentionally gone.
 - Run the stack: **`scripts/stack.sh {up|down|restart|status}`** (run via
   `pixi run bash scripts/stack.sh ...`). It starts router → agent → rosbridge → web
-  → oled → **sensors** (one `sensor_hub` process = imu+sys+odom+lds) → nav in order,
+  → oled → **sensors** (one `sensor_hub` process = imu+sys+odom+lds) → nav → **map**
+  (`sim_hardware.map_bridge_node`, republishing `/dev/shm/nano_map.bin` as a real
+  `nav_msgs/OccupancyGrid` for a remote RViz — see "Remote RViz" below) in order,
   idempotent (pgrep-guarded), logs to `.run/*.log`. `down`/`restart` SIGTERM→wait→SIGKILL
   and verify (also sweeps pre-merge per-node stragglers). (The agent is skipped if
   `$AGENT_DEV` isn't plugged in.)
@@ -172,6 +194,69 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - On the board the stack **auto-starts on boot** via systemd `nano-stack.service`.
 - OS-level setup (overlays, udev, groups, sudoers, systemd) is scripted in
   **`deploy/sbc-setup.sh`** (idempotent; run once after a reflash + reboot).
+
+## Dev/prod ROS parity + Gazebo sim
+There are now **two dev paths**, not one, serving different purposes:
+- **`scripts/dev_webui.py` / `dev_run.ps1`** (Windows, no ROS at all) — unchanged, still
+  the fastest way to iterate on the LLM/personality/TTS layer (see the LLM/cognition
+  section below). Doesn't run `web_control`'s rclpy node, `oled_display`,
+  `behavior/mood_node`, `wheel_odometry`, or `slam_nav` — it's a ROS-free stand-in for
+  just the AI/Speak/Brain cards.
+- **`scripts/sim_run.sh`** (Ubuntu/Linux dev PC, real ROS 2 via the SAME `pixi.toml`
+  RoboStack env the board uses — `linux-64` is already one of its `platforms`) — runs
+  the **exact same node graph** as the robot: `web_control`, `oled_display`,
+  `behavior/mood_node`, `sys_monitor`, `wheel_odometry`, `slam_nav` are all real,
+  unmodified rclpy nodes. Only the lowest hardware-transducer layer differs: **Gazebo
+  Sim** (`ros_gz_sim`, the modern actively-maintained "Ignition"-lineage simulator —
+  `robostack-staging` doesn't cleanly ship classic `gazebo_ros_pkgs` for Humble, but does
+  ship `ros-gz-*`) plus `ros_gz_bridge` and the new `sim_hardware` package stand in for
+  the LDS02RR/BWT901CL/ESP32. `sim_hardware.sim_bridge_node` converts Gazebo's bridged
+  wheel-joint angles into `/wheel_ticks` (so the **real** `wheel_odometry` node still
+  does the integration — Gazebo's own diff-drive odometry is deliberately not used) and
+  its bridged IMU into `/imu/euler`+`/imu/web` matching `imu_driver`'s exact contract;
+  `sim_hardware.map_bridge_node` republishes `slam_nav`'s `/dev/shm/nano_map.bin` blob as
+  a real `nav_msgs/OccupancyGrid` on `/map` for RViz (also usable on the real robot).
+  The webcam/mic aren't simulated at all — `mjpeg_camera.py`/`mic_audio.py` are
+  V4L2/ALSA and just use the dev PC's real ones.
+  - `robot_bringup/launch/bringup.launch.py` (replaces the previously-stale
+    `robot.launch.py`, which still referenced the abandoned Rust LDS node +
+    `micro_ros_agent`) is the single launch description for both: `sim:=false` (default)
+    launches the real `lds_driver_py`/`imu_driver` — a `ros2 launch`-based **debug**
+    alternative to `stack.sh` (which stays the production launcher, unchanged, for its
+    RAM-saving direct-executable approach); `sim:=true` swaps those for Gazebo +
+    `ros_gz_bridge` + `sim_hardware`. `rviz:=true` also opens RViz2
+    (`robot_bringup/rviz/nano.rviz`: RobotModel/TF/LaserScan/Map/Odometry).
+  - The Gazebo/RViz/`ros_gz_*`/`xacro`/`robot_state_publisher` deps live under
+    `pixi.toml`'s **`[target.linux-64.dependencies]`**, not the top-level
+    `[dependencies]` table, so none of it ever resolves onto the board
+    (`linux-aarch64`) — same "don't bloat the 1 GB/7 GB board" discipline as the
+    rust/clang ban below.
+  - `pixi run sim` / `scripts/sim_run.sh` build + launch it (the script additionally
+    resolves `OPENROUTER_API_KEY` and pre-warms the phrase bank, mirroring
+    `dev_run.ps1`'s job for the ROS-free path).
+
+### Remote RViz (the REAL robot, not a simulation)
+A third option, orthogonal to the two dev paths above: watch the **physical robot live**
+in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo, no sim.
+- `scripts/rviz_remote.sh` (optionally `--connect <robot-ip>`) / `pixi run visualize` runs
+  `robot_bringup/launch/visualize.launch.py`, which starts **only**
+  `robot_state_publisher` + `rviz2` — deliberately NOT `wheel_odometry`/`slam_nav`/
+  `sensor_hub`/etc. a second time (the robot is already publishing all of that; a second
+  copy on the dev PC would just be a redundant duplicate publisher on the same topics).
+  `/scan`, `/odom`, `/imu/euler`, TF, `/map` all stream in over the shared `rmw_zenoh`
+  graph.
+- **`/dev/shm` is per-machine RAM**, so `sim_hardware.map_bridge_node` (republishing
+  `slam_nav`'s map blob as a real `nav_msgs/OccupancyGrid`) has to run **on the board**,
+  not the dev PC, for a remote RViz to see `/map` — `stack.sh up` now also starts it
+  (after `nav`; harmless/cheap, no Gazebo deps).
+- **Cross-host zenoh discovery**: `ROS_DOMAIN_ID`/`RMW_IMPLEMENTATION` already match by
+  construction (both machines activate the same `pixi.toml`). Same-LAN zenoh multicast
+  scouting usually finds the robot's `zenohd-serial` router with no extra config; if not
+  (blocked multicast / different subnet), `rviz_remote.sh --connect <ip>` writes a small
+  session config pointing at `tcp/<ip>:7447` and sets `ZENOH_SESSION_CONFIG_URI` (written
+  without a way to test cross-host discovery end-to-end from here — if `ros2 topic list`
+  on the dev PC doesn't show the robot's topics, check the installed `rmw_zenoh_cpp`
+  version's docs for the current session-config env var/schema).
 
 ## Conventions / gotchas
 - **NEVER add `rust`, `clang`, or `libclang` to `pixi.toml`.** They were build-only
@@ -219,7 +304,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     the **same `CognitionCore`** (so there's one base, not two — see below), wiring `/llm/*`,
     `/skills/*`, `/tts*` + the brain card, so the AI/Skills/Brain cards + Speak box can be
     tested in a browser locally (telemetry/joystick/map show offline — no rosbridge). Reads
-    the persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`.
+    the persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`, or —
+    if unset — a one-line `memory/openrouter_key` file (gitignored; `_load_openrouter_key()`
+    in `dev_webui.py`/`dev_tts_test.py`/`personality_creator.py`/`pregenerate_phrases.py`,
+    falling back to the old `scripts/.openrouter_key` path for back-compat).
 - **Cognition core (`cognition.py`, ROS-free).** ALL the LLM-personality *logic* — generate +
   express, the say/chat/observe/look paths, the statechart beat executor, the skill library
   invocation, the phrase bank, the decision log, slow reflection, lifecycle speech — lives in
@@ -339,8 +427,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   net-👍 + no errors, or **auto-retires** (deletes the file) on errors/net-👎. The contextual
   👍/👎 reward is forwarded to the trial that last ran (`reward_trial_skill`). Manual override:
   `GET /skills/workshop` + `POST /skills/workshop/{keep,kill}` (web "🛠 Skills" card, 🧪 trials).
-  `deploy.sh` pushes `devstate/skills/*.md` + `workshop.json` with the soul. Config: `workshop_*`
-  in robot.yaml. Runs identically on the dev harness (mints into `devstate/skills/`).
+  `deploy.sh` pushes `memory/skills/*.md` + `workshop.json` with the soul. Config: `workshop_*`
+  in robot.yaml. Runs identically on the dev harness (mints into `memory/skills/`).
   **The workshop is also an on-demand skill** — `skills/forge-skill.md` (`action.kind: workshop`,
   a "meta" kind in `skills.py` that runs an internal routine, never a topic/narrative): invoke it
   any time (web "🛠 Skills" / `POST /skills/invoke {name:"forge-skill"}`) to forge a skill outside
@@ -374,7 +462,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — copies `src/`+`scripts/`,
   colcon-builds (optionally `--packages-select`), then `stack.sh restart`. Creds via
   env (`NANO_PW`, `NANO_HOST`, `NANO_HOSTKEY`) — **never commit secrets**.
-  It also pushes the dev-made soul/bank (`devstate/personality.json` + `phrases.json`)
+  It also pushes the dev-made soul/bank (`memory/personality.json` + `phrases.json`, plus
+  hand-edited `presence_chart.yaml`/`beats.json` if present)
   into the board's `~/.local/state/nanobot/` — **ON by default for now**
   (`DEPLOY_SOUL=1`), which **overwrites** the robot's own persisted personality (discarding
   any evolved trait drift). Set **`DEPLOY_SOUL=0`** to skip and keep the robot's evolved soul.

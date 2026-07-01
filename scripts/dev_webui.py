@@ -15,20 +15,30 @@ you can watch/hear the whole enriched-behaviour loop — and every decision show
 web UI "🧠 Decision log".
 
 The **🧠 Brain card** (Speak tab) is fully wired here too: this harness runs the real
-ROS-free `behavior.purpose` (Purpose Engine) + `behavior.planner` (Horizon Planner + A/B
-bandit), serves the readouts the robot publishes over rosbridge (`/purpose`,
+ROS-free brain (`behavior.brain`: Purpose Engine + Pursuit driver + A/B bandit),
+serves the readouts the robot publishes over rosbridge (`/purpose`,
 `/task_current`, `/experiments`) over plain HTTP (the page polls them when rosbridge is
 absent), and handles `/brain/reward` + `/brain/reflect`. So you can reward the current
 line (👍/👎 → the A/B bandit learns), watch the reward weights drift, and toggle
 reflection mode — all without the board. With `--behavior` the idle `musing` beat upgrades to a
 `pursuing` beat (planner task → webcam observation), so 👍/👎 becomes *contextual* and
 credits the chosen variant. (All dev state — the personality "soul" + decision log + goal/
-reward state — persists to the project-local `devstate/` folder; delete it for a clean slate.)
+reward state — persists to the project-local `memory/` folder; delete it for a clean slate.)
 
-Telemetry/joystick/map show offline (no rosbridge). The API key comes from
-$OPENROUTER_API_KEY; persona/model are read from robot.yaml.
+Telemetry/joystick/map show offline (no rosbridge), but the hero's **OLED** view works: it's
+a client-side mirror of the physical panel and reads the current face/word from GET /oled/state
+(served here), so you can watch the same screen the robot's SSD1306 would show. The API key
+comes from $OPENROUTER_API_KEY, or (if unset) a one-line memory/openrouter_key file
+(gitignored — see _load_openrouter_key); persona/model are read from robot.yaml.
 
-    set OPENROUTER_API_KEY first, then:
+The robot's body sensors (CPU/RAM/disk/temp/IMU/...) are **faked** here. By default they jitter
+randomly (lifelike); open **http://localhost:PORT/dev** (or start with `--manual-sensors`) to
+switch to **manual mode** and freeze every value to one you set — handy for reproducing a state
+(e.g. hot + picked up) while testing faces/beats. The manual reading feeds BOTH the OLED-mirror
+dashboard AND the LLM body snapshot, persists to `memory/dev_sensors.json`, and is controllable
+live via GET/POST `/dev/sensors`.
+
+    set OPENROUTER_API_KEY first (or drop it in memory/openrouter_key), then:
     python scripts/dev_webui.py                       # AI card + TTS only
     python scripts/dev_webui.py --behavior            # + autonomous enriched beats
     python scripts/dev_webui.py --behavior --idle-secs 10
@@ -51,20 +61,22 @@ sys.path.insert(0, os.path.join(_ROOT, "src", "behavior"))   # ROS-free presence
 from web_control.tts import TtsEngine, clamp                 # noqa: E402
 from web_control.llm import LlmClient                        # noqa: E402
 from web_control.skills import resolve_skills_dir            # noqa: E402
+from web_control.jsonio import read_json, write_json         # noqa: E402  (atomic dev-state I/O)
 # The SAME cognition core the robot runs — one base to maintain (see cognition.py).
 from web_control.cognition import CognitionCore              # noqa: E402
-# The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Horizon
-# Planner), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
-from behavior.brain import PurposeBrain                      # noqa: E402
-from behavior.presence import BEATS                          # noqa: E402  (beat table)
+# The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Pursuit
+# driver), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
+from behavior.brain import Personality, PurposeBrain         # noqa: E402
+from behavior.presence import merge_beats                    # noqa: E402  (beat table)
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
 # All dev-harness state — the "soul" (personality.json), the decision log (cognition.log),
-# and the goal/reward state (purpose.json, experiments.json, phrases.json) — lives in ONE
-# project-local folder so you can see/edit it in the repo while developing, instead of buried
-# in ~/.local/state/nanobot (where the robot keeps its own). It's gitignored (volatile state).
-DEV_STATE_DIR = os.path.join(_ROOT, "devstate")
+# the goal/reward state (purpose.json, experiments.json, phrases.json), and hand-editable
+# data like the sismic chart/beat templates — lives in ONE project-local folder so you can
+# see/edit it in the repo while developing, instead of buried in ~/.local/state/nanobot
+# (where the robot keeps its own). It's gitignored (volatile state).
+DEV_STATE_DIR = os.path.join(_ROOT, "memory")
 os.makedirs(DEV_STATE_DIR, exist_ok=True)
 
 
@@ -73,9 +85,82 @@ def _dev_state(name):
     return os.path.join(DEV_STATE_DIR, name)
 
 
+def _load_openrouter_key():
+    """If $OPENROUTER_API_KEY isn't already set, load it from memory/openrouter_key (one
+    line, gitignored) so you don't have to export it every shell session. Falls back to the
+    old scripts/.openrouter_key location. No-op (never overwrites) if the env var is set."""
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        return
+    for path in (_dev_state("openrouter_key"),
+                 os.path.join(_HERE, ".openrouter_key")):
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                os.environ["OPENROUTER_API_KEY"] = key
+            return
+
+
+_load_openrouter_key()
+
+
 # Decision-log file (same JSON-lines format the robot's web_server uses). A robot.yaml
 # cognition_log_path overrides; "" falls back to the project-local folder.
 DEFAULT_COG_LOG = _dev_state("cognition.log")
+
+# Hand-editable beat templates (memory/beats.json, see behavior.presence.merge_beats) layered
+# over the built-in BEATS defaults — same file the robot reads via mood_node's `beats_path`.
+BEATS = merge_beats(read_json(_dev_state("beats.json")))
+# Hand-editable sismic chart (memory/presence_chart.yaml) — "" (missing) falls back to the
+# bundled default (behavior.presence.PRESENCE_YAML), same as the robot's `chart_path`.
+CHART_PATH = _dev_state("presence_chart.yaml")
+
+# --- synthetic sensor control (dev harness only) -----------------------------
+# The dev host has no real sensors, so the harness fakes the robot's body telemetry (CPU/RAM/
+# disk/temp/IMU/...). By default it's RANDOM (jittering, lifelike). Flip to MANUAL to freeze it
+# and set every value yourself — useful for reproducing a specific state (e.g. "hot + picked up")
+# while testing faces/beats. Controlled live via GET/POST /dev/sensors and the /dev page, started
+# manual with --manual-sensors, and persisted here so it survives a restart.
+DEV_SENSORS_FILE = _dev_state("dev_sensors.json")
+
+# Web-tunable LLM settings (enable + the model ids: normal/deepthink/vision/free). Persisted
+# here so UI changes survive a dev restart, exactly like the robot's ~/.local/state/nanobot/llm.json.
+DEV_LLM_FILE = _dev_state("llm.json")
+LLM_SETTINGS_KEYS = ("enabled", "model", "smart_model", "vision_model",
+                     "vision_fallback_model", "free_model", "free_smart_model")
+# field -> editable spec (drives coercion AND the auto-generated /dev form, so they never drift).
+SENSOR_FIELDS = {
+    "cpu":      {"label": "CPU %",            "type": "int",   "min": 0,    "max": 100},
+    "mem":      {"label": "RAM %",            "type": "int",   "min": 0,    "max": 100},
+    "disk":     {"label": "Disk %",           "type": "int",   "min": 0,    "max": 100},
+    "temp":     {"label": "CPU temp °C",      "type": "int",   "min": 0,    "max": 120},
+    "esp_temp": {"label": "ESP temp °C",      "type": "float", "min": 0,    "max": 120},
+    "imu_hz":   {"label": "IMU rate Hz",      "type": "float", "min": 0,    "max": 200},
+    "roll":     {"label": "IMU roll °",       "type": "float", "min": -180, "max": 180},
+    "pitch":    {"label": "IMU pitch °",      "type": "float", "min": -180, "max": 180},
+    "lds_hz":   {"label": "LDS rate Hz",      "type": "float", "min": 0,    "max": 20},
+    "tilt":     {"label": "Tilt ° (snapshot)", "type": "int",  "min": 0,    "max": 90},
+    "pickup":   {"label": "Pickup 0/1/2",     "type": "int",   "min": 0,    "max": 2},
+    "moving":   {"label": "Moving",           "type": "bool"},
+    "esp_alive": {"label": "ESP online",      "type": "bool"},
+}
+# A plausible static reading used as the manual-mode starting point (matches the random ranges).
+DEFAULT_SENSORS = {"cpu": 25, "mem": 45, "disk": 50, "temp": 48, "esp_temp": 44.0,
+                   "imu_hz": 15.0, "roll": 6.0, "pitch": -2.0, "lds_hz": 0.0,
+                   "moving": False, "tilt": 6, "pickup": 0, "esp_alive": True}
+
+
+def _coerce_sensor(val, spec):
+    """Clamp + type a single posted sensor value per its SENSOR_FIELDS spec. Returns None for an
+    unparseable number so the caller keeps the previous value (untrusted input is never trusted)."""
+    if spec["type"] == "bool":
+        return bool(val)
+    try:
+        x = float(val)
+    except (TypeError, ValueError):
+        return None
+    x = max(spec.get("min", x), min(spec.get("max", x), x))
+    return int(round(x)) if spec["type"] == "int" else round(x, 2)
 
 
 def _capture_webcam_jpeg(log=lambda m: print(m, file=sys.stderr)):
@@ -109,22 +194,6 @@ def _capture_webcam_jpeg(log=lambda m: print(m, file=sys.stderr)):
             cap.release()
 
 
-def _load_personality():
-    """Seed personality from personality.json (made by personality_creator.py); {} fields
-    on any problem so the harness still runs with the chart's built-in defaults."""
-    base = {"name": "Nano", "persona": "", "traits": {}, "registry": {}}
-    try:
-        with open(_dev_state("personality.json"), encoding="utf-8") as f:
-            saved = json.load(f)
-        if isinstance(saved, dict):
-            for k in base:
-                if k in saved:
-                    base[k] = saved[k]
-    except Exception:
-        pass
-    return base
-
-
 def _load_cfg(section):
     """Best-effort read of a robot.yaml ros__parameters section (needs PyYAML). {} on any
     problem so the harness still runs with defaults."""
@@ -148,19 +217,56 @@ class DevState:
     def __init__(self, voice):
         cfg = _load_cfg("web_control")
         bcfg = _load_cfg("behavior")
-        self.personality = _load_personality()              # seed traits/registry/persona
-        persona = self.personality.get("persona") or cfg.get("llm_persona", "")
-        name = self.personality.get("name", "Nano")
+        # Current OLED panel state, so the web UI's client-side OLED mirror (see web/index.html)
+        # can reflect the exact same screen off-robot, polled via GET /oled/state.
+        self.oled_face = ""
+        self.oled_word = ""
+        # Synthetic-sensor source: random (jittering, default) or manual (frozen, user-set). Loaded
+        # from the persisted dev-state so a chosen manual reading survives restarts. See _sensor_values.
+        self._sensors_lock = threading.Lock()
+        saved = read_json(DEV_SENSORS_FILE, {}) or {}
+        vals = dict(DEFAULT_SENSORS)
+        vals.update({k: v for k, v in (saved.get("values") or {}).items() if k in SENSOR_FIELDS})
+        self._sensors = {"manual": bool(saved.get("manual", False)), "values": vals}
+        self._rand_cache = None        # (t, full-dict) cache so random telemetry doesn't jitter every poll
+        # The SAME Personality the robot's mood_node uses (behavior.brain) — it owns the
+        # chart-context traits/registry/drives AND their throttled persistence back to
+        # personality.json. Wiring it here (instead of the old read-only dict) is what makes
+        # evolved temperament COMPOUND across dev sessions, exactly like on the robot: the
+        # reflection loop drifts the soul, publish_and_persist saves it, next run reseeds from it.
+        self._personality = Personality(
+            path=_dev_state("personality.json"),
+            logger=lambda m: print(f"[personality] {m}", file=sys.stderr),
+            heartbeat_enable=True, brain_timeout=float(bcfg.get("brain_timeout", 1800.0)),
+            nudge_pickup_caution=float(bcfg.get("nudge_pickup_caution", 0.92)),
+            nudge_pickup_playful=float(bcfg.get("nudge_pickup_playful", 0.3)),
+            publish=None)                                    # no ROS topic off-robot
+        persona = self._personality.persona or cfg.get("llm_persona", "")
+        name = self._personality.name
         self.tts = TtsEngine(default_voice=voice, on_word=self._on_word,
                              logger=lambda m: print(f"[tts] {m}", file=sys.stderr))
+        # Seed the web-tunable LLM settings from robot.yaml, then let any persisted UI changes
+        # (memory/llm.json) win — so a model id picked in the browser sticks across restarts.
+        llm_settings = {
+            "enabled": True,
+            "model": cfg.get("llm_model", ""),
+            "smart_model": cfg.get("llm_smart_model", ""),
+            "vision_model": cfg.get("llm_vision_model", ""),
+            "vision_fallback_model": cfg.get("llm_vision_fallback_model", ""),
+            "free_model": cfg.get("llm_free_model", ""),
+            "free_smart_model": cfg.get("llm_free_smart_model", ""),
+        }
+        saved_llm = read_json(DEV_LLM_FILE, {}) or {}
+        if isinstance(saved_llm, dict):
+            llm_settings.update({k: v for k, v in saved_llm.items() if k in LLM_SETTINGS_KEYS})
         self.llm = LlmClient(
-            enabled=True, api_key="",                       # key from $OPENROUTER_API_KEY
-            model=cfg.get("llm_model", ""), persona=persona,
-            vision_model=cfg.get("llm_vision_model", ""),
-            smart_model=cfg.get("llm_smart_model", ""),
-            free_model=cfg.get("llm_free_model", ""),
-            free_smart_model=cfg.get("llm_free_smart_model", ""),
-            vision_fallback_model=cfg.get("llm_vision_fallback_model", ""),
+            enabled=bool(llm_settings["enabled"]), api_key="",  # key from $OPENROUTER_API_KEY
+            model=llm_settings["model"], persona=persona,
+            vision_model=llm_settings["vision_model"],
+            smart_model=llm_settings["smart_model"],
+            free_model=llm_settings["free_model"],
+            free_smart_model=llm_settings["free_smart_model"],
+            vision_fallback_model=llm_settings["vision_fallback_model"],
             smart_max_per_hour=int(cfg.get("llm_smart_max_per_hour", 15)),
             vision_max_per_hour=int(cfg.get("llm_vision_max_per_hour", 10)),
             timeout=float(cfg.get("llm_timeout", 20.0)),
@@ -172,14 +278,16 @@ class DevState:
         # skills + reflection are all the real, shared code.
         self.cog = CognitionCore(
             llm=self.llm, tts=self.tts, persona=persona, persona_name=name,
-            traits=self.personality.get("traits"),
-            settings={"enabled": True, "model": cfg.get("llm_model", "")},
-            face=lambda m: print(f"\n[face] {m or 'dashboard'}", file=sys.stderr),
+            traits=self._personality.traits,
+            settings=dict(llm_settings),
+            face=self._set_face,
             capture_frame=_capture_webcam_jpeg, sensor_snapshot=self._synth_snapshot,
             sensor_signals=self._synth_signals, scan_summary=lambda: "no scan (dev harness)",
             audio_summary=lambda: "a quiet room with a faint hum (dev harness — no mic)",
             publish_action=lambda _a: (False, "no ROS on the dev harness — actions are robot-only"),
-            logger=lambda m: print(f"[cog] {m}", file=sys.stderr), persist_settings=None,
+            logger=lambda m: print(f"[cog] {m}", file=sys.stderr),
+            persist_settings=lambda s: write_json(
+                DEV_LLM_FILE, {k: s[k] for k in LLM_SETTINGS_KEYS if k in s}),
             cog_log_path=(cfg.get("cognition_log_path") or "").strip() or DEFAULT_COG_LOG,
             face_hold=0.0,
             bank_path=(cfg.get("phrasebank_path") or "").strip() or _dev_state("phrases.json"),
@@ -206,17 +314,23 @@ class DevState:
             camera_announce=bool(cfg.get("camera_announce", True)),
             camera_face=str(cfg.get("camera_face", "looking")),
             # The skill workshop mints/adapts skills into a project-local "learned" dir so you
-            # can see them in the repo (deploy carries devstate/ to the board, like the soul).
+            # can see them in the repo (deploy carries memory/ to the board, like the soul).
             workshop_enable=bool(cfg.get("workshop_enable", True)),
             workshop_dir=(cfg.get("workshop_dir") or "").strip() or _dev_state("skills"),
             workshop_path=(cfg.get("workshop_path") or "").strip() or _dev_state("workshop.json"),
             workshop_rounds=int(cfg.get("workshop_rounds", 1)),
             workshop_min_runs=int(cfg.get("workshop_min_runs", 3)),
             workshop_retire_errors=int(cfg.get("workshop_retire_errors", 2)),
-            workshop_retire_net_neg=int(cfg.get("workshop_retire_net_neg", 2)))
+            workshop_retire_net_neg=int(cfg.get("workshop_retire_net_neg", 2)),
+            workshop_adopt_quiet_runs=int(cfg.get("workshop_adopt_quiet_runs", 5)),
+            workshop_trial_ttl=float(cfg.get("workshop_trial_ttl", 172800.0)),
+            workshop_trial_bias=float(cfg.get("workshop_trial_bias", 0.5)),
+            skill_likes_path=(cfg.get("skill_likes_path") or "").strip() or _dev_state("skill_likes.json"),
+            skill_like_bias=float(cfg.get("skill_like_bias", 0.6)),
+            reflect_announce=bool(cfg.get("reflect_announce", True)))
         self._pending_evolve = None                         # reflection -> chart (drained by loop)
         self._lock_pe = threading.Lock()
-        # --- Purpose Engine + Horizon Planner (the real ROS-free brain orchestration) -----
+        # --- Purpose Engine + Pursuit driver (the real ROS-free brain orchestration) -----
         # On the dev host there's no behaviour node, so we run the SAME PurposeBrain the robot
         # runs (behavior.brain) so the web "🧠 Brain" card is fully exercisable: objective +
         # reward weights, the pursuing/skill beats, A/B variants + 👍/👎 reward, and reflection.
@@ -255,30 +369,97 @@ class DevState:
                 if offline:
                     self.cog.speak_lifecycle("offline", face="sleepy")
                 elif prev:                                  # only if we WERE offline
-                    print("\n[face] dashboard (LLM online)", file=sys.stderr)
+                    self._set_face("")                      # back to the dashboard
+                    print("(LLM online)", file=sys.stderr)
 
     @staticmethod
-    def _synth_signals():
-        """A plausible, slightly-random structured body snapshot (dev stand-in for the
-        robot's real sensors) — the core's sensor_signals adapter."""
-        return {"cpu": random.randint(8, 90), "mem": random.randint(28, 70),
-                "temp": random.randint(34, 64),
-                "moving": random.random() < 0.25,
-                "tilt": random.choice([2, 6, 14, 22, 30]),
-                "pickup": random.choice([0, 0, 0, 1, 2])}
+    def _gen_random():
+        """One fresh random full sensor reading (the lifelike default). IMU/ESP telemetry is
+        derived from the body so the dashboard stays internally consistent."""
+        cpu, mem, temp = random.randint(8, 90), random.randint(28, 70), random.randint(34, 64)
+        tilt = random.choice([2, 6, 14, 22, 30])
+        return {"cpu": cpu, "mem": mem, "disk": random.randint(30, 80), "temp": temp,
+                "esp_temp": float(temp) - 4.0, "imu_hz": 15.0, "roll": float(tilt),
+                "pitch": -float(tilt) / 3.0, "lds_hz": 0.0,
+                "moving": random.random() < 0.25, "tilt": tilt,
+                "pickup": random.choice([0, 0, 0, 1, 2]), "esp_alive": True}
+
+    def _sensor_values(self):
+        """The current FULL sensor reading feeding every adapter + the OLED mirror. Manual mode
+        returns the frozen user-set values; random mode returns a fresh reading cached ~2 s so the
+        dashboard doesn't jitter every poll AND one beat's classifier + snapshot agree."""
+        with self._sensors_lock:
+            if self._sensors["manual"]:
+                return dict(self._sensors["values"])
+        now = time.monotonic()
+        if self._rand_cache is None or now - self._rand_cache[0] > 2.0:
+            self._rand_cache = (now, self._gen_random())
+        return dict(self._rand_cache[1])
+
+    def _synth_signals(self):
+        """The core's sensor_signals adapter — the structured body subset (random or manual)."""
+        v = self._sensor_values()
+        return {"cpu": v["cpu"], "mem": v["mem"], "disk": v["disk"], "temp": v["temp"],
+                "moving": bool(v["moving"]), "tilt": v["tilt"], "pickup": v["pickup"]}
 
     def _synth_snapshot(self):
-        """A synthetic plain-English body snapshot (the core's sensor_snapshot adapter)."""
+        """A plain-English body snapshot (the core's sensor_snapshot adapter)."""
         sig = self._synth_signals()
         body = ["being moved or jostled" if sig["moving"] else "physically still",
                 f"tilted ({sig['tilt']} degrees)" if sig["tilt"] > 10 else "sitting level",
                 {0: "resting on the ground", 1: "with one wheel off the ground",
                  2: "lifted off the ground (being held)"}[sig["pickup"]]]
-        return (f"CPU load {sig['cpu']}%, memory {sig['mem']}% used, main board "
-                f"{sig['temp']} degrees C, " + ", ".join(body))
+        return (f"CPU load {sig['cpu']}%, memory {sig['mem']}% used, disk {sig['disk']}% full, "
+                f"main board {sig['temp']} degrees C, " + ", ".join(body))
+
+    # ---- synthetic-sensor control (random vs manual) ------------------------
+    def get_sensors(self):
+        """Current sensor source for the /dev page: mode + values + the field specs (so the form
+        is generated from one table)."""
+        with self._sensors_lock:
+            return {"manual": self._sensors["manual"], "values": dict(self._sensors["values"]),
+                    "fields": SENSOR_FIELDS}
+
+    def set_sensors(self, patch):
+        """Update the sensor source from the /dev page or POST /dev/sensors: toggle manual and/or
+        set individual values (clamped/typed). Persists so it survives a restart; returns the new
+        state. Switching mode clears the random cache so the change takes effect immediately."""
+        patch = patch if isinstance(patch, dict) else {}
+        with self._sensors_lock:
+            if "manual" in patch:
+                self._sensors["manual"] = bool(patch["manual"])
+            for k, v in (patch.get("values") or {}).items():
+                if k in SENSOR_FIELDS:
+                    c = _coerce_sensor(v, SENSOR_FIELDS[k])
+                    if c is not None:
+                        self._sensors["values"][k] = c
+            snap = {"manual": self._sensors["manual"], "values": dict(self._sensors["values"])}
+        self._rand_cache = None
+        write_json(DEV_SENSORS_FILE, snap)
+        return self.get_sensors()
+
+    def _set_face(self, m):
+        """Cognition's face adapter: print it AND record it so GET /oled/state can mirror
+        the panel in the browser (the robot does this over /oled_face)."""
+        self.oled_face = (m or "").strip()
+        print(f"\n[face] {self.oled_face or 'dashboard'}", file=sys.stderr)
 
     def _on_word(self, w):
+        # TTS karaoke: track the current word so the OLED mirror shows it big+centred (the
+        # robot streams these on /oled_word); "" hands the panel back to the face/dashboard.
+        self.oled_word = w or ""
         print(w, end=" ", flush=True) if w else print()
+
+    def oled_state(self):
+        """The exact inputs the physical OLED renders from, for the web UI's client-side mirror.
+        Telemetry is synthetic on the dev host (random by default, or the frozen manual reading) —
+        see _sensor_values."""
+        v = self._sensor_values()
+        return {"face": self.oled_face, "word": self.oled_word, "brand": "", "system": "",
+                "esp_alive": bool(v["esp_alive"]), "esp_temp": float(v["esp_temp"]),
+                "imu_hz": float(v["imu_hz"]), "roll": float(v["roll"]), "pitch": float(v["pitch"]),
+                "lds_hz": float(v["lds_hz"]),
+                "cpu": v["cpu"], "mem": v["mem"], "temp": v["temp"], "ip": "dev-host"}
 
     # ---- cognition-core delegators (the shared LLM brain lives in cognition.py) ----
     # The page's endpoints call these; all the logic is the same CognitionCore the robot runs.
@@ -318,6 +499,17 @@ class DevState:
     def invoke_skill(self, name):
         return self.cog.invoke_skill(name)
 
+    def like_skill(self, data):
+        """👍 a skill so the brain favours it (repeatable). Body {"name","delta":±1}."""
+        name = str((data or {}).get("name") or "").strip()
+        if not name:
+            return {"error": "empty name"}
+        try:
+            delta = int((data or {}).get("delta", 1))
+        except (TypeError, ValueError):
+            delta = 1
+        return self.cog.like_skill(name, delta)
+
     # ---- statechart beat (used by --behavior) -------------------------------
     def fire_beat(self, name):
         """The chart's do_beat: run the matching enrichment in a worker thread (async,
@@ -343,7 +535,8 @@ class DevState:
             elif skill_beat:
                 self.cog.run_skill_beat("acting")       # let the brain pick a skill (shared core)
             elif beat is not None:
-                self.cog.run_beat("beat:" + name, name, beat.prompt, beat.camera, beat.audio)
+                self.cog.run_beat("beat:" + name, name, beat.prompt, beat.camera, beat.audio,
+                                  beat.face)
         threading.Thread(target=work, daemon=True).start()
 
     def reflect(self, traits_dict):
@@ -390,7 +583,7 @@ class DevState:
                 self.cog.log_decision("beat:pursuing", "pursuing", True, status="no-frame")
                 return
         self.cog.generate(prompt, image_jpeg=frame, trigger="beat:pursuing", state="pursuing",
-                          camera=bool(spec["camera"]), prelude=True)
+                          camera=bool(spec["camera"]), prelude=True, base_face=BEATS["pursuing"].face)
 
     def brain_reward(self, data):
         """Mirror web_server.brain_reward: log + (contextual) credit the A/B arm + reflect so
@@ -419,6 +612,8 @@ class DevState:
         forge a skill (the workshop)."""
         on = bool(data.get("on"))
         self._brain.set_reflecting(on)                  # flag + (on entry) reflect + A/B finalize
+        self.cog.set_reflecting(on)                     # so the core speaks self/forge conclusions
+        self.cog.announce_reflect(on)                   # say a short bookend line (turning inward / done)
         if on:
             self.cog.bank_regen_check()
             self.cog.bank_grow_check()                  # grow the bank: add fresh offline lines
@@ -445,7 +640,7 @@ class DevState:
 def run_behavior(state, idle_secs, reflect_secs):
     """Run the ROS-free presence statechart on a real clock; its beats drive the local LLM
     (see DevState.fire_beat) and a periodic reflection drifts the traits (see
-    DevState.reflect). Honours camera_beats/look_every + the seed personality from robot.yaml
+    DevState.reflect). Honours camera_beats + the seed personality from robot.yaml
     / personality.json."""
     try:
         from sismic.clock import SimulatedClock
@@ -457,24 +652,28 @@ def run_behavior(state, idle_secs, reflect_secs):
         return
     b = _load_cfg("behavior")
     camera_beats = bool(b.get("camera_beats", True))
-    look_every = int(b.get("look_every", 4))
     auto_on = bool(b.get("reflect_auto_enable", True))   # autonomously drift into reflection mode
     auto_idle = max(0.0, float(b.get("reflect_auto_idle", 1200.0)))
     auto_secs = max(1.0, float(b.get("reflect_auto_secs", 120.0)))
     clock = SimulatedClock()
     clock.time = 0.0
     interp, _ = build_interpreter(
-        face=lambda _m: None,                  # dev: no OLED, faces are not shown
+        face=state._set_face,                  # mirror the chart's reflex faces to /oled/state
         do_beat=state.fire_beat,
         greet_secs=1.0, idle_secs=idle_secs, perform_secs=4.0,
-        camera_beats=camera_beats, look_every=look_every,
-        traits=state.personality.get("traits"), registry=state.personality.get("registry"),
-        drives=state.personality.get("drives"),
+        # A live callable (re-checked on every draw), not a snapshot: stop offering camera
+        # beats ("looking") the moment the LLM isn't available, same as the robot wires
+        # cognition/llm_ready into MoodNode._camera_beats_ok.
+        camera_beats=lambda: camera_beats and state.llm.available(),
+        traits=state._personality.traits, registry=state._personality.registry,
+        drives=state._personality.drives,
         attend_secs=float(b.get("attend_secs", 2.0)), feel_secs=float(b.get("feel_secs", 2.5)),
         attend_face=str(b.get("attend_face", "looking")),
-        alpha=float(b.get("smoothing_alpha", 0.1)), clock=clock)
+        alpha=float(b.get("smoothing_alpha", 0.1)), clock=clock,
+        chart_path=CHART_PATH, beats=BEATS)
+    state._personality.attach(interp)          # bind so it can read/persist the live soul
     print(f"[behavior] statechart running — idle_secs={idle_secs}, camera_beats="
-          f"{camera_beats}, look_every={look_every}, reflect_secs={reflect_secs}. "
+          f"{camera_beats}, reflect_secs={reflect_secs}. "
           f"Stop clicking and listen; watch the Decision log.", file=sys.stderr)
     t0 = last_reflect = last_purpose = time.monotonic()
     next_auto = t0 + auto_idle                  # when to auto-enter reflection (dev: time-based)
@@ -501,20 +700,107 @@ def run_behavior(state, idle_secs, reflect_secs):
             state._brain.run_reflection()
         ev = state.take_evolve()               # apply reflection drift (queued single-threaded)
         if ev:
-            interp.queue(Event("evolve", traits=ev[0], registry=ev[1],
-                               drives=(ev[2] if len(ev) > 2 else {})))
-            print(f"[behavior] traits now {dict(interp.context['traits'])}; "
-                  f"drives {dict(interp.context['drives'])}", file=sys.stderr)
-            state.cog.update_traits(dict(interp.context["traits"]))  # track soul for bank-regen
-            state.cog.bank_regen_check()                     # refresh bank if it drifted too far
+            # Route through Personality.on_evolve (NOT a raw queue) so the heartbeat sees the
+            # brain is alive AND the drift gets persisted by publish_and_persist below — exactly
+            # the path mood_node uses on the robot.
+            state._personality.on_evolve({"traits": ev[0], "registry": ev[1],
+                                          "drives": (ev[2] if len(ev) > 2 else {})})
         try:
             interp.execute()
         except Exception as exc:
             print(f"[behavior] step error: {exc}", file=sys.stderr)
+        # Heartbeat (reverts to the seed if the cognitive layer goes quiet for brain_timeout)
+        # + throttled persist of the drifted soul to memory/personality.json — the parity
+        # bits that make temperament compound across dev sessions.
+        if state._personality.tick_events(now, picked=False) == "lost":
+            print("[personality] brain lost — reverting toward the seed", file=sys.stderr)
+        if ev:
+            print(f"[behavior] traits now {dict(interp.context['traits'])}; "
+                  f"drives {dict(interp.context['drives'])}", file=sys.stderr)
+            state.cog.update_traits(dict(interp.context["traits"]))  # track soul for bank-regen
+            state.cog.bank_regen_check()                     # refresh bank if it drifted too far
+        state._personality.publish_and_persist(now)          # save drift (throttled, on change)
         if reflect_secs > 0 and state.llm.available() and (now - last_reflect) > reflect_secs:
             last_reflect = now
             threading.Thread(target=state.reflect,
                              args=(dict(interp.context["traits"]),), daemon=True).start()
+
+
+# A tiny self-contained control page for the synthetic sensors (dev-only). Kept separate from the
+# shared web/index.html (which also runs on the robot) so the robot UI stays clean — open it at
+# /dev. The form is generated from /dev/sensors' `fields`, so it never drifts from SENSOR_FIELDS.
+DEV_SENSORS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nano dev sensors</title>
+<style>
+ body{font:14px system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:18px;max-width:560px}
+ h1{font-size:18px;margin:0 0 4px} p.sub{color:#8b949e;margin:0 0 16px}
+ .mode{display:flex;align-items:center;gap:10px;padding:12px;border:1px solid #30363d;border-radius:10px;margin-bottom:16px}
+ .mode b{font-size:15px}
+ fieldset{border:1px solid #30363d;border-radius:10px;margin:0 0 16px;padding:12px}
+ fieldset[disabled]{opacity:.45}
+ .row{display:flex;align-items:center;gap:10px;margin:7px 0}
+ .row label{flex:0 0 180px} .row input[type=range]{flex:1} .row .val{flex:0 0 64px;text-align:right;font-variant-numeric:tabular-nums}
+ .row input[type=number]{width:84px;background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px}
+ button{background:#238636;color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:14px;cursor:pointer}
+ button.sec{background:#30363d} .bar{display:flex;gap:10px;align-items:center}
+ #status{color:#8b949e}
+ input[type=checkbox]{width:18px;height:18px}
+</style></head><body>
+<h1>Synthetic sensors</h1>
+<p class="sub">Dev harness only. Random by default; turn on <b>Manual</b> to freeze and set every
+value yourself. Changes apply live (the OLED mirror + the LLM body snapshot read these).</p>
+<div class="mode">
+  <input type="checkbox" id="manual"><b><label for="manual">Manual mode</label></b>
+  <span id="status" style="margin-left:auto"></span>
+</div>
+<fieldset id="fs"></fieldset>
+<div class="bar">
+  <button id="apply">Apply &amp; save</button>
+  <button class="sec" id="reload">Reload</button>
+  <a href="/" style="margin-left:auto;color:#58a6ff">&larr; main UI</a>
+</div>
+<script>
+let fields={}, vals={};
+const $=id=>document.getElementById(id);
+function build(){
+  const fs=$("fs"); fs.innerHTML="";
+  for(const [k,spec] of Object.entries(fields)){
+    const row=document.createElement("div"); row.className="row";
+    const lab=document.createElement("label"); lab.textContent=spec.label; row.appendChild(lab);
+    if(spec.type==="bool"){
+      const cb=document.createElement("input"); cb.type="checkbox"; cb.id="f_"+k; cb.checked=!!vals[k];
+      cb.onchange=()=>vals[k]=cb.checked; row.appendChild(cb);
+    } else {
+      const rng=document.createElement("input"); rng.type="range"; rng.id="f_"+k;
+      rng.min=spec.min; rng.max=spec.max; rng.step=(spec.type==="int")?1:0.5; rng.value=vals[k];
+      const num=document.createElement("input"); num.type="number"; num.className="val";
+      num.min=spec.min; num.max=spec.max; num.step=rng.step; num.value=vals[k];
+      rng.oninput=()=>{num.value=rng.value; vals[k]=parseFloat(rng.value);};
+      num.oninput=()=>{rng.value=num.value; vals[k]=parseFloat(num.value);};
+      row.appendChild(rng); row.appendChild(num);
+    }
+    fs.appendChild(row);
+  }
+  $("fs").disabled = !$("manual").checked;
+}
+function load(){
+  fetch("/dev/sensors").then(r=>r.json()).then(s=>{
+    fields=s.fields; vals=Object.assign({},s.values); $("manual").checked=s.manual;
+    build(); status(s.manual?"manual":"random");
+  });
+}
+function status(m){ $("status").textContent = "source: "+m; }
+$("manual").onchange=()=>{ $("fs").disabled=!$("manual").checked; };
+$("apply").onclick=()=>{
+  fetch("/dev/sensors",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({manual:$("manual").checked, values:vals})})
+    .then(r=>r.json()).then(s=>{ vals=Object.assign({},s.values); $("manual").checked=s.manual;
+      build(); status((s.manual?"manual":"random")+" — saved"); });
+};
+$("reload").onclick=load;
+load();
+</script></body></html>"""
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -560,6 +846,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.brain_workshop())
         if p == "/tts/config":
             return self._json(self.state.tts_config())
+        if p == "/oled/state":
+            return self._json(self.state.oled_state())
+        if p == "/dev/sensors":
+            return self._json(self.state.get_sensors())
+        if p == "/dev" or p == "/dev/":
+            body = DEV_SENSORS_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         # Brain readouts — the robot serves these over rosbridge (latched topics); the dev
         # harness serves them over HTTP and the page polls them when rosbridge is absent.
         if p == "/purpose":
@@ -603,10 +901,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.invoke_skill(name))
         if p == "/skills/reload":
             return self._json(s.reload_skills())
+        if p == "/skills/like":
+            return self._json(s.like_skill(self._body()))
         if p == "/skills/workshop/keep":
             return self._json(s.workshop_keep(self._body()))
         if p == "/skills/workshop/kill":
             return self._json(s.workshop_kill(self._body()))
+        if p == "/dev/sensors":
+            return self._json(s.set_sensors(self._body()))
         if p == "/brain/reward":
             return self._json(s.brain_reward(self._body()))
         if p == "/brain/reflect":
@@ -646,15 +948,22 @@ def main():
                     help="(--behavior) seconds idle before each beat (default 15)")
     ap.add_argument("--reflect-secs", type=float, default=90.0,
                     help="(--behavior) seconds between personality reflections (0=off, default 90)")
+    ap.add_argument("--manual-sensors", action="store_true",
+                    help="start with synthetic sensors FROZEN at manual values (set them at /dev) "
+                         "instead of the default random jitter")
     args = ap.parse_args()
 
     state = DevState(args.voice)
+    if args.manual_sensors:
+        state.set_sensors({"manual": True})
     if args.behavior:
         threading.Thread(target=run_behavior,
                          args=(state, args.idle_secs, args.reflect_secs), daemon=True).start()
     handler = functools.partial(Handler, directory=WEB_DIR, state=state)
     httpd = http.server.ThreadingHTTPServer(("0.0.0.0", args.port), handler)
+    sensors = "manual (frozen)" if state.get_sensors()["manual"] else "random"
     print(f"\n  Dev web UI:  http://localhost:{args.port}\n"
+          f"  Sensors:     http://localhost:{args.port}/dev   (synthetic source: {sensors})\n"
           f"  Speak tab -> 'AI · OpenRouter' card; open '🧠 Decision log' to watch decisions.\n"
           f"  {'Behaviour beats ON. ' if args.behavior else ''}"
           f"(Telemetry/joystick/map show offline — no rosbridge. Ctrl+C to stop.)\n",

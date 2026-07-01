@@ -46,6 +46,8 @@ import json
 import os
 import re
 
+from .llm import _extract_json
+
 NARRATIVE_KINDS = ("say", "observe", "look")
 ACTION_KINDS = ("topic",)
 # "Meta" kinds run an internal cognition routine rather than speaking or publishing. They're
@@ -288,13 +290,9 @@ class SkillLibrary:
             return None
         offered = {s.name: s for s in self.offered(allow_actions)}
         # Preferred: a JSON object naming the skill.
-        for cand in re.findall(r"\{[^{}]*\}", reply_text, re.DOTALL) or [reply_text]:
-            try:
-                obj = json.loads(cand)
-            except Exception:
-                continue
-            if isinstance(obj, dict) and "skill" in obj:
-                return offered.get(_slug(obj.get("skill")))
+        obj = _extract_json(reply_text, keys=("skill",))
+        if "skill" in obj:
+            return offered.get(_slug(obj.get("skill")))
         # Fallback: the reply just contains a known slug somewhere.
         low = reply_text.lower()
         for name, sk in offered.items():

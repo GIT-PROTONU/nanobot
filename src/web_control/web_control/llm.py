@@ -40,18 +40,14 @@ DEFAULT_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 # we only pay when the free quota is exhausted. Free `:free` slugs rotate and the popular
 # ones get upstream-throttled, so we list a couple per tier (verified working 2026-06-28);
 # pick current ones via OpenRouter's /models API if these stop responding.
-DEFAULT_FREE_MODEL = ("nvidia/nemotron-3-nano-30b-a3b:free,"
-                      "meta-llama/llama-3.3-70b-instruct:free")    # free, cheap tier
-DEFAULT_FREE_SMART_MODEL = ("nvidia/nemotron-3-super-120b-a12b:free,"
-                            "openai/gpt-oss-120b:free")            # free, smart/chat tier
-# PAID fallbacks (DeepSeek) — used only when the matching free model is rate-limited.
-# Cheap fallback: beats/observe/say/look-text. Smart fallback: chat + personality reflection.
+DEFAULT_FREE_MODEL = "deepseek/deepseek-v4-flash"   # free, cheap tier
+DEFAULT_FREE_SMART_MODEL = "deepseek/deepseek-v4-flash"  # free, smart/chat tier
+# Fallbacks — used only when the matching free model is rate-limited.
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"        # any OpenRouter model id works
-DEFAULT_SMART_MODEL = "deepseek/deepseek-v4-pro"
-# A *vision* (multimodal) model used only when an image is attached (the text models can't
-# see). DeepSeek has no vision model, so this stays a separate id. Free + verified working;
-# swap for a paid multimodal id (Gemini/GPT/Claude vision) for sharper descriptions.
-DEFAULT_VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
+DEFAULT_SMART_MODEL = "deepseek/deepseek-v4-flash"
+# A *vision* (multimodal) call used only when an image is attached. openrouter/free routes
+# the request to a current free model on OpenRouter's side.
+DEFAULT_VISION_MODEL = "openrouter/free"
 MAX_SAY = 240          # chars; keep spoken lines short (TTS hard-caps at 300 anyway)
 
 # The fixed framing every request gets, on top of the user-tunable persona. We force a
@@ -75,33 +71,61 @@ def coerce_mood(mood):
     return m if m in MOODS else "neutral"
 
 
-def _extract_json(text):
-    """Pull our ``{"say","mood"}`` object out of a model reply, tolerating code fences,
-    a stray sentence, or a *reasoning model* that narrates its thinking first and emits
-    the JSON answer LAST. Returns a dict, or {} if nothing usable parses."""
+def _strip_code_fence(text):
+    """Drop a leading/trailing ```json … ``` (or bare ```) fence a model may wrap its
+    answer in, and surrounding whitespace. Returns '' for falsy input."""
     if not text:
-        return {}
-    t = text.strip()
-    # Strip a ```json ... ``` (or bare ```) fence if the model wrapped its answer.
+        return ""
+    t = str(text).strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t).strip()
+    return t
+
+
+def _extract_json(text, keys=("say", "mood")):
+    """Pull a flat JSON object out of a model reply, tolerating code fences, a stray
+    sentence, or a *reasoning model* that narrates its thinking first and emits the JSON
+    answer LAST. Prefers the last ``{...}`` span carrying any of ``keys`` (the real answer
+    follows the prose). Returns a dict, or {} if nothing usable parses."""
+    t = _strip_code_fence(text)
+    if not t:
+        return {}
     try:
         obj = json.loads(t)
         if isinstance(obj, dict):
             return obj
     except Exception:
         pass
-    # Our object is flat (no nesting), so match each {...} span and prefer the LAST one
-    # carrying our keys — reasoning models put prose first and the real answer at the end.
     for cand in reversed(re.findall(r"\{[^{}]*\}", t, re.DOTALL)):
         try:
             obj = json.loads(cand)
         except Exception:
             continue
-        if isinstance(obj, dict) and ("say" in obj or "mood" in obj):
+        if isinstance(obj, dict) and any(k in obj for k in keys):
             return obj
     return {}
+
+
+def _extract_json_list(text, key="lines"):
+    """Pull a JSON list out of a model reply: either a top-level array, or an object whose
+    ``key`` holds the array (tolerating fences / stray prose). Returns a list, or []."""
+    t = _strip_code_fence(text)
+    if not t:
+        return []
+    obj = None
+    try:
+        obj = json.loads(t)
+    except Exception:
+        m = re.search(r"\{.*\}|\[.*\]", t, re.DOTALL)   # first object/array that parses
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = None
+    if isinstance(obj, dict):
+        obj = obj.get(key)
+    return obj if isinstance(obj, list) else []
 
 
 class LlmClient:
@@ -156,8 +180,8 @@ class LlmClient:
     # ---- config (web-tunable at runtime) ------------------------------------
     def configure(self, enabled=None, model=None, persona=None, api_key=None,
                   vision_model=None, smart_model=None, free_model=None,
-                  free_smart_model=None, smart_max_per_hour=None,
-                  vision_max_per_hour=None):
+                  free_smart_model=None, vision_fallback_model=None,
+                  smart_max_per_hour=None, vision_max_per_hour=None):
         if enabled is not None:
             self._enabled = bool(enabled)
         if model is not None:
@@ -166,6 +190,8 @@ class LlmClient:
             self._smart_model = smart_model.strip() or DEFAULT_SMART_MODEL
         if vision_model is not None:
             self._vision_model = vision_model.strip() or DEFAULT_VISION_MODEL
+        if vision_fallback_model is not None:
+            self._vision_fallback = vision_fallback_model.strip()  # "" => no paid vision fallback
         if free_model is not None:
             self._free_model = free_model.strip()          # "" => paid-only for cheap tier
         if free_smart_model is not None:
@@ -246,13 +272,19 @@ class LlmClient:
         return self._free_smart_model
 
     @property
+    def vision_fallback_model(self):
+        return self._vision_fallback
+
+    @property
     def last_model(self):
         """The slug that produced the most recent reply (free primary or paid fallback)."""
         return self._last_model
 
     @staticmethod
     def _is_free(model):
-        return str(model).strip().lower().endswith(":free")
+        m = str(model).strip().lower()
+        # `:free` slugs and the openrouter/free meta-id are free (never count against caps).
+        return m.endswith(":free") or m == "openrouter/free"
 
     def _candidates(self, smart=False, image=False):
         """Ordered (model, is_paid) to try for a call: the FREE model(s) first, the PAID

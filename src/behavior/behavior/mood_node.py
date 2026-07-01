@@ -7,7 +7,7 @@ src/behavior/test`):
   * `presence.py` — the Sismic statechart (states + timed transitions + the personality
     context the guards read).
   * `brain.py` — everything else, in one module: the Purpose Engine (goals + intrinsic
-    reward), the Horizon Planner (task queue + A/B bandit), and the platform-agnostic
+    reward), the Pursuit driver (objective narration + A/B bandit), and the platform-agnostic
     *orchestration* of both (`PurposeBrain`) + the chart-context personality (`Personality`).
     The SAME orchestration runs on the dev web harness (`scripts/dev_webui.py`) via injected
     adapters, so there's one base, not two.
@@ -26,7 +26,8 @@ semantic signals, and on each tick steps the chart and delegates to `PurposeBrai
 
 Consumes (all light std/geometry msgs): `/cmd_vel`, `/goal_pose`, `/oled_word`,
 `/oled_face` (to detect a manual/foreign mood vs our own echo), `/left|right_wheel_suspended`,
-`/cognition/evolve`, `/cognition/reward`, `/reflect`. Drives `/oled_face`,
+`/cognition/evolve`, `/cognition/reward`, `/reflect`, `/cognition/llm_ready` (gates camera
+beats — see `_camera_beats_ok`). Drives `/oled_face`,
 `/cognition/request`, `/reflect_request` (auto reflection-mode trigger), and the latched
 `/cognition/traits` + `/purpose` + `/task_current` + `/experiments` readouts.
 """
@@ -40,8 +41,8 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, String
 from geometry_msgs.msg import Twist, PoseStamped
 
-from .presence import build_interpreter, BEATS, clamp01
-from .brain import PurposeBrain, Personality
+from .presence import build_interpreter, clamp01, merge_beats
+from .brain import PurposeBrain, Personality, _state_path, load_json
 
 # Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
 # Import defensively so a board that hasn't run `pixi install` yet still boots the
@@ -73,17 +74,19 @@ class MoodNode(Node):
             ("enrich_enable", True),  # publish /cognition/request on enrichable beats
             ("enrich_min_interval", 45.0),  # s, per-beat rate-limit on requests
             ("camera_beats", True),   # allow the autonomous camera ("looking") beat
-            ("look_every", 4),        # camera beat every Nth idle beat (>=1)
             # --- skill library: let the brain pick a capability (skills/*.md) on a beat ---
             ("skills_enable", True),  # allow the autonomous "skill" beat (web_control selects)
             ("skill_every", 6),       # a skill beat in place of every Nth body (musing) beat (>=1)
             # --- personality / evolution ---
             ("personality_path", ""),       # "" -> ~/.local/state/nanobot/personality.json
+            # Hand-editable overrides for the chart + beat templates (no code change needed):
+            ("chart_path", ""),             # "" -> ~/.local/state/nanobot/presence_chart.yaml
+            ("beats_path", ""),             # "" -> ~/.local/state/nanobot/beats.json
             ("smoothing_alpha", 0.1),       # exponential-smoothing rate for `evolve` (0..1)
             ("brain_timeout", 90.0),        # s without an evolve before reverting to baseline
             ("nudge_pickup_caution", 0.92), # fast rule: being picked up eases caution toward this
             ("nudge_pickup_playful", 0.3),  #            and playfulness toward this (startled)
-            # --- Purpose Engine + Horizon Planner (goals/reward + A/B) ---
+            # --- Purpose Engine + Pursuit driver (goals/reward + A/B) ---
             ("purpose_enable", True),       # run the goal/reward layer (else pure presence)
             ("purpose_period", 600.0),      # s between purpose reflections (reads the decision log)
             ("pursue_min_interval", 180.0), # s, min gap between goal-pursuit ("pursuing") beats
@@ -113,7 +116,10 @@ class MoodNode(Node):
         self.enrich_enable = bool(g("enrich_enable").value)
         self.enrich_min_interval = float(g("enrich_min_interval").value)
         self.camera_beats = bool(g("camera_beats").value)
-        self.look_every = max(1, int(g("look_every").value))
+        # Live "is the LLM actually usable right now" signal from web_control (cognition/llm_ready,
+        # latched). Optimistic default (True) so the chart behaves as before until the first
+        # message arrives / if web_control isn't running (e.g. some offline dev setups).
+        self._llm_ready = True
         self._reflect_face = str(g("reflect_face").value or "focused")
         self._greet_face = str(g("greet_face").value or "happy")
         self._reflect_auto_enable = bool(g("reflect_auto_enable").value)
@@ -158,6 +164,12 @@ class MoodNode(Node):
         # Personality owns the chart-context traits/registry + their evolution/persist;
         # PurposeBrain owns the goal/reward layer + the A/B planner. Both publish their state
         # through the adapters below (here: latched ROS topics).
+        # Hand-editable beat templates (face/camera/audio/prompt) layered over the built-in
+        # defaults — lets a beat be tuned, or a whole new one added (paired with a registry
+        # entry), by editing JSON alone. Best-effort: absent/malformed -> the built-in BEATS.
+        self._beats = merge_beats(load_json(
+            _state_path(g("beats_path").value, "beats.json"), logger=self.get_logger().warning))
+
         self._personality = Personality(
             path=g("personality_path").value, logger=self.get_logger().warning,
             heartbeat_enable=self.enrich_enable, brain_timeout=float(g("brain_timeout").value),
@@ -200,6 +212,11 @@ class MoodNode(Node):
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
         # Trait/registry updates proposed by the cognitive layer (slow LLM reflection).
         self.create_subscription(String, "cognition/evolve", self._on_evolve, 10)
+        # Whether the LLM is actually usable right now (web_control: enabled + keyed) — gates the
+        # idle-beat lottery's camera beats ("looking"/"pursuing") so it stops picking them the
+        # moment there's no LLM to process the frame (a mere network blip is handled separately,
+        # via the offline-face standdown, which already pauses ALL beats).
+        self.create_subscription(Bool, "cognition/llm_ready", self._on_llm_ready, latched)
         # Human reward (from the web UI via web_control) -> A/B bandit credit.
         self.create_subscription(String, "cognition/reward", self._on_reward, 10)
         # Reflection-mode state command (from the web UI toggle or our own auto trigger,
@@ -224,7 +241,7 @@ class MoodNode(Node):
                 greet_secs=float(g("greet_secs").value),
                 idle_secs=float(g("idle_secs").value),
                 perform_secs=float(g("perform_secs").value),
-                camera_beats=self.camera_beats, look_every=self.look_every,
+                camera_beats=self._camera_beats_ok,
                 traits=self._personality.traits, registry=self._personality.registry,
                 drives=self._personality.drives,
                 alpha=float(g("smoothing_alpha").value), clock=self._clock,
@@ -232,7 +249,9 @@ class MoodNode(Node):
                 attend_face=str(g("attend_face").value or "looking"),
                 attend_secs=float(g("attend_secs").value),
                 feel_secs=float(g("feel_secs").value),
-                rng=random.Random())          # the idle-beat lottery + burst/attend gates
+                rng=random.Random(),          # the idle-beat lottery + burst/attend gates
+                chart_path=_state_path(g("chart_path").value, "presence_chart.yaml"),
+                beats=self._beats)
             self._personality.attach(self._interp)
             self.get_logger().info(
                 f"behavior up: presence statechart (personality '{self._personality.name}', "
@@ -265,17 +284,17 @@ class MoodNode(Node):
         web_control to enrich asynchronously (LLM line + camera + mood). Never blocks.
 
         The `musing` body beat (the chooser's highest-priority default) is upgraded by the
-        brain: to a `pursuing` beat when the Horizon Planner has a verified task, else to a
-        `skill` beat every Nth body beat — that's how the Purpose/Planner/skill layers reach
+        brain: to a `pursuing` beat when the Pursuit driver has a verified objective, else to a
+        `skill` beat every Nth body beat — that's how the Purpose/Pursuit/skill layers reach
         expression. Goals win the slot, then skills, else the plain beat (which may be any of
         the chooser's picks: musing/looking/wondering/listening)."""
-        beat = BEATS.get(name)
+        beat = self._beats.get(name)
         if beat is None:
             return
         if name == "musing" and self._enrich_ready("pursuing"):
             spec = self._brain.next_pursuing(time.monotonic())
             if spec is not None:
-                self._deliver_pursuing(spec, beat=BEATS["pursuing"])
+                self._deliver_pursuing(spec, beat=self._beats["pursuing"])
                 return
         if name == "musing" and self._brain.take_skill_beat() and self._enrich_ready("skill"):
             self._deliver_skill_beat()
@@ -286,6 +305,9 @@ class MoodNode(Node):
         self._beat_last[name] = time.monotonic()
         req = {"beat": name, "state": name, "prompt": beat.prompt,
                "camera": bool(beat.camera), "audio": bool(beat.audio),
+               # the action's eye-shape, so web_control keeps it and rides the LLM emotion as an
+               # accent (e.g. "looking:happy") instead of replacing the action face
+               "face": beat.face,
                # carry the current personality so the executor can colour the line
                "traits": self._personality.live_traits()}
         self.cog_pub.publish(String(data=json.dumps(req)))
@@ -298,7 +320,7 @@ class MoodNode(Node):
         self._beat_last["pursuing"] = time.monotonic()
         req = {"beat": "pursuing", "state": "pursuing",
                "prompt": self._brain.pursuing_prompt(spec, beat.prompt),
-               "camera": bool(spec["camera"]), "audio": False,
+               "camera": bool(spec["camera"]), "audio": False, "face": beat.face,
                "exp": spec["exp"], "variant": spec["variant"], "task": spec["task"],
                "traits": self._personality.live_traits()}
         self.cog_pub.publish(String(data=json.dumps(req)))
@@ -307,7 +329,7 @@ class MoodNode(Node):
         """Fire a `skill` beat: show the offline-safe default face, then hand off to
         web_control to pick a capability from the skill library and perform it. Like every
         beat this is fire-and-forget — a slow/absent brain just leaves the default face."""
-        beat = BEATS.get("skill")
+        beat = self._beats.get("skill")
         if beat is not None:
             self._emit_face(beat.face)
         self._beat_last["skill"] = time.monotonic()
@@ -327,6 +349,14 @@ class MoodNode(Node):
             return
         if self._personality.on_evolve(payload):
             self.get_logger().info("cognitive layer reachable again")
+
+    def _on_llm_ready(self, msg: Bool):
+        self._llm_ready = bool(msg.data)
+
+    def _camera_beats_ok(self):
+        """Live gate passed to the chart's chooser: the admin toggle AND the LLM actually being
+        usable right now (see the cognition/llm_ready subscription above)."""
+        return self.camera_beats and self._llm_ready
 
     def _on_reward(self, msg: String):
         """A human reward from the web UI: credit the A/B arm that produced the narrated line

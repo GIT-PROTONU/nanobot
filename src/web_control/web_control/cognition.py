@@ -29,10 +29,12 @@ never load-bearing.
 import json
 import os
 import random
+import re
 import threading
 import time
 from collections import deque
 
+from .jsonio import read_json, read_jsonl_tail, write_json
 from .llm import MOODS, _extract_json
 from .phrasebank import PhraseBank
 from .skills import SkillLibrary, _slug
@@ -43,7 +45,24 @@ REFLECT_TRAITS = ("curiosity", "extraversion", "caution", "playfulness")  # pers
 # behavior/presence.py. Kept as plain strings here so web_control never imports the behavior pkg.
 REFLECT_DRIVES = ("energy", "focus", "introspection")     # 0..1 scalars, smoothed in the chart
 DRIVE_MOODS = ("", "happy", "angry", "focused", "stress", "neutral", "looking", "sleepy")  # idle tint
+# Distinctive action eye-SHAPES (oled_display geometries) that can carry an emotion accent.
+# An action beat ("looking"/"focused") keeps its scanning/intent eyes AND shows the LLM's emotion
+# as an accent on top -> a compound "shape:emotion" face (see compose_face). The plain round
+# bases (happy/neutral) aren't distinctive, so there the emotion alone IS the face (unchanged).
+SHAPE_FACES = ("looking", "focused")
 LLM_HISTORY_MAX = 8          # chat turns kept for context (user+assistant messages)
+
+
+def compose_face(base, accent):
+    """Combine an action eye-shape with an emotion accent into the OLED face string the panel
+    renders (oled_display._on_face parses "shape:emotion"). Returns "looking:happy" for a
+    distinctive action shape + a real emotion, else just the emotion (legacy single mood) — so
+    on-demand chat/observe and the round musing beat are unchanged."""
+    base = (base or "").strip().lower()
+    accent = (accent or "").strip().lower()
+    if base in SHAPE_FACES and accent and accent != "neutral" and accent != base:
+        return f"{base}:{accent}"
+    return accent
 LLM_LOG_MAX = 50             # decision-log ring buffer length (also what the file tail loads)
 
 # Skill `sources:` -> (prompt template, the CognitionCore method that supplies the text).
@@ -54,8 +73,48 @@ SKILL_SOURCES = {
     "scan":    ("Your lidar reports: {}.", "_scan_summary"),
     "audio":   ("Through your microphone you hear: {}.", "_audio_summary"),
     "memory":  ("Lately you have been doing:\n{}", "recent_events_text"),
+    "docs":    ("From your own documentation:\n{}", "_docs_summary"),
 }
-SOURCE_ALIASES = {"sound": "audio", "mic": "audio", "events": "memory", "recent": "memory"}
+SOURCE_ALIASES = {"sound": "audio", "mic": "audio", "events": "memory", "recent": "memory",
+                  "readme": "docs", "about": "docs", "self": "docs"}
+
+# Self-knowledge: the small whitelist of its own docs the robot may read aloud, as
+# (filename-relative-to-repo-root, max_chars). Extend by adding a row — keep excerpts short so
+# the prompt stays cheap, and NEVER list a file that holds secrets (e.g. robot.yaml with a key);
+# credential-looking lines are redacted defensively below regardless.
+SELF_DOCS = (("README.md", 700), ("CLAUDE.md", 700))
+_DOC_SECRET_RE = re.compile(
+    r"(?im)^(\s*[\w.\-]*(?:api[_-]?key|key|token|secret|password|passwd|pw)\s*[:=]\s*)\S.*$")
+
+
+def read_self_docs(root, docs=SELF_DOCS):
+    """A short, redacted excerpt of the robot's own documentation (the `docs` skill source).
+    Reads ONLY the whitelisted files under `root` (never a caller/LLM-chosen path) and masks any
+    credential-looking line. Returns one block per readable file, or '' if none was readable."""
+    out = []
+    for name, limit in docs:
+        try:
+            with open(os.path.join(root, name), "r", encoding="utf-8", errors="replace") as f:
+                text = f.read(limit * 4)              # read a little extra; trim after redaction
+        except OSError:
+            continue
+        text = _DOC_SECRET_RE.sub(r"\1[redacted]", text).strip()
+        if len(text) > limit:
+            text = text[:limit].rsplit(" ", 1)[0] + "…"
+        if text:
+            out.append("[%s] %s" % (name, text))
+    return "\n\n".join(out)
+
+# Spoken bookends for reflection mode (offline-safe, no LLM): one as it turns inward, one as it
+# surfaces — so the pause reads as deliberate thinking with a clear before/after.
+REFLECT_ENTER_LINES = ("Let me take a moment to think things over.",
+                       "Time to sit quietly and reflect.",
+                       "I'm going to turn inward for a little while.",
+                       "Let me gather my thoughts.")
+REFLECT_LEAVE_LINES = ("Okay, I've thought it through.",
+                       "There — I feel a little clearer now.",
+                       "I've worked some things out. Back to it.",
+                       "Done reflecting; I feel more like myself.")
 
 
 def clamp01(v, lo=0.0, hi=1.0):
@@ -84,7 +143,10 @@ class CognitionCore:
                  prelude_face="focused", camera_announce=True, camera_face="looking",
                  workshop_enable=True, workshop_path=None,
                  workshop_dir="", workshop_rounds=1, workshop_min_runs=3,
-                 workshop_retire_errors=2, workshop_retire_net_neg=2):
+                 workshop_retire_errors=2, workshop_retire_net_neg=2,
+                 workshop_adopt_quiet_runs=5, workshop_trial_ttl=172800.0,
+                 workshop_trial_bias=0.5, reflect_announce=True,
+                 skill_likes_path=None, skill_like_bias=0.6):
         self.llm = llm
         self.tts = tts
         self.persona = (persona or "").strip()
@@ -153,7 +215,7 @@ class CognitionCore:
         # most once per `trait_history_period`; `trait_trend_text()` summarises the drift over the
         # trailing `trait_history_window` and is folded into reflect()/consolidate() prompts so
         # the self-narrative grows from a real trajectory ("curiosity 0.50 -> 0.68"). Deploy-synced
-        # like the soul (lives in the XDG state dir / devstate on the harness).
+        # like the soul (lives in the XDG state dir / memory on the harness).
         self._trait_hist_enable = bool(trait_history_enable)
         self._trait_hist_period = max(60.0, float(trait_history_period))
         self._trait_hist_max = max(8, int(trait_history_max))
@@ -170,9 +232,30 @@ class CognitionCore:
         self._workshop = WorkshopState(
             workshop_path or os.path.expanduser("~/.local/state/nanobot/workshop.json"),
             logger=self._log, min_runs=workshop_min_runs,
-            retire_errors=workshop_retire_errors, retire_net_neg=workshop_retire_net_neg)
+            retire_errors=workshop_retire_errors, retire_net_neg=workshop_retire_net_neg,
+            adopt_quiet_runs=workshop_adopt_quiet_runs, trial_ttl=workshop_trial_ttl)
+        # Probation: P(a skill beat exercises a freshly forged trial instead of asking the model
+        # to pick) — the LLM picker rarely lands on a brand-new skill among the whole catalogue,
+        # so without this nudge a trial would never accrue the runs the adopt/retire gate needs.
+        self._workshop_trial_bias = clamp01(workshop_trial_bias)
         self._workshop_busy = False
         self._last_trial_skill = None        # the trial skill that ran most recently (reward target)
+        # Skill likes: a human can 👍 a skill (repeatedly) to make the brain FAVOUR it. The count
+        # is a per-skill weight folded into the autonomous skill-beat pick — the more a skill is
+        # liked, the more often it's performed (a like-weighted lottery, see _liked_skill_pick).
+        # Durable across reboots + deploy-synced like the soul/bank; net count, floored at 0.
+        self._skill_likes_path = skill_likes_path or os.path.expanduser(
+            "~/.local/state/nanobot/skill_likes.json")
+        self._skill_like_bias = clamp01(skill_like_bias)
+        self._skill_likes = self._load_skill_likes()
+        # Reflection mode speaks its conclusions out loud: a bookend line on enter/leave, and a
+        # short in-character line each time it actually CONCLUDES something (a refined sense of
+        # self, a freshly forged skill, a trial adopted/retired) — so the quiet thinking is
+        # legible from the outside instead of looking like the robot just went silent. Best-effort
+        # + expression-only; `_reflecting` tells the core when a deliberate reflection is running
+        # (self-narrative + forge conclusions only land then; adopt/retire can fire any time).
+        self._reflect_announce = bool(reflect_announce)
+        self._reflecting = False
         # Interaction fillers: an instant "thinking" line the moment a slow call starts (so a
         # skill/beat feels instant), and a graceful "stumped" line when a call comes back empty
         # instead of dead air. Both pull from the phrase bank (offline-safe FALLBACK_LINES).
@@ -200,23 +283,15 @@ class CognitionCore:
     # ---- trait trajectory (self-knowledge: how it has changed over time) -----
     def _load_trait_history(self):
         """Read the persisted (timestamp, traits) snapshots. Best-effort: [] on any problem."""
-        try:
-            with open(self._trait_hist_path, encoding="utf-8") as f:
-                data = json.load(f)
-            snaps = data.get("snapshots") if isinstance(data, dict) else data
-            return [s for s in snaps if isinstance(s, dict) and "traits" in s][-self._trait_hist_max:]
-        except Exception:
+        data = read_json(self._trait_hist_path)
+        snaps = data.get("snapshots") if isinstance(data, dict) else data
+        if not isinstance(snaps, list):
             return []
+        return [s for s in snaps if isinstance(s, dict) and "traits" in s][-self._trait_hist_max:]
 
     def _save_trait_history(self):
-        try:
-            os.makedirs(os.path.dirname(self._trait_hist_path), exist_ok=True)
-            tmp = self._trait_hist_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"snapshots": self._trait_hist}, f, indent=1)
-            os.replace(tmp, self._trait_hist_path)
-        except Exception as exc:
-            self._log(f"trait history: save failed ({exc})")
+        if not write_json(self._trait_hist_path, {"snapshots": self._trait_hist}):
+            self._log("trait history: save failed")
 
     def record_trait_snapshot(self, force=False):
         """Append the current live traits to the trajectory log, at most once per period (or
@@ -262,20 +337,7 @@ class CognitionCore:
     def _load_cog_log(self):
         """Seed the ring from the file's last LLM_LOG_MAX JSON lines (history across reboots
         / dev runs, shared file). Best-effort (returns [] on any problem)."""
-        try:
-            with open(self._cog_log_path, encoding="utf-8") as f:
-                lines = f.readlines()[-LLM_LOG_MAX:]
-        except Exception:
-            return []
-        out = []
-        for ln in lines:
-            ln = ln.strip()
-            if ln:
-                try:
-                    out.append(json.loads(ln))
-                except Exception:
-                    pass
-        return out
+        return read_jsonl_tail(self._cog_log_path, LLM_LOG_MAX)
 
     def log_decision(self, trigger, state="", camera=False, status="", model="",
                      prompt="", say="", mood="", ms=0, detail=""):
@@ -306,11 +368,14 @@ class CognitionCore:
         return "\n".join(lines) or "(no recent events)"
 
     # ---- express + generate -------------------------------------------------
-    def express(self, mood, say):
-        """Show a mood on the face and speak the line. Optionally clear the face back to the
-        dashboard after face_hold seconds (0 = leave it up like a manual mood)."""
+    def express(self, mood, say, base_face=""):
+        """Show a mood on the face and speak the line. `base_face` is the action's eye-shape (set
+        on a `looking`/`focused` beat): the emotion `mood` then rides it as an accent (e.g.
+        "looking:happy"), so the robot keeps its scanning eyes while showing how it feels. With no
+        base_face the emotion is the whole face (on-demand chat/observe). Optionally clears back to
+        the dashboard after face_hold seconds (0 = leave it up like a manual mood)."""
         if mood and mood != "neutral":
-            self._face(mood)
+            self._face(compose_face(base_face, mood))
             if self._face_hold > 0:
                 self._later(self._face_hold, lambda: self._face(""))
         if say and self.tts is not None and self.tts.available():
@@ -368,7 +433,7 @@ class CognitionCore:
                           say=reply["say"], mood=reply["mood"])
 
     def generate(self, prompt, history=None, image_jpeg=None, trigger="manual",
-                 state="", camera=False, smart=False, prelude=False):
+                 state="", camera=False, smart=False, prelude=False, base_face=""):
         """Blocking generate + express, guarded so only one call runs at a time (little
         RAM/CPU; the API costs money). Records the decision + outcome. Returns the reply dict
         or None. Safe to call from any worker thread. With `prelude`, speak an instant
@@ -394,7 +459,7 @@ class CognitionCore:
         ms = int((time.monotonic() - t0) * 1000)
         if reply:
             self.llm_fail_streak = 0                    # a real call succeeded -> online
-            self.express(reply["mood"], reply["say"])
+            self.express(reply["mood"], reply["say"], base_face=base_face)
             self.log_decision(trigger, state, camera, status="spoke", model=model,
                               prompt=prompt, say=reply["say"], mood=reply["mood"], ms=ms)
         else:
@@ -450,17 +515,22 @@ class CognitionCore:
                   f"{snap}. In character, say one short spoken line about what you can "
                   "see in front of you right now, and pick a fitting mood.")
         # prelude=False: the peek line already covered the "I'm on it" filler, so don't double up.
+        # base_face=the camera ("looking") shape, so a vision reply keeps the looking eyes + emotion.
         return self.generate(prompt, image_jpeg=frame, trigger=trigger, state=state,
-                             camera=True, prelude=False)
+                             camera=True, prelude=False, base_face=self._camera_face)
 
     # ---- statechart beat executor (the chart's /cognition/request) ----------
-    def run_beat(self, trigger, state, prompt, camera, audio=False):
+    def run_beat(self, trigger, state, prompt, camera, audio=False, face=""):
         """Execute one enrichable beat: capture a frame if asked (else, for a non-audio body
         beat, try the cached phrase bank), add the live sensors + personality (+ what the mic
         hears for an `audio` beat), generate + express. An audio beat always goes live (the
-        cached bank isn't sound-aware)."""
+        cached bank isn't sound-aware). `face` is the beat's action eye-shape (e.g. "looking" /
+        "focused"); the emotion rides it as an accent so the robot keeps its action eyes."""
         frame = None
         if camera:
+            if not self.llm.available():                # no LLM to process the frame at all
+                self.log_decision(trigger, state, camera, status="llm-unavailable")
+                return
             if not self.llm.can_call(image=True):       # don't spin up the camera if capped
                 self.log_decision(trigger, state, camera, status="rate-limited")
                 return
@@ -468,7 +538,7 @@ class CognitionCore:
             if frame is None:
                 self.log_decision(trigger, state, camera, status="no-frame")
                 return
-        elif not audio and self.bank_say(trigger, state):  # frequent body beat -> cached line
+        elif not audio and self.bank_say(trigger, state, base_face=face):  # cached line
             return                                       # (free/instant/offline; no LLM call)
         full = (prompt + " Your current personality (0..1) is " + self.traits_phrase()
                 + ", and your body senses: " + self._sensor_snapshot())
@@ -477,13 +547,14 @@ class CognitionCore:
         # Camera beats already spoke the peek line; only the non-camera (audio) beat needs the
         # generic "thinking" prelude.
         self.generate(full, image_jpeg=frame, trigger=trigger, state=state, camera=camera,
-                      prelude=not camera)
+                      prelude=not camera, base_face=face)
 
     # ---- phrase bank --------------------------------------------------------
-    def bank_say(self, trigger, state="", camera=False):
+    def bank_say(self, trigger, state="", camera=False, base_face=""):
         """Try the pre-generated phrase bank for a body-reaction line: classify the live
         sensors, pick + fill a cached line, speak/emote it, log it. Returns the reply dict if
-        a line was used, else None (honours the live-LLM ratio for variety)."""
+        a line was used, else None (honours the live-LLM ratio for variety). `base_face` lets a
+        cached line on a `focused` body beat keep its action eyes with the emotion as an accent."""
         if not self._bank_enable or camera:
             return None
         if random.random() < self._bank_live_ratio:     # occasionally go live for variety
@@ -491,7 +562,7 @@ class CognitionCore:
         reply = self._bank.pick(self._sensor_signals())
         if not reply:
             return None
-        self.express(reply["mood"], reply["say"])
+        self.express(reply["mood"], reply["say"], base_face=base_face)
         self.log_decision(trigger, state, camera, status="bank", model="phrasebank",
                           say=reply["say"], mood=reply["mood"], detail=reply["category"])
         return reply
@@ -549,11 +620,87 @@ class CognitionCore:
         cat, added = res
         return {"status": "grew", "category": cat, "added": added}
 
+    # ---- skill likes (a human 👍 makes the brain favour a skill) -------------
+    def _load_skill_likes(self):
+        """Read the persisted {skill: like_count} map. Best-effort: {} on any problem; counts
+        are coerced to non-negative ints and keyed by canonical slug."""
+        data = read_json(self._skill_likes_path)
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for key, val in data.items():
+            try:
+                n = int(val)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                out[_slug(key)] = n
+        return out
+
+    def _save_skill_likes(self):
+        if not write_json(self._skill_likes_path, self._skill_likes):
+            self._log("skill likes: save failed")
+
+    def like_skill(self, name, delta=1):
+        """Adjust a skill's like count by `delta` (+1 = a 👍, -1 = take one back), floored at 0,
+        and persist. Liking the same skill again just bumps the count, so the brain favours it
+        more strongly. Returns the new count. Unknown skill -> error (no phantom entries)."""
+        sk = self._skills.get(name)
+        if sk is None:
+            return {"error": "unknown skill: %s" % name}
+        try:
+            delta = int(delta)
+        except (TypeError, ValueError):
+            delta = 0
+        count = max(0, int(self._skill_likes.get(sk.name, 0)) + delta)
+        if count:
+            self._skill_likes[sk.name] = count
+        else:
+            self._skill_likes.pop(sk.name, None)
+        self._save_skill_likes()
+        self.log_decision("skill_like", status=("liked" if delta >= 0 else "unliked"),
+                          model="like", detail="%s=%d" % (sk.name, count))
+        return {"status": "ok", "name": sk.name, "likes": count}
+
+    def get_skill_likes(self):
+        return dict(self._skill_likes)
+
+    def _liked_skill_pick(self, offered):
+        """Choose one skill from `offered` by a like-weighted lottery (weight = 1 + likes), or
+        None if nothing on offer is liked. A 👍 raises a skill's weight so it's performed more
+        often the more it's liked; unliked skills keep weight 1, so behaviour stays varied (it's
+        a bias, not an exclusive pick). Pure + RNG-driven; unit-tested offline."""
+        weights = [(s, 1 + max(0, int(self._skill_likes.get(s.name, 0)))) for s in offered]
+        if not any(w > 1 for _, w in weights):
+            return None                                  # nothing liked -> let the model pick
+        total = sum(w for _, w in weights)
+        r = random.random() * total
+        upto = 0.0
+        for s, w in weights:
+            upto += w
+            if r <= upto:
+                return s
+        return weights[-1][0]
+
+    def _liked_skills_hint(self):
+        """A one-line nudge for the model picker naming the human's favoured skills (most-liked
+        first), so even the non-short-circuit pick leans toward liked skills. "" when none."""
+        liked = sorted(((n, c) for n, c in self._skill_likes.items() if c > 0),
+                       key=lambda x: x[1], reverse=True)
+        if not liked:
+            return ""
+        names = ", ".join("%s (liked x%d)" % (n, c) for n, c in liked[:5])
+        return "Your human especially likes: %s — lean toward these.\n" % names
+
     # ---- skill library ------------------------------------------------------
     def get_skills(self):
+        skills = []
+        for s in self._skills.values():
+            info = s.info()
+            info["likes"] = int(self._skill_likes.get(s.name, 0))
+            skills.append(info)
         return {"enabled": self.skills_enable, "allow_actions": self.skills_allow_actions,
-                "dir": self.skills_dir, "error": self._skills.error,
-                "skills": self._skills.as_list()}
+                "dir": self.skills_dir, "error": self._skills.error, "skills": skills}
 
     def reload_skills(self):
         if not self.skills_enable:
@@ -580,17 +727,38 @@ class CognitionCore:
         if not cat:
             self.log_decision("beat:skill", state, status="no-skills")
             return
+        offered = self._skills.offered(self.skills_allow_actions)
+        # Probation: with probability `workshop_trial_bias`, exercise a freshly forged trial
+        # skill instead of asking the model to pick — the picker rarely lands on a brand-new
+        # skill, so this is how a trial accrues the runs its adopt/retire gate needs. Only when
+        # the LLM is up (a narrative trial needs it to generate; an offline run would mis-count
+        # as an error). No due trial -> fall through to the normal pick.
+        trial = None
+        if self.llm.available() and random.random() < self._workshop_trial_bias:
+            trial = self._due_trial_skill()
+        # Likes bias: a human can 👍 a skill (repeatedly) to make the brain favour it. With
+        # probability `skill_like_bias`, short-circuit the model pick and choose by a like-
+        # weighted lottery, so a liked skill is performed more often the more it's liked. No
+        # liked skill on offer -> None, and we fall through to the normal contextual pick.
+        liked = None
+        if trial is None and random.random() < self._skill_like_bias:
+            liked = self._liked_skill_pick(offered)
+        chosen = trial or liked
         # Say an instant "thinking" filler BEFORE the (slow) pick call, so the beat feels
         # responsive instead of going silent while the model chooses. The chosen skill is then
         # performed with prelude=False so we don't double up on fillers.
         if self._prelude_enable and self.llm.available():
             self._speak_prelude()
+        if chosen is not None:
+            self._invoke_skill(chosen, trigger="skill:" + chosen.name, state=state, prelude=False)
+            return
         system = ("You choose which ONE of a small robot's capabilities best fits this "
                   'moment, or none. Reply with ONLY compact JSON {"skill": "<name>"} using '
                   'an EXACT name from the list, or {"skill": ""} to do nothing. No prose.')
-        user = ("Capabilities:\n%s\n\nYour body senses: %s.\nYour personality (0..1): %s.\n"
+        liked_hint = self._liked_skills_hint()
+        user = ("Capabilities:\n%s\n\nYour body senses: %s.\nYour personality (0..1): %s.\n%s"
                 "Pick the single most fitting capability to do now, or none."
-                % (cat, self._sensor_snapshot(), self.traits_phrase()))
+                % (cat, self._sensor_snapshot(), self.traits_phrase(), liked_hint))
         content = self.llm.complete(system, user, json_object=True)
         skill = self._skills.choose(content or "", self.skills_allow_actions)
         if skill is None:
@@ -599,6 +767,17 @@ class CognitionCore:
                               detail=(content or "")[:80])
             return
         self._invoke_skill(skill, trigger="skill:" + skill.name, state=state, prelude=False)
+
+    def _docs_summary(self):
+        """`docs` skill source: a short, redacted excerpt of my own documentation so I can talk
+        about what I am. Resolves the repo root by walking up from this module — the package is
+        installed editable, so __file__ is the src tree on the robot too. Extend via SELF_DOCS."""
+        d = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(6):                            # walk up to the repo root (holds the docs)
+            if any(os.path.exists(os.path.join(d, n)) for n, _ in SELF_DOCS):
+                return read_self_docs(d) or "my documentation seems to be empty right now"
+            d = os.path.dirname(d)
+        return "I can't find my own documentation right now"
 
     def _skill_prompt(self, skill):
         """The user-turn steering a narrative skill: its body + any requested live context
@@ -746,6 +925,9 @@ class CognitionCore:
                              rationale=str(spec.get("rationale", "")), path=path)
         self.log_decision("workshop:trial", status="trialing", say=name,
                           detail=str(spec.get("rationale", ""))[:120])
+        desc = str(spec.get("description") or name.replace("-", " ")).strip().rstrip(".")
+        self._announce_conclusion(
+            "forge", f"I've thought up a new little knack — {desc}. I'll give it a try.")
         return {"status": "trialing", "name": name}
 
     def _suggest_skill(self):
@@ -819,6 +1001,19 @@ class CognitionCore:
         self._workshop.record_run(name, ok=ok)
         self._apply_gate(name)
 
+    def _due_trial_skill(self):
+        """The least-run trial skill that still needs exercise AND can actually run right now
+        (it's in `offered()` — narrative, or an enabled action). The skill beat runs it on
+        probation so a freshly forged skill reaches an adopt/retire verdict instead of lingering
+        unused. None if no such trial exists."""
+        if not (self._workshop_enable and self.skills_enable):
+            return None
+        offered = {s.name for s in self._skills.offered(self.skills_allow_actions)}
+        for name in self._workshop.due_trials():
+            if name in offered:
+                return self._skills.get(name)
+        return None
+
     def reward_trial_skill(self, value):
         """Credit a human 👍/👎 (the 'happy user' signal) to the trial skill that ran most
         recently, then re-gate it. Returns whether a trial was credited."""
@@ -852,6 +1047,9 @@ class CognitionCore:
         self.log_decision("workshop:adopt", status="adopted", say=name,
                           detail="runs=%s +%s/-%s" % (rec.get("runs"), rec.get("reward_pos"),
                                                       rec.get("reward_neg")))
+        self._announce_conclusion(
+            "adopt", "That new trick, %s, has earned its place — I'll keep it for good."
+            % name.replace("-", " "), mood="happy")
 
     def _retire_skill(self, name):
         """Roll a trial back: delete its .md (the parent of an `adapt` is never touched) and
@@ -862,6 +1060,9 @@ class CognitionCore:
         self._workshop.forget(name)
         self._skills.remove(name)                   # drop from the index (no full re-scan)
         self.log_decision("workshop:retire", status="retired", say=name)
+        self._announce_conclusion(
+            "retire", "That %s idea didn't pan out — I'll let it go." % name.replace("-", " "),
+            mood="neutral")
 
     # ---- workshop file IO + web API -----------------------------------------
     def _write_skill_file(self, name, text):
@@ -988,20 +1189,57 @@ class CognitionCore:
     # ---- long-term self-narrative (smart-LLM, durable) ----------------------
     def _load_self_model(self):
         """Read the persisted self-narrative (best-effort; '' if absent/unreadable)."""
-        try:
-            with open(self._self_model_path, encoding="utf-8") as f:
-                return str(json.load(f).get("narrative", "")).strip()
-        except Exception:
-            return ""
+        data = read_json(self._self_model_path)
+        return str(data.get("narrative", "")).strip() if isinstance(data, dict) else ""
 
     def _save_self_model(self):
-        try:
-            os.makedirs(os.path.dirname(self._self_model_path), exist_ok=True)
-            with open(self._self_model_path, "w", encoding="utf-8") as f:
-                json.dump({"narrative": self.self_narrative, "name": self.persona_name,
-                           "updated_at": int(time.time())}, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        write_json(self._self_model_path, {"narrative": self.self_narrative,
+                                           "name": self.persona_name,
+                                           "updated_at": int(time.time())})
+
+    # ---- spoken reflection conclusions --------------------------------------
+    def set_reflecting(self, on):
+        """Tell the core whether a deliberate reflection is running, so it knows which
+        conclusions are worth speaking (a refined self-narrative + a freshly forged skill only
+        land during reflection; a skill adopting/retiring can happen any time)."""
+        self._reflecting = bool(on)
+
+    def _announce_conclusion(self, kind, line, mood="focused"):
+        """Speak ONE short in-character 'here's what I concluded' line + log it. Best-effort and
+        expression-only — a no-op if announcements are off, there's no line, or TTS is absent."""
+        line = (line or "").strip()
+        if not (self._reflect_announce and line):
+            return
+        self.express(mood, line)
+        self.log_decision("reflect:%s" % kind, status="spoke", model="reflect", say=line[:160])
+
+    def announce_reflect(self, on):
+        """Bookend reflection mode out loud (entering / leaving). Offline-safe canned lines so the
+        pause is always legible even with no network."""
+        self._announce_conclusion("enter" if on else "leave",
+                                  random.choice(REFLECT_ENTER_LINES if on
+                                                else REFLECT_LEAVE_LINES),
+                                  mood=("focused" if on else "happy"))
+
+    def _conclude_self(self):
+        """After the self-narrative actually changes, say a short first-person line about how the
+        robot has just realized it's changing — generated when the model's up, templated when not
+        (so it always speaks). Called only while reflecting."""
+        line = ""
+        if self.llm.available():
+            try:
+                line = (self.llm.complete(
+                    f"You are {self.persona_name}, a small robot reflecting quietly. In ONE short "
+                    "first-person sentence, tell whoever is near the gist of how you have just "
+                    "realized you are changing. Plain, warm, in character; output only the "
+                    "sentence.",
+                    f"Your updated sense of yourself: {self.self_narrative}",
+                    smart=False, json_object=False) or "").strip()
+                line = line.splitlines()[0].strip().strip('"') if line else ""
+            except Exception:
+                line = ""
+        self._announce_conclusion(
+            "self", line or "I've been reflecting, and I feel myself changing a little.")
 
     def _maybe_consolidate(self):
         """Every `consolidate_every`-th successful reflection, rewrite the self-narrative
@@ -1051,11 +1289,17 @@ class CognitionCore:
         if not text:
             self.log_decision("consolidate", status="no-reply", model=rmodel, ms=ms)
             return None
+        changed = text[: self._self_model_max] != (self.self_narrative or "")
         self.self_narrative = text[: self._self_model_max]
         self.llm.set_self_note(self.self_narrative)
         self._save_self_model()
         self.log_decision("consolidate", status="spoke", model=rmodel,
                           say=self.self_narrative[:160], ms=ms)
+        # Speak the conclusion only when the self-narrative actually shifted (it usually nudges
+        # only a little) and only inside a deliberate reflection — so normal idle consolidations
+        # stay silent and we don't repeat an unchanged self-image aloud.
+        if changed and self._reflecting:
+            self._conclude_self()
         return self.self_narrative
 
     def get_self_model(self):
@@ -1070,6 +1314,7 @@ class CognitionCore:
         s["model_effective"] = self.llm.model
         s["smart_model"] = self.llm.smart_model
         s["vision_model"] = self.llm.vision_model
+        s["vision_fallback_model"] = self.llm.vision_fallback_model  # optional paid vision fallback
         s["free_model"] = self.llm.free_model           # free primaries (paid models are fallbacks)
         s["free_smart_model"] = self.llm.free_smart_model
         s["persona"] = self.persona                     # read-only: single-sourced from personality.json
@@ -1082,7 +1327,25 @@ class CognitionCore:
             self.settings["enabled"] = bool(data["enabled"])
         if "model" in data:
             self.settings["model"] = str(data["model"] or "")[:120]
-        self.llm.configure(enabled=self.settings["enabled"], model=self.settings["model"])
+        if "smart_model" in data:
+            self.settings["smart_model"] = str(data["smart_model"] or "")[:120]
+        if "vision_model" in data:
+            self.settings["vision_model"] = str(data["vision_model"] or "")[:120]
+        if "vision_fallback_model" in data:
+            self.settings["vision_fallback_model"] = str(data["vision_fallback_model"] or "")[:120]
+        if "free_model" in data:
+            self.settings["free_model"] = str(data["free_model"] or "")[:120]
+        if "free_smart_model" in data:
+            self.settings["free_smart_model"] = str(data["free_smart_model"] or "")[:120]
+        self.llm.configure(
+            enabled=self.settings["enabled"],
+            model=self.settings["model"],
+            smart_model=self.settings.get("smart_model"),
+            vision_model=self.settings.get("vision_model"),
+            vision_fallback_model=self.settings.get("vision_fallback_model"),
+            free_model=self.settings.get("free_model"),
+            free_smart_model=self.settings.get("free_smart_model"),
+        )
         if self._persist_settings is not None:
             self._persist_settings(dict(self.settings))
         return self.get_llm_settings()

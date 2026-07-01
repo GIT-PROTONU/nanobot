@@ -11,9 +11,22 @@
   <exec_depend>motor_control</exec_depend>
   <exec_depend>oled_display</exec_depend>
   <exec_depend>web_control</exec_depend>
+  <exec_depend>sys_monitor</exec_depend>
+  <exec_depend>behavior</exec_depend>
+  <exec_depend>slam_nav</exec_depend>
+  <exec_depend>lds_driver_py</exec_depend>
+  <exec_depend>imu_driver</exec_depend>
   <exec_depend>robot_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <!-- Dev-PC-only (sim:=true); not installed/available on the board (linux-aarch64);
+       see pixi.toml's [target.linux-64.dependencies]. -->
+  <exec_depend>sim_hardware</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>rviz2</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

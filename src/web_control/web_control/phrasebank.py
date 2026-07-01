@@ -28,14 +28,14 @@ The bank is a JSON file (default ~/.local/state/nanobot/phrases.json), shared by
 (`web_server`) and the dev harness (`dev_webui.py`).
 """
 import hashlib
-import json
 import os
 import random
 import re
 import threading
 import time
 
-from .llm import MOODS, coerce_mood
+from .jsonio import read_json, write_json
+from .llm import MOODS, _extract_json_list, coerce_mood
 
 # Situations Nano most often comments on, in *priority* order (first match wins), each with
 # a plain-English description (fed to the generator) naming the placeholders that fit it.
@@ -193,22 +193,14 @@ class PhraseBank:
 
     # ---- persistence --------------------------------------------------------
     def _load(self):
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                d = json.load(f)
-            if isinstance(d, dict) and isinstance(d.get("categories"), dict):
-                return d
-        except Exception:
-            pass
+        d = read_json(self.path)
+        if isinstance(d, dict) and isinstance(d.get("categories"), dict):
+            return d
         return {"version": 1, "signature": None, "generated_at": 0, "categories": {}}
 
     def _save(self):
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=1)
-        except Exception as exc:
-            self._log(f"phrasebank: save failed ({exc})")
+        if not write_json(self.path, self._data):
+            self._log("phrasebank: save failed")
 
     def is_empty(self):
         with self._lock:
@@ -293,12 +285,14 @@ class PhraseBank:
         ``{"lines": []}`` for this batch (multi-line, structured) request, whereas the smart
         model follows it. Generation is rare (once per persona/drift) and free-first, so the
         extra capability is nearly free — unlike the per-beat lines, which stay on the cheap
-        tier. Single-line beat generation is unaffected."""
+        tier. Single-line beat generation is unaffected.
+
+        Saves to file after EACH category block so progress is preserved if interrupted."""
         if llm is None or not llm.available():
             self._log("phrasebank: LLM unavailable — cannot generate")
             return False
         system = soul_system(persona, traits, name)
-        new_cats = {}
+        any_success = False
         for cat, desc in CATEGORIES.items():
             user = (
                 f"Situation: {desc}.\nWrite {per_category} DIFFERENT in-character spoken "
@@ -313,19 +307,18 @@ class PhraseBank:
                     break
                 time.sleep(1.5)                   # pace the burst + let a rotating free slug recover
             if lines:
-                new_cats[cat] = lines
-                self._log(f"phrasebank: {cat}: {len(lines)} lines")
+                # Save after each category so progress isn't lost if interrupted
+                with self._lock:
+                    cats = dict(self._data.get("categories", {}))
+                    cats[cat] = lines
+                    self._data = {"version": 1, "signature": signature(persona, traits),
+                                  "name": name, "generated_at": int(time.time()), "categories": cats}
+                    self._save()
+                self._log(f"phrasebank: {cat}: {len(lines)} lines (saved)")
+                any_success = True
             else:
                 self._log(f"phrasebank: {cat}: no lines (kept old)")
-        if not new_cats:
-            return False
-        with self._lock:
-            cats = dict(self._data.get("categories", {}))
-            cats.update(new_cats)                       # keep any category that failed this run
-            self._data = {"version": 1, "signature": signature(persona, traits),
-                          "name": name, "generated_at": int(time.time()), "categories": cats}
-            self._save()
-        return True
+        return any_success
 
     def maybe_regenerate(self, llm, persona, traits, name="Nano", threshold=0.6,
                          per_category=6, background=True):
@@ -450,25 +443,7 @@ class PhraseBank:
     @staticmethod
     def _parse_lines(raw):
         """Pull a list of {say,mood} from a model reply, tolerating fences / stray prose."""
-        if not raw:
-            return []
-        t = str(raw).strip()
-        if t.startswith("```"):
-            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
-            t = re.sub(r"\s*```$", "", t).strip()
-        obj = None
-        try:
-            obj = json.loads(t)
-        except Exception:
-            m = re.search(r"\{.*\}", t, re.DOTALL)       # first {...} that parses
-            if m:
-                try:
-                    obj = json.loads(m.group(0))
-                except Exception:
-                    obj = None
-        items = obj.get("lines") if isinstance(obj, dict) else (obj if isinstance(obj, list) else None)
-        if not isinstance(items, list):
-            return []
+        items = _extract_json_list(raw, key="lines")
         out = []
         for it in items:
             if isinstance(it, dict):

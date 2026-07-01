@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<!-- One simple room with a couple of interior walls; enough clutter for slam_nav's
+     scan-matcher + the RViz LaserScan/Map displays to have something to show. Not meant to
+     be realistic; just a small maze. Robot spawns at the origin (matches wheel_odometry's
+     odom origin + slam_nav's grid origin, both (0,0) at boot). -->
+<sdf version="1.9">
+  <world name="nano_room">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>20 20</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>20 20</size></plane></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- xyz size="length width height", centred at pose -->
+    <model name="wall_north"><static>true</static><pose>0 3 0.5 0 0 0</pose>
+      <link name="link"><collision name="c"><geometry><box><size>6 0.1 1</size></box></geometry></collision>
+      <visual name="v"><geometry><box><size>6 0.1 1</size></box></geometry></visual></link></model>
+    <model name="wall_south"><static>true</static><pose>0 -3 0.5 0 0 0</pose>
+      <link name="link"><collision name="c"><geometry><box><size>6 0.1 1</size></box></geometry></collision>
+      <visual name="v"><geometry><box><size>6 0.1 1</size></box></geometry></visual></link></model>
+    <model name="wall_east"><static>true</static><pose>3 0 0.5 0 0 0</pose>
+      <link name="link"><collision name="c"><geometry><box><size>0.1 6 1</size></box></geometry></collision>
+      <visual name="v"><geometry><box><size>0.1 6 1</size></box></geometry></visual></link></model>
+    <model name="wall_west"><static>true</static><pose>-3 0 0.5 0 0 0</pose>
+      <link name="link"><collision name="c"><geometry><box><size>0.1 6 1</size></box></geometry></collision>
+      <visual name="v"><geometry><box><size>0.1 6 1</size></box></geometry></visual></link></model>
+
+    <!-- interior partition with a gap (a doorway), so it isn't just a bare box room. -->
+    <model name="wall_mid_a"><static>true</static><pose>1 1.2 0.5 0 0 0</pose>
+      <link name="link"><collision name="c"><geometry><box><size>0.1 2 1</size></box></geometry></collision>
+      <visual name="v"><geometry><box><size>0.1 2 1</size></box></geometry></visual></link></model>
+    <model name="wall_mid_b"><static>true</static><pose>1 -1.6 0.5 0 0 0</pose>
+      <link name="link"><collision name="c"><geometry><box><size>0.1 2 1</size></box></geometry></collision>
+      <visual name="v"><geometry><box><size>0.1 2 1</size></box></geometry></visual></link></model>
+  </world>
+</sdf>

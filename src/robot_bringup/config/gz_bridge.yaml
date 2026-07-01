@@ -1,0 +1,38 @@
+# ros_gz_bridge topic map for dev-sim (sim:=true). Every entry here becomes a real ROS
+# topic that the unmodified rest of the node graph consumes exactly like the physical
+# robot's hardware nodes -- see src/sim_hardware/sim_hardware/sim_bridge_node.py for the
+# one further translation step (wheel joint angle -> /wheel_ticks, imu -> euler/web).
+#
+# ros_gz_bridge direction: GZ_TO_ROS / ROS_TO_GZ / BIDIRECTIONAL.
+#
+# NOTE (written without a Linux/ROS/Gazebo machine to test on): these gz_type_name values
+# are the standard ros_gz_bridge factory pairings for ros_gz 0.244.x/Humble. If the bridge
+# node logs "failed to create a bridge for topic ..." for any entry on first run, list the
+# actually-supported pairs with `ros2 run ros_gz_bridge parameter_bridge --print-pairs` and
+# correct the type name here (the topic names/directions/purpose won't change).
+- ros_topic_name: "cmd_vel"
+  gz_topic_name: "/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "scan"
+  gz_topic_name: "/scan"
+  ros_type_name: "sensor_msgs/msg/LaserScan"
+  gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "imu"
+  gz_topic_name: "/imu"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS
+
+# Remapped: wheel_odometry already owns the real "/joint_states" topic name (its own
+# ticks-integration output), so the bridged Gazebo joint angles land on a different name;
+# sim_bridge_node subscribes THIS one and converts it to /wheel_ticks.
+- ros_topic_name: "joint_states_sim"
+  gz_topic_name: "/joint_states_gz"
+  ros_type_name: "sensor_msgs/msg/JointState"
+  gz_type_name: "gz.msgs.Model"
+  direction: GZ_TO_ROS

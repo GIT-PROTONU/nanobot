@@ -19,6 +19,7 @@ import http.server
 import json
 import math
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -30,6 +31,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int32, Float32, String
 from geometry_msgs.msg import Twist, Vector3Stamped
 
+from .jsonio import read_json, write_json
 from .mjpeg_camera import CameraStream
 from .mic_audio import AudioStream
 from .tts import TtsEngine, VOICES, clamp
@@ -49,6 +51,7 @@ SETTINGS_DEFAULTS = {
 }
 ANNOUNCE_MIN = 5              # don't let the announcer spam faster than this (s)
 ANNOUNCE_MAX = 3600
+MAX_BODY = 65536             # cap on a POST body we'll buffer (bytes); larger = drained + dropped
 
 # Web-tunable LLM (OpenRouter) settings, merged over the file on disk and seeded from
 # the robot.yaml params. The API key is NEVER stored here — it stays in robot.yaml /
@@ -56,6 +59,22 @@ ANNOUNCE_MAX = 3600
 LLM_DEFAULTS = {
     "enabled": False,         # opt-in: it costs money + needs the network
     "model": "",              # "" -> llm.DEFAULT_MODEL
+    "smart_model": "",        # "" -> llm.DEFAULT_SMART_MODEL
+    "vision_model": "",       # "" -> llm.DEFAULT_VISION_MODEL
+    "vision_fallback_model": "",  # optional PAID vision fallback ("" -> none)
+    "free_model": "",         # "" -> llm.DEFAULT_FREE_MODEL
+    "free_smart_model": "",   # "" -> llm.DEFAULT_FREE_SMART_MODEL
+}
+# Each LLM "variant" (normal / deep-think / vision) has a PRIMARY (free-first) and a
+# SECONDARY (paid fallback). The robot.yaml param feeding each settings key as its default.
+LLM_PARAM_FOR = {
+    "enabled": "llm_enabled",
+    "model": "llm_model",                       # normal secondary (paid fallback)
+    "smart_model": "llm_smart_model",           # deep-think secondary (paid fallback)
+    "vision_model": "llm_vision_model",         # vision primary
+    "vision_fallback_model": "llm_vision_fallback_model",  # vision secondary (paid fallback)
+    "free_model": "llm_free_model",             # normal primary (free-first)
+    "free_smart_model": "llm_free_smart_model", # deep-think primary (free-first)
 }
 # NOTE: the persona is NOT here — it's single-sourced from personality.json (written by
 # scripts/personality_creator.py, the same file the behaviour node loads), falling back to
@@ -160,6 +179,12 @@ class WebServerNode(Node):
         self.declare_parameter("workshop_min_runs", 3)         # runs before a trial may adopt
         self.declare_parameter("workshop_retire_errors", 2)    # errors that retire a trial
         self.declare_parameter("workshop_retire_net_neg", 2)   # net 👎 that retire a trial
+        self.declare_parameter("workshop_adopt_quiet_runs", 5) # clean runs (no 👎) that auto-adopt w/o praise
+        self.declare_parameter("workshop_trial_ttl", 172800.0) # s a trial may linger before rollback (0=off)
+        self.declare_parameter("workshop_trial_bias", 0.5)     # P(a skill beat exercises a due trial)
+        self.declare_parameter("skill_likes_path", "")         # 👍 likes ledger; "" -> XDG state dir
+        self.declare_parameter("skill_like_bias", 0.6)         # P(a skill beat picks a liked skill by weight)
+        self.declare_parameter("reflect_announce", True)       # speak reflection conclusions out loud
         # Lifecycle speech + the persistent "AI offline" indicator (all offline-safe via the
         # phrase bank's FALLBACK_LINES, so they work with no key / no network).
         self.declare_parameter("startup_greeting", True)   # speak a greeting line on boot
@@ -227,13 +252,14 @@ class WebServerNode(Node):
         self._persona = self._load_persona()           # single-sourced from personality.json
         self._persona_name = self._load_persona_name() # the robot's name (for the phrase bank)
         self._face_pub = self.create_publisher(String, "oled_face", 10)
+        ls = self._llm_settings   # merged robot.yaml defaults + persisted UI changes
         llm = LlmClient(
-            enabled=self._llm_settings["enabled"], api_key=g("llm_api_key").value,
-            model=self._llm_settings["model"], base_url=g("llm_base_url").value,
-            persona=self._persona, vision_model=g("llm_vision_model").value,
-            smart_model=g("llm_smart_model").value, free_model=g("llm_free_model").value,
-            free_smart_model=g("llm_free_smart_model").value,
-            vision_fallback_model=g("llm_vision_fallback_model").value,
+            enabled=ls["enabled"], api_key=g("llm_api_key").value,
+            model=ls["model"], base_url=g("llm_base_url").value,
+            persona=self._persona, vision_model=ls["vision_model"],
+            smart_model=ls["smart_model"], free_model=ls["free_model"],
+            free_smart_model=ls["free_smart_model"],
+            vision_fallback_model=ls["vision_fallback_model"],
             smart_max_per_hour=int(g("llm_smart_max_per_hour").value),
             vision_max_per_hour=int(g("llm_vision_max_per_hour").value),
             timeout=float(g("llm_timeout").value), max_tokens=int(g("llm_max_tokens").value),
@@ -291,7 +317,13 @@ class WebServerNode(Node):
             workshop_rounds=int(g("workshop_rounds").value),
             workshop_min_runs=int(g("workshop_min_runs").value),
             workshop_retire_errors=int(g("workshop_retire_errors").value),
-            workshop_retire_net_neg=int(g("workshop_retire_net_neg").value))
+            workshop_retire_net_neg=int(g("workshop_retire_net_neg").value),
+            workshop_adopt_quiet_runs=int(g("workshop_adopt_quiet_runs").value),
+            workshop_trial_ttl=float(g("workshop_trial_ttl").value),
+            workshop_trial_bias=float(g("workshop_trial_bias").value),
+            skill_likes_path=(g("skill_likes_path").value or None),
+            skill_like_bias=float(g("skill_like_bias").value),
+            reflect_announce=bool(g("reflect_announce").value))
         # Statechart-driven enrichment requests: the behaviour node decides when/what, the
         # core executes (capture frame if asked, add sensors, generate, speak + emote).
         self.create_subscription(String, "cognition/request", self._on_cog, 10)
@@ -305,6 +337,13 @@ class WebServerNode(Node):
         self._llm_offline_reassert = 0.0 # monotonic of last face re-assert while offline
         self._evolve_pub = self.create_publisher(String, "cognition/evolve", 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        # Tells the behaviour node whether the LLM is actually usable right now (enabled + a key
+        # configured), so its idle-beat lottery can stop picking camera beats ("looking"/
+        # "pursuing") when there's nothing to process the frame — a mere network blip is already
+        # handled separately by the offline-face standdown below, which pauses ALL beats.
+        self._llm_ready_pub = self.create_publisher(Bool, "cognition/llm_ready", latched)
+        self._llm_ready = None            # None=not yet published
+        self._update_llm_ready()
         self.create_subscription(String, "cognition/traits", self._on_traits, latched)
         # Brain controls from the web UI (the behaviour node consumes these): human reward
         # -> A/B bandit + reward shaping; reflection mode -> consolidation + skill forging.
@@ -351,24 +390,14 @@ class WebServerNode(Node):
     def _load_settings(self):
         s = dict(SETTINGS_DEFAULTS)
         s["voice"] = self.get_parameter("tts_default_voice").value or "en-US"
-        try:
-            with open(self._settings_file()) as f:
-                saved = json.load(f)
+        saved = read_json(self._settings_file())       # no/invalid file -> defaults
+        if isinstance(saved, dict):
             s.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULTS})
-        except Exception:
-            pass                                       # no/invalid file -> defaults
         return _sanitize_settings(s)
 
     def _save_settings(self):
-        try:
-            path = self._settings_file()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self._settings, f)
-            os.replace(tmp, path)                      # atomic; never a half-written file
-        except Exception as exc:
-            self.get_logger().warning(f"tts: could not persist settings ({exc})")
+        if not write_json(self._settings_file(), self._settings):
+            self.get_logger().warning("tts: could not persist settings")
 
     def _apply_engine(self):
         """Push the current voice + markup levels into the TTS engine."""
@@ -438,16 +467,13 @@ class WebServerNode(Node):
 
     def _load_llm_settings(self):
         s = dict(LLM_DEFAULTS)
-        for k, param in (("enabled", "llm_enabled"), ("model", "llm_model")):
+        for k, param in LLM_PARAM_FOR.items():           # robot.yaml params seed the defaults
             v = self.get_parameter(param).value
             if v is not None:
                 s[k] = v
-        try:                                           # persisted UI changes win over params
-            with open(self._llm_settings_file()) as f:
-                saved = json.load(f)
+        saved = read_json(self._llm_settings_file())   # persisted UI changes win over params
+        if isinstance(saved, dict):
             s.update({k: v for k, v in saved.items() if k in LLM_DEFAULTS})
-        except Exception:
-            pass
         return _sanitize_llm_settings(s)
 
     def _load_persona(self):
@@ -455,13 +481,9 @@ class WebServerNode(Node):
         the behaviour node seeds from), else the llm_persona param fallback."""
         path = (self.get_parameter("personality_path").value
                 or os.path.expanduser("~/.local/state/nanobot/personality.json"))
-        try:
-            with open(path, encoding="utf-8") as f:
-                persona = (json.load(f) or {}).get("persona")
-            if isinstance(persona, str) and persona.strip():
-                return persona.strip()
-        except Exception:
-            pass
+        persona = (read_json(path) or {}).get("persona")
+        if isinstance(persona, str) and persona.strip():
+            return persona.strip()
         return self.get_parameter("llm_persona").value or ""
 
     def _load_persona_name(self):
@@ -469,28 +491,18 @@ class WebServerNode(Node):
         as a fallback."""
         path = (self.get_parameter("personality_path").value
                 or os.path.expanduser("~/.local/state/nanobot/personality.json"))
-        try:
-            with open(path, encoding="utf-8") as f:
-                name = (json.load(f) or {}).get("name")
-            if isinstance(name, str) and name.strip():
-                return name.strip()
-        except Exception:
-            pass
+        name = (read_json(path) or {}).get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
         return "Nano"
 
     def _save_llm_settings(self, settings):
         """The core's `persist_settings` adapter: write the UI {enabled,model} to llm.json
-        (never the API key). Atomic via .tmp + rename."""
+        (never the API key). Atomic via jsonio.write_json."""
         self._llm_settings = dict(settings)
-        try:
-            path = self._llm_settings_file()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self._llm_settings, f)       # note: never contains the API key
-            os.replace(tmp, path)
-        except Exception as exc:
-            self.get_logger().warning(f"llm: could not persist settings ({exc})")
+        # note: never contains the API key
+        if not write_json(self._llm_settings_file(), self._llm_settings):
+            self.get_logger().warning("llm: could not persist settings")
 
     # --- cognition-core delegators (the shared LLM brain lives in cognition.py) ----
     # These thin forwards are the node's public API for the HTTP handler; all the logic is in
@@ -514,13 +526,25 @@ class WebServerNode(Node):
         return self._cog.regenerate_phrasebank()
 
     def get_skills(self):
-        return self._cog.get_skills()
+        return self._cog.get_skills()              # like counts merged in by the core
 
     def reload_skills(self):
         return self._cog.reload_skills()
 
     def invoke_skill(self, name):
         return self._cog.invoke_skill(name)
+
+    def like_skill(self, data):
+        """Adjust a skill's like count (a 👍 makes the brain favour it; repeatable). Body:
+        {"name": "<skill>", "delta": ±1}. Persisted + biases the autonomous skill beat."""
+        name = str((data or {}).get("name") or "").strip()
+        if not name:
+            return {"error": "empty name"}
+        try:
+            delta = int((data or {}).get("delta", 1))
+        except (TypeError, ValueError):
+            delta = 1
+        return self._cog.like_skill(name, delta)
 
     def llm_say(self, prompt=""):
         return self._cog.llm_say(prompt)
@@ -538,17 +562,27 @@ class WebServerNode(Node):
     def brain_reward(self, data):
         """Record a human reward and publish it for the behaviour node. Contextual reward
         (with a `target` echoed from /task_current) credits a specific A/B arm; global reward
-        shapes the intrinsic-reward weights via the decision log on the next reflection."""
+        shapes the intrinsic-reward weights via the decision log on the next reflection.
+        Skill reward (scope="skill", target=skill_name) is a 👍/👎 like on a specific skill —
+        it adjusts the skill's like weight in the core (which biases the autonomous skill beat)."""
         try:
             value = clamp(float(data.get("value", 0)), -1, 1)
         except (TypeError, ValueError):
             value = 0.0
-        scope = "global" if data.get("scope") == "global" else "contextual"
-        target = data.get("target") if isinstance(data.get("target"), dict) else None
+        scope = data.get("scope", "contextual")
+        if scope not in ("global", "contextual", "skill"):
+            scope = "contextual"
+        target = data.get("target")
+        # Skill like: scope="skill", target=skill_name (string). +1 favours it, -1 takes one back.
+        if scope == "skill" and isinstance(target, str) and target.strip():
+            res = self._cog.like_skill(target, 1 if value >= 0 else -1)
+            return {"status": "ok", "value": value, "scope": scope, "target": target, **res}
+        # Contextual/global reward (target is a dict for A/B experiments)
+        target_dict = target if isinstance(target, dict) else None
         status = "up" if value > 0 else ("down" if value < 0 else "neutral")
         detail = scope
-        if target:
-            detail += " " + json.dumps({k: target.get(k) for k in ("exp", "variant", "task")})
+        if target_dict:
+            detail += " " + json.dumps({k: target_dict.get(k) for k in ("exp", "variant", "task")})
         self._cog.log_decision("reward", status=status, detail=detail,
                                say=("👍" if value > 0 else "👎" if value < 0 else "·"))
         # Also credit a trial skill that just ran (the workshop's "happy user" signal): a
@@ -556,7 +590,7 @@ class WebServerNode(Node):
         if scope == "contextual":
             self._cog.reward_trial_skill(value)
         self._reward_pub.publish(String(data=json.dumps(
-            {"value": value, "scope": scope, "target": target})))
+            {"value": value, "scope": scope, "target": target_dict})))
         return {"status": "ok", "value": value, "scope": scope}
 
     def brain_reflect(self, data):
@@ -566,6 +600,8 @@ class WebServerNode(Node):
         forges a skill at once."""
         on = bool(data.get("on"))
         self._reflecting = on
+        self._cog.set_reflecting(on)               # so the core speaks self/forge conclusions
+        self._cog.announce_reflect(on)             # say a short bookend line (turning inward / done)
         self._reflect_pub.publish(Bool(data=on))
         if on:
             self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
@@ -609,6 +645,7 @@ class WebServerNode(Node):
         prompt = str(req.get("prompt") or "")
         camera = bool(req.get("camera"))
         audio = bool(req.get("audio"))
+        face = str(req.get("face") or "")              # the beat's action eye-shape (for the accent)
         if isinstance(req.get("traits"), dict):        # freshest personality snapshot
             self._cog.update_traits(req["traits"])
         trigger = "beat:" + beat
@@ -620,7 +657,7 @@ class WebServerNode(Node):
                              args=(state or "acting",), daemon=True).start()
             return
         threading.Thread(target=self._cog.run_beat,
-                         args=(trigger, state, prompt, camera, audio), daemon=True).start()
+                         args=(trigger, state, prompt, camera, audio, face), daemon=True).start()
 
     # --- action-tier publish + lidar summary (the core's ROS-backed adapters) ----
     def _scan_summary(self):
@@ -656,7 +693,6 @@ class WebServerNode(Node):
         already listening, else spins it up for ~`listen` s — and turns the raw S16LE level
         into words. The RMS/peak thresholds are rough and meant to be TUNED ON HARDWARE.
         Returns 'no audio available' if the mic isn't there or nothing arrives."""
-        import queue as _q
         if getattr(self, "_mic", None) is None:
             return "no audio available"
         sink = self._mic.add_listener()
@@ -665,7 +701,7 @@ class WebServerNode(Node):
             while time.monotonic() < deadline:
                 try:
                     chunks.append(sink.get(timeout=0.2))
-                except _q.Empty:
+                except queue.Empty:
                     pass
         finally:
             self._mic.remove_listener(sink)
@@ -867,6 +903,15 @@ class WebServerNode(Node):
         cat = "farewell" if action in ("shutdown", "poweroff") else "restarting"
         return self._cog.speak_lifecycle(cat)
 
+    def _update_llm_ready(self):
+        """Publish (on change) whether the LLM is enabled + keyed right now — see the
+        cognition/llm_ready publisher above. Latched, so a behaviour node that (re)starts later
+        still picks up the current value immediately."""
+        ready = self._cog.available()
+        if ready != self._llm_ready:
+            self._llm_ready = ready
+            self._llm_ready_pub.publish(Bool(data=ready))
+
     def _llm_health_tick(self):
         """Persistent 'AI offline' indicator: when the LLM is enabled but unreachable, show
         the offline face + speak the offline line once, and clear when it recovers. Edge-
@@ -874,6 +919,7 @@ class WebServerNode(Node):
         the face. Counts repeated real-call failures too, so a network drop (key present) also
         trips it — not just a missing key. The behaviour node stands down on the foreign face,
         so its idle beats pause while we're offline."""
+        self._update_llm_ready()
         if not self.get_parameter("llm_offline_indicator").value:
             return
         if not bool(self._cog.settings.get("enabled")):
@@ -966,11 +1012,22 @@ def _sanitize_llm_settings(s):
     out = dict(LLM_DEFAULTS)
     out.update(s)
     out["enabled"] = bool(out["enabled"])
-    out["model"] = str(out["model"] or "")[:120]
+    for k in ("model", "smart_model", "vision_model", "vision_fallback_model",
+              "free_model", "free_smart_model"):
+        out[k] = str(out.get(k) or "")[:120]
     return out
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
+    # HTTP/1.1 so the browser reuses ONE keep-alive connection for the frequent
+    # /map + /scan.bin + config polls instead of a fresh TCP connect (and a fresh
+    # ThreadingHTTPServer thread) per request — the cheapest steady-state win on the
+    # 1 GB SBC. Every non-streaming response below sends Content-Length, so keep-alive
+    # framing is well-defined; the streaming handlers opt back out with close_connection.
+    # `timeout` reaps an idle kept-alive socket so abandoned connections can't pin a thread.
+    protocol_version = "HTTP/1.1"
+    timeout = 30
+
     def __init__(self, *args, stream=None, audio=None, tts=None, node=None, **kwargs):
         self._stream = stream
         self._audio = audio
@@ -1006,6 +1063,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        # Consume the body up front so it's always drained — a kept-alive connection
+        # would otherwise desync on endpoints that ignore the body (or on a payload
+        # larger than _read_json would have read).
+        self._body = self._read_body()
         if path == "/tts":
             # Speak a line and karaoke its words to the OLED. Body: {"text","voice"?}.
             data = self._read_json()
@@ -1098,6 +1159,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._respond(503, "no node")
             else:
                 self._respond_json(self._node.reload_skills())
+        elif path == "/skills/like":
+            # 👍 a skill so the brain favours it (repeatable): {"name":"<skill>","delta":±1}.
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._node.like_skill(self._read_json()))
         elif path == "/skills/workshop/keep":
             # Manually adopt a trial skill now: {"name":"<skill>"} (Keep button).
             if self._node is None:
@@ -1167,12 +1234,30 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
 
-    def _read_json(self):
-        """Parse the request body as JSON; {} on any problem (length-bounded)."""
+    def _read_body(self):
+        """Read and FULLY consume the request body (keeping the kept-alive connection in
+        sync). A body over MAX_BODY is drained but dropped, so a bad/huge payload can't
+        buffer megabytes or leave the socket mid-message."""
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(min(n, 8192)) if n > 0 else b""
-            return json.loads(raw or b"{}")
+        except ValueError:
+            return b""
+        if n <= 0:
+            return b""
+        if n <= MAX_BODY:
+            return self.rfile.read(n)
+        remaining = n                                  # too big: drain to resync, keep nothing
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        return b""
+
+    def _read_json(self):
+        """Parse the already-read request body as JSON; {} on any problem."""
+        try:
+            return json.loads(getattr(self, "_body", b"") or b"{}")
         except Exception:
             return {}
 
@@ -1198,6 +1283,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(503, "no camera")
             return
         self._stream.add_viewer()
+        self.close_connection = True   # never-ending multipart body: no keep-alive
         try:
             self.send_response(200)
             self.send_header("Cache-Control", "no-cache, private")
@@ -1217,8 +1303,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(b"Content-Length: %d\r\n\r\n" % len(jpeg))
                 self.wfile.write(jpeg)
                 self.wfile.write(b"\r\n")
-        except (BrokenPipeError, ConnectionResetError):
-            pass                       # client closed the stream
+        except OSError:
+            pass                       # client closed the stream / write timed out
         finally:
             self._stream.remove_viewer()
 
@@ -1227,12 +1313,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(503, "no microphone")
             return
         q = self._audio.add_listener()
+        self.close_connection = True   # live mic stream runs until the client leaves
         try:
-            # Stream as HTTP/1.1 chunked. Browsers buffer an HTTP/1.0 (close-
-            # delimited) streaming body and never hand it to fetch()'s reader until
-            # the connection closes — which for a live mic is never — so without
-            # chunked the page would receive nothing. Chunked is surfaced live.
-            self.protocol_version = "HTTP/1.1"
+            # Stream as HTTP/1.1 chunked. Browsers buffer a close-delimited streaming
+            # body and never hand it to fetch()'s reader until the connection closes —
+            # which for a live mic is never — so without chunked the page would receive
+            # nothing. Chunked is surfaced live. (protocol_version is HTTP/1.1 class-wide.)
             self.send_response(200)
             self.send_header("Cache-Control", "no-cache, private")
             self.send_header("Pragma", "no-cache")
@@ -1244,11 +1330,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("X-Channels", str(self._audio.channels))
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            import queue as _q
             while True:
                 try:
                     data = q.get(timeout=5.0)
-                except _q.Empty:
+                except queue.Empty:
                     if not self._audio.running():
                         break          # mic failed / no device
                     continue
@@ -1259,8 +1344,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass                       # client stopped listening
+        except OSError:
+            pass                       # client stopped listening / write timed out
         finally:
             self._audio.remove_listener(q)
 
@@ -1290,7 +1375,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
 
     def log_message(self, *args):      # silence per-request stderr spam

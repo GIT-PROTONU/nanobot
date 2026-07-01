@@ -57,6 +57,12 @@
   #mapWait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     text-align:center;color:var(--muted);font-size:13px;padding:18px}
   #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none}
+  /* OLED mirror: a pixel-exact, client-side copy of the physical SSD1306 panel */
+  #view-oled{background:#05080d}
+  #view-oled.on{display:flex;align-items:center;justify-content:center}
+  canvas#oledcv{image-rendering:pixelated;width:94%;max-width:560px;height:auto;
+    aspect-ratio:2/1;background:#000;border-radius:7px;
+    box-shadow:0 0 0 2px #12202c,0 0 0 8px #0a0f16,0 8px 26px rgba(0,0,0,.6)}
 
   #viewSwitch{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:6;
     display:flex;gap:2px;padding:3px;border-radius:999px;
@@ -206,6 +212,8 @@
   .skillrow .skmeta{flex:1;min-width:0}
   .skillrow .skdesc{color:var(--muted);font-size:12px;margin-top:2px}
   .skillrow .skinvoke{flex:0 0 auto;padding:5px 12px}
+  .skillrow .sklike{flex:0 0 auto;padding:5px 10px}
+  .skillrow .sklike.liked{border-color:var(--accent);color:var(--accent)}
   .skillrow.disabled{opacity:.55}
 </style>
 </head>
@@ -241,10 +249,14 @@
         <div id="view-cam" class="view">
           <img id="cam" alt="">
         </div>
+        <div id="view-oled" class="view">
+          <canvas id="oledcv"></canvas>
+        </div>
         <div id="viewSwitch">
           <button data-view="lidar" class="active">Lidar</button>
           <button data-view="map">Map</button>
           <button data-view="cam">Camera</button>
+          <button data-view="oled">OLED</button>
         </div>
       </div>
 
@@ -347,9 +359,30 @@
               <button id="llmSend" class="btn primary grow">Send</button>
             </div>
             <p class="hint" id="llmReply"></p>
-            <div class="field"><label>Model</label>
-              <input id="llmModel" type="text" maxlength="120"
-                placeholder="deepseek/deepseek-v4-flash"></div>
+            <details class="logbox" open>
+              <summary>🔧 Models</summary>
+              <div class="field"><label>Normal (cheap) — primary</label>
+                <input id="llmFreeModel" type="text" maxlength="120"
+                  placeholder="openrouter/free"></div>
+              <div class="field"><label>Normal (cheap) — secondary (fallback)</label>
+                <input id="llmModel" type="text" maxlength="120"
+                  placeholder="openrouter/free"></div>
+              <div class="field"><label>Deep-think (smart / chat) — primary</label>
+                <input id="llmFreeSmartModel" type="text" maxlength="120"
+                  placeholder="openrouter/free"></div>
+              <div class="field"><label>Deep-think (smart / chat) — secondary (fallback)</label>
+                <input id="llmSmartModel" type="text" maxlength="120"
+                  placeholder="openrouter/free"></div>
+              <div class="field"><label>Camera (vision) — primary</label>
+                <input id="llmVisionModel" type="text" maxlength="120"
+                  placeholder="openrouter/free"></div>
+              <div class="field"><label>Camera (vision) — secondary (fallback)</label>
+                <input id="llmVisionFallbackModel" type="text" maxlength="120"
+                  placeholder="(blank = none)"></div>
+              <p class="hint">Each variant tries its <b>primary</b> first and only falls back to the
+                <b>secondary</b> when the primary is rate-limited. Primaries are usually free
+                <code>:free</code> slugs; secondaries are paid fallbacks. Leave blank to use defaults.</p>
+            </details>
             <div class="field"><label>Persona (from personality.json)</label>
               <input id="llmPersona" type="text" readonly
                 placeholder="run scripts/personality_creator.py, then restart"></div>
@@ -371,9 +404,11 @@
             </div>
             <p class="hint">Each capability is a self-documenting <code>skills/*.md</code> file —
               drop a new one in and <b>Reload</b> to add a skill, no code change. The brain also
-              picks one on its own on a <b>skill beat</b>. <b>Action</b> skills (move / LED) run
-              only when <code>skills_allow_actions</code> is enabled in <code>robot.yaml</code>;
-              motion stays clamped by <code>slam_nav</code>.</p>
+              picks one on its own on a <b>skill beat</b>. <b>👍 Like</b> a skill (repeatable) to
+              make the brain perform it more often — the count weights the skill-beat lottery;
+              shift-click a 👍 to take one back. <b>Action</b> skills (move / LED) run only when
+              <code>skills_allow_actions</code> is enabled in <code>robot.yaml</code>; motion
+              stays clamped by <code>slam_nav</code>.</p>
             <h2 style="margin-top:10px">🧪 Workshop · skills on trial</h2>
             <p class="hint" id="workshopStatus">loading…</p>
             <div id="workshopList" class="skills"></div>
@@ -415,9 +450,14 @@
               robot, so it <b>keeps going after you close this page</b> and survives a reboot.</p>
           </div>
           <div class="card">
-            <h2>Face</h2>
+            <h2>Face &amp; display</h2>
+            <label class="switch"><input type="checkbox" id="dashOn"><span class="track"></span>
+              Show dashboard</label>
+            <label class="switch"><input type="checkbox" id="wordsOn" checked><span class="track"></span>
+              Show spoken text</label>
+            <hr style="border:none;border-top:1px solid var(--line);margin:.6rem 0">
             <label class="switch"><input type="checkbox" id="faceOn"><span class="track"></span>
-              Eye animation</label>
+              Manual mood</label>
             <div class="field"><label>Mood</label>
               <select id="faceMood">
                 <option value="happy">Happy</option>
@@ -425,8 +465,12 @@
                 <option value="focused">Focused</option>
                 <option value="stress">Stress test (max load)</option>
               </select></div>
-            <p class="hint">Publishes the mood on <b>/oled_face</b> (off = dashboard). Eyes blink &amp;
-              glance at random; frames are only sent on change, so idle eyes cost ~no CPU.</p>
+            <p class="hint">The panel shows the <b>face</b> by default. <b>Show dashboard</b>
+              (<b>/oled_dashboard</b>) pins the status panel instead; <b>Show spoken text</b>
+              (<b>/oled_show_words</b>) shows TTS karaoke words — off keeps the face up while
+              speaking. <b>Manual mood</b> publishes a mood on <b>/oled_face</b> (off = the
+              behaviour layer's resting face). Frames are only sent on change, so idle eyes cost
+              ~no CPU. Watch it live on the hero's <b>OLED</b> view — a pixel-exact mirror.</p>
           </div>
         </section>
 
@@ -606,6 +650,19 @@
               <input id="simNoise" type="range" min="0" max="10" step="1" value="0"></div>
             <p class="hint">Beams/range mimic the LDS02RR (12 cm–6 m). Add noise to stress-test SLAM.</p>
           </div>
+          <div class="card" id="devSensorsCard" style="display:none">
+            <h2>Synthetic sensors (dev)</h2>
+            <label class="switch"><input type="checkbox" id="devManual"><span class="track"></span>
+              Manual mode</label>
+            <p class="hint">Dev harness only. Random by default; turn on <b>Manual</b> to freeze and set
+              every value yourself. Changes apply live (the OLED mirror + the LLM body snapshot read these).</p>
+            <div id="devSensorsFields"></div>
+            <div class="row">
+              <button class="btn primary" id="devSensorsApply">Apply & save</button>
+              <button class="btn" id="devSensorsReload">Reload</button>
+            </div>
+            <p class="hint" id="devSensorsStatus"></p>
+          </div>
         </section>
 
       </div>
@@ -638,6 +695,8 @@ let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
 let homeTopic=null, saveTopic=null, testTopic=null, testResTopic=null;
 // Brain: purpose / current task / A/B experiment stats (latched, from the behaviour node)
 let purposeTopic=null, taskTopic=null, expTopic=null;
+// OLED mirror feed: the same inputs the physical panel renders from (face/word/text)
+let wordTopic=null, textTopic=null, dashTopic=null, wordsTopic=null;
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -832,6 +891,26 @@ function subscribe(){
   // (TTS/speech goes over HTTP POST /tts, not rosbridge — see sendOled.)
   faceTopic=new ROSLIB.Topic({ros,name:"/oled_face",messageType:"std_msgs/msg/String"});
   systemTopic=new ROSLIB.Topic({ros,name:"/oled_system",messageType:"std_msgs/msg/String"});
+  // Dashboard pin + spoken-text toggle (the OLED node + the mirror both honour these).
+  dashTopic=new ROSLIB.Topic({ros,name:"/oled_dashboard",messageType:"std_msgs/msg/Bool"});
+  wordsTopic=new ROSLIB.Topic({ros,name:"/oled_show_words",messageType:"std_msgs/msg/Bool"});
+  // Mirror the OLED panel: subscribe to the exact inputs it renders from. We also
+  // publish on /oled_face and /oled_system elsewhere — subscribing just reflects what the
+  // panel sees (our own publishes + the behaviour/cognition layer's). Heavy lifting is
+  // client-side (see the OLED module); these only feed it state.
+  faceTopic.subscribe(m=>OLED.setFace(m.data));
+  systemTopic.subscribe(m=>OLED.setSystem(m.data));
+  dashTopic.subscribe(m=>{ $("dashOn").checked=!!m.data; OLED.setDashboard(!!m.data); });
+  wordsTopic.subscribe(m=>{ $("wordsOn").checked=!!m.data; OLED.setShowWords(!!m.data); });
+  // Push our current toggle state up once connected (the topics are ephemeral, so a fresh
+  // OLED node adopts what the page shows — matching how sendFace re-asserts the mood).
+  sendDash(); sendWords();
+  wordTopic=new ROSLIB.Topic({ros,name:"/oled_word",messageType:"std_msgs/msg/String",
+    throttle_rate:0,queue_length:1});
+  wordTopic.subscribe(m=>OLED.setWord(m.data));
+  textTopic=new ROSLIB.Topic({ros,name:"/oled_text",messageType:"std_msgs/msg/String"});
+  textTopic.subscribe(m=>OLED.setBrand(m.data));
+  OLED.tel({ip:($("host").value||"").split(":")[0]});
   // /imu/web is a tiny summary (|accel|,|gyro|,actual /imu/data Hz) the node emits at
   // ~15 Hz, so we don't make rosbridge bridge the full 50 Hz /imu/data just for a readout.
   imuTopic=new ROSLIB.Topic({ros,name:"/imu/web",messageType:"geometry_msgs/msg/Vector3Stamped",
@@ -871,7 +950,8 @@ function subscribe(){
   suspRTopic.subscribe(m=>suspTxt("espSuspR",m.data));
   tempTopic=new ROSLIB.Topic({ros,name:"/esp32_temp",
     messageType:"std_msgs/msg/Float32",queue_length:1});
-  tempTopic.subscribe(m=>$("espTemp").textContent=m.data.toFixed(1)+"°C");
+  tempTopic.subscribe(m=>{ $("espTemp").textContent=m.data.toFixed(1)+"°C";
+    OLED.tel({espTemp:m.data}); });
   hallTopic=new ROSLIB.Topic({ros,name:"/esp32_hall",
     messageType:"std_msgs/msg/Int32",queue_length:1});
   hallTopic.subscribe(m=>$("espHall").textContent=m.data);
@@ -880,7 +960,8 @@ function subscribe(){
   ldsRpmTopic.subscribe(m=>$("espLdsRpm").textContent=m.data.toFixed(0)+" rpm");
   ldsHzTopic=new ROSLIB.Topic({ros,name:"/lds_hz",
     messageType:"std_msgs/msg/Float32",queue_length:1});
-  ldsHzTopic.subscribe(m=>$("espLdsHz").textContent=m.data.toFixed(1)+" Hz");
+  ldsHzTopic.subscribe(m=>{ $("espLdsHz").textContent=m.data.toFixed(1)+" Hz";
+    OLED.tel({lds:m.data}); });
   ldsDutyTopic=new ROSLIB.Topic({ros,name:"/lds_duty",
     messageType:"std_msgs/msg/Float32",queue_length:1});
   ldsDutyTopic.subscribe(m=>$("espLdsDuty").textContent=(m.data*100).toFixed(0)+"%");
@@ -911,7 +992,7 @@ function subscribe(){
 
 // ---- ESP32 coprocessor handlers ----
 let espTickCount=0, espTickHzT=performance.now(), lastHb=null, lastHbT=0;
-function onHb(msg){ lastHb=msg.data; lastHbT=performance.now(); }
+function onHb(msg){ lastHb=msg.data; lastHbT=performance.now(); OLED.tel({espBeat:1}); }
 function onTicks(msg){
   const d=msg.data||[];
   $("espTicks").textContent = d.length>=2 ? `${d[0]} / ${d[1]}` : "–";
@@ -945,6 +1026,7 @@ function onImu(msg){
   $("imuA").textContent=msg.vector.x.toFixed(2);
   $("imuG").textContent=(msg.vector.y*180/Math.PI).toFixed(1);
   const el=$("imuHz"); el.textContent=msg.vector.z.toFixed(0)+" Hz"; el.style.color="";
+  OLED.tel({imuHz:msg.vector.z});
 }
 // IMU connectivity: /imu/web streams ~15 Hz whenever the IMU is up. If it stops (USB
 // unplugged, or the driver lost the port) the rate readout goes red "lost" — so even
@@ -957,6 +1039,7 @@ function onEul(msg){
   $("imuR").textContent=msg.vector.x.toFixed(1)+"°";
   $("imuP").textContent=msg.vector.y.toFixed(1)+"°";
   $("imuY").textContent=msg.vector.z.toFixed(1)+"°";
+  OLED.tel({roll:msg.vector.x, pitch:msg.vector.y});
 }
 
 function fmtUptime(s){
@@ -986,6 +1069,7 @@ function onDiag(msg){
   const st=(msg.status||[]).find(s=>s.name==="system"); if(!st) return;
   const kv={}; for(const p of st.values) kv[p.key]=p.value;
   $("sysCpu").textContent=(kv.cpu_percent??"–")+"%";
+  OLED.tel({cpu:Number(kv.cpu_percent), mem:Number(kv.mem_percent), sbc:Number(kv.cpu_temp_c)});
   renderCores(kv.cpu_cores);
   $("sysLoad").textContent=kv.load1??"–";
   $("sysMem").textContent=`${kv.mem_used_mb??"?"}/${kv.mem_total_mb??"?"}MB (${kv.mem_percent??"?"}%)`;
@@ -1060,7 +1144,13 @@ function llmApply(s){
   if(!s) return;
   const set=(id,v)=>{ if($(id)&&v!=null) $(id).value=v; };
   if($("llmOn")) $("llmOn").checked=!!s.enabled;
-  set("llmModel",s.model); set("llmPersona",s.persona);
+  set("llmModel",s.model);
+  set("llmSmartModel",s.smart_model);
+  set("llmVisionModel",s.vision_model);
+  set("llmVisionFallbackModel",s.vision_fallback_model);
+  set("llmFreeModel",s.free_model);
+  set("llmFreeSmartModel",s.free_smart_model);
+  set("llmPersona",s.persona);
   if($("llmStatus")) $("llmStatus").textContent =
     s.available ? ("ready · "+(s.model_effective||"")) :
     (s.enabled ? "enabled but no API key configured" : "disabled");
@@ -1095,6 +1185,11 @@ $("llmChat").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefaul
 $("llmPrompt").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();$("llmSay").click();} });
 $("llmOn").addEventListener("change",()=>llmSave({enabled:$("llmOn").checked}));
 $("llmModel").addEventListener("change",()=>llmSave({model:$("llmModel").value.trim()}));
+$("llmSmartModel").addEventListener("change",()=>llmSave({smart_model:$("llmSmartModel").value.trim()}));
+$("llmVisionModel").addEventListener("change",()=>llmSave({vision_model:$("llmVisionModel").value.trim()}));
+$("llmVisionFallbackModel").addEventListener("change",()=>llmSave({vision_fallback_model:$("llmVisionFallbackModel").value.trim()}));
+$("llmFreeModel").addEventListener("change",()=>llmSave({free_model:$("llmFreeModel").value.trim()}));
+$("llmFreeSmartModel").addEventListener("change",()=>llmSave({free_smart_model:$("llmFreeSmartModel").value.trim()}));
 // Persona is read-only here — it's single-sourced from personality.json (the creator's
 // output). Edit it by re-running scripts/personality_creator.py and restarting.
 fetch("/llm/config").then(r=>r.ok?r.json():null).then(llmApply).catch(()=>{});
@@ -1140,8 +1235,12 @@ function fmtSkill(s){
   const gated=s.is_action && !s.enabled;            // an off-by-default action skill
   const act=s.is_action?` <span class="lm">${s.topic||"action"}</span>`:"";
   const tag=gated?` <span class="ls">disabled</span>`:"";
+  const likes=s.likes||0;                            // 👍 count: the brain favours liked skills
   return `<div class="skillrow${gated?" disabled":""}"><div class="skmeta">`
     +`<b>${ic} ${s.name}</b>${act}${tag}<div class="skdesc">${s.description||""}</div></div>`
+    +`<button class="btn sklike${likes>0?" liked":""}" data-name="${s.name}"`
+    +` title="Like — the brain performs liked skills more often. Click again to like more;`
+    +` shift-click to take one back.">👍 ${likes}</button>`
     +`<button class="btn skinvoke" data-name="${s.name}">Run</button></div>`;
 }
 function loadSkills(){
@@ -1154,7 +1253,15 @@ function loadSkills(){
       +(d.allow_actions?"on":"off");
     box.innerHTML=sk.length?sk.map(fmtSkill).join(""):"<i>no skills found — add a .md to skills/</i>";
     box.querySelectorAll(".skinvoke").forEach(b=>b.onclick=()=>invokeSkill(b.dataset.name));
+    box.querySelectorAll(".sklike").forEach(b=>b.onclick=e=>likeSkill(b.dataset.name,e.shiftKey?-1:1));
   }).catch(()=>{ st.textContent="offline"; });
+}
+// Like (👍) a skill so the brain performs it more often — repeatable (each click +1), shift-click
+// takes one back. The count is a per-skill weight in the autonomous skill-beat lottery.
+function likeSkill(name,delta){
+  fetch("/skills/like",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name,delta})}).then(r=>r.ok?r.json():null)
+    .then(()=>loadSkills()).catch(()=>{});
 }
 function invokeSkill(name){
   const st=$("skillsStatus"); if(st) st.textContent="running "+name+"…";
@@ -1268,7 +1375,7 @@ function pollBrainHttp(){
 }
 setInterval(pollBrainHttp, 3000); pollBrainHttp();
 
-// ---- OLED face / mood ---- empty string = dashboard, else the selected mood.
+// ---- OLED face / mood ---- empty string = the resting idle face, else the selected mood.
 function sendFace(){
   if(!faceTopic){ return; }
   const mood=$("faceOn").checked ? $("faceMood").value : "";
@@ -1277,6 +1384,21 @@ function sendFace(){
 $("faceOn").addEventListener("change",sendFace);
 $("faceMood").addEventListener("change",()=>{ if($("faceOn").checked) sendFace(); });
 
+// ---- OLED dashboard pin + spoken-text toggle ----
+// Each updates the client-side mirror immediately AND (when connected) publishes the Bool so
+// the physical panel follows. Off-robot (dev harness) the publish is a no-op and the mirror is
+// the only display, so the local set is what makes the toggle work there.
+function sendDash(){
+  const on=$("dashOn").checked; OLED.setDashboard(on);
+  if(dashTopic) dashTopic.publish(new ROSLIB.Message({data:on}));
+}
+function sendWords(){
+  const on=$("wordsOn").checked; OLED.setShowWords(on);
+  if(wordsTopic) wordsTopic.publish(new ROSLIB.Message({data:on}));
+}
+$("dashOn").addEventListener("change",sendDash);
+$("wordsOn").addEventListener("change",sendWords);
+
 // ---- lidar scan over HTTP (same-origin /dev/shm), not rosbridge ----
 // /scan.bin = a JSON header line ({seq,amin,ainc,n}), '\n', then n raw float32 ranges
 // (inf = no hit). The driver rewrites it per scan; we poll a touch faster and skip
@@ -1284,6 +1406,7 @@ $("faceMood").addEventListener("change",()=>{ if($("faceOn").checked) sendFace()
 // old rosbridge path, minus the LaserScan deserialization that dominated rosbridge CPU.
 let lastScanSeq=-1;
 const scanDec=new TextDecoder();
+let curHeroView="lidar";     // tracked by the hero view switcher (showView)
 async function pollScan(){
   try{
     const r=await fetch("/scan.bin?t="+Date.now());
@@ -1308,7 +1431,16 @@ async function pollScan(){
       $("hz").textContent=scanHz.toFixed(1); $("ldsHz").textContent=scanHz.toFixed(1)+" Hz"; }
   }catch(e){ /* transient: keep polling */ }
 }
-setInterval(pollScan,80);    // ~12.5 Hz poll; the file updates at the scan rate (~5-10 Hz)
+// Poll fast (a touch above the scan rate, which runs ~5-10 Hz) only while the lidar hero
+// view is up AND the tab is visible — every poll is an HTTP round-trip the board serves
+// from /dev/shm, so there's no point hammering it when nobody's looking at the lidar.
+// Off-view we still tick ~1 Hz to keep the header scan-Hz / pts readouts alive; when the
+// tab is backgrounded we stop entirely.
+let scanTick=0;
+setInterval(()=>{
+  if(document.hidden) return;
+  if(curHeroView==="lidar" || (++scanTick % 12)===0) pollScan();
+},80);
 function onOdom(msg){
   const p=msg.pose.pose.position, q=msg.pose.pose.orientation;
   const yaw=Math.atan2(2*(q.w*q.z),1-2*(q.z*q.z));
@@ -1327,7 +1459,13 @@ function publishCmd(){
     linear:{x:curV*Number($("lin").value),y:0,z:0},
     angular:{x:0,y:0,z:curW*Number($("ang").value)}}));
 }
-setInterval(()=>{ if(connected && (curV||curW)) publishCmd(); },100); // 10 Hz while moving
+// 10 Hz dead-man keepalive while moving (the ESP32 stops the motors if /cmd_vel goes
+// stale). Skip it when the tab is backgrounded; and if we get hidden mid-drive, send one
+// stop right away so the robot halts immediately instead of coasting to the watchdog.
+setInterval(()=>{ if(connected && !document.hidden && (curV||curW)) publishCmd(); },100);
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden && (curV||curW)){ setCmd(0,0); publishCmd(); }
+});
 $("stop").onclick=()=>{setCmd(0,0);publishCmd();};
 
 // keyboard
@@ -1508,6 +1646,313 @@ connect();   // auto-connect on load
 </script>
 
 <script>
+// ===== OLED mirror — a pixel-exact, fully client-side copy of the physical SSD1306 =====
+// Renders the SAME screen the panel shows (dashboard / mood face / TTS karaoke / shutdown),
+// from the SAME inputs: /oled_face, /oled_word, /oled_text, /oled_system + live telemetry.
+// This is a faithful port of src/oled_display/oled_display/display_node.py — all the drawing
+// happens here in the browser, so it works identically on the robot (state over rosbridge)
+// and on the dev harness (state polled from /oled/state; see scripts/dev_webui.py). Blink &
+// gaze are animated locally with their own RNG, so they aren't frame-identical to the panel,
+// but the mode / mood / words / dashboard all mirror exactly.
+window.OLED=(function(){
+  "use strict";
+  const W=128, H=64;                       // logical SSD1306 resolution
+  const ON="#cfe9ff", OFF="#000";          // lit pixel (blue-white OLED) / dark
+  const FONT='8px "DejaVu Sans Mono","Courier New",monospace';
+  const KNOWN=["happy","angry","focused","stress","sleepy","looking"];
+  const IDLE_FACE="neutral";               // resting face when no mood is up (== oled_display idle_face)
+  const EYE_DX=37, EYE_W=20, EYE_H=26, BLINK_DUR=0.16;   // eye geometry (== display_node.py)
+
+  let cv=null, ctx=null, timer=0;
+  // ---- panel state (mirrors DisplayNode fields) ----
+  let face="", accent="", word="", brand="", sys="", pinned=false, showWords=true;
+  // The EFFECTIVE mood rendered: "" = dashboard (pinned), else a face (the requested mood, or
+  // IDLE_FACE between beats) — the single arbiter, mirroring DisplayNode._recompute_mood.
+  const effMood=()=>pinned ? "" : (face||IDLE_FACE);
+  // The emotion accent rides only an actively-requested mood (not the resting idle face), and
+  // `has` treats it as in-play alongside the base shape — mirroring DisplayNode._has.
+  const effAccent=()=>(pinned || !face) ? "" : accent;
+  const has=m=>effMood()===m || effAccent()===m;
+  const tel={espTemp:NaN, espAt:-1e9, imuHz:0, imuAt:-1e9, roll:0, pitch:0, lds:0, ldsAt:-1e9,
+             cpu:NaN, mem:NaN, sbc:NaN, ip:"0.0.0.0"};
+  // ---- animation state (== _anim_update) ----
+  let aT=0, open=1, blinkT=null, dbl=false, nextBlink=0,
+      gxf=0, gyf=0, gtx=0, gty=0, nextGaze=0, nextSmile=0, smileUntil=0, frame=0;
+  const now=()=>performance.now()/1000;
+  const rand=(a,b)=>a+Math.random()*(b-a);
+
+  // ---- primitives (1:1 with PIL's ImageDraw on a 128x64 mono buffer) ----
+  function clear(){ ctx.fillStyle=OFF; ctx.fillRect(0,0,W,H); }
+  function rect(x0,y0,x1,y1,on){ ctx.fillStyle=on?ON:OFF; ctx.fillRect(x0,y0,x1-x0+1,y1-y0+1); }
+  function line(x0,y0,x1,y1){ ctx.strokeStyle=ON; ctx.lineWidth=1; ctx.beginPath();
+    ctx.moveTo(x0+0.5,y0+0.5); ctx.lineTo(x1+0.5,y1+0.5); ctx.stroke(); }
+  // PIL ellipse takes a bounding box; centre/radii derived from it.
+  function bell(x0,y0,x1,y1,on){ const cx=(x0+x1)/2, cy=(y0+y1)/2,
+      rx=Math.max(0.5,Math.abs(x1-x0)/2), ry=Math.max(0.5,Math.abs(y1-y0)/2);
+    ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fillStyle=on?ON:OFF; ctx.fill(); }
+  function arc(x0,y0,x1,y1,a0,a1){ const cx=(x0+x1)/2, cy=(y0+y1)/2,
+      rx=Math.abs(x1-x0)/2, ry=Math.abs(y1-y0)/2;
+    ctx.strokeStyle=ON; ctx.lineWidth=1; ctx.beginPath();
+    ctx.ellipse(cx,cy,rx,ry,0,a0*Math.PI/180,a1*Math.PI/180); ctx.stroke(); }
+  function poly(pts,on){ ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
+    for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
+    ctx.closePath(); ctx.fillStyle=on?ON:OFF; ctx.fill(); }
+  function textW(s){ ctx.font=FONT; return ctx.measureText(s).width; }
+  function text(x,y,s,on){ ctx.fillStyle=on?ON:OFF; ctx.font=FONT;
+    ctx.textBaseline="top"; ctx.textAlign="left"; ctx.fillText(s,x,y); }
+
+  // ---- dashboard (== _dashboard_tick / _row) ----
+  function row(y,name,alive,value){
+    text(2,y,name,1);
+    const cx=30, cy=y+1;                    // 6px disc; ring when not alive
+    bell(cx,cy,cx+6,cy+6,1);
+    if(!alive) bell(cx+1,cy+1,cx+5,cy+5,0);
+    text(48,y,value,1);
+  }
+  function clock(){ return new Date().toTimeString().slice(0,8); }
+  function dashboard(){
+    const t=performance.now();
+    const espUp=t-tel.espAt<4000, imuUp=t-tel.imuAt<1500,
+          ldsUp=(t-tel.ldsAt<3000)&&tel.lds>0.1;
+    clear();
+    rect(0,0,W-1,11,1);                                       // header bar (inverted)
+    text(2,2,(brand||"NANOBOT").slice(0,12),0);
+    const clk=clock(); text(W-2-textW(clk),2,clk,0);
+    text(2,14,tel.ip||"0.0.0.0",1);
+    if(!isNaN(tel.sbc)){ const s=Math.round(tel.sbc)+"C"; text(W-2-textW(s),14,s,1); }
+    line(0,25,W-1,25);
+    row(28,"ESP",espUp, (espUp&&!isNaN(tel.espTemp))?Math.round(tel.espTemp)+"C":"off");
+    row(40,"IMU",imuUp, imuUp?Math.round(tel.imuHz)+"Hz":"off");
+    row(52,"LDS",ldsUp, ldsUp?tel.lds.toFixed(1)+"Hz":"off");
+    [[28,tel.cpu,"CPU"],[40,tel.mem,"RAM"]].forEach(([y,val,lab])=>{
+      if(isNaN(val)) return;
+      const s=lab+" "+Math.round(val)+"%";
+      text(Math.max(0,W-3-textW(s)),y,s,1);
+    });
+    if(imuUp){                                                // row 52: IMU roll/pitch tilt (deg)
+      const sgn=v=>(v>=0?"+":"")+Math.round(v);
+      const s="R"+sgn(tel.roll)+" P"+sgn(tel.pitch);
+      text(Math.max(0,W-3-textW(s)),52,s,1);
+    }
+  }
+
+  // ---- TTS karaoke: one word, as big as it fits, centred (== _draw_word) ----
+  function drawWord(w){
+    clear();
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    let fs=H-8; ctx.font="bold "+fs+'px "DejaVu Sans Mono","Courier New",monospace';
+    while(fs>6 && ctx.measureText(w).width>W-4){
+      fs--; ctx.font="bold "+fs+'px "DejaVu Sans Mono","Courier New",monospace'; }
+    ctx.fillStyle=ON; ctx.fillText(w,W/2,H/2);
+    ctx.textAlign="left"; ctx.textBaseline="top";
+  }
+
+  // ---- face / mood animation (== _anim_update + the *_eye helpers) ----
+  function animUpdate(n){
+    const dt=n-aT; aT=n;
+    if(blinkT!==null){
+      blinkT+=dt; const p=blinkT/BLINK_DUR;
+      if(p>=1){ blinkT=null; open=1;
+        if(dbl){ dbl=false; nextBlink=n+0.18; }
+        else if(has("focused")){ nextBlink=n+rand(5,9); dbl=false; }
+        else { nextBlink=n+rand(2,5); dbl=Math.random()<0.3; }
+      } else open=Math.abs(1-2*p);
+    } else if(n>=nextBlink){ blinkT=0; open=1; }
+    else open=1;
+    if(n>=nextGaze){
+      if(Math.random()<0.35){ gtx=0; gty=0; }
+      else { gtx=rand(-3,3); gty=rand(-3,3); }
+      const fast=(has("focused")||has("looking"));
+      nextGaze=n+rand(fast?0.6:1.0, fast?1.8:3.0);
+    }
+    if(has("happy") && n>=nextSmile){ smileUntil=n+0.45; nextSmile=n+rand(3,7); }
+    const k=Math.min(1,dt*6);
+    gxf+=(gtx-gxf)*k; gyf+=(gty-gyf)*k;
+    if(Math.abs(gtx-gxf)<0.4) gxf=gtx;
+    if(Math.abs(gty-gyf)<0.4) gyf=gty;
+  }
+  function pupil(cx,cy,eh,px,py,pw,ph,sparkle){
+    const mx=Math.max(0,EYE_W-pw-2), my=Math.max(0,eh-ph-2);
+    const pcx=cx+Math.max(-mx,Math.min(mx,px)), pcy=cy+Math.max(-my,Math.min(my,py));
+    bell(pcx-pw,pcy-ph,pcx+pw,pcy+ph,0);
+    if(sparkle) bell(pcx-pw+1,pcy-ph+1,pcx-pw+4,pcy-ph+4,1);
+  }
+  function smileEye(cx,cy){           // happy upward crescent (== _smile_eye)
+    const top=cy-16, bot=cy+10;
+    bell(cx-EYE_W,top,cx+EYE_W,bot,1);
+    bell(cx-EYE_W,top+8,cx+EYE_W,bot+8,0);
+  }
+  function happyEye(cx,cy,px,py,smiling){
+    if(smiling || open<0.3){ smileEye(cx,cy); return; }
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,7,9,true);
+  }
+  function brow(cx,cy,inner,eh){      // slanted scowl brow (== _brow)
+    const xin=cx+inner*(EYE_W+2), xout=cx-inner*(EYE_W+2), b=Math.round(eh*1.1);
+    poly([[xout,cy-eh-3],[xin,cy-eh-3],[xin,cy-eh+b],[xout,cy-eh+3]],0);
+  }
+  function droop(cx,cy){              // heavy upper eyelid (sleepy accent, == _droop)
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    rect(cx-EYE_W-1,cy-eh-1,cx+EYE_W+1,cy+Math.round(eh*0.35),0);
+  }
+  function angryEye(cx,cy,inner,px,py){
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    if(open<0.25){ line(cx-EYE_W,cy,cx+EYE_W,cy); return; }
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,6,7,false);
+    brow(cx,cy,inner,eh);
+  }
+  // Emotion accent ON TOP of the base shape (== _accent_overlay): angry brows / sleepy lids.
+  // Happy folds to a smile crescent earlier (faceTick); focused/looking/neutral are cadence-only.
+  function accentOverlay(lcx,rcx,cy){
+    const a=effAccent();
+    if(!a || a===effMood()) return;
+    if(a==="angry"){ const eh=Math.max(2,Math.round(EYE_H*open)); brow(lcx,cy,1,eh); brow(rcx,cy,-1,eh); }
+    else if(a==="sleepy"){ droop(lcx,cy); droop(rcx,cy); }
+  }
+  function focusedEye(cx,cy,px,py){
+    if(open<0.25){ line(cx-EYE_W,cy,cx+EYE_W,cy); return; }
+    const eh=Math.max(3,Math.round(EYE_H*0.6*open));
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,5,Math.max(2,eh-3),false);
+  }
+  function lookingEye(cx,cy,px,py){
+    if(open<0.25){ line(cx-EYE_W,cy,cx+EYE_W,cy); return; }
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,6,8,false);
+  }
+  function sleepy(n){
+    const zc=Math.floor(n*1.2)%3+1;
+    clear();
+    const cy=H/2+4;
+    for(const cx of [W/2-EYE_DX, W/2+EYE_DX])
+      for(const dy of [0,1,2]) arc(cx-EYE_W,cy-8+dy,cx+EYE_W,cy+8+dy,20,160);
+    const zx=W-30, zy=18;
+    for(let i=0;i<zc;i++) text(zx+i*8,zy-i*6,"z",1);
+  }
+  function stress(){
+    clear(); const ph=frame, o=ph%8;
+    for(let x=-H;x<W;x+=8) line(x+o,0,x+o+H,H);
+    const bx=Math.round(W/2+(W/2-9)*Math.sin(ph*0.5)),
+          by=Math.round(H/2+(H/2-9)*Math.cos(ph*0.33));
+    bell(bx-9,by-9,bx+9,by+9,0);
+    ctx.strokeStyle=ON; ctx.lineWidth=1; ctx.beginPath();
+    ctx.ellipse(bx,by,9,9,0,0,Math.PI*2); ctx.stroke();
+  }
+  function faceTick(){
+    const n=now(); animUpdate(n); frame++; const m=effMood();
+    if(m==="stress"){ stress(); return; }
+    if(m==="sleepy"){ sleepy(n); return; }
+    const cy=H/2, lcx=W/2-EYE_DX, rcx=W/2+EYE_DX;
+    const px=Math.round(gxf*3.0), py=Math.round(gyf*2.5);
+    const smiling=has("happy") && n<smileUntil;
+    clear();
+    // Happy (base OR accent) folds the whole eye into a smile crescent on the smile beat/blink.
+    if(has("happy") && (smiling || open<0.3)){ smileEye(lcx,cy); smileEye(rcx,cy); return; }
+    if(m==="angry"){ angryEye(lcx,cy,1,px,py); angryEye(rcx,cy,-1,px,py); }
+    else if(m==="focused"){ focusedEye(lcx,cy,px,py); focusedEye(rcx,cy,px,py); }
+    else if(m==="looking"){ lookingEye(lcx,cy,px,py); lookingEye(rcx,cy,px,py); }
+    else { happyEye(lcx,cy,px,py,smiling); happyEye(rcx,cy,px,py,smiling); }   // happy / neutral
+    accentOverlay(lcx,rcx,cy);                                                 // emotion on top
+  }
+
+  // ---- end screens (== _shutdown_screen / _restart_screen) ----
+  function shutdownScreen(){
+    clear(); const cx=W/2, gy=H/2-12, r=8;
+    arc(cx-r,gy-r,cx+r,gy+r,300,240); line(cx,gy-r-1,cx,gy+2);
+    const msg="Shutting down"; text((W-textW(msg))/2,gy+r+4,msg,1);
+  }
+  function restartScreen(msg){
+    clear(); const cx=W/2, gy=H/2-12, r=8;
+    arc(cx-r,gy-r,cx+r,gy+r,70,360);
+    const ax=cx+Math.round(r*Math.cos(70*Math.PI/180)),
+          ay=gy+Math.round(r*Math.sin(70*Math.PI/180));
+    poly([[ax-3,ay-1],[ax+3,ay-1],[ax,ay+4]],1);
+    text((W-textW(msg))/2,gy+r+4,msg,1);
+  }
+
+  // ---- frame router (== the owner priority in display_node.py) ----
+  // Face is the default; the dashboard shows only when pinned (effMood()==="").  Karaoke words
+  // take over only while showWords is on — else speech keeps the face up.
+  function render(){
+    if(!ctx) return;
+    const m=effMood();
+    if(sys==="shutdown") shutdownScreen();
+    else if(sys==="restart"||sys==="reboot") restartScreen(sys==="restart"?"Restarting stack":"Restarting");
+    else if(word && showWords) drawWord(word);
+    else if(m) faceTick();
+    else dashboard();
+  }
+
+  function reseed(){ const n=now(); aT=n; open=1; blinkT=null; dbl=false;
+    nextBlink=n+rand(1.5,3.5); gxf=gyf=gtx=gty=0;
+    nextGaze=n+rand(1.0,2.5); nextSmile=n+rand(2.0,5.0); smileUntil=0; }
+
+  return {
+    init(){
+      cv=document.getElementById("oledcv"); if(!cv) return;
+      cv.width=W; cv.height=H; ctx=cv.getContext("2d");
+      ctx.imageSmoothingEnabled=false; reseed();
+    },
+    // Only animate while the OLED hero view is visible (zero cost otherwise).
+    setActive(on){
+      if(on && !timer){ render(); timer=setInterval(render,50); }   // ~20 fps
+      else if(!on && timer){ clearInterval(timer); timer=0; }
+    },
+    setFace(raw){ raw=(raw||"").trim().toLowerCase();
+      let next="", acc="";
+      if(!["","off","dashboard","none"].includes(raw)){
+        const i=raw.indexOf(":");                                    // compound "shape:emotion"
+        const shape=i<0?raw:raw.slice(0,i); acc=i<0?"":raw.slice(i+1);
+        next=KNOWN.includes(shape)?shape:"neutral";
+        acc=(KNOWN.includes(acc)&&acc!==next)?acc:"";
+      }
+      if(next===face && acc===accent) return;
+      if(next && !face) reseed();                                    // entering face mode
+      face=next; accent=acc;
+    },
+    setWord(w){ word=(w||"").trim(); },
+    setBrand(t){ brand=t||""; },
+    setDashboard(on){ on=!!on; if(on===pinned) return;
+      if(pinned && !on) reseed();          // unpinning -> re-enter the resting face cleanly
+      pinned=on; },
+    setShowWords(on){ showWords=!!on; },
+    setSystem(s){ s=(s||"").trim().toLowerCase();
+      if(["restart","reboot","shutdown"].includes(s)) sys=s; },
+    tel(p){ const t=performance.now();
+      if("espTemp" in p){ tel.espTemp=p.espTemp; tel.espAt=t; }     // temp also proves ESP alive
+      if("espBeat" in p){ tel.espAt=t; }
+      if("imuHz" in p){ tel.imuHz=p.imuHz; tel.imuAt=t; }
+      if("roll" in p) tel.roll=p.roll;
+      if("pitch" in p) tel.pitch=p.pitch;
+      if("lds" in p){ tel.lds=p.lds; tel.ldsAt=t; }
+      if("cpu" in p) tel.cpu=p.cpu;
+      if("mem" in p) tel.mem=p.mem;
+      if("sbc" in p) tel.sbc=p.sbc;
+      if("ip" in p) tel.ip=p.ip;
+    },
+  };
+})();
+OLED.init();
+// Dev harness (no rosbridge): poll the panel state the robot would publish over topics.
+// On the robot we're `connected`, so this never fires (topics drive the mirror); a 404 here
+// is harmless.
+setInterval(()=>{
+  if(typeof connected!=="undefined" && connected) return;
+  fetch("/oled/state").then(r=>r.ok?r.json():null).then(s=>{
+    if(!s) return;
+    OLED.setFace(s.face||""); OLED.setWord(s.word||""); OLED.setBrand(s.brand||"");
+    if(s.system) OLED.setSystem(s.system);
+    const p={imuHz:s.imu_hz, roll:s.roll, pitch:s.pitch, lds:s.lds_hz, cpu:s.cpu, mem:s.mem, sbc:s.temp, ip:s.ip};
+    if(s.esp_alive) p.espTemp=s.esp_temp;
+    OLED.tel(p);
+  }).catch(()=>{});
+},500);
+</script>
+
+<script>
 // ---- UI chrome: bottom tabs, hero view switcher, tips, virtual joystick ------
 (function(){
   "use strict";
@@ -1525,14 +1970,17 @@ connect();   // auto-connect on load
   // mapOn / camOn checkboxes — flipping them runs the original start/stop handlers.
   function setChk(id,val){ const el=$(id); if(el && el.checked!==val){ el.checked=val; el.dispatchEvent(new Event("change")); } }
   function showView(name){
+    curHeroView=name;   // lets pollScan run at full rate only while the lidar view is up
     document.querySelectorAll("#viewSwitch button").forEach(b=>b.classList.toggle("active",b.dataset.view===name));
     $("view-lidar").classList.toggle("on",name==="lidar");
     $("view-map").classList.toggle("on",name==="map");
     $("view-cam").classList.toggle("on",name==="cam");
+    $("view-oled").classList.toggle("on",name==="oled");
     $("ctlMap").classList.toggle("on",name==="map");
     $("ctlCam").classList.toggle("on",name==="cam");
     setChk("mapOn",name==="map");
     setChk("camOn",name==="cam");
+    if(window.OLED) OLED.setActive(name==="oled");   // only animate while visible
   }
   document.querySelectorAll("#viewSwitch button").forEach(b=>b.onclick=()=>showView(b.dataset.view));
 
@@ -1882,6 +2330,97 @@ connect();   // auto-connect on load
   // redraw the editor only while it's on screen (or sim running) — cheap, idle-free.
   setInterval(()=>{ if(on || $("panel-sim").classList.contains("active")) drawEditor(); },100);
   drawEditor();
+})();
+</script>
+
+<script>
+// ---- Synthetic sensors (dev harness only) -----------------------------------
+// Polls /dev/sensors to detect if the dev harness is running. If so, shows the
+// "Synthetic sensors (dev)" card in the Sim panel and wires up the form. The form
+// is generated from the `fields` spec returned by /dev/sensors, so it never drifts
+// from the server's SENSOR_FIELDS table. Manual mode freezes the synthetic sensor
+// values; random mode lets them jitter lifelike. Changes POST to /dev/sensors and
+// persist across dev harness restarts.
+(function(){
+  "use strict";
+  const $=id=>document.getElementById(id);
+  const card=$("devSensorsCard");
+  if(!card) return;
+  let fields={}, vals={};
+
+  function buildForm(){
+    const box=$("devSensorsFields"); if(!box) return;
+    box.innerHTML="";
+    for(const [k,spec] of Object.entries(fields)){
+      const row=document.createElement("div"); row.className="field";
+      const lab=document.createElement("label");
+      const valSpan=document.createElement("span"); valSpan.id="devFv_"+k;
+      valSpan.textContent=vals[k];
+      lab.textContent=spec.label+" "; lab.appendChild(valSpan);
+      row.appendChild(lab);
+      if(spec.type==="bool"){
+        const sw=document.createElement("label"); sw.className="switch";
+        const cb=document.createElement("input"); cb.type="checkbox"; cb.id="devF_"+k;
+        cb.checked=!!vals[k];
+        cb.onchange=()=>{ vals[k]=cb.checked; valSpan.textContent=cb.checked?"1":"0"; };
+        const track=document.createElement("span"); track.className="track";
+        sw.appendChild(cb); sw.appendChild(track);
+        row.appendChild(sw);
+      } else {
+        const rng=document.createElement("input"); rng.type="range"; rng.id="devF_"+k;
+        rng.min=spec.min; rng.max=spec.max; rng.step=(spec.type==="int")?1:0.5; rng.value=vals[k];
+        rng.oninput=()=>{ valSpan.textContent=rng.value; vals[k]=parseFloat(rng.value); };
+        row.appendChild(rng);
+      }
+      box.appendChild(row);
+    }
+    // disable fields when not in manual mode
+    Array.from(box.querySelectorAll("input")).forEach(el=>{
+      if(el.type!=="checkbox") el.disabled=!$("devManual").checked;
+    });
+  }
+
+  function loadSensors(){
+    fetch("/dev/sensors").then(r=>{
+      if(!r.ok) throw new Error("not available");
+      return r.json();
+    }).then(s=>{
+      fields=s.fields||{}; vals=Object.assign({},s.values||{});
+      $("devManual").checked=!!s.manual;
+      buildForm();
+      card.style.display="";  // show the card
+      const st=$("devSensorsStatus");
+      if(st) st.textContent="source: "+(s.manual?"manual":"random");
+    }).catch(()=>{
+      // /dev/sensors not available (real robot) — hide the card silently
+      card.style.display="none";
+    });
+  }
+
+  $("devManual").addEventListener("change",()=>{
+    const box=$("devSensorsFields");
+    Array.from(box.querySelectorAll("input")).forEach(el=>{
+      if(el.type!=="checkbox") el.disabled=!$("devManual").checked;
+    });
+  });
+
+  $("devSensorsApply").onclick=()=>{
+    fetch("/dev/sensors",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({manual:$("devManual").checked, values:vals})})
+      .then(r=>r.ok?r.json():null).then(s=>{
+        if(!s) return;
+        vals=Object.assign({},s.values||{});
+        $("devManual").checked=!!s.manual;
+        buildForm();
+        const st=$("devSensorsStatus");
+        if(st) st.textContent="source: "+(s.manual?"manual":"random")+" — saved";
+      }).catch(()=>{});
+  };
+
+  $("devSensorsReload").onclick=loadSensors;
+
+  // Try to load on page load; if the endpoint doesn't exist (real robot), the card stays hidden.
+  loadSensors();
 })();
 </script>
 </body>

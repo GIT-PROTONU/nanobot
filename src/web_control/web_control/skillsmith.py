@@ -23,10 +23,9 @@ inert, never load-bearing.
     pixi run python -m pytest src/web_control/test
 """
 import json
-import os
-import threading
 import time
 
+from .jsonio import read_json, write_json
 from .skills import KNOWN_KINDS, NARRATIVE_KINDS, _slug, parse_skill_text
 
 # Status values a tracked skill moves through.
@@ -128,12 +127,19 @@ class WorkshopState:
 
     The adopt/retire decision is ``gate()`` — deterministic, config-driven."""
 
-    def __init__(self, path, logger=None, min_runs=3, retire_errors=2, retire_net_neg=2):
+    def __init__(self, path, logger=None, min_runs=3, retire_errors=2, retire_net_neg=2,
+                 adopt_quiet_runs=5, trial_ttl=0.0):
         self.path = path or ""
         self._log = logger or (lambda *_: None)
         self.min_runs = max(1, int(min_runs))
         self.retire_errors = max(1, int(retire_errors))
         self.retire_net_neg = max(1, int(retire_net_neg))
+        # An autonomous robot rarely gets an explicit 👍, so a trial that simply runs cleanly
+        # a few more times (and draws no 👎) graduates on its own — else trials pile up forever.
+        self.adopt_quiet_runs = max(self.min_runs, int(adopt_quiet_runs))
+        # Backstop: a trial that lingers this long (s) without earning adoption is rolled back
+        # (e.g. a disabled action trial that can never accrue runs). 0 = no TTL.
+        self.trial_ttl = max(0.0, float(trial_ttl))
         self.skills = {}
         self.load()
 
@@ -142,33 +148,19 @@ class WorkshopState:
         self.skills = {}
         if not self.path:
             return self
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
-            skills = data.get("skills", data) if isinstance(data, dict) else {}
-            if isinstance(skills, dict):
-                self.skills = {_slug(k): v for k, v in skills.items()
-                               if isinstance(v, dict)}
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            self._log("workshop: failed to load %s: %s" % (self.path, exc))
+        data = read_json(self.path)
+        skills = data.get("skills", data) if isinstance(data, dict) else {}
+        if isinstance(skills, dict):
+            self.skills = {_slug(k): v for k, v in skills.items()
+                           if isinstance(v, dict)}
         return self
 
     def save(self):
-        if not self.path:
-            return
-        # The ledger is mutated from two threads — the background workshop (reflection) and the
-        # executor (a trial skill running / a reward). A per-thread temp name + atomic os.replace
-        # keeps concurrent writers from clobbering each other's file (no lock held over IO).
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            tmp = "%s.%d.tmp" % (self.path, threading.get_ident())
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"skills": self.skills}, f, indent=2)
-            os.replace(tmp, self.path)
-        except Exception as exc:
-            self._log("workshop: failed to save %s: %s" % (self.path, exc))
+        # The ledger is mutated from two threads — the background workshop (reflection) and
+        # the executor (a trial skill running / a reward). write_json's unique temp + atomic
+        # os.replace keeps concurrent writers from clobbering each other (no lock held over IO).
+        if self.path and not write_json(self.path, {"skills": self.skills}):
+            self._log("workshop: failed to save %s" % self.path)
 
     # ---- mutation -----------------------------------------------------------
     def track(self, name, origin="new", parent="", rationale="", path=""):
@@ -238,11 +230,28 @@ class WorkshopState:
         runs = int(rec.get("runs", 0))
         pos, neg = int(rec.get("reward_pos", 0)), int(rec.get("reward_neg", 0))
         errors = int(rec.get("errors", 0))
+        # Clear failures retire first.
         if errors >= self.retire_errors or (neg - pos) >= self.retire_net_neg:
             return "retire"
-        if runs >= self.min_runs and pos > neg and errors == 0:
-            return "adopt"
+        if errors == 0:
+            if runs >= self.min_runs and pos > neg:
+                return "adopt"                       # happy user (fast path)
+            if runs >= self.adopt_quiet_runs and neg == 0:
+                return "adopt"                       # clean, uncomplained-about track record
+        # Stale backstop: lingered past its TTL without earning adoption -> roll it back.
+        if self.trial_ttl and (time.time() - float(rec.get("created", 0.0))) > self.trial_ttl:
+            return "retire"
         return None
+
+    def due_trials(self, bar=None):
+        """Trial skills that still need exercise to be judged (runs < ``bar``, default the
+        quiet-adopt threshold), least-run first — the probation queue the skill beat draws from
+        so a freshly forged skill actually accrues runs instead of sitting unused."""
+        bar = self.adopt_quiet_runs if bar is None else max(1, int(bar))
+        rows = [(int(r.get("runs", 0)), n) for n, r in self.skills.items()
+                if r.get("status") == TRIAL and int(r.get("runs", 0)) < bar]
+        rows.sort()
+        return [n for _, n in rows]
 
     def gate_all(self):
         """Run the gate over every trial; return ``[(name, 'adopt'|'retire'), ...]``."""

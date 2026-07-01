@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Export the presence Sismic statechart to PlantUML (for visualising the brain).
 
-The chart in `behavior/presence.py` is written in **Sismic's YAML format**, which is NOT
-PlantUML — pasting it into a PlantUML renderer fails with "directive `statechart:` is not
-recognized". Sismic ships the right converter (`sismic.io.export_to_plantuml`); this wraps it
-so a single command always emits PlantUML that matches the live chart.
+The chart is written in **Sismic's YAML format**, which is NOT PlantUML — pasting it into a
+PlantUML renderer fails with "directive `statechart:` is not recognized". Sismic ships the
+right converter (`sismic.io.export_to_plantuml`); this wraps it so a single command always
+emits PlantUML that matches the live chart — reading `memory/presence_chart.yaml` if you've
+hand-edited it there, else the bundled default in `behavior/presence.py`.
 
     pixi run python scripts/export_statechart_puml.py            # -> docs/presence.puml
     pixi run python scripts/export_statechart_puml.py --stdout   # print instead of writing
@@ -27,13 +28,16 @@ def main():
     ap = argparse.ArgumentParser(description="Export the presence statechart to PlantUML.")
     ap.add_argument("--out", default=os.path.join(_REPO, "docs", "presence.puml"),
                     help="output .puml path (default: docs/presence.puml)")
+    ap.add_argument("--chart", default=os.path.join(_REPO, "memory", "presence_chart.yaml"),
+                    help="statechart YAML to render (default: memory/presence_chart.yaml if "
+                         "present, else the bundled default in behavior/presence.py)")
     ap.add_argument("--stdout", action="store_true", help="print to stdout instead of writing")
     args = ap.parse_args()
 
     import sismic.io as sio
-    from behavior.presence import PRESENCE_YAML
+    from behavior.presence import load_chart_yaml
 
-    statechart = sio.import_from_yaml(PRESENCE_YAML)
+    statechart = sio.import_from_yaml(load_chart_yaml(args.chart))
     puml = sio.export_to_plantuml(statechart)
     if not isinstance(puml, str):                       # older sismic may return a filepath
         with open(puml, encoding="utf-8") as f:

@@ -6,6 +6,7 @@ Covers the deterministic pieces of reflection mode's skill-synthesis loop: candi
 round-trip, the validation gate, and the trial ledger's adopt/retire decisions.
 """
 import os
+import time
 
 from web_control.skills import parse_skill_text
 from web_control.skillsmith import (ADOPTED, RETIRED, TRIAL, WorkshopState,
@@ -142,6 +143,57 @@ def test_positive_reward_outweighs_one_thumbsdown(tmp_path):
     st.record_reward("quip", 1.0)
     st.record_reward("quip", -1.0)
     assert st.gate("quip") == "adopt"
+
+
+def test_gate_quiet_adopts_without_any_reward(tmp_path):
+    # An autonomous robot rarely gets an explicit 👍: a clean, uncomplained-about track record
+    # of enough runs must adopt on its own, or trials would pile up forever.
+    st = _state(tmp_path, min_runs=3, adopt_quiet_runs=5)
+    st.track("quip")
+    for _ in range(4):
+        st.record_run("quip", ok=True)
+    assert st.gate("quip") is None                  # clean but not enough runs yet
+    st.record_run("quip", ok=True)
+    assert st.gate("quip") == "adopt"               # 5 clean runs, no 👎 -> graduates
+
+
+def test_quiet_adopt_blocked_by_a_thumbsdown(tmp_path):
+    st = _state(tmp_path, min_runs=3, adopt_quiet_runs=4, retire_net_neg=2)
+    st.track("quip")
+    for _ in range(5):
+        st.record_run("quip", ok=True)
+    st.record_reward("quip", -1.0)                  # one complaint
+    assert st.gate("quip") is None                  # not adopted (neg>0) and not yet net-retire
+
+
+def test_quiet_runs_floor_is_min_runs(tmp_path):
+    st = _state(tmp_path, min_runs=6, adopt_quiet_runs=3)
+    assert st.adopt_quiet_runs == 6                 # can't quiet-adopt below min_runs
+
+
+def test_gate_retires_stale_trial_past_ttl(tmp_path):
+    st = _state(tmp_path, trial_ttl=100.0)
+    st.track("dud")
+    st.skills["dud"]["created"] = time.time() - 200.0   # aged past the TTL
+    assert st.gate("dud") == "retire"
+    # a fresh trial with no TTL configured never goes stale
+    st2 = _state(tmp_path, trial_ttl=0.0)
+    st2.track("ok")
+    st2.skills["ok"]["created"] = time.time() - 10 ** 7
+    assert st2.gate("ok") is None
+
+
+def test_due_trials_least_run_first(tmp_path):
+    st = _state(tmp_path, adopt_quiet_runs=5)
+    st.track("a")
+    st.track("b")
+    st.track("c")
+    for _ in range(2):
+        st.record_run("a", ok=True)
+    st.record_run("b", ok=True)
+    for _ in range(5):
+        st.record_run("c", ok=True)                 # c has hit the bar -> not "due"
+    assert st.due_trials() == ["b", "a"]            # fewest runs first, c excluded
 
 
 def test_manual_keep_and_kill(tmp_path):

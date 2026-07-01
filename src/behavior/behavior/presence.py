@@ -81,8 +81,8 @@ BEATS = {
     "listening": Beat(
         face="focused", camera=False, audio=True,
         prompt=("React in one short spoken line to what you can hear around you right now.")),
-    # Goal-pursuit beat: delivered in place of the chosen body beat when the Horizon Planner
-    # has a verified task to narrate. `{task}` is filled by mood_node._deliver_pursuing. Not in
+    # Goal-pursuit beat: delivered in place of the chosen body beat when the Pursuit driver
+    # has a verified objective to narrate. `{task}` is filled by mood_node._deliver_pursuing. Not in
     # the registry — it's a node-side upgrade, not a discretionary chart beat.
     "pursuing": Beat(
         face="looking", camera=True, audio=False,
@@ -145,6 +145,26 @@ def clamp01(v, default=0.5):
         return max(0.0, min(1.0, float(v)))
     except (TypeError, ValueError):
         return default
+
+
+def merge_beats(overrides=None):
+    """Layer a `beats.json` override (per-beat face/camera/audio/prompt) over the built-in
+    BEATS templates: patches an existing beat's fields, or adds an entirely new beat name
+    (pair it with a `registry` entry — e.g. via `personality.json` — so the lottery can pick
+    it; DEFAULT_REGISTRY/`BEATS` need no code change either way). Unknown fields are ignored.
+    Never raises: a malformed override is skipped, not fatal (the beat table degrades to the
+    default, same philosophy as `load_chart_yaml`)."""
+    merged = {name: b._asdict() for name, b in BEATS.items()}
+    for name, patch in (overrides or {}).items():
+        if not isinstance(patch, dict):
+            continue
+        base = dict(merged.get(
+            name, {"face": "happy", "camera": False, "audio": False, "prompt": ""}))
+        for k in ("face", "camera", "audio", "prompt"):
+            if k in patch:
+                base[k] = patch[k]
+        merged[name] = base
+    return {name: Beat(**fields) for name, fields in merged.items()}
 
 
 def choose_beat(traits, registry, rng, camera_beats=True, last=None, beats=BEATS):
@@ -274,24 +294,63 @@ statechart:
 """
 
 
+def load_chart_yaml(path=""):
+    """Read the presence statechart's Sismic YAML from `path` if given and non-empty, else the
+    bundled default (PRESENCE_YAML). Lets the chart's states/transitions/timings be hand-edited
+    (e.g. `memory/presence_chart.yaml`) with zero code change. Best-effort: a missing file falls
+    back silently; the caller (`_build_statechart`) also falls back on a parse/validate error, so
+    a broken edit degrades to the default chart rather than disabling the whole behaviour layer."""
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            if text.strip():
+                return text
+        except FileNotFoundError:
+            pass
+    return PRESENCE_YAML
+
+
+def _build_statechart(chart_path):
+    """Parse+validate the chart from `chart_path` (see `load_chart_yaml`); on any failure (a
+    hand-edit typo, an invalid Sismic graph) fall back to the bundled default rather than raising
+    — an editable chart file should never be able to take the presence layer offline."""
+    from sismic.io import import_from_yaml
+    text = load_chart_yaml(chart_path)
+    try:
+        statechart = import_from_yaml(text)
+        statechart.validate()
+        return statechart
+    except Exception:
+        if text is PRESENCE_YAML:
+            raise
+        statechart = import_from_yaml(PRESENCE_YAML)
+        statechart.validate()
+        return statechart
+
+
 def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
-                      perform_secs=4.0, camera_beats=True, look_every=4,
+                      perform_secs=4.0, camera_beats=True,
                       traits=None, registry=None, drives=None, alpha=0.1, clock=None,
                       reflect_face="focused", greet_face="happy", attend_face="looking",
-                      attend_secs=2.0, feel_secs=2.5, rng=None):
+                      attend_secs=2.0, feel_secs=2.5, rng=None, chart_path="", beats=None):
     """Parse + validate the chart and return (interpreter, clock), already advanced into
     `greeting`. `traits`/`registry`/`drives` seed the live personality (merged over the frozen
     defaults); `alpha` is the exponential-smoothing rate for `evolve`. `rng` (injected for
-    deterministic tests) drives the idle-beat lottery + the burst/attend gates. The live dicts
-    are `interpreter.context['traits' | 'registry' | 'drives']` — the node reads them to colour
-    prompts, persist, and publish. Sismic is imported lazily so importing this module never needs
-    it.
-
-    `look_every` is accepted for backward-compat but no longer used — the camera cadence is now
-    driven by the `looking` beat's learnable priority/trait in the registry (see choose_beat)."""
-    from sismic.io import import_from_yaml
+    deterministic tests) drives the idle-beat lottery + the burst/attend gates. `chart_path`
+    optionally overrides the bundled statechart YAML (see `load_chart_yaml`); `beats` optionally
+    overrides the bundled BEATS table (see `merge_beats`) — both default to the built-ins when
+    omitted/empty. The live dicts are `interpreter.context['traits' | 'registry' | 'drives']` —
+    the node reads them to colour prompts, persist, and publish. `camera_beats` may be a plain
+    bool OR a zero-arg callable re-checked on every draw — the latter lets a caller wire it to a
+    LIVE signal (e.g. "is the LLM actually available right now") so the chooser stops offering
+    camera beats ("looking") the moment there's no LLM to process the frame, without rebuilding
+    the interpreter. Sismic is imported lazily so importing this module never needs it."""
     from sismic.interpreter import Interpreter
     from sismic.clock import SimulatedClock
+
+    beats = beats if beats is not None else BEATS
+    camera_beats_fn = camera_beats if callable(camera_beats) else (lambda: bool(camera_beats))
 
     # Live dicts (deep-copied so they never alias the frozen defaults).
     live_traits = copy.deepcopy(DEFAULT_TRAITS)
@@ -363,14 +422,13 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
     def pick_beat():
         """The chart's per-cycle beat chooser: a priority-weighted, novelty-aware draw over the
         live (evolving) registry. Remembers what it picked so the next cycle can avoid it."""
-        name = choose_beat(live_traits, live_registry, rng, camera_beats=camera_beats,
-                           last=last_beat["name"])
+        name = choose_beat(live_traits, live_registry, rng, camera_beats=camera_beats_fn(),
+                           last=last_beat["name"], beats=beats)
         if name:
             last_beat["name"] = name
         return name
 
-    statechart = import_from_yaml(PRESENCE_YAML)
-    statechart.validate()
+    statechart = _build_statechart(chart_path)
     clock = clock if clock is not None else SimulatedClock()
     interpreter = Interpreter(statechart, clock=clock, initial_context={
         "face": face,
