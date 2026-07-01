@@ -17,7 +17,7 @@ setup(
         # package share so the node finds them; also resolvable from the source tree.
         (os.path.join("share", package_name, "skills"), glob("skills/*.md")),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "nanobot-brain"],
     zip_safe=True,
     maintainer="ib",
     maintainer_email="ib.elfaramawy@gmail.com",

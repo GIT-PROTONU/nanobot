@@ -28,8 +28,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
 sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 
-from web_control.llm import LlmClient                       # noqa: E402
-from web_control.phrasebank import PhraseBank, CATEGORIES   # noqa: E402
+from nanobot_brain.cognition import LlmClient                       # noqa: E402
+from nanobot_brain.cognition import PhraseBank, CATEGORIES   # noqa: E402
 
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
 # Dev tooling keeps its state in the project-local devstate/ folder (same as dev_webui.py),

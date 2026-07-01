@@ -31,7 +31,7 @@ def main():
     args = ap.parse_args()
 
     import sismic.io as sio
-    from behavior.presence import PRESENCE_YAML
+    from nanobot_brain.behavior import PRESENCE_YAML
 
     statechart = sio.import_from_yaml(PRESENCE_YAML)
     puml = sio.export_to_plantuml(statechart)

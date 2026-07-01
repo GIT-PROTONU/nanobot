@@ -497,6 +497,19 @@
               turn it off to force a fixed speed.</p>
           </div>
           <div class="card">
+            <h2>Brain health</h2>
+            <div class="kv" id="brainHealth">
+              <span>behavior</span><b id="bhBehavior">–</b>
+              <span>cognition</span><b id="bhCognition">–</b>
+              <span>LLM</span><b id="bhLlm">–</b>
+              <span>purpose</span><b id="bhPurpose">–</b>
+              <span>chart</span><b id="bhChart">–</b>
+            </div>
+            <p class="hint">Two brain layers: <b>behavior</b> (Sismic statechart + purpose) and
+              <b>cognition</b> (LLM personality + skills). Green = alive, red = lost.
+              Polled from <b>/brain/health</b>.</p>
+          </div>
+          <div class="card">
             <h2>Coprocessor (ESP32)</h2>
             <div class="kv">
               <span>link</span><b id="espHb">–</b>
@@ -937,6 +950,28 @@ setInterval(()=>{
   el.textContent = alive ? `alive (#${lastHb})` : "lost";
   el.style.color = alive ? "var(--green)" : "var(--red)";
 },1000);
+
+// ---- brain health (polled from HTTP /brain/health) ----
+function bhTxt(id, ok, label){
+  const el=$(id);
+  if(ok===true){ el.textContent=label||"alive"; el.style.color="var(--green)"; }
+  else if(ok===false){ el.textContent=label||"lost"; el.style.color="var(--red)"; }
+  else { el.textContent="–"; el.style.color=""; }
+}
+setInterval(()=>{
+  fetch("/brain/health").then(r=>r.json()).then(d=>{
+    const b=d.behavior||{}, c=d.cognition||{}, o=d.overall||{};
+    bhTxt("bhBehavior", o.behavior_alive, b.chart_states?.join(", ")||"alive");
+    bhTxt("bhCognition", o.cognition_alive);
+    bhTxt("bhLlm", c.llm_available, c.llm_offline ? "offline" : "online");
+    bhTxt("bhPurpose", b.purpose_enabled, b.reflecting?"reflecting":(b.purpose_enabled?"on":"off"));
+    bhTxt("bhChart", b.alive, (b.chart_states||[]).slice(-2).join("·")||"–");
+  }).catch(()=>{
+    ["bhBehavior","bhCognition","bhLlm","bhPurpose","bhChart"].forEach(id=>{
+      $(id).textContent="err"; $(id).style.color="var(--amber)";
+    });
+  });
+},2000);
 
 let lastImuT=0;
 function onImu(msg){

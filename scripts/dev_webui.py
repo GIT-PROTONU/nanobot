@@ -49,14 +49,14 @@ sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 sys.path.insert(0, os.path.join(_ROOT, "src", "behavior"))   # ROS-free presence chart
 
 from web_control.tts import TtsEngine, clamp                 # noqa: E402
-from web_control.llm import LlmClient                        # noqa: E402
-from web_control.skills import resolve_skills_dir            # noqa: E402
-# The SAME cognition core the robot runs — one base to maintain (see cognition.py).
-from web_control.cognition import CognitionCore              # noqa: E402
+from nanobot_brain.cognition import LlmClient                        # noqa: E402
+from nanobot_brain.cognition import resolve_skills_dir            # noqa: E402
+# The SAME cognition core the robot runs — one base to maintain.
+from nanobot_brain.cognition import CognitionCore              # noqa: E402
 # The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Horizon
 # Planner), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
-from behavior.brain import PurposeBrain                      # noqa: E402
-from behavior.presence import BEATS                          # noqa: E402  (beat table)
+from nanobot_brain.behavior import PurposeBrain                      # noqa: E402
+from nanobot_brain.behavior import BEATS                          # noqa: E402  (beat table)
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
@@ -450,7 +450,7 @@ def run_behavior(state, idle_secs, reflect_secs):
     try:
         from sismic.clock import SimulatedClock
         from sismic.model import Event
-        from behavior.presence import build_interpreter
+        from nanobot_brain.behavior import build_interpreter
     except Exception as exc:
         print(f"[behavior] unavailable ({exc}) — run `pip install sismic pyyaml`",
               file=sys.stderr)

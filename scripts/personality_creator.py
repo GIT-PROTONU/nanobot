@@ -27,7 +27,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
 sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 
-from web_control.llm import LlmClient, _extract_json      # noqa: E402
+from nanobot_brain.cognition import LlmClient, _extract_json      # noqa: E402
 
 TRAITS = ("curiosity", "extraversion", "caution", "playfulness")
 # Dev tooling keeps its state in the project-local devstate/ folder (visible/editable in the

@@ -33,9 +33,9 @@ from geometry_msgs.msg import Twist, Vector3Stamped
 from .mjpeg_camera import CameraStream
 from .mic_audio import AudioStream
 from .tts import TtsEngine, VOICES, clamp
-from .llm import LlmClient
-from .skills import resolve_skills_dir
-from .cognition import CognitionCore
+from nanobot_brain.cognition import LlmClient
+from nanobot_brain.cognition import resolve_skills_dir
+from nanobot_brain.cognition import CognitionCore
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
@@ -329,6 +329,12 @@ class WebServerNode(Node):
             f"llm: {'enabled' if self._cog.available() else 'idle (no key / disabled)'}"
             f" model={self._cog.llm.model}")
         self._cog.bank_regen_check()                    # build/refresh the bank if needed
+        # --- brain health monitoring ---
+        # Publish our health for the behavior layer to monitor; subscribe to its health so
+        # the web UI (via /brain/health HTTP) knows whether both layers are alive.
+        self._cog_health_pub = self.create_publisher(String, "brain/cognition_health", latched)
+        self._behavior_health = {}                     # last received from mood_node
+        self.create_subscription(String, "brain/behavior_health", self._on_behavior_health, 10)
         if bool(g("startup_greeting").value):
             # Say hello a few seconds after boot (once the OLED/TTS are up). Offline-safe via
             # the phrase bank's greeting fallback; the boot face is the behaviour node's job.
@@ -342,6 +348,7 @@ class WebServerNode(Node):
         self._announce_tick()                          # piggy-backs on this 1 Hz tick
         self._reflect_tick()                           # ditto (cheap when not due)
         self._llm_health_tick()                        # persistent "AI offline" indicator
+        self._brain_health_tick()                      # cognition health heartbeat
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -898,6 +905,58 @@ class WebServerNode(Node):
             self._llm_offline_reassert = now               # best-effort re-assert
             self._face_pub.publish(String(data=face))
 
+    def _on_behavior_health(self, msg: String):
+        """Store the latest behavior-layer health from mood_node."""
+        try:
+            self._behavior_health = json.loads(msg.data)
+        except Exception:
+            pass
+
+    def _brain_health_tick(self):
+        """Publish cognition-layer health as JSON on /brain/cognition_health (~1 Hz)."""
+        now = time.monotonic()
+        bh = self._behavior_health
+        behavior_alive = bool(bh.get("alive")) if bh else False
+        behavior_stale = not bh or (now - (bh.get("_t", now))) > 10.0
+        health = {
+            "_t": now,
+            "layer": "cognition",
+            "alive": True,
+            "llm_available": self._cog.available(),
+            "llm_fail_streak": self._cog.llm_fail_streak,
+            "llm_offline": bool(self._llm_offline),
+            "reflecting": self._reflecting,
+            "enabled": bool(self._cog.settings.get("enabled")),
+            "behavior_alive": behavior_alive and not behavior_stale,
+            "behavior_stale": behavior_stale,
+        }
+        self._cog_health_pub.publish(String(data=json.dumps(health)))
+
+    def get_brain_health(self):
+        """Aggregated brain health for the /brain/health HTTP endpoint."""
+        now = time.monotonic()
+        bh = self._behavior_health
+        behavior = dict(bh) if bh else {}
+        behavior_stale = not bh or (now - (bh.get("_t", now))) > 10.0
+        return {
+            "behavior": behavior,
+            "cognition": {
+                "alive": True,
+                "llm_available": self._cog.available(),
+                "llm_fail_streak": self._cog.llm_fail_streak,
+                "llm_offline": bool(self._llm_offline),
+                "reflecting": self._reflecting,
+                "enabled": bool(self._cog.settings.get("enabled")),
+            },
+            "overall": {
+                "behavior_alive": bool(behavior.get("alive")) and not behavior_stale,
+                "behavior_stale": behavior_stale,
+                "cognition_alive": True,
+                "all_healthy": (bool(behavior.get("alive")) and not behavior_stale
+                               and bool(self._cog.settings.get("enabled"))),
+            },
+        }
+
     def _cpu_sample(self):
         try:
             with open(STAT_PATH) as f:
@@ -1002,6 +1061,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._serve_map()
         if path == "/scan.bin":
             return self._serve_scan()
+        if path == "/brain/health":
+            return self._respond_json(
+                self._node.get_brain_health() if self._node else {"error": "no node"})
         return super().do_GET()
 
     def do_POST(self):

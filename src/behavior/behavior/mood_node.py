@@ -40,8 +40,8 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, String
 from geometry_msgs.msg import Twist, PoseStamped
 
-from .presence import build_interpreter, BEATS, clamp01
-from .brain import PurposeBrain, Personality
+from nanobot_brain.behavior import build_interpreter, BEATS, clamp01
+from nanobot_brain.behavior import PurposeBrain, Personality
 
 # Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
 # Import defensively so a board that hasn't run `pixi install` yet still boots the
@@ -144,6 +144,11 @@ class MoodNode(Node):
         # this into the /reflect state command we (and it) act on, so there's one entry path
         # for both the manual web toggle and this autonomous trigger.
         self.reflect_req_pub = self.create_publisher(Bool, "reflect_request", 10)
+        # Brain health: publish our status so web_server (and the web UI via HTTP) can monitor
+        # the behavior layer's liveness and the cognition heartbeat RSSI.
+        self._health_pub = self.create_publisher(String, "brain/behavior_health", latched)
+        self._cognition_alive = True                      # starts optimistic
+        self._last_cognition_ping = time.monotonic()
         self._beat_last = {}
         # Latched readouts so late subscribers (slam_nav's motion clamp, web_control's
         # reflection, the web UI brain card) get them immediately; PurposeBrain/Personality
@@ -205,6 +210,8 @@ class MoodNode(Node):
         # Reflection-mode state command (from the web UI toggle or our own auto trigger,
         # mediated by web_control).
         self.create_subscription(Bool, "reflect", self._on_reflect, latched)
+        # Cognition health heartbeat — tracks whether the cognition layer is alive.
+        self.create_subscription(String, "brain/cognition_health", self._on_cog_health, 10)
 
         if self._interp is not None:
             self.create_timer(1.0 / self.tick_rate, self._tick)
@@ -351,6 +358,15 @@ class MoodNode(Node):
         self.get_logger().info("reflecting — consolidating brain + forging skills (beats paused)"
                                if on else "reflection ended — resuming presence")
 
+    def _on_cog_health(self, msg: String):
+        """Track the cognition layer's heartbeat from web_server."""
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        self._cognition_alive = bool(payload.get("alive", False))
+        self._last_cognition_ping = time.monotonic()
+
     # --- signal callbacks ----------------------------------------------------
     def _on_cmd(self, msg: Twist):
         if abs(msg.linear.x) > self.motion_eps or abs(msg.angular.z) > self.motion_eps:
@@ -447,10 +463,31 @@ class MoodNode(Node):
             self._interp.execute()
             self._personality.publish_and_persist(now)     # publish + persist on change
             self._brain.tick(now)                          # purpose reflection + latched republish
+            self._publish_health(now)                      # brain health heartbeat
         except Exception as exc:
-            # The behaviour layer must never take the process down; log + keep going.
+                # The behaviour layer must never take the process down; log + keep going.
             self.get_logger().error(f"statechart step failed: {exc}",
                                     throttle_duration_sec=10.0)
+
+    def _publish_health(self, now):
+        """Publish behavior-layer health as JSON on /brain/behavior_health (throttled to ~1 Hz)."""
+        if not hasattr(self, '_health_last') or (now - self._health_last) >= 1.0:
+            self._health_last = now
+            cog_stale = (now - self._last_cognition_ping) > 5.0
+            traits = self._personality.live_traits() if self._personality else {}
+            chart_state = list(self._interp.configuration) if self._interp is not None else []
+            health = {
+                "_t": now,
+                "layer": "behavior",
+                "alive": self._interp is not None and self.enable,
+                "chart_states": chart_state,
+                "cognition_alive": self._cognition_alive and not cog_stale,
+                "cognition_ping_ago": round(now - self._last_cognition_ping, 1),
+                "reflecting": self._brain.reflecting if self._brain else False,
+                "purpose_enabled": self._brain.enable if self._brain else False,
+                "traits": traits,
+            }
+            self._health_pub.publish(String(data=json.dumps(health)))
 
     def destroy_node(self):
         if self._interp is not None:               # persist the latest drift on clean exit

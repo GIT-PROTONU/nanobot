@@ -27,7 +27,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "src", "web_control"))
 
 from web_control.tts import TtsEngine            # noqa: E402
-from web_control.llm import LlmClient, MOODS     # noqa: E402
+from nanobot_brain.cognition import LlmClient, MOODS     # noqa: E402
 
 
 def main():
