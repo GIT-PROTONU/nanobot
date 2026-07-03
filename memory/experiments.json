@@ -1,0 +1,18 @@
+{
+  "objective": "get_acquainted",
+  "bandit": {
+    "stats": {
+      "get_acquainted": {
+        "terse": {
+          "n": 0,
+          "mean": 0.0
+        },
+        "playful": {
+          "n": 0,
+          "mean": 0.0
+        }
+      }
+    },
+    "epsilon": 0.2
+  }
+}

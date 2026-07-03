@@ -1,0 +1,38 @@
+{
+  "musing": {
+    "face": "happy",
+    "camera": false,
+    "audio": false,
+    "prompt": "React in one short spoken line to how your body and sensors feel right now."
+  },
+  "looking": {
+    "face": "looking",
+    "camera": true,
+    "audio": false,
+    "prompt": "Say one short spoken line about what you can see in front of you right now."
+  },
+  "wondering": {
+    "face": "focused",
+    "camera": false,
+    "audio": false,
+    "prompt": "Wonder aloud in one short spoken line about yourself or what might have changed around you — a small, curious thought."
+  },
+  "listening": {
+    "face": "focused",
+    "camera": false,
+    "audio": true,
+    "prompt": "React in one short spoken line to what you can hear around you right now."
+  },
+  "pursuing": {
+    "face": "looking",
+    "camera": true,
+    "audio": false,
+    "prompt": "Say one short spoken line as you {task} right now."
+  },
+  "skill": {
+    "face": "focused",
+    "camera": false,
+    "audio": false,
+    "prompt": "Choose and perform a fitting capability right now."
+  }
+}

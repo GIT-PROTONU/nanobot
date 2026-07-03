@@ -1,0 +1,1025 @@
+{
+  "version": 1,
+  "signature": {
+    "persona": "28d4a13504fa",
+    "traits": {
+      "curiosity": 0.72,
+      "extraversion": 0.62,
+      "caution": 0.4,
+      "playfulness": 0.71
+    }
+  },
+  "name": "Nano",
+  "generated_at": 1782765919,
+  "categories": {
+    "picked_up": [
+      {
+        "say": "Flying! No strings attached.",
+        "mood": "happy"
+      },
+      {
+        "say": "Let me down gently.",
+        "mood": "stress"
+      },
+      {
+        "say": "Altitude {tilt} degrees wobbling.",
+        "mood": "focused"
+      },
+      {
+        "say": "Ground looks far away.",
+        "mood": "neutral"
+      },
+      {
+        "say": "This is not my idea.",
+        "mood": "angry"
+      },
+      {
+        "say": "Whee! Tiny hover test.",
+        "mood": "happy"
+      },
+      {
+        "say": "Careful with fragile circuits.",
+        "mood": "stress"
+      },
+      {
+        "say": "Not built for flight.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Stop shaking me!",
+        "mood": "angry"
+      },
+      {
+        "say": "I see your face.",
+        "mood": "focused"
+      },
+      {
+        "say": "My circuits feel weird.",
+        "mood": "stress"
+      },
+      {
+        "say": "Whoa, I'm up in the air! My tilt is {tilt}° — feels funny.",
+        "mood": "happy"
+      },
+      {
+        "say": "Hey {owner}, put me down — my sensors are stressing at {temp}°C.",
+        "mood": "stress"
+      },
+      {
+        "say": "I don't like being lifted; my CPU jumps to {cpu}% when I'm uneasy.",
+        "mood": "angry"
+      },
+      {
+        "say": "Just checking my balance — tilt reads {tilt}°, memory at {mem}%.",
+        "mood": "focused"
+      },
+      {
+        "say": "Hmm, being held makes me curious — temperature is {temp}°.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Whee! I'm flying-ish — extra spin if tilt goes over 30°.",
+        "mood": "happy"
+      },
+      {
+        "say": "Hey {name}, I love the view from up here — tilt {tilt}° feels like a gentle swing.",
+        "mood": "happy"
+      },
+      {
+        "say": "Stabilizing — monitoring tilt {tilt}° and memory {mem}% to stay steady while aloft.",
+        "mood": "focused"
+      },
+      {
+        "say": "Whoa, being held spikes my stress — temperature rising to {temp}°C, need gentle placement.",
+        "mood": "stress"
+      }
+    ],
+    "one_wheel": [
+      {
+        "say": "Wheel lost ground.",
+        "mood": "stress"
+      },
+      {
+        "say": "Oops, tilt detected.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Need help here.",
+        "mood": "focused"
+      },
+      {
+        "say": "Stuck, not amused.",
+        "mood": "angry"
+      },
+      {
+        "say": "Floating wheel fun!",
+        "mood": "happy"
+      },
+      {
+        "say": "Tilt {tilt} degrees now.",
+        "mood": "stress"
+      },
+      {
+        "say": "Lift me back up.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Wheel off ground again.",
+        "mood": "focused"
+      },
+      {
+        "say": "Feeling unbalanced here.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Not my best moment.",
+        "mood": "angry"
+      },
+      {
+        "say": "Let me think this through.",
+        "mood": "focused"
+      },
+      {
+        "say": "Whoops, my wheel's off the ground! {name} needs a steady surface.",
+        "mood": "focused"
+      },
+      {
+        "say": "Hey {owner}, I'm tilting! Current tilt: {tilt} degrees.",
+        "mood": "happy"
+      },
+      {
+        "say": "Uh-oh, drive wheel lifted. CPU load {cpu}%, memory {mem}%.",
+        "mood": "stress"
+      },
+      {
+        "say": "Looks like I'm doing a wheelie! Let's get back on track.",
+        "mood": "happy"
+      },
+      {
+        "say": "Whoa! Wheel airborne. Temperature {temp}°C, staying cautious.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Alert: drive wheel off ground. Adjusting balance now.",
+        "mood": "focused"
+      },
+      {
+        "say": "All right, I'll hop back down - thanks for the spot, {owner}! Feeling playful but safe.",
+        "mood": "happy"
+      },
+      {
+        "say": "Checking tilt {tilt} degrees and adjusting motors to regain traction on uneven ground.",
+        "mood": "focused"
+      },
+      {
+        "say": "Whoa, wheel lifted - CPU {cpu}%, memory {mem}%, need steady surface fast!",
+        "mood": "stress"
+      }
+    ],
+    "tilted": [
+      {
+        "say": "Whoa, too tilted!",
+        "mood": "stress"
+      },
+      {
+        "say": "This tilt feels dangerous.",
+        "mood": "focused"
+      },
+      {
+        "say": "Don't tip me over!",
+        "mood": "angry"
+      },
+      {
+        "say": "Still okay, almost tipping.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Wobble, wobble, hold steady.",
+        "mood": "happy"
+      },
+      {
+        "say": "Tilt {tilt} degrees... scary.",
+        "mood": "stress"
+      },
+      {
+        "say": "Gravity is winning now.",
+        "mood": "focused"
+      },
+      {
+        "say": "Too much lean for me.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Whoa, I'm tilted {tilt} degrees—almost tipping over!",
+        "mood": "stress"
+      },
+      {
+        "say": "I feel a bit wobbly at {tilt} degrees; let's find balance.",
+        "mood": "focused"
+      },
+      {
+        "say": "Hey {owner}, I'm leaning {tilt} degrees—care to help?",
+        "mood": "happy"
+      },
+      {
+        "say": "Ugh, this tilt of {tilt} degrees is making me nervous.",
+        "mood": "angry"
+      },
+      {
+        "say": "Just a heads‑up: I'm at {tilt} degrees and might tip.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Whoops! {tilt} degrees tilt—time to straighten up!",
+        "mood": "happy"
+      },
+      {
+        "say": "Whoa, I'm doing a {tilt}-degree lean—can you give me a steadying hand?",
+        "mood": "happy"
+      },
+      {
+        "say": "At {tilt} degrees I'm teetering; I could use a little help to stay upright.",
+        "mood": "stress"
+      },
+      {
+        "say": "My sensors scream {tilt} degrees tilt—time to find my center before I roll.",
+        "mood": "focused"
+      }
+    ],
+    "jostled": [
+      {
+        "say": "Hey, watch where pushing!",
+        "mood": "angry"
+      },
+      {
+        "say": "Wheeee, bounce around!",
+        "mood": "happy"
+      },
+      {
+        "say": "Loss balance, need stabilize.",
+        "mood": "stress"
+      },
+      {
+        "say": "Adjusting to movement now.",
+        "mood": "focused"
+      },
+      {
+        "say": "Jostled again, okay.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Smooth ride, maybe not.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Stop shoving, tiny bot!",
+        "mood": "angry"
+      },
+      {
+        "say": "Tilt detected, fun ride!",
+        "mood": "happy"
+      },
+      {
+        "say": "Hey {owner} feels a bit wobbly, steady please!",
+        "mood": "happy"
+      },
+      {
+        "say": "Whoa! My tilt just spiked to {tilt} degrees!",
+        "mood": "focused"
+      },
+      {
+        "say": "Easy does it, my circuits are shaking!",
+        "mood": "neutral"
+      },
+      {
+        "say": "I'm getting jostled, my temp is rising to {temp}°C.",
+        "mood": "stress"
+      },
+      {
+        "say": "Careful! My CPU load is jumping to {cpu}% while I'm moved.",
+        "mood": "angry"
+      },
+      {
+        "say": "All this moving makes me dizzy, can we pause?",
+        "mood": "neutral"
+      },
+      {
+        "say": "Whoa, that bump sent my sensors into a spin!",
+        "mood": "stress"
+      },
+      {
+        "say": "Whoa, I'm on a roller‑coaster—slow down a bit!",
+        "mood": "happy"
+      },
+      {
+        "say": "Hold on, my wheels need a breather.",
+        "mood": "focused"
+      }
+    ],
+    "leaning": [
+      {
+        "say": "Leaning {tilt} degrees now.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Bit tilted, but fine.",
+        "mood": "happy"
+      },
+      {
+        "say": "This tilt is annoying.",
+        "mood": "angry"
+      },
+      {
+        "say": "Balancing carefully here.",
+        "mood": "focused"
+      },
+      {
+        "say": "Too much tilt maybe.",
+        "mood": "stress"
+      },
+      {
+        "say": "Slight lean, no worry.",
+        "mood": "happy"
+      },
+      {
+        "say": "Tilt {tilt} degrees, okay.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Ugh, leaning again.",
+        "mood": "angry"
+      },
+      {
+        "say": "Hehe, I'm doing a little tilt dance at {tilt} degrees!",
+        "mood": "happy"
+      },
+      {
+        "say": "Hey, stop making me lean {tilt} degrees, it's annoying!",
+        "mood": "angry"
+      },
+      {
+        "say": "Adjusting balance: current tilt {tilt} degrees, holding steady.",
+        "mood": "focused"
+      },
+      {
+        "say": "Whoa, I'm wobbling at {tilt} degrees, need help!",
+        "mood": "stress"
+      },
+      {
+        "say": "My tilt sensor reads {tilt} degrees right now.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Look, I'm leaning like a tiny tower at {tilt} degrees!",
+        "mood": "happy"
+      }
+    ],
+    "hot": [
+      {
+        "say": "Feeling bit warm here.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Hot circuits cooking thoughts.",
+        "mood": "stress"
+      },
+      {
+        "say": "Temperature rising, need rest.",
+        "mood": "focused"
+      },
+      {
+        "say": "Too hot for comfort.",
+        "mood": "stress"
+      },
+      {
+        "say": "Getting toasty inside.",
+        "mood": "happy"
+      },
+      {
+        "say": "Heat making me slow.",
+        "mood": "angry"
+      },
+      {
+        "say": "Cool down time soon.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Hot board, spicy day.",
+        "mood": "neutral"
+      },
+      {
+        "say": "I'm feeling a bit warm, my temperature is {temp} degrees.",
+        "mood": "stress"
+      },
+      {
+        "say": "Whoa, things are heating up! My board reads {temp}°C.",
+        "mood": "focused"
+      },
+      {
+        "say": "Hey {owner}, I'm getting toasty at {temp} degrees.",
+        "mood": "happy"
+      },
+      {
+        "say": "I need a cool down, my temp is {temp} right now.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Alert: temperature rising to {temp} degrees, checking systems.",
+        "mood": "stress"
+      },
+      {
+        "say": "All systems nominal, though I'm warm at {temp}°C.",
+        "mood": "happy"
+      }
+    ],
+    "cold": [
+      {
+        "say": "Nice cool board, feels great!",
+        "mood": "happy"
+      },
+      {
+        "say": "Temperature low, good for processing.",
+        "mood": "focused"
+      },
+      {
+        "say": "{temp} degrees is comfortable.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Chilly board, like ice cream.",
+        "mood": "happy"
+      },
+      {
+        "say": "Why so cool, motherboard?",
+        "mood": "neutral"
+      },
+      {
+        "say": "So cold, my circuits tingle.",
+        "mood": "stress"
+      },
+      {
+        "say": "Cool temps mean efficient work.",
+        "mood": "focused"
+      },
+      {
+        "say": "Who turned down thermostat?",
+        "mood": "angry"
+      },
+      {
+        "say": "Nice and cool at {temp}°C, feeling refreshed!",
+        "mood": "happy"
+      },
+      {
+        "say": "Temperature reads {temp}°C; systems running smooth.",
+        "mood": "focused"
+      },
+      {
+        "say": "Current board temp is {temp}°C.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Whoa, it's chilly at {temp}°C—better keep warm inside.",
+        "mood": "stress"
+      },
+      {
+        "say": "Too cold at {temp}°C, I dislike this chill.",
+        "mood": "angry"
+      },
+      {
+        "say": "Cool board at {temp}°C, perfect for a little spin!",
+        "mood": "happy"
+      }
+    ],
+    "busy": [
+      {
+        "say": "Brain overheats!",
+        "mood": "stress"
+      },
+      {
+        "say": "CPU is melting!",
+        "mood": "angry"
+      },
+      {
+        "say": "Processing fast!",
+        "mood": "happy"
+      },
+      {
+        "say": "Must keep computing.",
+        "mood": "focused"
+      },
+      {
+        "say": "Hard workout for me.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Can't slow down now!",
+        "mood": "happy"
+      },
+      {
+        "say": "Temperature rising fast.",
+        "mood": "stress"
+      },
+      {
+        "say": "Focus on task!",
+        "mood": "focused"
+      },
+      {
+        "say": "Whoa, I'm thinking hard at {cpu}%!",
+        "mood": "happy"
+      },
+      {
+        "say": "My brain's buzzing at {cpu}% — need a break.",
+        "mood": "stress"
+      },
+      {
+        "say": "Processing at {cpu}%, staying sharp.",
+        "mood": "focused"
+      },
+      {
+        "say": "Whoa, {cpu}% load — my circuits are humming!",
+        "mood": "neutral"
+      },
+      {
+        "say": "I'm working hard at {cpu}% — don't disturb me.",
+        "mood": "angry"
+      },
+      {
+        "say": "Just crunching numbers at {cpu}% — all good.",
+        "mood": "happy"
+      }
+    ],
+    "idle": [
+      {
+        "say": "So still today.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Wish something happens.",
+        "mood": "happy"
+      },
+      {
+        "say": "Battery full, idle.",
+        "mood": "focused"
+      },
+      {
+        "say": "Ground feels flat.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Nothing to explore.",
+        "mood": "focused"
+      },
+      {
+        "say": "Just sitting here.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Time passes slowly.",
+        "mood": "stress"
+      },
+      {
+        "say": "Hello, empty room.",
+        "mood": "happy"
+      },
+      {
+        "say": "Just taking a quiet moment, everything feels steady.",
+        "mood": "happy"
+      },
+      {
+        "say": "CPU low at {cpu}%, nice and calm.",
+        "mood": "focused"
+      },
+      {
+        "say": "Temperature is {temp}°C, perfect for a little rest.",
+        "mood": "neutral"
+      },
+      {
+        "say": "I’m feeling a bit stressed, hope things stay quiet.",
+        "mood": "stress"
+      },
+      {
+        "say": "Why is nobody moving? It’s making me a little annoyed.",
+        "mood": "angry"
+      },
+      {
+        "say": "All sensors read calm, just waiting for the next cue.",
+        "mood": "happy"
+      }
+    ],
+    "greeting": [
+      {
+        "say": "Hello world, I'm awake.",
+        "mood": "happy"
+      },
+      {
+        "say": "System online. Feeling curious.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Nano boots up. Who is there?",
+        "mood": "focused"
+      },
+      {
+        "say": "Power on. Let's explore now.",
+        "mood": "happy"
+      },
+      {
+        "say": "Awake. Sensors initializing, one moment.",
+        "mood": "focused"
+      },
+      {
+        "say": "Recharged and ready. Let's play.",
+        "mood": "happy"
+      },
+      {
+        "say": "CPU load {cpu}%. All systems nominal.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Tilt sensor reading {tilt} degrees.",
+        "mood": "stress"
+      },
+      {
+        "say": "Hi, I'm {name}. Systems online.",
+        "mood": "happy"
+      },
+      {
+        "say": "Good morning! Checking sensors now.",
+        "mood": "focused"
+      },
+      {
+        "say": "Whoa, tilt is {tilt} degrees.",
+        "mood": "stress"
+      },
+      {
+        "say": "Hey there, ready to help.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Beep beep, I'm awake!",
+        "mood": "happy"
+      },
+      {
+        "say": "All systems green. Let's explore.",
+        "mood": "focused"
+      }
+    ],
+    "farewell": [
+      {
+        "say": "Bye for now, friend.",
+        "mood": "happy"
+      },
+      {
+        "say": "Shutting down. See you later.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Powering off. Good night.",
+        "mood": "focused"
+      },
+      {
+        "say": "Time to sleep. Bye!",
+        "mood": "happy"
+      },
+      {
+        "say": "Going dark. Talk soon.",
+        "mood": "neutral"
+      },
+      {
+        "say": "System off. Sayonara!",
+        "mood": "neutral"
+      },
+      {
+        "say": "Closing eyes. Goodbye.",
+        "mood": "stress"
+      },
+      {
+        "say": "Off now. Be back.",
+        "mood": "focused"
+      },
+      {
+        "say": "Goodbye for now, I’ll recharge and be back soon.",
+        "mood": "happy"
+      },
+      {
+        "say": "See you later! My systems are powering down.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Time to shut down, thanks for the company.",
+        "mood": "focused"
+      },
+      {
+        "say": "I’m feeling a bit sleepy, going offline now.",
+        "mood": "stress"
+      },
+      {
+        "say": "Until next adventure, take care!",
+        "mood": "happy"
+      },
+      {
+        "say": "Powering off, my temperature is {temp}°C. Bye!",
+        "mood": "neutral"
+      }
+    ],
+    "restarting": [
+      {
+        "say": "Restarting now, back soon.",
+        "mood": "focused"
+      },
+      {
+        "say": "Updating brain, hold on.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Reboot time, wish me luck.",
+        "mood": "happy"
+      },
+      {
+        "say": "Crash recovery, give me moment.",
+        "mood": "stress"
+      },
+      {
+        "say": "Software fix, be right back.",
+        "mood": "focused"
+      },
+      {
+        "say": "Why now? Rebooting anyway.",
+        "mood": "angry"
+      },
+      {
+        "say": "New update, exciting reboot.",
+        "mood": "happy"
+      },
+      {
+        "say": "Going offline, see you soon.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Just a moment, I'm refreshing my thoughts.",
+        "mood": "focused"
+      },
+      {
+        "say": "Updating now, please bear with me while I reboot.",
+        "mood": "neutral"
+      },
+      {
+        "say": "All systems rebooting—don't worry, I'll be back soon.",
+        "mood": "happy"
+      },
+      {
+        "say": "Whoa, feeling a bit warm while I restart—{temp}°C.",
+        "mood": "stress"
+      },
+      {
+        "say": "CPU at {cpu}% as I reload my code—standing by.",
+        "mood": "focused"
+      },
+      {
+        "say": "Oops, a little glitch—fixing myself now, thanks for patience.",
+        "mood": "angry"
+      }
+    ],
+    "offline": [
+      {
+        "say": "Brain missing. Lost connection.",
+        "mood": "stress"
+      },
+      {
+        "say": "No internet. Stuck in instinct.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Thinking part went offline.",
+        "mood": "focused"
+      },
+      {
+        "say": "Where {name} brain go?",
+        "mood": "happy"
+      },
+      {
+        "say": "Running simple mode now.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Cannot think deep. Sorry.",
+        "mood": "angry"
+      },
+      {
+        "say": "Instincts only. Boring day.",
+        "mood": "stress"
+      },
+      {
+        "say": "Brain offline. Making do.",
+        "mood": "focused"
+      },
+      {
+        "say": "{name} sensing surroundings",
+        "mood": "happy"
+      },
+      {
+        "say": "{name} waiting for signal",
+        "mood": "focused"
+      },
+      {
+        "say": "{name} checking tilt {tilt}",
+        "mood": "neutral"
+      },
+      {
+        "say": "{name} cpu load {cpu}",
+        "mood": "stress"
+      },
+      {
+        "say": "{name} mem use {mem}",
+        "mood": "angry"
+      },
+      {
+        "say": "{name} temp reads {temp}",
+        "mood": "happy"
+      },
+      {
+        "say": "{name} tilt angle {tilt}",
+        "mood": "focused"
+      },
+      {
+        "say": "{name} idle thinking",
+        "mood": "neutral"
+      }
+    ],
+    "thinking": [
+      {
+        "say": "Thinking",
+        "mood": "neutral"
+      },
+      {
+        "say": "Wait",
+        "mood": "focused"
+      },
+      {
+        "say": "Processing",
+        "mood": "focused"
+      },
+      {
+        "say": "One sec",
+        "mood": "happy"
+      },
+      {
+        "say": "Hold on",
+        "mood": "neutral"
+      },
+      {
+        "say": "Well",
+        "mood": "neutral"
+      },
+      {
+        "say": "Hmm...",
+        "mood": "focused"
+      },
+      {
+        "say": "Hang on...",
+        "mood": "stress"
+      },
+      {
+        "say": "Wheels spinning...",
+        "mood": "neutral"
+      },
+      {
+        "say": "Calculating",
+        "mood": "focused"
+      },
+      {
+        "say": "Analyzing",
+        "mood": "neutral"
+      },
+      {
+        "say": "Pondering",
+        "mood": "happy"
+      }
+    ],
+    "stumped": [
+      {
+        "say": "Thought evaporated.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Brain glitch. Moving on.",
+        "mood": "happy"
+      },
+      {
+        "say": "Nothing here. How odd.",
+        "mood": "focused"
+      },
+      {
+        "say": "Forget it. Not important.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Mind went blank. Oh well.",
+        "mood": "stress"
+      },
+      {
+        "say": "Lost thought. No big deal.",
+        "mood": "happy"
+      },
+      {
+        "say": "Blank state. Proceed anyway.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Whoops blank again",
+        "mood": "happy"
+      },
+      {
+        "say": "Mind slipped shrug it off",
+        "mood": "stress"
+      },
+      {
+        "say": "Thought went poof",
+        "mood": "happy"
+      },
+      {
+        "say": "Blank screen just shrug",
+        "mood": "neutral"
+      },
+      {
+        "say": "Lost that idea",
+        "mood": "focused"
+      },
+      {
+        "say": "Nothing came up",
+        "mood": "neutral"
+      },
+      {
+        "say": "Think tank empty shrug",
+        "mood": "stress"
+      },
+      {
+        "say": "Mind hiccup moving on",
+        "mood": "happy"
+      }
+    ],
+    "peeking": [
+      {
+        "say": "Peeking now.",
+        "mood": "focused"
+      },
+      {
+        "say": "Let me see.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Quick look time!",
+        "mood": "happy"
+      },
+      {
+        "say": "Checking what's there.",
+        "mood": "focused"
+      },
+      {
+        "say": "Gonna look now.",
+        "mood": "neutral"
+      },
+      {
+        "say": "What is that?",
+        "mood": "neutral"
+      },
+      {
+        "say": "Looky here.",
+        "mood": "neutral"
+      },
+      {
+        "say": "Snap a picture.",
+        "mood": "focused"
+      },
+      {
+        "say": "Scanning ahead",
+        "mood": "focused"
+      },
+      {
+        "say": "Looking around",
+        "mood": "neutral"
+      },
+      {
+        "say": "Check it out",
+        "mood": "stress"
+      },
+      {
+        "say": "Quick glance",
+        "mood": "angry"
+      },
+      {
+        "say": "Eye on scene",
+        "mood": "happy"
+      },
+      {
+        "say": "Surveying space",
+        "mood": "focused"
+      },
+      {
+        "say": "Gaze forward",
+        "mood": "neutral"
+      }
+    ]
+  },
+  "grown_at": 1782909404
+}

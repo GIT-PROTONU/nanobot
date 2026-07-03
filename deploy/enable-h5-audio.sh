@@ -65,7 +65,7 @@ aplay -l | sed 's/^/   /'
 echo
 echo "Done. Test the speaker:"
 echo "   speaker-test -c2 -twav -l1            # a spoken 'front left/right'"
-echo "   pico2wave -l en-US -w /tmp/t.wav 'Audio is working' && aplay /tmp/t.wav"
+echo "   espeak-ng -w /tmp/t.wav 'Audio is working' && aplay /tmp/t.wav"
 echo
 echo "web_control 'tts_device' can stay \"\" (it now resolves to this codec via the"
 echo "default). To target it explicitly instead, set:  tts_device: \"plughw:CARD=$CARD\""

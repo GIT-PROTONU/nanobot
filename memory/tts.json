@@ -1,0 +1,8 @@
+{
+  "voice": "en-US",
+  "volume": 100,
+  "speed": 100,
+  "pitch": 100,
+  "announce": false,
+  "announce_interval": 30
+}

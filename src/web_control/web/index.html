@@ -324,9 +324,9 @@
             <h2>Text to speech</h2>
             <input id="oledText" type="text" maxlength="300" placeholder="Type something to say…">
             <select id="ttsVoice">
-              <option value="en-US">English (US)</option>
-              <option value="en-GB">English (UK)</option>
-              <option value="de-DE">German</option>
+<option value="en-gb">English (UK)</option>
+              <option value="en-gb-x-gbclan">Lancaster</option>
+              <option value="en-gb-scotland">Scottish</option>
             </select>
             <div class="row">
               <button id="oledSend" class="btn primary grow">▶ Speak</button>
@@ -338,8 +338,8 @@
               <input id="ttsSpeed" type="range" min="50" max="200" step="5" value="100"></div>
             <div class="field"><label>Pitch <span id="ttsPitchV">100</span>%</label>
               <input id="ttsPitch" type="range" min="50" max="200" step="5" value="100"></div>
-            <p class="hint">Speaks aloud (SVOX Pico) and karaokes each word onto the OLED.
-              English / German only; all settings persist across a reboot. <b>Volume</b> trims the
+            <p class="hint">Speaks aloud (espeak-ng) and karaokes each word onto the OLED.
+              English only; all settings persist across a reboot. <b>Volume</b> trims the
               synthesis (100% = cleanest) — for loudness use the speaker's hardware mixer.
               <kbd>Enter</kbd> speaks.</p>
           </div>
@@ -1088,7 +1088,7 @@ function onDiag(msg){
   }
 }
 
-// ---- Speech (TTS) ---- POSTs to web_control, which speaks via pico2wave and
+// ---- Speech (TTS) ---- POSTs to web_control, which speaks via espeak-ng and
 // streams the words to the OLED (/oled_word). Not over rosbridge — keeps the bridge
 // light and lets the server own the audio + word timing in one place. Voice/volume/
 // speed/pitch + the stats-announcer are persisted server-side (survive a reboot),

@@ -18,7 +18,7 @@
 - [SBC CPU profile](sbc-cpu-profile.md) — ~50% CPU is mostly rosbridge while the web UI is open; CBOR=bandwidth-not-CPU; real win = don't bridge heavy topics (/imu/web summary); 2026-06-23 adds the web-CLOSED idle baseline (~83% of 1 core) per-process+per-thread
 - [CPU reduction plan](cpu-reduction-plan.md) — 3-tier idle-CPU plan (IMU device auto-rate / SLAM skip-when-stationary / OLED de-chatter), all keep sensor rates+function; nothing built yet, user to pick scope
 - [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
-- [TTS / speech](tts-speech.md) — robot speaks (en/de) via pico2wave in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh)
+- [TTS / speech](tts-speech.md) — robot speaks (en) via espeak-ng in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh)
 - [Behaviour layer plan](behavior-layer-plan.md) — supervisor/reflexes "feel alive"; Sismic statecharts. STEP 1 BUILT: src/behavior idle presence supervisor (expression-only OLED face, yields to other owners, no-op-safe, own process)
 - [Stack autoheal](stack-autoheal.md) — nano-heal.timer runs `stack.sh heal` every 20s to relaunch crashed nodes (idempotent do_up); gated on nano-stack.service; catches crashes not hangs
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then

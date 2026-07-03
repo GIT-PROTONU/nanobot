@@ -151,7 +151,7 @@ DEFAULT_SENSORS = {"cpu": 25, "mem": 45, "disk": 50, "temp": 48, "esp_temp": 44.
 
 # Persisted TTS settings (same defaults as the robot so the dev harness behaves identically).
 SETTINGS_DEFAULTS = {
-    "voice": "en-US",
+    "voice": "en-gb",
     "volume": 100,
     "speed": 100,
     "pitch": 100,
@@ -292,6 +292,11 @@ class DevState:
             timeout=float(cfg.get("llm_timeout", 20.0)),
             hard_deadline=float(cfg.get("llm_hard_deadline", 45.0)),
             logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
+        # Auto-enable when a key is present (the persisted llm.json may have disabled it).
+        if not llm_settings["enabled"] and os.environ.get("OPENROUTER_API_KEY", "").strip():
+            llm_settings["enabled"] = True
+            self.llm.configure(enabled=True)
+            print("[llm] key detected, auto-enabling", file=sys.stderr)
         # The SAME cognition core the robot runs (web_control.cognition) — one base to
         # maintain. We give it dev adapters: face -> print, camera -> webcam, sensors ->
         # synthetic, scan/actions -> unavailable (no ROS). The decision log + phrase bank +
@@ -478,7 +483,7 @@ class DevState:
 
     def _load_tts_settings(self):
         s = dict(SETTINGS_DEFAULTS)
-        s["voice"] = self.tts.voice or "en-US"
+        s["voice"] = self.tts.voice or "en-gb"
         saved = read_json(self._tts_settings_file())
         if isinstance(saved, dict):
             s.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULTS})
@@ -543,16 +548,15 @@ class DevState:
             self.tts.say(text)
 
     def _compose_stats(self, cpu, mem, temp):
-        de = self._settings["voice"].startswith("de")
         parts = []
         if cpu == cpu:
-            parts.append(f"Prozessor {cpu:.0f} Prozent" if de else f"C P U {cpu:.0f} percent")
+            parts.append(f"C P U {cpu:.0f} percent")
         if mem == mem:
-            parts.append(f"Arbeitsspeicher {mem:.0f} Prozent" if de else f"RAM {mem:.0f} percent")
+            parts.append(f"RAM {mem:.0f} percent")
         if temp == temp:
-            parts.append(f"Temperatur {temp:.0f} Grad" if de else f"Temperature {temp:.0f} degrees")
+            parts.append(f"Temperature {temp:.0f} degrees")
         if not parts:
-            return "Keine Daten" if de else "No data"
+            return "No data"
         return ". ".join(parts)
 
     def _cpu_sample(self):
@@ -1083,7 +1087,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser(description="Dev-only web UI harness (AI card + TTS, no ROS).")
     ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--voice", default="en-US", help="en-US | en-GB | de-DE")
+    ap.add_argument("--voice", default="en-gb", help="voice: en-gb | en-gb-x-gbclan | en-gb-scotland")
     ap.add_argument("--behavior", action="store_true",
                     help="also run the presence statechart so beats drive the LLM")
     ap.add_argument("--idle-secs", type=float, default=15.0,

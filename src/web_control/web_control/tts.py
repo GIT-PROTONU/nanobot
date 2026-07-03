@@ -1,43 +1,36 @@
-"""Text-to-speech for the web UI, English + German only (SVOX Pico / picotts).
+"""Text-to-speech for the web UI — espeak-ng on Linux, with SAPI/macOS fallbacks.
 
 The robot speaks a line typed in the web page and, in lock-step, streams the
 individual words to the OLED so they appear/disappear as they're said (the line
 is far too long for a 128x64 panel, so we karaoke it one word at a time).
 
 Design — deliberately near-zero idle cost on the 1 GB / quad-A53 board:
-  * Synthesis is `pico2wave` (a tiny C binary from https://github.com/ihuguet/picotts)
-    writing a WAV to **/dev/shm** (tmpfs → no SD-card wear, freed right after).
+  * Synthesis is `espeak-ng` (a tiny C binary) writing a WAV to **/dev/shm**
+    (tmpfs → no SD-card wear, freed right after).
   * Playback is `aplay` (alsa-utils, already used for the mic). Both processes are
     spawned ONLY while actually speaking, so when nobody triggers TTS it costs
     nothing — no thread, no process, no RAM beyond this object.
-  * SVOX Pico's CLI emits no word-boundary marks, so we sync the OLED by spreading
+  * espeak-ng's CLI emits no word-boundary marks, so we sync the OLED by spreading
     the clip's true duration (read from the WAV header) across the words weighted
     by length. It's an estimate, but it tracks short phrases well and is free.
 
-**Backends.** The robot uses `pico2wave`+`aplay` (the only fully-featured path:
-voice markup, German lingware, ALSA device targeting). But so the same TTS can be
-exercised on a dev PC with no ROS/robot attached, the engine falls back to the OS's
-built-in synthesiser when pico isn't installed: **Windows SAPI** (via PowerShell's
-`System.Speech`) or **macOS `say`**. Every backend produces a WAV at `WAV_PATH` and
-reports its duration, so the karaoke/word-timing logic below is backend-agnostic.
-Voice/volume/speed markup is best-effort on the fallback backends (pitch and the
-en-GB/de voice nuances are pico-only).
+**Backends.** The robot uses `espeak-ng`+`aplay`. On a dev PC with no robot ROS
+stack, the engine falls back to the OS's built-in synthesiser: **Windows SAPI**
+(via PowerShell's `System.Speech`) or **macOS `say`**. Every backend produces
+a WAV at `WAV_PATH` and reports its duration, so the karaoke/word-timing logic
+below is backend-agnostic.
 
 `say()` is fire-and-forget and self-cancelling: a new request stops the current
 utterance (audio + OLED) and starts the new one. `on_word(word)` is called as each
 word begins, and `on_word("")` once at the end to hand the panel back to the
 dashboard.
 
-Volume / speed / pitch are applied as SVOX Pico's inline markup (`<volume>`,
-`<speed>`, `<pitch>` level tags — the same ones Android's Pico engine used), so
-there's no extra processing or ALSA-mixer dependency. `configure()` sets them and
-the current voice; the web layer persists those across reboots (see web_server).
+Volume, speed, and pitch are supported natively by all backends.
+The web layer persists settings across reboots.
 """
 import contextlib
-import math
 import os
 import platform
-import re
 import shutil
 import subprocess
 import tempfile
@@ -45,9 +38,9 @@ import threading
 import time
 import wave
 
-# English + German voices only (the UI exposes exactly these; anything else falls
-# back to the default). Matching pico lingware is installed by deploy/install-picotts.sh.
-VOICES = ("en-US", "en-GB", "de-DE")
+# English voices: UK default, Lancaster, Scottish (the install script prunes to
+# these three to keep the rootfs lean).
+VOICES = ("en-gb", "en-gb-x-gbclan", "en-gb-scotland")
 
 # tmpfs scratch on the robot (no SD-card wear); the OS temp dir on a dev PC that has
 # no /dev/shm (Windows/macOS). Overwritten per utterance either way.
@@ -56,7 +49,7 @@ WAV_PATH = os.path.join(_SCRATCH, "nano_tts.wav")
 _TXT_PATH = os.path.join(_SCRATCH, "nano_tts.txt")   # for the macOS `say -f` backend
 MAX_CHARS = 300                      # hard cap on a single utterance (also bounds synth time)
 
-# Hard clamps for the Pico markup levels (percent; 100 = normal). The UI exposes
+# Hard clamps for the markup levels (percent; 100 = normal). The UI exposes
 # friendlier sub-ranges, but anything out of these is clamped here regardless.
 VOLUME_RANGE = (0, 500)
 SPEED_RANGE = (20, 500)
@@ -71,10 +64,8 @@ def clamp(v, lo, hi):
 
 
 def _clean(text):
-    """Make user text safe to both speak and (optionally) wrap in Pico markup, and
-    keep the spoken words identical to what the OLED shows. Drops the three markup-
-    significant chars (< > &) and common markdown/non-speech symbols (* _ ` ~ # |
-    $ \\ [ ] { }) — not meaningful to speak anyway — and collapses whitespace so
+    """Make user text safe to speak — drops markdown/non-speech symbols
+    (* _ ` ~ # | $ \\ [ ] { }) and collapses whitespace so
     the karaoke word split is clean."""
     t = (text or "")
     for ch in ("<", ">", "&", "*", "_", "`", "~", "#", "|", "$", "\\", "[", "]", "{", "}"):
@@ -85,21 +76,19 @@ def _clean(text):
 class TtsEngine:
     """One-at-a-time speaker. Thread-safe: callers just call say()/stop()."""
 
-    def __init__(self, pico_bin="pico2wave", device=None, default_voice="en-US",
+    def __init__(self, device=None, default_voice="en-gb",
                  enabled=True, on_word=None, logger=None):
-        # Resolve to absolute paths up front: the stack is launched detached via
-        # setsid/pixi where PATH can be trimmed, so a bare "pico2wave" might not exec
-        # even though it's installed in /usr/local/bin. "" here means "not found".
-        self._pico = _resolve_bin(pico_bin or "pico2wave")
         self._aplay = _resolve_bin("aplay")
+        self._paplay = _resolve_bin("paplay")
+        self._ffplay = _resolve_bin("ffplay")
         self._espeak = _resolve_bin("espeak-ng")
         self._device = device or None                 # aplay -D target; None = ALSA default
         self._enabled = bool(enabled)
         self._on_word = on_word or (lambda _w: None)
         self._log = logger or (lambda *_: None)
 
-        # Pick the synthesis/playback backend once. The robot has pico+aplay (the
-        # full-featured path); a dev PC falls back to the OS speech engine so TTS is
+        # Pick the synthesis/playback backend once. The robot has espeak+aplay (the
+        # preferred path); a dev PC falls back to the OS speech engine so TTS is
         # still testable off-robot. "" = no usable backend (available() -> False).
         self._ps = shutil.which("powershell") or shutil.which("pwsh") or ""  # Windows SAPI
         self._say = shutil.which("say") or ""                                # macOS
@@ -109,7 +98,7 @@ class TtsEngine:
 
         # Live voice + markup levels (percent). Set via configure(); the web layer
         # restores the persisted values on startup.
-        self._voice = default_voice if default_voice in VOICES else "en-US"
+        self._voice = default_voice if default_voice in VOICES else "en-gb"
         self._volume = 100
         self._speed = 100
         self._pitch = 100
@@ -121,12 +110,9 @@ class TtsEngine:
         self._available = None                        # memoized capability check (see available)
 
     def _pick_backend(self):
-        """Choose the backend by what's installed (pico preferred — it's the only one
-        with the German lingware + level markup + ALSA device targeting). Falls back to
-        espeak-ng on Linux when pico is absent."""
-        if self._pico and self._aplay:
-            return "pico"
-        if platform.system() == "Linux" and self._espeak and self._aplay:
+        """Choose the backend by what's installed (espeak-ng preferred on Linux, then
+        Windows SAPI, then macOS say)."""
+        if platform.system() == "Linux" and self._espeak and (self._aplay or self._paplay or self._ffplay):
             return "espeak"
         if platform.system() == "Windows" and self._ps:
             return "sapi"
@@ -157,12 +143,6 @@ class TtsEngine:
     def voice(self):
         return self._voice
 
-    def _ssml(self, text):
-        """Pico2wave does not support SSML (confirmed — it speaks SSML tags as
-        literal text), so this is a no-op. The volume/speed/pitch settings are
-        stored and respected by non-pico backends that handle them natively."""
-        return text
-
     # ---- public API ----------------------------------------------------------
     def say(self, text, voice=None):
         if not self._enabled:
@@ -172,9 +152,8 @@ class TtsEngine:
         if not text:
             return
         voice = voice if voice in VOICES else self._voice
-        # Pico level markup is pico-only; the OS fallback backends speak plain text
-        # (they apply volume/speed natively in _synth_* from the snapshot below).
-        synth = self._ssml(text) if self._backend == "pico" else text
+        # Backends apply volume/speed/pitch from the snapshot levels inside their
+        # _synth_* method — the raw text goes through unchanged here.
         with self._lock:
             # Stop any in-flight utterance and WAIT for its worker to fully unwind
             # (incl. its trailing on_word("")) before starting the new one, so the
@@ -187,7 +166,7 @@ class TtsEngine:
             # Snapshot the current markup levels for backends that apply them in synth.
             levels = (self._volume, self._speed, self._pitch)
             self._thread = threading.Thread(
-                target=self._run, args=(voice, text, synth, levels, self._stop),
+                target=self._run, args=(voice, text, text, levels, self._stop),
                 daemon=True)
             self._thread.start()
 
@@ -219,8 +198,6 @@ class TtsEngine:
     def _synth(self, voice, text, levels):
         """Run the active backend to write WAV_PATH. Returns the clip duration (s)."""
         try:
-            if self._backend == "pico":
-                return self._synth_pico(voice, text)
             if self._backend == "espeak":
                 return self._synth_espeak(voice, text, levels)
             if self._backend == "sapi":
@@ -230,82 +207,6 @@ class TtsEngine:
         except Exception as exc:
             self._log(f"tts: synth failed ({exc})")
         return 0.0
-
-    def _chunk_text(self, text, max_chars=20):
-        """Split text at word boundaries so each chunk is <= max_chars characters.
-        pico2wave has a bug where text longer than ~24 characters produces garbled
-        audio, so we keep each chunk safely under that threshold."""
-        words = text.split()
-        chunks = []
-        cur = []
-        cur_len = 0
-        for w in words:
-            add = len(w) + (1 if cur else 0)
-            if cur_len + add > max_chars and cur:
-                chunks.append(" ".join(cur))
-                cur = [w]
-                cur_len = len(w)
-            else:
-                cur.append(w)
-                cur_len += add
-        if cur:
-            chunks.append(" ".join(cur))
-        return chunks
-
-    def _synth_pico(self, voice, text):
-        """Synthesize text with pico2wave, splitting into ~20-char chunks to work around
-        a bug in the Pico engine where texts longer than ~24 characters produce 6+ seconds
-        of garbled audio. Each chunk is synthesized separately and the WAVs are concatenated
-        into WAV_PATH."""
-        try:
-            os.remove(WAV_PATH)
-        except FileNotFoundError:
-            pass
-        chunks = self._chunk_text(text)
-        if len(chunks) == 1:
-            subprocess.run([self._pico, "-l", voice, "-w", WAV_PATH, chunks[0]],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=20, check=True)
-            return self._wav_duration()
-        temp_dir = tempfile.mkdtemp(prefix="nano_tts_")
-        try:
-            total_frames = 0
-            framerate = None
-            chunk_wavs = []
-            for i, chunk in enumerate(chunks):
-                wav = os.path.join(temp_dir, f"chunk_{i}.wav")
-                subprocess.run([self._pico, "-l", voice, "-w", wav, chunk],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=20, check=True)
-                chunk_wavs.append(wav)
-            out_data = bytearray()
-            for wav in chunk_wavs:
-                with contextlib.closing(wave.open(wav, "rb")) as w:
-                    if framerate is None:
-                        framerate = w.getframerate()
-                    raw = w.readframes(w.getnframes())
-                samples = memoryview(raw).cast("h")
-                lo = next((i for i, s in enumerate(samples) if abs(s) > 20), 0)
-                hi = next((len(samples) - i for i, s in enumerate(reversed(samples)) if abs(s) > 20), 0)
-                if hi > lo:
-                    out_data.extend(raw[lo * 2:hi * 2])
-            with contextlib.closing(wave.open(WAV_PATH, "wb")) as out:
-                out.setnchannels(1)
-                out.setsampwidth(2)
-                out.setframerate(framerate or 16000)
-                out.writeframes(bytes(out_data))
-                total_frames = out.getnframes()
-            return total_frames / float(framerate or 16000)
-        finally:
-            for wav in chunk_wavs:
-                try:
-                    os.remove(wav)
-                except Exception:
-                    pass
-            try:
-                os.rmdir(temp_dir)
-            except Exception:
-                pass
 
     def _synth_sapi(self, voice, text, levels):
         """Windows SAPI via PowerShell System.Speech → WAV. Text + tunables are passed
@@ -351,13 +252,12 @@ class TtsEngine:
         return self._wav_duration()
 
     def _espeak_voice(self, voice):
-        """Map pico-style voice codes to espeak-ng -v values."""
-        return {"en-US": "en-us", "en-GB": "en-gb", "de-DE": "de"}.get(voice, "en-us")
+        """Map UI voice codes to espeak-ng -v values."""
+        return voice if voice in ("en-gb", "en-gb-x-gbclan", "en-gb-scotland") else "en-gb"
 
     def _synth_espeak(self, voice, text, levels):
         """Linux espeak-ng → 16-bit WAV. Speed maps to words/min (~175 default, clamped
-        80..600 via the -s flag — espeak understands 80..450 so we cap there but keep the
-        clamp range wide for consistency with other backends)."""
+        80..450 via the -s flag). Volume uses -a (amplitude 0..200)."""
         _volume, speed, _pitch = levels
         cmd = [self._espeak, "-w", WAV_PATH,
                "-v", self._espeak_voice(voice)]
@@ -376,11 +276,18 @@ class TtsEngine:
         """Start (and return) a killable process playing WAV_PATH on the active
         backend, or None if there's no player. WAV_PATH is a fixed constant, so
         embedding it in the PowerShell command is safe (no user input)."""
-        if self._backend in ("pico", "espeak"):
-            cmd = [self._aplay, "-q"]
-            if self._device:
-                cmd += ["-D", self._device]
-            cmd.append(WAV_PATH)
+        if self._backend in ("espeak",):
+            if self._aplay:
+                if self._device:
+                    cmd = [self._aplay, "-D", self._device, WAV_PATH]
+                else:
+                    cmd = [self._aplay, "-q", WAV_PATH]
+            elif self._paplay:
+                cmd = [self._paplay, WAV_PATH]
+            elif self._ffplay:
+                cmd = [self._ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", WAV_PATH]
+            else:
+                return None
         elif self._backend == "sapi":
             cmd = [self._ps, "-NoProfile", "-NonInteractive", "-Command",
                    f"(New-Object System.Media.SoundPlayer '{WAV_PATH}').PlaySync()"]
@@ -450,13 +357,11 @@ def _wait_until(stop, deadline):
 
 def _resolve_bin(binary):
     """Absolute path to an executable: the given path if it's absolute + runnable,
-    else found on PATH, else in the usual install dirs (preferring /usr/bin over
-    /usr/local/bin so the official distribution packages win over custom builds).
+    else found on PATH, else in the usual install dirs.
     Returns "" if not found anywhere."""
     if os.path.isabs(binary):
         return binary if os.access(binary, os.X_OK) else ""
-    # Check /usr/bin first so official packages (e.g. libttspico-utils) win
-    # over self-built/custom binaries in /usr/local/bin which may be broken.
+    # Check /usr/bin first so official packages win over custom builds.
     for d in ("/usr/bin", "/bin", "/usr/local/bin"):
         cand = os.path.join(d, binary)
         if os.access(cand, os.X_OK):

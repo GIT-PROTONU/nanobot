@@ -42,7 +42,7 @@ from .cognition import CognitionCore
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
 SETTINGS_DEFAULTS = {
-    "voice": "en-US",
+    "voice": "en-gb",            # seeded from tts_default_voice param at load time
     "volume": 100,            # Pico level %, 100 = normal
     "speed": 100,
     "pitch": 100,
@@ -109,9 +109,8 @@ class WebServerNode(Node):
         self.declare_parameter("mic_device", "")       # "" = auto-detect USB mic
         self.declare_parameter("mic_rate", 16000)      # Hz; 16k mono = 32 KB/s
         self.declare_parameter("tts_enabled", True)
-        self.declare_parameter("tts_pico_bin", "pico2wave")  # from PATH (deploy/install-picotts.sh)
         self.declare_parameter("tts_device", "")       # aplay -D target; "" = ALSA default
-        self.declare_parameter("tts_default_voice", "en-US")
+        self.declare_parameter("tts_default_voice", "en-gb")
         # Where the live TTS settings (voice/volume/speed/pitch + stats-announcer) are
         # persisted so they survive an SBC reboot. "" = XDG state dir under $HOME.
         self.declare_parameter("tts_settings_path", "")
@@ -206,7 +205,7 @@ class WebServerNode(Node):
         # blanking with "" at the end so the panel returns to the dashboard.
         self._word_pub = self.create_publisher(String, "oled_word", 10)
         self._tts = TtsEngine(
-            pico_bin=g("tts_pico_bin").value, device=g("tts_device").value or None,
+            device=g("tts_device").value or None,
             default_voice=g("tts_default_voice").value, enabled=g("tts_enabled").value,
             on_word=lambda w: self._word_pub.publish(String(data=w)),
             logger=self.get_logger().info)
@@ -265,6 +264,16 @@ class WebServerNode(Node):
             timeout=float(g("llm_timeout").value), max_tokens=int(g("llm_max_tokens").value),
             hard_deadline=float(g("llm_hard_deadline").value),
             logger=self.get_logger().info)
+        # Auto-enable the LLM when a key is present: the user who provides a key
+        # (via robot.yaml, env var, or memory/openrouter_key) clearly wants it on,
+        # without also having to toggle the web UI switch. The web UI can still
+        # turn it off explicitly (which persists to llm.json and survives a restart).
+        if not ls["enabled"]:
+            raw_key = (g("llm_api_key").value or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+            if raw_key:
+                self.get_logger().info("llm: key detected, auto-enabling")
+                ls["enabled"] = True
+                llm.configure(enabled=True)
         # Gated action-tier publishers — only created when actions are permitted, so
         # web_control doesn't appear as a /cmd_vel talker etc. while the tier is off.
         self._skills_allow_actions = bool(g("skills_allow_actions").value)
@@ -389,7 +398,7 @@ class WebServerNode(Node):
 
     def _load_settings(self):
         s = dict(SETTINGS_DEFAULTS)
-        s["voice"] = self.get_parameter("tts_default_voice").value or "en-US"
+        s["voice"] = self.get_parameter("tts_default_voice").value or "en-gb"
         saved = read_json(self._settings_file())       # no/invalid file -> defaults
         if isinstance(saved, dict):
             s.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULTS})
@@ -448,22 +457,26 @@ class WebServerNode(Node):
             self._tts.say(text)
 
     def _compose_stats(self, cpu, mem, temp):
-        de = self._settings["voice"].startswith("de")
         parts = []
         if cpu == cpu:                                 # not NaN
-            parts.append(f"Prozessor {cpu:.0f} Prozent" if de else f"C P U {cpu:.0f} percent")
+            parts.append(f"C P U {cpu:.0f} percent")
         if mem == mem:
-            parts.append(f"Arbeitsspeicher {mem:.0f} Prozent" if de else f"RAM {mem:.0f} percent")
+            parts.append(f"RAM {mem:.0f} percent")
         if temp == temp:
-            parts.append(f"Temperatur {temp:.0f} Grad" if de else f"Temperature {temp:.0f} degrees")
+            parts.append(f"Temperature {temp:.0f} degrees")
         if not parts:
-            return "Keine Daten" if de else "No data"
+            return "No data"
         return ". ".join(parts)
 
     # ---- LLM (OpenRouter) personality ---------------------------------------
     def _llm_settings_file(self):
         p = self.get_parameter("llm_settings_path").value
-        return p or os.path.expanduser("~/.local/state/nanobot/llm.json")
+        if p:
+            return os.path.expanduser(p)
+        project_path = os.path.expanduser("~/Nano/memory/llm.json")
+        if os.path.exists(project_path):
+            return project_path
+        return os.path.expanduser("~/.local/state/nanobot/llm.json")
 
     def _load_llm_settings(self):
         s = dict(LLM_DEFAULTS)

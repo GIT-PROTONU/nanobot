@@ -33,9 +33,7 @@ __pycache__/
 # back-compat fallback the dev scripts still check.
 scripts/.openrouter_key
 
-# dev web UI (scripts/dev_webui.py) runtime state — the "soul" + logs + goal/reward state
-# + the local OpenRouter key (memory/openrouter_key, one line, never committed).
-# Volatile + drifts, so kept out of git; the folder stays (see memory/.gitkeep). To version
-# a hand-made personality anyway: git add -f memory/personality.json
-/memory/*
-!/memory/.gitkeep
+# dev web UI runtime state — soul, logs, goal/reward state. The memory/ folder is now
+# tracked in git (with an empty openrouter_key placeholder). Hand-crafted personality
+# and other memory files are versioned.
+/memory/openrouter_key

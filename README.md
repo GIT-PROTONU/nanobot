@@ -14,7 +14,7 @@ Hardware:
 | **ESP32-WROOM** coprocessor (motors + encoders + lidar RPM/spin) | UART1 (`/dev/ttyS1`, PG6/PG7 — zenoh-pico link) | firmware | sub `/cmd_vel`; pub `/wheel_ticks`, `/lds_rpm`, `/lds_hz`, `/esp32_*` |
 | Wheel **encoders** (single-channel ×2) + **motors** | ESP32 GPIO (see firmware pinout) | `wheel_odometry` (`/wheel_ticks`→`/odom`) | `/odom`, TF |
 | **SSD1306** OLED | I2C0 (`/dev/i2c-0`, PA11/PA12 @400 kHz) | `oled_display` | sub `/oled_face`, `/oled_word` |
-| **Speaker** (text-to-speech) | USB/analog audio out (`aplay`) | `web_control` (`pico2wave`) | `POST /tts`; pub `/oled_word` |
+| **Speaker** (text-to-speech) | USB/analog audio out (`aplay`) | `web_control` (`espeak-ng`) | `POST /tts`; pub `/oled_word` |
 | **BWT901CL** IMU | USB-serial (`/dev/imu`, CH340) | `imu_driver` | `/imu/data`, `/imu/web` |
 | **Logitech C270** webcam + mic | USB | `web_control` | `/stream.mjpg`, `/audio.pcm` |
 | **PCA9685** PWM | I2C1 (`/dev/i2c-1`, 0x40) | — (retired; ESP32 owns motors) | — |
@@ -103,12 +103,12 @@ pixi run build        # colcon build (msgs + all python pkgs)
 
 ## 3b. (Optional) Text-to-speech
 
-The web UI's **Speak** box reads a line aloud (English/German) and karaokes the
-words onto the OLED. It needs `pico2wave` (SVOX Pico). Install it — English +
-German voices only — once on the board:
+The web UI's **Speak** box reads a line aloud (English) and karaokes the
+words onto the OLED. It needs `espeak-ng`. Install it — en-gb voice only —
+once on the board:
 
 ```bash
-sudo bash deploy/install-picotts.sh
+sudo bash deploy/install-espeakng.sh
 ```
 
 **Audio out — the SBC's internal H5 analog codec:** enable + un-mute it (it boots

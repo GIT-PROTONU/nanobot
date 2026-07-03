@@ -1,0 +1,77 @@
+statechart:
+  name: Nano presence
+  description: Idle "feel alive" OLED-face supervisor (expression only).
+  root state:
+    name: presence
+    initial: greeting
+    transitions:
+      - event: evolve
+        action: apply_evolve(event.traits, event.registry, getattr(event, 'drives', {}))
+      - event: brain_lost
+        action: revert()
+      # Reflection mode: from anywhere, drop into a calm "reflecting" state that pauses the
+      # idle beats (the node consolidates the brain + forges skills in the background) until `wake`.
+      - event: reflect
+        target: reflecting
+    states:
+      - name: greeting
+        on entry: face(greet_face)
+        transitions:
+          - target: idle_life
+            guard: after(greet_secs)
+          - event: standdown
+            target: dormant
+      - name: idle_life
+        initial: resting
+        transitions:
+          - event: standdown
+            target: dormant
+        states:
+          # Cadence: idle_secs, lengthened by calmness (low extraversion) AND low energy, so a
+          # restless/outgoing robot comes alive sooner. On entry we DECIDE (once, with the rng)
+          # whether this cycle perks up into the focus-gated "attending" state; the two outgoing
+          # guards then read that flag so they stay mutually exclusive (Sismic forbids two
+          # simultaneously-enabled eventless transitions from one state).
+          - name: resting
+            on entry: face(''); decide_attend()
+            transitions:
+              - target: attending
+                guard: after(idle_secs * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and attend_next()
+              - target: performing
+                guard: after(idle_secs * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and not attend_next()
+          # Attention: briefly perk up with the alert face before acting (focus-driven). A
+          # short, expressive "I noticed something" pause that precedes the beat.
+          - name: attending
+            on entry: face(attend_face)
+            transitions:
+              - target: performing
+                guard: after(attend_secs)
+          # One beat per cycle: the chooser picks WHICH (priority-weighted, novelty-aware,
+          # trait-gated). do_beat('') (nothing eligible) is a harmless no-op in the node. On entry
+          # we also DECIDE the next step once (burst / feel / rest) so the three guards below are
+          # mutually exclusive: an energetic burst chains another beat, else briefly wear the
+          # baseline mood (if set), else rest.
+          - name: performing
+            on entry: do_beat(pick_beat()); decide_next()
+            transitions:
+              - target: performing
+                guard: after(perform_secs) and next_step() == 'burst'
+              - target: feeling
+                guard: after(perform_secs) and next_step() == 'feel'
+              - target: resting
+                guard: after(perform_secs) and next_step() == 'rest'
+          # Wear the LLM's chosen baseline mood for a moment, then return to the dashboard.
+          - name: feeling
+            on entry: face(drives['mood'])
+            transitions:
+              - target: resting
+                guard: after(feel_secs)
+      - name: dormant
+        transitions:
+          - event: resume
+            target: idle_life
+      - name: reflecting
+        on entry: face(reflect_face)
+        transitions:
+          - event: wake
+            target: idle_life

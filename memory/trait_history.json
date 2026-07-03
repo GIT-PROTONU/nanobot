@@ -1,0 +1,112 @@
+{
+  "snapshots": [
+    {
+      "t": 1782721437.779281,
+      "traits": {
+        "curiosity": 0.5,
+        "extraversion": 0.5,
+        "caution": 0.6,
+        "playfulness": 0.5
+      }
+    },
+    {
+      "t": 1782734991.5009675,
+      "traits": {
+        "curiosity": 0.5,
+        "extraversion": 0.5,
+        "caution": 0.6,
+        "playfulness": 0.5
+      }
+    },
+    {
+      "t": 1782738640.4045706,
+      "traits": {
+        "curiosity": 0.522,
+        "extraversion": 0.5,
+        "caution": 0.604,
+        "playfulness": 0.517
+      }
+    },
+    {
+      "t": 1782753619.5540793,
+      "traits": {
+        "curiosity": 0.573,
+        "extraversion": 0.5,
+        "caution": 0.537,
+        "playfulness": 0.573
+      }
+    },
+    {
+      "t": 1782758471.2869534,
+      "traits": {
+        "curiosity": 0.648,
+        "extraversion": 0.542,
+        "caution": 0.448,
+        "playfulness": 0.648
+      }
+    },
+    {
+      "t": 1782762149.1005108,
+      "traits": {
+        "curiosity": 0.701,
+        "extraversion": 0.601,
+        "caution": 0.408,
+        "playfulness": 0.699
+      }
+    },
+    {
+      "t": 1782766009.776681,
+      "traits": {
+        "curiosity": 0.721,
+        "extraversion": 0.622,
+        "caution": 0.397,
+        "playfulness": 0.708
+      }
+    },
+    {
+      "t": 1782769896.8374405,
+      "traits": {
+        "curiosity": 0.775,
+        "extraversion": 0.651,
+        "caution": 0.357,
+        "playfulness": 0.754
+      }
+    },
+    {
+      "t": 1782806825.80205,
+      "traits": {
+        "curiosity": 0.817,
+        "extraversion": 0.574,
+        "caution": 0.359,
+        "playfulness": 0.714
+      }
+    },
+    {
+      "t": 1782821578.4532254,
+      "traits": {
+        "curiosity": 0.817,
+        "extraversion": 0.574,
+        "caution": 0.359,
+        "playfulness": 0.714
+      }
+    },
+    {
+      "t": 1782859377.4916625,
+      "traits": {
+        "curiosity": 0.869,
+        "extraversion": 0.417,
+        "caution": 0.375,
+        "playfulness": 0.733
+      }
+    },
+    {
+      "t": 1782907018.8231483,
+      "traits": {
+        "curiosity": 0.869,
+        "extraversion": 0.417,
+        "caution": 0.375,
+        "playfulness": 0.733
+      }
+    }
+  ]
+}

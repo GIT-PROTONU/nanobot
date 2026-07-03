@@ -3,14 +3,13 @@
 robot, no rosbridge. Drives the same ``web_control.tts`` / ``web_control.llm`` modules
 the robot uses; both are deliberately ROS-free so they import and run standalone.
 
-TTS picks a backend automatically: the robot's ``pico2wave``+``aplay`` if installed,
+TTS picks a backend automatically: the robot's ``espeak-ng``+``aplay`` if installed,
 else the OS speech engine — **Windows SAPI** (PowerShell ``System.Speech``) or macOS
 ``say`` — so you actually hear the line on your laptop.
 
 Examples (run with any Python 3; no extra packages needed):
 
     python scripts/dev_tts_test.py "Hello, I am Nano."
-    python scripts/dev_tts_test.py --voice de-DE --speed 120 "Guten Tag!"
     # Full pipeline (set your key first, or drop it in memory/openrouter_key):
     export OPENROUTER_API_KEY=sk-or-...
     python scripts/dev_tts_test.py --llm "tell me a short robot joke"
@@ -57,7 +56,7 @@ def main():
     ap.add_argument("--model", default="",
                     help="OpenRouter model id (default nvidia/nemotron-3-ultra-550b-a55b:free)")
     ap.add_argument("--persona", default="", help="extra in-character system prompt")
-    ap.add_argument("--voice", default="en-US", help="en-US | en-GB | de-DE")
+    ap.add_argument("--voice", default="en-gb", help="voice: en-gb | en-gb-x-gbclan | en-gb-scotland")
     ap.add_argument("--volume", type=int, default=100)
     ap.add_argument("--speed", type=int, default=100)
     ap.add_argument("--pitch", type=int, default=100)
@@ -66,7 +65,7 @@ def main():
 
     tts = TtsEngine(default_voice=args.voice, on_word=_print_word, logger=_log)
     if not tts.available():
-        print("! No TTS backend found. Install pico2wave (Linux) — on Windows/macOS the "
+        print("! No TTS backend found. Install espeak-ng (Linux) — on Windows/macOS the "
               "built-in SAPI/`say` engine should be auto-detected.", file=sys.stderr)
         return 2
     tts.configure(voice=args.voice, volume=args.volume, speed=args.speed, pitch=args.pitch)

@@ -274,17 +274,17 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
   (browsers don't stream an HTTP/1.0 body to `fetch`).
 - **Text-to-speech** (`tts.py`): `POST /tts {text,voice?}` synthesises with
-  `pico2wave` (SVOX Pico, **English + German only** — install via
-  `deploy/install-picotts.sh`) to a `/dev/shm` WAV, plays it with `aplay`, and
+  `espeak-ng` (https://github.com/espeak-ng/espeak-ng, install via
+  `deploy/install-espeakng.sh`) to a `/dev/shm` WAV, plays it with `aplay`, and
   publishes the words one at a time on **`/oled_word`** timed to the clip duration
-  (Pico emits no word marks, so timing is length-weighted). `oled_display` shows
+  (espeak emits no word marks, so timing is length-weighted). `oled_display` shows
   each word big+centred as it's spoken ("karaoke"); `""` returns to the dashboard.
   Both binaries run **only while speaking** (zero idle cost). The web "Speak" box
   reuses the old OLED-text field; it no longer publishes `/oled_text` (that brand
   override still works if published manually). Off rosbridge on purpose (HTTP POST).
-  - **Voice/volume/speed/pitch** are tuned in the UI and applied as Pico's inline
-    `<volume>/<speed>/<pitch>` level markup (no ALSA-mixer dep). They + the stats
-    announcer are **persisted** to `~/.local/state/nanobot/tts.json` (override with
+  - **Voice/volume/speed/pitch** are tuned in the UI and applied directly to
+    espeak-ng's `-v`/`-a`/`-s` flags. They + the stats announcer are **persisted**
+    to `~/.local/state/nanobot/tts.json` (override with
     the `tts_settings_path` param) and reloaded on node start, so they survive a
     reboot. `GET/POST /tts/config` read/update them; the page restores its controls
     from `GET /tts/config` on load.
@@ -293,28 +293,13 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
     in the node, so it **keeps running after every browser closes** and resumes after
     a reboot. `POST /tts/announce` says it once now. CPU/RAM/temp come from the same
     cheap `/proc` + thermal reads the OLED uses; phrasing follows the selected voice.
-- **Known pico2wave bug + workaround**: Both the custom-built (ihuguet/picotts fork)
-    and the official (`libttspico-utils` / `libttspico0t64`) versions of pico2wave have
-    a bug where text longer than ~24 characters produces exactly 97792 frames (6.11
-    seconds) of garbled audio output. `_synth_pico` in `tts.py` works around this by
-    splitting text into ~20-character chunks at word boundaries, synthesizing each
-    chunk separately via pico2wave, trimming leading/trailing silence (threshold 20
-    out of 32768), and concatenating the clean audio into a single WAV. Short phrases
-    (≤20 chars) take the fast path — one pico2wave call, no overhead.
-    `_resolve_bin` checks `/usr/bin` before `/usr/local/bin` so the official Debian
-    package wins over a potentially-broken custom build. The `espeak-ng` backend is
-    also available as a Linux fallback (no text-length bug, used when pico2wave is
-    absent). On the dev PC, install the official pico with:
-    `sudo apt-get install libttspico-utils libttspico-data` — this provides a working
-    `/usr/bin/pico2wave`.
   - **Cross-platform TTS for dev testing**: `tts.py` is ROS-free and auto-selects a
-  backend — the robot's `pico2wave`+`aplay` if present, else `espeak-ng` on Linux,
-  Windows SAPI (via PowerShell `System.Speech`) or macOS `say`. So `scripts/dev_tts_test.py` (no ROS)
-    speaks a line on a dev PC: `python scripts/dev_tts_test.py "hi"`, or
-    `--llm "prompt"` to run the full OpenRouter→speech pipeline (needs
-    `OPENROUTER_API_KEY`). Pico level markup + German lingware are pico-only; the
-    fallbacks speak plain text with native rate/volume. `scripts/dev_webui.py` serves
-    the **real `web/index.html`** on a dev PC (ROS-free stand-in for `web_server`) and runs
+  backend — `espeak-ng` on Linux, Windows SAPI (via PowerShell `System.Speech`) or
+  macOS `say`. So `scripts/dev_tts_test.py` (no ROS) speaks a line on a dev PC:
+  `python scripts/dev_tts_test.py "hi"`, or `--llm "prompt"` to run the full
+  OpenRouter→speech pipeline (needs `OPENROUTER_API_KEY`). espeak-ng supports
+  volume, speed, and pitch natively. `scripts/dev_webui.py` serves the
+  **real `web/index.html`** on a dev PC (ROS-free stand-in for `web_server`) and runs
     the **same `CognitionCore`** (so there's one base, not two — see below), wiring `/llm/*`,
     `/skills/*`, `/tts*` + the brain card, so the AI/Skills/Brain cards + Speak box can be
     tested in a browser locally (telemetry/joystick/map show offline — no rosbridge). Reads
@@ -371,9 +356,15 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   was retired (one brain). Best-effort: **no key / no network = silent no-op**, never on
   the critical path. All config is in `robot.yaml` (`llm_*`, and the `behavior:` beat
   knobs); the **key is read from `llm_api_key` or, when blank, `$OPENROUTER_API_KEY`** —
-  keep real keys out of the committed yaml. UI toggles (enable/model/persona) persist to
-  `~/.local/state/nanobot/llm.json` (never the key). Calls run off the ROS executor thread
-  and are one-at-a-time guarded.
+  keep real keys out of the committed yaml. To set it up: copy
+  `memory/openrouter_key.example` to `memory/openrouter_key`, replace with your real
+  OpenRouter key (one line, no quotes), and the key is picked up by **every entry point**
+  (`scripts/dev_webui.py`, `scripts/sim_run.sh`, `scripts/stack.sh`, and all `pixi run`
+  tasks) — see `scripts/stack.sh` / `pixi.toml` for the inline bash resolution. The LLM
+  **auto-enables** when a key is detected (`web_server.py` + `dev_webui.py` override
+  `llm_enabled: false` to `true`), so no web UI toggle needed on first run. UI toggles
+  (enable/model/persona) persist to `~/.local/state/nanobot/llm.json` (never the key).
+  Calls run off the ROS executor thread and are one-at-a-time guarded.
   - **Decision log** (`GET /llm/log`, web "🧠 Decision log" panel): every generation path
     (`say`/`chat`/`observe`/`look`/`beat:*`) records a `CognitionLog` entry (trigger,
     state, camera, model, status, say/mood, latency) — incl. skip reasons
