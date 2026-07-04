@@ -166,6 +166,12 @@ class NavNode(Node):
         self._prev_odom = None
         self._prev_imu = None
         self._last_write = 0.0
+        # _write_map export cache: recomputing occupancy_int8 (a full-grid np.exp) +
+        # coverage at the write rate cost ~40% of a core even while SLAM was paused.
+        # grid.rev only moves when the grid content does, so cache the derived bytes.
+        self._occ_rev = -1
+        self._occ_bytes = b""
+        self._cov_cache = (0.0, 0.0, 0.0)
 
         # navigation state (all callbacks + the control timer run on the one spin
         # thread, so plain attributes are safe — no locks needed).
@@ -807,8 +813,11 @@ class NavNode(Node):
         self.path_pub.publish(path)
 
     def _write_map(self):
-        occ = self.grid.occupancy_int8()
-        seen_frac, free_m2, _occ_m2 = self.grid.coverage()
+        if self._occ_rev != self.grid.rev:
+            self._occ_bytes = self.grid.occupancy_int8().tobytes()
+            self._cov_cache = self.grid.coverage()
+            self._occ_rev = self.grid.rev
+        seen_frac, free_m2, _occ_m2 = self._cov_cache
         mode = ("explore" if self._goal_is_frontier else
                 "goal" if self._goal is not None else "idle")
         loc = ("picked up" if self._picked_up else
@@ -831,7 +840,7 @@ class NavNode(Node):
         try:
             with open(tmp, "wb") as f:
                 f.write(header)
-                f.write(occ.tobytes())
+                f.write(self._occ_bytes)
             os.replace(tmp, MAP_FILE)        # atomic: the server never reads a torn file
         except OSError as exc:
             self.get_logger().warning(f"map write failed: {exc}", throttle_duration_sec=10.0)

@@ -11,6 +11,7 @@ seeds its pose straight from /odom each cycle (see nav_node.py._on_odom), so the
 world origin already coincides with odom's origin.
 """
 import array
+import hashlib
 import json
 import os
 
@@ -34,6 +35,7 @@ class MapBridgeNode(Node):
         self.map_file = g("map_file").value
         self.frame_id = g("frame_id").value
         self._mtime = None
+        self._digest = None          # hash of the last-published grid body
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                           history=HistoryPolicy.KEEP_LAST)
         self.pub = self.create_publisher(OccupancyGrid, "map", qos)
@@ -42,12 +44,19 @@ class MapBridgeNode(Node):
         self.get_logger().info(f"map_bridge up: {self.map_file} -> /map ({self.frame_id})")
 
     def _tick(self):
+        # Nobody listening -> do nothing at all. Building + publishing this grid costs
+        # hundreds of ms of Python on the H5, and on the robot /map usually has NO
+        # subscriber (the web UI polls the blob over HTTP; RViz is only occasionally
+        # attached). A late joiner is served the rmw TRANSIENT_LOCAL cache, and any
+        # update it missed goes out on the first tick after it subscribes.
+        if self.pub.get_subscription_count() == 0:
+            return
         try:
             st = os.stat(self.map_file)
         except OSError:
             return
         if self._mtime == st.st_mtime:
-            return          # unchanged since the last publish
+            return          # file untouched since the last look
         try:
             with open(self.map_file, "rb") as f:
                 header = f.readline()
@@ -62,6 +71,13 @@ class MapBridgeNode(Node):
         if len(body) < w * h:
             return           # torn read (shouldn't happen -- the writer is atomic)
         self._mtime = st.st_mtime
+        # slam_nav rewrites the blob every write_period even when the GRID is unchanged
+        # (the header carries live pose/status telemetry), so mtime alone would republish
+        # an identical 230k-cell grid forever. Dedupe on the grid bytes themselves.
+        digest = hashlib.md5(body[:w * h]).digest()
+        if digest == self._digest:
+            return
+        self._digest = digest
 
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()

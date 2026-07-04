@@ -31,6 +31,10 @@ class GridMap:
         self.origin = -0.5 * self.n * self.res
         self.log = np.zeros((self.n, self.n), dtype=np.float32)   # [row=y, col=x]
         self.seen = np.zeros((self.n, self.n), dtype=bool)
+        # Bumped on every content mutation (integrate/load) so callers can cache
+        # derived exports (occupancy_int8/coverage) instead of recomputing a full-grid
+        # np.exp at the map-write rate while nothing is changing.
+        self.rev = 0
 
     # --- world <-> grid ------------------------------------------------------
     def w2g(self, x, y):
@@ -122,6 +126,7 @@ class GridMap:
             self.seen[fr[mf], fc[mf]] = True
 
         np.clip(self.log, -L_CLAMP, L_CLAMP, out=self.log)
+        self.rev += 1
 
     # --- export --------------------------------------------------------------
     def occupancy_int8(self):
@@ -167,6 +172,7 @@ class GridMap:
             self.seen = np.ascontiguousarray(z["seen"], dtype=bool)
         except (KeyError, ValueError):
             return False
+        self.rev += 1
         return True
 
     # --- global planner (Stage 2) -------------------------------------------

@@ -231,8 +231,12 @@ class MoodNode(Node):
         try:
             g = self.get_parameter
             self._t0 = time.monotonic()
-            self._clock = SimulatedClock()
-            self._clock.time = 0.0
+            # NOT self._clock: rclpy's Node keeps its ROS clock in a private `_clock`
+            # attribute, and overwriting it makes every later create_timer() crash
+            # ("'SimulatedClock' object has no attribute 'handle'") — which silently
+            # killed this node on boot once before.
+            self._chart_clock = SimulatedClock()
+            self._chart_clock.time = 0.0
             # build_interpreter runs the initial step, so the chart enters `greeting`
             # and shows the boot face. Best-effort: if the OLED node isn't up yet the
             # publish is simply lost.
@@ -244,7 +248,7 @@ class MoodNode(Node):
                 camera_beats=self._camera_beats_ok,
                 traits=self._personality.traits, registry=self._personality.registry,
                 drives=self._personality.drives,
-                alpha=float(g("smoothing_alpha").value), clock=self._clock,
+                alpha=float(g("smoothing_alpha").value), clock=self._chart_clock,
                 reflect_face=self._reflect_face, greet_face=self._greet_face,
                 attend_face=str(g("attend_face").value or "looking"),
                 attend_secs=float(g("attend_secs").value),
@@ -442,7 +446,7 @@ class MoodNode(Node):
     # --- the periodic statechart step ----------------------------------------
     def _tick(self):
         now = time.monotonic()
-        self._clock.time = now - self._t0
+        self._chart_clock.time = now - self._t0
 
         picked = self._susp_l and self._susp_r
         manual = self._external_active
