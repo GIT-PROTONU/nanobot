@@ -23,3 +23,4 @@
 - [Stack autoheal](stack-autoheal.md) — nano-heal.timer runs `stack.sh heal` every 20s to relaunch crashed nodes (idempotent do_up); gated on nano-stack.service; catches crashes not hangs
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then
 - [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; not yet flashed/deployed
+- [Motors dead after GPIO reassign](motors-dead-after-gpio-reassign.md) — open 2026-07-04: cmd_vel dead post-e60e99e; LDS/link OK; suspect removed MOTOR_STBY(23) or motor IN wiring; --once pubs to ESP32 can drop
