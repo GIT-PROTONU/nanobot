@@ -29,3 +29,9 @@ A "liveness + data-flow check" (e.g. is `/scan` actually flowing) was the option
 the `heal` subcommand is the hook to add it later. Especially relevant because sensor_hub
 runs imu+sys+odom+lds in one executor — one crash takes all four down, now auto-revived
 within ~20s.
+
+**2026-07-04: NOT actually installed on the live board** — `systemctl status nano-heal.timer`
+returns "Unit could not be found" (a killed map_bridge stayed dead >10 min; behavior/mood_node
+was also found dead). Either `deploy/sbc-setup.sh` wasn't re-run after a reflash or the units
+were never pushed. Re-run `deploy/sbc-setup.sh` on the board to get autoheal back; until then a
+crashed node stays down until a manual `stack.sh up`.

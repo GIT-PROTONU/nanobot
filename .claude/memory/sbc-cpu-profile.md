@@ -89,3 +89,24 @@ Profiler scripts (per-process + per-thread /proc utime+stime samplers, and the l
 micro-benchmarks) were one-off in /tmp on the board; re-derive from this note if needed.
 The actionable reduction plan from this session is in [[cpu-reduction-plan]] (user will
 decide scope later — nothing implemented yet).
+
+**Update (2026-07-04) — "80% CPU" investigated; new dominant waster = map_bridge.**
+Load avg 5.9 on 4 cores, web UI open. Sustained per-process (of 400%): rosbridge ~85-93,
+**map_bridge_node ~75-100 (NEW regression)**, sensor_hub ~70, nav ~42, oled ~35, web ~27,
+zenohd ~8. Findings:
+- **map_bridge burns ~a full core doing nothing useful**: slam_nav rewrites
+  `/dev/shm/nano_map.bin` every ~0.5 s (`map_write_rate` 2.0) even when SLAM is paused
+  ("picked up"), and the bytes are **md5-identical** between writes — but map_bridge's
+  only change-check is **mtime**, so it republishes the full 480×480 = 230k-cell
+  OccupancyGrid at 2 Hz forever, **with zero /map subscribers** (no RViz attached; the web
+  UI polls the blob over HTTP). Measured on-board: `tolist()` 12 ms + int8-range validate
+  137 ms per publish, plus CDR+zenoh. Fixes (not yet applied): hash the body instead of
+  mtime, and/or skip when `pub.get_subscription_count()==0`, and/or have slam_nav skip
+  rewriting an unchanged map.
+- rosbridge ~0.9 core = the known UI-open cost, now with ~25 subscribed topics totalling
+  ~110 msg/s (probe-measured: /wheel_ticks 30 Hz, /imu/euler 21, /odom 15, /imu/web 13,
+  lds×3 @5, rest ≤1 Hz — all as designed, no flooding/bounce). py-spy confirms time goes
+  to per-msg extract_values + JSON + websocket send.
+- /imu/data still streams 100 Hz with zero consumers (unchanged from 2026-06-23).
+- Profiling tool now on the board: **`/tmp/py-spy`** (aarch64 binary from the v0.4.0 wheel;
+  needs sudo, ptrace_scope=1; `--nonblocking` panics on this platform — use normal mode).
