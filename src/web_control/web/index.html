@@ -201,7 +201,7 @@
   .logbox{margin-top:8px}
   .logbox>summary{cursor:pointer;color:var(--muted);font-size:12px;user-select:none}
   .log{margin-top:6px;max-height:220px;overflow:auto;font-family:var(--mono);
-    font-size:11px;line-height:1.5;color:var(--text)}
+    font-size:11px;line-height:1.5;color:var(--txt)}
   .logrow{padding:3px 0;border-bottom:1px solid var(--border);word-break:break-word}
   .logrow .lt{color:var(--muted)}
   .logrow .ls{color:var(--muted)}
@@ -296,6 +296,7 @@
       <nav id="tabbar">
         <button data-tab="drive" class="active"><span class="ic">🕹</span>Drive</button>
         <button data-tab="speak"><span class="ic">💬</span>Speak</button>
+        <button data-tab="ai"><span class="ic">🧠</span>AI</button>
         <button data-tab="sensors"><span class="ic">📊</span>Sensors</button>
         <button data-tab="system"><span class="ic">⚙️</span>System</button>
         <button data-tab="sim"><span class="ic">🧪</span>Sim</button>
@@ -346,6 +347,43 @@
               synthesis (100% = cleanest) — for loudness use the speaker's hardware mixer.
               <kbd>Enter</kbd> speaks.</p>
           </div>
+          <div class="card">
+            <h2>Announce</h2>
+            <label class="switch"><input type="checkbox" id="announceOn"><span class="track"></span>
+              Speak system stats</label>
+            <div class="field inline">every <input id="announceInterval" type="number" min="5" max="3600"
+              step="5" value="30"> s</div>
+            <button id="announceSay" class="btn">Say stats now</button>
+            <p class="hint">Announces CPU&nbsp;%, RAM&nbsp;% and CPU temp on a timer. Runs in the
+              robot, so it <b>keeps going after you close this page</b> and survives a reboot.</p>
+          </div>
+          <div class="card">
+            <h2>Face &amp; display</h2>
+            <label class="switch"><input type="checkbox" id="dashOn"><span class="track"></span>
+              Show dashboard</label>
+            <label class="switch"><input type="checkbox" id="wordsOn" checked><span class="track"></span>
+              Show spoken text</label>
+            <hr style="border:none;border-top:1px solid var(--border);margin:.6rem 0">
+            <label class="switch"><input type="checkbox" id="faceOn"><span class="track"></span>
+              Manual mood</label>
+            <div class="field"><label>Mood</label>
+              <select id="faceMood">
+                <option value="happy">Happy</option>
+                <option value="angry">Angry</option>
+                <option value="focused">Focused</option>
+                <option value="stress">Stress test (max load)</option>
+              </select></div>
+            <p class="hint">The panel shows the <b>face</b> by default. <b>Show dashboard</b>
+              (<b>/oled_dashboard</b>) pins the status panel instead; <b>Show spoken text</b>
+              (<b>/oled_show_words</b>) shows TTS karaoke words — off keeps the face up while
+              speaking. <b>Manual mood</b> publishes a mood on <b>/oled_face</b> (off = the
+              behaviour layer's resting face). Frames are only sent on change, so idle eyes cost
+              ~no CPU. Watch it live on the hero's <b>OLED</b> view — a pixel-exact mirror.</p>
+          </div>
+        </section>
+
+        <!-- ===== AI ===== -->
+        <section id="panel-ai" class="panel">
           <div class="card">
             <h2>AI · OpenRouter</h2>
             <p class="hint" id="llmStatus">checking…</p>
@@ -441,39 +479,6 @@
               <summary>🧪 Experiments</summary>
               <div id="abLog" class="log">…</div>
             </details>
-          </div>
-          <div class="card">
-            <h2>Announce</h2>
-            <label class="switch"><input type="checkbox" id="announceOn"><span class="track"></span>
-              Speak system stats</label>
-            <div class="field inline">every <input id="announceInterval" type="number" min="5" max="3600"
-              step="5" value="30"> s</div>
-            <button id="announceSay" class="btn">Say stats now</button>
-            <p class="hint">Announces CPU&nbsp;%, RAM&nbsp;% and CPU temp on a timer. Runs in the
-              robot, so it <b>keeps going after you close this page</b> and survives a reboot.</p>
-          </div>
-          <div class="card">
-            <h2>Face &amp; display</h2>
-            <label class="switch"><input type="checkbox" id="dashOn"><span class="track"></span>
-              Show dashboard</label>
-            <label class="switch"><input type="checkbox" id="wordsOn" checked><span class="track"></span>
-              Show spoken text</label>
-            <hr style="border:none;border-top:1px solid var(--line);margin:.6rem 0">
-            <label class="switch"><input type="checkbox" id="faceOn"><span class="track"></span>
-              Manual mood</label>
-            <div class="field"><label>Mood</label>
-              <select id="faceMood">
-                <option value="happy">Happy</option>
-                <option value="angry">Angry</option>
-                <option value="focused">Focused</option>
-                <option value="stress">Stress test (max load)</option>
-              </select></div>
-            <p class="hint">The panel shows the <b>face</b> by default. <b>Show dashboard</b>
-              (<b>/oled_dashboard</b>) pins the status panel instead; <b>Show spoken text</b>
-              (<b>/oled_show_words</b>) shows TTS karaoke words — off keeps the face up while
-              speaking. <b>Manual mood</b> publishes a mood on <b>/oled_face</b> (off = the
-              behaviour layer's resting face). Frames are only sent on change, so idle eyes cost
-              ~no CPU. Watch it live on the hero's <b>OLED</b> view — a pixel-exact mirror.</p>
           </div>
         </section>
 
@@ -709,19 +714,25 @@ let wordTopic=null, textTopic=null, dashTopic=null, wordsTopic=null;
 $("host").value = `${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
+$("host").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();
+  if(connected) disconnect(); connect(); } });
 $("fit").onclick=autoFit;
 $("lin").oninput=()=>$("linv").textContent=$("lin").value;
 $("ang").oninput=()=>$("angv").textContent=$("ang").value;
 
-// retune a node's publish_rate live via its own /<node>/set_parameters service
-// (rcl_interfaces/SetParameters — works without rosapi). type 3 = double.
-function setNodeRate(srv,hz){
+// set one parameter on a node live via its own /<node>/set_parameters service
+// (rcl_interfaces/SetParameters — works without rosapi). JS boolean -> type 1 (bool),
+// JS number -> type 3 (double). All the tuning sliders/toggles funnel through here.
+function setParam(srv,name,value){
   if(!srv) return;
-  srv.callService(new ROSLIB.ServiceRequest({parameters:[{name:"publish_rate",
-    value:{type:3,bool_value:false,integer_value:0,double_value:hz,string_value:"",
+  const isB=typeof value==="boolean";
+  srv.callService(new ROSLIB.ServiceRequest({parameters:[{name,
+    value:{type:isB?1:3,bool_value:isB?value:false,integer_value:0,
+      double_value:isB?0:value,string_value:"",
       byte_array_value:[],bool_array_value:[],integer_array_value:[],
       double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
 }
+const setNodeRate=(srv,hz)=>setParam(srv,"publish_rate",hz);
 $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
 $("imuRate").onchange=()=>setNodeRate(imuParamSrv,Number($("imuRate").value));
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
@@ -735,30 +746,16 @@ function mapSetGoal(wx,wy){
     pose:{position:{x:wx,y:wy,z:0},orientation:{x:0,y:0,z:0,w:1}}}));
   mapGoal=[wx,wy];
 }
-// flip a slam_nav bool param live (rcl_interfaces SetParameters; type 1 = bool).
-function setNavBool(name,on){
-  if(!navMotionSrv) return;
-  navMotionSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name,
-    value:{type:1,bool_value:on,integer_value:0,double_value:0,string_value:"",
-      byte_array_value:[],bool_array_value:[],integer_array_value:[],
-      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
-}
-const setNavMotion=on=>setNavBool("enable_motion",on);
-const setNavExplore=on=>setNavBool("auto_explore",on);
+const setNavMotion=on=>setParam(navMotionSrv,"enable_motion",on);
+const setNavExplore=on=>setParam(navMotionSrv,"auto_explore",on);
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
 function publishLdsTgt(){ if(ldsTgtTopic)
   ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); }
-// Fan override -> sys_monitor fan_override param (rcl_interfaces SetParameters; type 3 =
-// double). v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
-function setFanOverride(v){
-  if(!fanParamSrv) return;
-  fanParamSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name:"fan_override",
-    value:{type:3,bool_value:false,integer_value:0,double_value:v,string_value:"",
-      byte_array_value:[],bool_array_value:[],integer_array_value:[],
-      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
-}
+// Fan override -> sys_monitor fan_override param.
+// v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
+const setFanOverride=v=>setParam(fanParamSrv,"fan_override",v);
 function fanApply(){
   const auto=$("fanAuto").checked;
   $("fanOv").disabled=auto;
@@ -875,13 +872,28 @@ $("btnShutdown").onclick=()=>{
   setConn(false);
 };
 
+// Auto-reconnect: rosbridge drops on a stack reset / reboot, so retry with a gentle
+// backoff until it's back. A manual Disconnect (wantConn=false) stops the retrying.
+let wantConn=true, reconnT=null, reconnDelay=1000;
+function scheduleReconnect(){
+  if(!wantConn || reconnT) return;
+  $("conn").textContent="reconnecting…";
+  reconnT=setTimeout(()=>{ reconnT=null; if(wantConn && !connected) connect(); }, reconnDelay);
+  reconnDelay=Math.min(10000, reconnDelay*1.5);
+}
 function connect(){
+  wantConn=true;
+  if(reconnT){ clearTimeout(reconnT); reconnT=null; }
   ros=new ROSLIB.Ros({url:`ws://${$("host").value}`});
-  ros.on("connection",()=>{connected=true;setConn(true);subscribe();syncLdsTgt();syncFan();});
-  ros.on("close",()=>{connected=false;setConn(false);});
+  ros.on("connection",()=>{connected=true;reconnDelay=1000;setConn(true);subscribe();syncLdsTgt();syncFan();});
+  ros.on("close",()=>{connected=false;setConn(false);scheduleReconnect();});
   ros.on("error",()=>{setConn(false);});
 }
-function disconnect(){ if(ros) ros.close(); connected=false; setConn(false); }
+function disconnect(){
+  wantConn=false;
+  if(reconnT){ clearTimeout(reconnT); reconnT=null; }
+  if(ros) ros.close(); connected=false; setConn(false);
+}
 function setConn(ok){
   $("dot").classList.toggle("ok",ok);
   $("conn").textContent=ok?"connected":"disconnected";
@@ -1517,6 +1529,7 @@ function updateKeys(){
   if(keys["a"]||keys["arrowleft"])w+=1;
   if(keys["d"]||keys["arrowright"])w-=1;
   if(keys[" "]){v=0;w=0;}
+  if(v===curV && w===curW) return;  // key autorepeat: unchanged command, the 10 Hz keepalive covers it
   setCmd(v,w); publishCmd();
 }
 
@@ -2022,9 +2035,12 @@ setInterval(()=>{
   // virtual joystick -> analog setCmd(v,w). Push forward = +v, push left = +w
   // (matches the keyboard mapping). Speed scales with how far it's pushed; the
   // global 10 Hz publisher keeps streaming /cmd_vel while it's held off-centre.
+  // Publishes during a drag are capped at ~15 Hz: pointermove fires at 60-120+ Hz
+  // and forwarding every event floods rosbridge + the 115200-baud ESP32 link, so
+  // delivery gaps blow past the ESP32's 500 ms cmd watchdog and driving stutters.
   (function(){
     const joy=$("joy"), knob=$("joyKnob"); if(!joy) return;
-    let id=null, cx=0, cy=0, R=60;
+    let id=null, cx=0, cy=0, R=60, lastPub=0;
     const begin=e=>{
       id=e.pointerId;
       const jr=joy.getBoundingClientRect(), kr=knob.getBoundingClientRect();
@@ -2036,7 +2052,9 @@ setInterval(()=>{
       let dx=e.clientX-cx, dy=e.clientY-cy; const d=Math.hypot(dx,dy);
       if(d>R){ dx*=R/d; dy*=R/d; }
       knob.style.transform=`translate(${dx}px,${dy}px)`;
-      setCmd(-dy/R, -dx/R); publishCmd();      // up = forward, left = +yaw
+      setCmd(-dy/R, -dx/R);                    // up = forward, left = +yaw
+      const t=performance.now();
+      if(t-lastPub>=66){ lastPub=t; publishCmd(); }
     };
     const end=e=>{
       if(e.pointerId!==id) return; id=null;

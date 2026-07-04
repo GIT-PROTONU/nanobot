@@ -78,5 +78,5 @@ if ($LASTEXITCODE -ne 0) {
 $devui = Join-Path $scriptsDir "dev_webui.py"
 $argv = @($devui, "--behavior") + $args
 Write-Host "Launching:  $py $($argv -join ' ')" -ForegroundColor Cyan
-Write-Host "Open http://localhost:8080  ->  Speak tab (AI card + Brain card). Ctrl+C to stop.`n"
+Write-Host "Open http://localhost:8080  ->  AI tab (AI card + Brain card). Ctrl+C to stop.`n"
 & $py @argv

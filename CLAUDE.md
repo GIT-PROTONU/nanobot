@@ -359,7 +359,7 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   OpenRouter `:free` vision slugs come and go (Llama-3.2-vision is paid-only now) — pick a
   current one via OpenRouter's `/models` API if the default stops working. Endpoints: `POST
   /llm/say` (one-shot), `POST /llm/chat` (rolling history), `GET|POST /llm/config`,
-  `GET /llm/log`. The web "AI" card (Speak tab) drives the on-demand ones. **Autonomous
+  `GET /llm/log`. The web "AI" card (AI tab) drives the on-demand ones. **Autonomous
   chatter is NOT here** — it's driven by the `behavior` statechart's beats via
   `/cognition/request`, which `web_control` executes (`_on_cog`→`_run_beat`: capture frame
   if asked, append the sensor snapshot, `_generate`). The old standalone idle-chatter timer

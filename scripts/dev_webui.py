@@ -14,7 +14,7 @@ LLM: `musing`→sensors (synthetic) and `looking`→your webcam (needs `opencv-p
 you can watch/hear the whole enriched-behaviour loop — and every decision shows in the
 web UI "🧠 Decision log".
 
-The **🧠 Brain card** (Speak tab) is fully wired here too: this harness runs the real
+The **🧠 Brain card** (AI tab) is fully wired here too: this harness runs the real
 ROS-free brain (`behavior.brain`: Purpose Engine + Pursuit driver + A/B bandit),
 serves the readouts the robot publishes over rosbridge (`/purpose`,
 `/task_current`, `/experiments`) over plain HTTP (the page polls them when rosbridge is
@@ -1110,7 +1110,7 @@ def main():
     sensors = "manual (frozen)" if state.get_sensors()["manual"] else "random"
     print(f"\n  Dev web UI:  http://localhost:{args.port}\n"
           f"  Sensors:     http://localhost:{args.port}/dev   (synthetic source: {sensors})\n"
-          f"  Speak tab -> 'AI · OpenRouter' card; open '🧠 Decision log' to watch decisions.\n"
+          f"  AI tab -> 'AI · OpenRouter' card; open '🧠 Decision log' to watch decisions.\n"
           f"  {'Behaviour beats ON. ' if args.behavior else ''}"
           f"(Telemetry/joystick/map show offline — no rosbridge. Ctrl+C to stop.)\n",
           file=sys.stderr)
