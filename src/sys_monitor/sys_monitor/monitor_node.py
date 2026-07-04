@@ -18,7 +18,9 @@ import time
 import rclpy
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int32
+
+from .health_log import HealthWatch, read_scan_blob_header
 
 # Soft thresholds -> status WARN (purely advisory, shown in the UI).
 TEMP_WARN_C = 75.0
@@ -72,6 +74,24 @@ class MonitorNode(Node):
         self._prev = self._cpu_times()      # (idle, total) for delta-based CPU%
         self._ssid = ""                     # cached; refreshed at most every 5 s (subprocess)
         self._ssid_at = -1e9
+
+        # Durable health-event log: timestamped ESP32-link / LDS outage transitions
+        # with a classified cause (see health_log.py), so intermittent failures can
+        # be diagnosed after the fact. Survives reboots/restarts; lines are also
+        # mirrored to the node logger (-> .run/sensors.log).
+        self.declare_parameter("health_log_path",
+                               "~/.local/state/nanobot/health.log")
+        self.watch = HealthWatch(
+            os.path.expanduser(self.get_parameter("health_log_path").value))
+        self._hb_at = None                  # monotonic time of last /esp32_heartbeat
+        self._rpm = (float("nan"), -1e9)    # (value, monotonic time received)
+        self._hz = (float("nan"), -1e9)
+        self.create_subscription(Int32, "/esp32_heartbeat", self._on_hb, 10)
+        self.create_subscription(Float32, "/lds_rpm", self._on_rpm, 10)
+        self.create_subscription(Float32, "/lds_hz", self._on_hz, 10)
+        up = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
+        self.watch.write([f"monitor start (boot uptime {up:.0f}s)"])
+
         self.create_timer(1.0 / rate, self._tick)
         self.get_logger().info(
             f"sys_monitor publishing /diagnostics at {rate} Hz "
@@ -212,6 +232,27 @@ class MonitorNode(Node):
         self.pub.publish(msg)
 
         self._publish_fan(cpu_t)
+        self._health_tick()
+
+    def _on_hb(self, _msg):
+        self._hb_at = time.monotonic()
+
+    def _on_rpm(self, msg):
+        self._rpm = (msg.data, time.monotonic())
+
+    def _on_hz(self, msg):
+        self._hz = (msg.data, time.monotonic())
+
+    def _health_tick(self):
+        now = time.monotonic()
+        hb_age = now - self._hb_at if self._hb_at is not None else float("inf")
+        # rpm/hz publish at 1 Hz from the ESP32; older than 5 s = stale -> nan
+        rpm = self._rpm[0] if now - self._rpm[1] < 5.0 else float("nan")
+        hz = self._hz[0] if now - self._hz[1] < 5.0 else float("nan")
+        lines = self.watch.update(now, hb_age, rpm, hz, read_scan_blob_header())
+        self.watch.write(lines)
+        for ln in lines:
+            self.get_logger().warning(f"[health] {ln}")
 
     def _publish_fan(self, cpu_t):
         """Publish the cooling-fan duty (0..1) on /fan_pwm: web override if set, else a

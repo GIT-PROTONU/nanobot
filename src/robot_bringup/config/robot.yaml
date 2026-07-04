@@ -192,6 +192,10 @@ map_bridge:
 sys_monitor:
   ros__parameters:
     publish_rate: 1.0         # Hz; CPU/mem/temp/disk are slow-moving
+    # Durable health-event log: timestamped ESP32-link/LDS outage transitions with a
+    # classified cause (sys_monitor/health_log.py), for diagnosing intermittent
+    # failures after the fact. Survives reboots/stack restarts.
+    health_log_path: "~/.local/state/nanobot/health.log"
     # Cooling fan: publishes a PWM duty (0..1) on /fan_pwm that the ESP32 actuates
     # (firmware FAN_PIN). Auto curve ramps the fan with the SBC CPU temperature; the
     # web UI Fan slider overrides it (sets fan_override). All retunable live.
