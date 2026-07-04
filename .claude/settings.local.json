@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git clone *)"
+      "Bash(git clone *)",
+      "Bash(ssh nano *)"
     ]
   }
 }

@@ -86,8 +86,8 @@ PY
   # Behaviour layer (Sismic statechart): idle "feel alive" presence supervisor. Drives
   # the OLED face during true idle only; expression-only (never /cmd_vel). No-op if
   # sismic/params disabled, so it's safe to always launch.
-  pgrep -f 'behavior/lib/behavior' >/dev/null \
-    || launch behavior "$own/behavior/lib/behavior/mood_node --ros-args --params-file $PARAMS"
+  pgrep -f 'behavior/bin/mood_node' >/dev/null \
+    || launch behavior "$own/behavior/bin/mood_node --ros-args --params-file $PARAMS"
   # Sensor hub: imu_driver + sys_monitor + wheel_odometry + lds_driver_py in ONE process
   # (one executor) to save ~100+ MB of RAM vs four separate interpreters on the 1 GB board.
   # Same node names/topics/params, so /odom, /diagnostics, /scan, /imu/*, the live-retune
@@ -104,8 +104,8 @@ PY
   # /map. /dev/shm is per-machine RAM, so this MUST run on the board (not the dev PC) for
   # a remote RViz (robot_bringup/launch/visualize.launch.py, over the shared zenoh graph)
   # to see the map. Cheap (one rclpy node, no Gazebo deps) — always safe to run.
-  pgrep -f 'sim_hardware/lib/sim_hardware/map_bridge_node' >/dev/null \
-    || launch map "$own/sim_hardware/lib/sim_hardware/map_bridge_node --ros-args --params-file $PARAMS"
+  pgrep -f 'sim_hardware/bin/map_bridge_node' >/dev/null \
+    || launch map "$own/sim_hardware/bin/map_bridge_node --ros-args --params-file $PARAMS"
 }
 
 # Node path substrings match whether launched directly or via ros2 run/launch.
@@ -115,14 +115,14 @@ PY
 # kept here too so `down`/`restart` also sweeps up stragglers from a pre-merge deploy.
 NODE_PATS=(
   'slam_nav/lib/slam_nav'
-  'sim_hardware/lib/sim_hardware/map_bridge_node'
+  'sim_hardware/bin/map_bridge_node'
   'sensor_hub/lib/sensor_hub'
   'lds_driver_py/lib/lds_driver_py'
   'wheel_odometry/lib/wheel_odometry'
   'sys_monitor/lib/sys_monitor'
   'imu_driver/lib/imu_driver'
   'oled_display/lib/oled_display'
-  'behavior/lib/behavior'
+  'behavior/bin/mood_node'
   'web_control/lib/web_control'
   'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon'
 )
@@ -161,10 +161,10 @@ do_down() {
 status() {
   for s in "zenohd:zenohd-serial" "rosbridge:rosbridge_websocket" \
            "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
-           "behavior:behavior/lib/behavior" \
+           "behavior:behavior/bin/mood_node" \
            "sensors:sensor_hub/lib/sensor_hub" \
            "nav:slam_nav/lib/slam_nav" \
-           "map:sim_hardware/lib/sim_hardware/map_bridge_node"; do
+           "map:sim_hardware/bin/map_bridge_node"; do
     if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi
   done
 }

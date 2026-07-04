@@ -338,6 +338,9 @@
               <input id="ttsSpeed" type="range" min="50" max="200" step="5" value="100"></div>
             <div class="field"><label>Pitch <span id="ttsPitchV">100</span>%</label>
               <input id="ttsPitch" type="range" min="50" max="200" step="5" value="100"></div>
+            <div class="field"><label>Capitals <span id="ttsCapV">0</span></label>
+              <input id="ttsCap" type="range" min="0" max="100" step="1" value="0">
+              <span class="hint-inline">Pitch rise on capital letters (0=off)</span></div>
             <p class="hint">Speaks aloud (espeak-ng) and karaokes each word onto the OLED.
               English only; all settings persist across a reboot. <b>Volume</b> trims the
               synthesis (100% = cleanest) — for loudness use the speaker's hardware mixer.
@@ -522,10 +525,14 @@
             <div class="kv">
               <span>rate</span><b id="ldsHz">–</b>
               <span>points</span><b id="ldsPts">–</b>
+              <span>lost/rev</span><b id="ldsLost">–</b>
+              <span>rx errors</span><b id="ldsErr">–</b>
             </div>
             <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
               <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
-            <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.</p>
+            <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
+              <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
+              bad-checksum packets since start (climbing fast = degraded serial RX wiring).</p>
           </div>
           <div class="card">
             <h2>Cooling fan</h2>
@@ -1116,6 +1123,7 @@ function bindSlider(id,labelId,key){
 bindSlider("ttsVol","ttsVolV","volume");
 bindSlider("ttsSpeed","ttsSpeedV","speed");
 bindSlider("ttsPitch","ttsPitchV","pitch");
+bindSlider("ttsCap","ttsCapV","cap_pitch");
 $("ttsVoice").addEventListener("change",()=>saveTts({voice:$("ttsVoice").value}));
 $("announceOn").addEventListener("change",()=>saveTts({announce:$("announceOn").checked}));
 $("announceInterval").addEventListener("change",
@@ -1128,9 +1136,9 @@ function loadTts(){
     if(!s) return;
     const set=(id,v)=>{ if($(id)) $(id).value=v; };
     set("ttsVoice",s.voice); set("ttsVol",s.volume); set("ttsSpeed",s.speed);
-    set("ttsPitch",s.pitch); set("announceInterval",s.announce_interval);
+    set("ttsPitch",s.pitch); set("ttsCap",s.cap_pitch); set("announceInterval",s.announce_interval);
     $("ttsVolV").textContent=s.volume; $("ttsSpeedV").textContent=s.speed;
-    $("ttsPitchV").textContent=s.pitch; $("announceOn").checked=!!s.announce;
+    $("ttsPitchV").textContent=s.pitch; $("ttsCapV").textContent=s.cap_pitch; $("announceOn").checked=!!s.announce;
   }).catch(()=>{});
 }
 loadTts();
@@ -1404,7 +1412,7 @@ $("wordsOn").addEventListener("change",sendWords);
 // (inf = no hit). The driver rewrites it per scan; we poll a touch faster and skip
 // unchanged seqs, so the canvas + point count + scan-Hz readouts are identical to the
 // old rosbridge path, minus the LaserScan deserialization that dominated rosbridge CPU.
-let lastScanSeq=-1;
+let lastScanSeq=-1, lastScanErr=null;
 const scanDec=new TextDecoder();
 let curHeroView="lidar";     // tracked by the hero view switcher (showView)
 async function pollScan(){
@@ -1416,6 +1424,12 @@ async function pollScan(){
     const h=JSON.parse(scanDec.decode(buf.subarray(0,nl)));
     if(h.seq===lastScanSeq) return;            // no new scan since the last poll
     lastScanSeq=h.seq;
+    // RX-health counters from the real driver's blob header (absent in the sim).
+    if(h.lost!==undefined){ const el=$("ldsLost"); el.textContent=h.lost;
+      el.style.color = h.lost>36 ? "var(--amber)" : ""; }      // >10% of a rev missing
+    if(h.err!==undefined){ const el=$("ldsErr"); el.textContent=h.err;
+      el.style.color = (lastScanErr!==null && h.err>lastScanErr) ? "var(--red)" : "";
+      lastScanErr=h.err; }
     const dv=new DataView(buf.buffer, buf.byteOffset+nl+1);
     const maxr=Number($("maxr").value)||1e9, pts=[];
     for(let i=0;i<h.n;i++){

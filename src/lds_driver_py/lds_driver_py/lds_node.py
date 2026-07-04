@@ -51,6 +51,10 @@ class LdsParser:
         self.buf = bytearray()
         self.building = []          # [(angle, dist_mm, quality)]
         self.rpm = 0.0
+        # Cumulative bad-checksum count at a 0xFA sync byte. UART framing errors
+        # (degraded RX wiring — see the lds-scan-path memory) corrupt packet bytes,
+        # so this climbing fast = electrical trouble, not a protocol change.
+        self.crc_errors = 0
 
     def feed(self, data: bytes):
         scans = []
@@ -68,6 +72,7 @@ class LdsParser:
                     scans.append(done)
                 i += PKT_LEN
             else:
+                self.crc_errors += 1
                 i += 1              # bad checksum -> resync a byte at a time
         del b[:i]
         return scans
@@ -192,7 +197,12 @@ class LdsNode(Node):
         msg.intensities = intensities
         self.pub.publish(msg)
         self._scan_seq += 1
-        write_scan_blob(self._scan_seq, msg.angle_min, msg.angle_increment, ranges)
+        # "lost" = readings missing from this revolution (dropped/corrupt packets);
+        # "err" = cumulative bad-checksum packets since start. Both ride the blob
+        # header so the web UI gets them for free with each scan poll.
+        write_scan_blob(self._scan_seq, msg.angle_min, msg.angle_increment, ranges,
+                        extra={"lost": max(0, RAYS - len(points)),
+                               "err": self.parser.crc_errors})
 
     def destroy_node(self):
         self._stop.set()

@@ -46,6 +46,8 @@ SETTINGS_DEFAULTS = {
     "volume": 100,            # Pico level %, 100 = normal
     "speed": 100,
     "pitch": 100,
+    "base_pitch": 50,         # espeak -p 0-99, default 50 (normal)
+    "cap_pitch": 0,           # espeak -k 0-100, 0=off
     "announce": False,        # speak CPU/RAM/temp every `announce_interval` s
     "announce_interval": 30,  # seconds (clamped to >= ANNOUNCE_MIN)
 }
@@ -412,7 +414,8 @@ class WebServerNode(Node):
         """Push the current voice + markup levels into the TTS engine."""
         s = self._settings
         self._tts.configure(voice=s["voice"], volume=s["volume"],
-                            speed=s["speed"], pitch=s["pitch"])
+                            speed=s["speed"], pitch=s["pitch"],
+                            base_pitch=s["base_pitch"], cap_pitch=s["cap_pitch"])
 
     def get_settings(self):
         return dict(self._settings)
@@ -1015,6 +1018,8 @@ def _sanitize_settings(s):
     out["volume"] = clamp(out["volume"], 0, 500)
     out["speed"] = clamp(out["speed"], 20, 500)
     out["pitch"] = clamp(out["pitch"], 50, 200)
+    out["base_pitch"] = clamp(out["base_pitch"], 0, 99)
+    out["cap_pitch"] = clamp(out["cap_pitch"], 0, 100)
     out["announce"] = bool(out["announce"])
     out["announce_interval"] = clamp(out["announce_interval"], ANNOUNCE_MIN, ANNOUNCE_MAX)
     return out

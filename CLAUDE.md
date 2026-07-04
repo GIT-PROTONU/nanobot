@@ -274,8 +274,8 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
   (browsers don't stream an HTTP/1.0 body to `fetch`).
 - **Text-to-speech** (`tts.py`): `POST /tts {text,voice?}` synthesises with
-  `espeak-ng` (https://github.com/espeak-ng/espeak-ng, install via
-  `deploy/install-espeakng.sh`) to a `/dev/shm` WAV, plays it with `aplay`, and
+  `espeak-ng` (install via `deploy/install-espeakng.sh`; NOT on conda-forge so must be
+  apt-installed on the board separately) to a `/dev/shm` WAV, plays it with `aplay`, and
   publishes the words one at a time on **`/oled_word`** timed to the clip duration
   (espeak emits no word marks, so timing is length-weighted). `oled_display` shows
   each word big+centred as it's spoken ("karaoke"); `""` returns to the dashboard.

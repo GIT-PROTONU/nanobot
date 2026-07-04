@@ -54,6 +54,12 @@ MAX_CHARS = 300                      # hard cap on a single utterance (also boun
 VOLUME_RANGE = (0, 500)
 SPEED_RANGE = (20, 500)
 PITCH_RANGE = (50, 200)
+# Espeak-ng advanced params. Base pitch is espeak's -p (0-99, default 50).
+# The UI slider maps 50-200% onto 0-99 via pitch/2.
+BASE_PITCH_RANGE = (0, 99)
+FLUTTER_RANGE = (0, 100)      # flutter <value> — pitch fluctuation
+ROUGHNESS_RANGE = (0, 7)      # roughness <value> — creaky voice
+CAP_PITCH_RANGE = (0, 100)    # -k <integer> — pitch boost on capitals
 
 
 def clamp(v, lo, hi):
@@ -102,6 +108,10 @@ class TtsEngine:
         self._volume = 100
         self._speed = 100
         self._pitch = 100
+        self._base_pitch = 50       # espeak -p; default 50 = normal
+        self._flutter = 0
+        self._roughness = 0
+        self._cap_pitch = 0
 
         self._lock = threading.Lock()
         self._thread = None
@@ -128,7 +138,8 @@ class TtsEngine:
             self._available = bool(self._enabled and self._backend)
         return self._available
 
-    def configure(self, voice=None, volume=None, speed=None, pitch=None):
+    def configure(self, voice=None, volume=None, speed=None, pitch=None,
+                  base_pitch=None, flutter=None, roughness=None, cap_pitch=None):
         """Update the current voice and markup levels (each optional). Clamped."""
         if voice is not None and voice in VOICES:
             self._voice = voice
@@ -138,6 +149,14 @@ class TtsEngine:
             self._speed = clamp(speed, *SPEED_RANGE)
         if pitch is not None:
             self._pitch = clamp(pitch, *PITCH_RANGE)
+        if base_pitch is not None:
+            self._base_pitch = clamp(base_pitch, *BASE_PITCH_RANGE)
+        if flutter is not None:
+            self._flutter = clamp(flutter, *FLUTTER_RANGE)
+        if roughness is not None:
+            self._roughness = clamp(roughness, *ROUGHNESS_RANGE)
+        if cap_pitch is not None:
+            self._cap_pitch = clamp(cap_pitch, *CAP_PITCH_RANGE)
 
     @property
     def voice(self):
@@ -164,7 +183,8 @@ class TtsEngine:
                 self._thread.join(timeout=1.5)
             self._stop = threading.Event()
             # Snapshot the current markup levels for backends that apply them in synth.
-            levels = (self._volume, self._speed, self._pitch)
+            levels = (self._volume, self._speed, self._pitch,
+                      self._base_pitch, self._flutter, self._roughness, self._cap_pitch)
             self._thread = threading.Thread(
                 target=self._run, args=(voice, text, text, levels, self._stop),
                 daemon=True)
@@ -257,8 +277,9 @@ class TtsEngine:
 
     def _synth_espeak(self, voice, text, levels):
         """Linux espeak-ng → 16-bit WAV. Speed maps to words/min (~175 default, clamped
-        80..450 via the -s flag). Volume uses -a (amplitude 0..200)."""
-        _volume, speed, _pitch = levels
+        80..450 via the -s flag). Volume uses -a (amplitude 0..200). Pitch maps the UI
+        percentage (50-200%) onto espeak's -p (0-99, default 50)."""
+        _volume, speed, pitch, _base_pitch, _flutter, _roughness, cap_pitch = levels
         cmd = [self._espeak, "-w", WAV_PATH,
                "-v", self._espeak_voice(voice)]
         if speed != 100:
@@ -267,6 +288,14 @@ class TtsEngine:
         if _volume != 100:
             amp = clamp(_volume // 2, 0, 100)
             cmd += ["-a", str(int(amp))]
+        # Pitch: map UI percentage (50-200%) → espeak -p (0-99, default 50).
+        # At 100% → -p 50 (normal); 50% → -p 25; 200% → -p 99.
+        p_val = clamp(int(pitch / 2), 0, 99)
+        if p_val != 50:
+            cmd += ["-p", str(p_val)]
+        # Capital-letter emphasis: espeak -k <0-100> (0=off, higher=more rise).
+        if cap_pitch:
+            cmd += ["-k", str(clamp(cap_pitch, 0, 100))]
         cmd.append(text)
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=30, check=True)
