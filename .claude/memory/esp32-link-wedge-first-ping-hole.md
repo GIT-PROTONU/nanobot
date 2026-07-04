@@ -22,9 +22,16 @@ Root cause (firmware watchdog hole in `firmware/nanobot_coprocessor/src/main.cpp
   ping arrives (e.g. race during an SBC power-cycle), NO watchdog can ever fire → the
   ESP32 sits wedged forever, zero bytes on the UART, until a manual power-cycle/reset.
 
-Proposed fix (not yet implemented): a first-ping deadline — `ready && !g_ping_seen`
-for ~90 s → `esp_restart()`, optionally capped by an RTC_NOINIT reboot counter to keep
-the original fail-safe (no boot loop if pings are legitimately absent).
+FIXED + FLASHED 2026-07-04: `LINK_FIRST_PING_DEADLINE_MS` (90 s) — `ready && !g_ping_seen`
+past the deadline → `esp_restart()`, capped at `LINK_FIRST_PING_MAX_REBOOTS` (5)
+consecutive SW reboots via an `RTC_NOINIT_ATTR` counter (cleared on any ping and on
+non-SW resets), preserving the original fail-safe (no boot loop if pings are
+legitimately absent). Verified: reconnects + heartbeat on the graph after flash.
+
+Related gotcha found while verifying: the web page re-publishes its lidar slider on
+every rosbridge (re)connect (`syncLdsTgt`, web/index.html) — an open tab with the
+slider at 0 silently commands `/lds_target_rpm=0` to a freshly-rebooted ESP32, so
+"lidar won't spin after ESP reboot" can just be a forgotten browser tab, not firmware.
 
 Diagnosis recipe (fast): `grep ttyS1 /proc/interrupts` twice on the board — climbing =
 traffic, 0/frozen = ESP32 silent. ESP32 console via dev-PC USB: reset with RTS pulse

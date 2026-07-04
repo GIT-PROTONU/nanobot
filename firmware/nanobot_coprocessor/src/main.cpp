@@ -151,6 +151,18 @@ static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RAD
 // from here. 0 disables. Keep > the 1 Hz ping period with margin.
 #define LINK_RX_TIMEOUT_MS 8000
 
+// First-ping deadline. The runtime watchdog above deliberately fails safe by arming only
+// after the first ping — but that leaves one permanent wedge (hit 2026-07-04): z_open()
+// succeeds against a router that dies before the first ping ever arrives (e.g. an SBC
+// power-cycle races the connect), leaving `ready` true with `g_ping_seen` false forever.
+// Neither watchdog can fire and the ESP sits silent until a manual reset. So: if we're
+// `ready` but have never seen a ping within this deadline of the (re)connect, reboot —
+// capped at LINK_FIRST_PING_MAX_REBOOTS consecutive SW reboots (counter in RTC noinit
+// RAM, cleared on any ping and on non-SW resets) so a robot that legitimately never
+// pings (feature off / topic mismatch) still can't boot-loop. 0 disables.
+#define LINK_FIRST_PING_DEADLINE_MS 90000
+#define LINK_FIRST_PING_MAX_REBOOTS 5
+
 #define CH_LEFT_FWD  0
 #define CH_LEFT_REV  1
 #define CH_RIGHT_FWD 2
@@ -180,6 +192,10 @@ static volatile bool     g_susp_l = false, g_susp_r = false;
 static volatile bool     g_led = false, g_led_dirty = false;
 static volatile uint32_t g_last_ping_ms = 0;   // last /esp32_ping rx (runtime liveness watchdog)
 static volatile bool     g_ping_seen = false;  // arm the runtime watchdog only after 1st ping
+#if LINK_RX_TIMEOUT_MS && LINK_FIRST_PING_DEADLINE_MS
+// Survives esp_restart() (undefined at power-on — setup() clears it on non-SW resets).
+RTC_NOINIT_ATTR static uint32_t g_fping_reboots;
+#endif
 
 static void IRAM_ATTR leftEncISR()  { g_left_ticks  += g_left_dir; }
 static void IRAM_ATTR rightEncISR() { g_right_ticks += g_right_dir; }
@@ -329,7 +345,12 @@ static void fan_cb(z_loaned_sample_t* sm, void*){
 }
 #if LINK_RX_TIMEOUT_MS
 // /esp32_ping (Int32) from the SBC web_control node — payload ignored; arrival = link alive.
-static void ping_cb(z_loaned_sample_t*, void*){ g_last_ping_ms = millis(); g_ping_seen = true; }
+static void ping_cb(z_loaned_sample_t*, void*){
+  g_last_ping_ms = millis(); g_ping_seen = true;
+#if LINK_FIRST_PING_DEADLINE_MS
+  g_fping_reboots = 0;   // real pings flow — re-earn the full first-ping reboot budget
+#endif
+}
 #endif
 
 static bool zenohConnect(){
@@ -512,6 +533,11 @@ void setup(){
   g_temp = temperatureRead(); g_hall = hallRead();   // seed telemetry so first pub isn't 0
   g_last_cmd_ms = millis();
   g_boot_ms = millis();                              // link-connect watchdog reference (see loop())
+#if LINK_RX_TIMEOUT_MS && LINK_FIRST_PING_DEADLINE_MS
+  // RTC noinit RAM is garbage at power-on; only an esp_restart() (SW reset) carries a
+  // meaningful count. Everything else (power-on, brownout, panic) starts a fresh budget.
+  if (esp_reset_reason() != ESP_RST_SW) g_fping_reboots = 0;
+#endif
   // zenohTask pinned to Core 0; setup()/loop() (this code, + the LDS) run on Core 1. The
   // LDS can't starve the link: zenoh's read/lease tasks are prio 12 vs this loop's prio 1,
   // and the UART2 (zenoh) and UART1 (LDS) RX ISRs sit on Core 0 and Core 1 respectively.
@@ -542,6 +568,19 @@ void loop(){   // Core 1: real-time control
     Serial.flush();
     esp_restart();
   }
+#if LINK_FIRST_PING_DEADLINE_MS
+  // First-ping deadline: `ready` but no ping EVER since the (re)connect — the session
+  // opened against a router that vanished before the graph came up (see the define).
+  // g_last_ping_ms was seeded with millis() at connect, so it doubles as the reference.
+  if (ready && !g_ping_seen && (now - g_last_ping_ms) > LINK_FIRST_PING_DEADLINE_MS
+      && g_fping_reboots < LINK_FIRST_PING_MAX_REBOOTS){
+    g_fping_reboots++;
+    Serial.printf("[nano] connected but no /esp32_ping ever — esp_restart() to re-handshake (%u/%u)\n",
+                  (unsigned)g_fping_reboots, (unsigned)LINK_FIRST_PING_MAX_REBOOTS);
+    Serial.flush();
+    esp_restart();
+  }
+#endif
 #endif
 
 #if LDS_ENABLED
