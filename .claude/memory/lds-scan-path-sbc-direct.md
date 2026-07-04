@@ -23,7 +23,17 @@ branch works.
 **Decisive, code-independent test** (used 2026-06-23): stop the sensor node and read
 the raw port — `timeout 3 cat /dev/ttyS2`. **0 bytes = no electrical signal on PA1**
 (wiring), not config/driver. A wrong baud/driver would give garbage or a parse error,
-never silence. Caveat: `pkill -f sensor_hub` self-kills your own SSH shell (the pattern
+never silence.
+
+**Even better — kernel UART counters, no node-stop needed (used 2026-07-04):**
+`sudo cat /proc/tty/driver/serial` twice a few seconds apart. Port 2 = ttyS2. A healthy
+LDS02RR stream is ~9.9 kB/s (450 pkt/s × 22 B) with `fe`/`brk` flat. That day: rx grew
+only ~1 kB/s while **`fe` (framing errors) grew ~550/s and `brk` ~5/s**, raw bytes had
+no `FA` sync at all, yet ESP32 reported rpm 304 / 430 valid Hz — i.e. **signal present
+but degraded on the SBC branch only** (loose/oxidised wire, cold joint, or bad ground
+to PA1 — header pin 22; PA0/UART2-TX is pin 11). Framing errors at correct stty baud =
+electrical, not software. After a wiring fix, verify: `fe` stops climbing, rx ≈ 10 kB/s,
+`/dev/shm/nano_scan.bin` appears. Caveat: `pkill -f sensor_hub` self-kills your own SSH shell (the pattern
 is in its argv) — write a script FILE and run it **by path** so its argv is just the
 path (same gotcha as [[deployment-state]]'s plink note). Restore with `stack.sh up`.
 
