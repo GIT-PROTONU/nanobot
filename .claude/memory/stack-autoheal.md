@@ -37,3 +37,16 @@ overwrote rclpy Node's private `_clock` with sismic's SimulatedClock, breaking c
 renamed to `_chart_clock`). Installed both units from `deploy/systemd/` and enabled the timer
 the same day (nano-stack.service was already present, so sbc-setup.sh had simply last run
 before the heal units existed).
+
+**2026-07-04 (later): heal could START nodes but they died seconds later — `KillMode` bug,
+now FIXED.** `nano-heal.service` lacked `KillMode=process` (defaulted to `control-group`):
+the `setsid`-detached nodes heal relaunched stayed in the oneshot's cgroup, and systemd
+reaps that cgroup the moment the oneshot deactivates (~4 s in), SIGKILLing the fresh node
+**with zero log output** (killed mid-import, before any Python print). Symptom: the journal
+shows `sensors: started` every ~20 s forever, the node's `.run/*.log` stays 0 bytes (truncated
+by each relaunch), and `pgrep` catches only the short-lived launcher bash. nano-stack.service
+always had `KillMode=process` (why boot-launched nodes survive) — heal never got it, so
+**autoheal had never actually revived anything**. Fix: `KillMode=process` added to
+`deploy/systemd/nano-heal.service` + installed on the board + daemon-reload. Diagnostic that
+cracked it: the same node ran fine launched manually in a foreground shell → the killer was
+environmental (cgroup), not the code.

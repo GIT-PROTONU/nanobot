@@ -532,7 +532,9 @@
               <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
             <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
               <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
-              bad-checksum packets since start (climbing fast = degraded serial RX wiring).</p>
+              bad-checksum packets since start (climbing fast = degraded serial RX wiring).
+              When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
+              UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.</p>
           </div>
           <div class="card">
             <h2>Cooling fan</h2>
@@ -1412,7 +1414,7 @@ $("wordsOn").addEventListener("change",sendWords);
 // (inf = no hit). The driver rewrites it per scan; we poll a touch faster and skip
 // unchanged seqs, so the canvas + point count + scan-Hz readouts are identical to the
 // old rosbridge path, minus the LaserScan deserialization that dominated rosbridge CPU.
-let lastScanSeq=-1, lastScanErr=null;
+let lastScanSeq=-1, lastScanErr=null, lastScanRx=null;
 const scanDec=new TextDecoder();
 let curHeroView="lidar";     // tracked by the hero view switcher (showView)
 async function pollScan(){
@@ -1424,6 +1426,22 @@ async function pollScan(){
     const h=JSON.parse(scanDec.decode(buf.subarray(0,nl)));
     if(h.seq===lastScanSeq) return;            // no new scan since the last poll
     lastScanSeq=h.seq;
+    if(h.stale){
+      // Driver heartbeat: the port-level truth when no revolutions are arriving.
+      // Distinguish the failure modes instead of showing nothing at all.
+      const el=$("ldsErr");
+      if(!h.open)                el.textContent="port open failed";
+      else if(!h.rx)             el.textContent="no RX data (wiring?)";
+      else if(h.rx===lastScanRx) el.textContent="RX stopped ("+h.rx+" B)";
+      else                       el.textContent="RX garbled · err "+h.err;
+      el.style.color="var(--red)";
+      $("ldsLost").textContent="–";
+      lastScanRx=h.rx; lastScanErr=h.err;
+      frame=[]; $("pts").textContent=0; $("ldsPts").textContent=0;
+      $("hz").textContent="0"; $("ldsHz").textContent="0 Hz";
+      return;
+    }
+    if(h.rx!==undefined) lastScanRx=h.rx;
     // RX-health counters from the real driver's blob header (absent in the sim).
     if(h.lost!==undefined){ const el=$("ldsLost"); el.textContent=h.lost;
       el.style.color = h.lost>36 ? "var(--amber)" : ""; }      // >10% of a rev missing

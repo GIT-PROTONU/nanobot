@@ -129,6 +129,16 @@ class LdsNode(Node):
         self.parser = LdsParser()
         self.ser = None
         self._stop = threading.Event()
+        self._rx_bytes = 0
+        self._last_blob = 0.0
+        # Health heartbeat: when no complete revolution arrives (dead or garbled RX),
+        # _publish never runs, so the blob — and the web UI's RX-health readout —
+        # would go silent exactly when it matters most (this is how a broken PA1
+        # wire looked like "nothing"). After 2.5 s of scan silence, write a
+        # points-free blob carrying the raw counters instead: rx bytes, checksum
+        # errors, and whether the port even opened. Created before the serial-open
+        # guards so a failed open still reports itself.
+        self.create_timer(2.0, self._health_tick)
 
         if not HAVE_SERIAL:
             self.get_logger().error(f"pyserial unavailable: {_SERIAL_ERR}")
@@ -152,8 +162,18 @@ class LdsNode(Node):
                 return
             if not chunk:
                 continue
+            self._rx_bytes += len(chunk)
             for scan in self.parser.feed(chunk):
                 self._publish(scan)
+
+    def _health_tick(self):
+        if time.monotonic() - self._last_blob < 2.5:
+            return                      # scans flowing; _publish owns the blob
+        self._scan_seq += 1
+        write_scan_blob(self._scan_seq, 0.0, 2.0 * math.pi / RAYS, [],
+                        extra={"stale": 1, "err": self.parser.crc_errors,
+                               "rx": self._rx_bytes,
+                               "open": 1 if self.ser else 0})
 
     def _on_params(self, params):
         for p in params:
@@ -202,7 +222,9 @@ class LdsNode(Node):
         # header so the web UI gets them for free with each scan poll.
         write_scan_blob(self._scan_seq, msg.angle_min, msg.angle_increment, ranges,
                         extra={"lost": max(0, RAYS - len(points)),
-                               "err": self.parser.crc_errors})
+                               "err": self.parser.crc_errors,
+                               "rx": self._rx_bytes})
+        self._last_blob = now
 
     def destroy_node(self):
         self._stop.set()

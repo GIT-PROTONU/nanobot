@@ -14,3 +14,8 @@ User=ibster
 WorkingDirectory=/home/ibster/Nano
 ExecStart=/home/ibster/.pixi/bin/pixi run bash scripts/stack.sh heal
 TimeoutStartSec=120
+# Same as nano-stack.service: the nodes heal relaunches are setsid-detached but stay
+# in THIS unit's cgroup, and a oneshot's cgroup is reaped the moment it deactivates —
+# without this, every node heal ever "revived" was silently SIGKILLed seconds later
+# and relaunched on the next tick, forever (a 20 s crash-loop treadmill).
+KillMode=process

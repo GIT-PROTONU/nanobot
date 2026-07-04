@@ -43,6 +43,19 @@ logs `LDS open on /dev/ttyS2 @115200`; `stty` 115200 — yet raw read = 0 bytes.
 cause is physical on PA1: TX/RX swap (landed on PA0/UART2-TX), missing common ground to
 the SBC, or the SBC branch of the TX split is open.
 
+**2026-07-04 (later, still open): now FULLY dead — kernel counters `rx:0` since boot**
+(`2: uart:U6_16550A mmio:0x01C28800 ... tx:0 rx:0`, flat across samples) while ESP32 still
+gets good frames. Worse than the morning's degraded-but-present state → the PA1 branch went
+from marginal to open, almost certainly disturbed in the motor/GPIO rewiring session
+([[motors-dead-after-gpio-reassign]] — same day, same loom). Check the LDS-TX→PA1 (header
+pin 22) splice first. **Driver-side blind spot fixed the same day:** the `lost`/`err`
+RX-health counters only rode the scan blob, which `_publish` writes **only after a complete
+valid revolution** — so a fully-dead RX showed *nothing* in the web UI. `lds_node.py` now has
+a 2 s health heartbeat (`_health_tick`) writing a points-free blob
+`{stale:1, rx:<bytes>, err:<crc>, open:0|1}` whenever scans stop, and `index.html` renders it
+as "port open failed" / "no RX data (wiring?)" / "RX stopped" / "RX garbled · err N" in red —
+so dead/garbled/stopped are now distinguishable at a glance, no ssh needed.
+
 **Port-health proof — RX↔TX loopback (2026-06-23):** to test the UART itself, bridge
 the LDS's RX and TX pins, stop `sensor_hub` (it holds `/dev/ttyS2`; killing it was
 needed for *exclusive* access — a concurrent test gives **false negatives** because
