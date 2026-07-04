@@ -163,10 +163,11 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
-  flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=26,
-  off-ground switches L=18 R=27, H-bridge IN L=25/4 R=32/33 (fwd/rev),
+  flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,
+  off-ground switches L=4 R=21, DRV8871 IN L=26/27 R=25/33 (fwd/rev; one DRV8871 per
+  motor, no STBY/enable pin),
   onboard LED=2, **UART2 = zenoh link (TX=17, RX=16) → SBC `/dev/ttyS1`**, **LDS data on
-  UART1 RX=GPIO14 (TX=GPIO13 unused)**, LDS spin-motor PWM=21, cooling-fan PWM=22 (via a
+  UART1 RX=GPIO14 (TX=GPIO13 unused)**, LDS spin-motor PWM=18, cooling-fan PWM=22 (via a
   logic-level MOSFET — the ESP can't source fan current). (SBC side: ESP32 link on
   `/dev/ttyS1`/UART1-PG6/PG7, LDS scan on `/dev/ttyS2`/UART2-PA0/PA1, OLED on
   `/dev/i2c-0`/PA11-PA12 @400kHz.) Keep diff-drive limits synced to `robot.yaml`.

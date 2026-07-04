@@ -46,9 +46,12 @@
 // ============================ pin / tunable config ============================
 // Reassigned vs the micro-ROS build: GPIO16/17 are now the zenoh UART2 link, so the
 // LDS data RX moves 16->35 (input-only, RX-only).
-#define LEFT_IN_FWD   25
+// DRV8871 x2 (one per motor), verified against the actual harness 2026-07-04:
+// LEFT motor = GPIO 26+27, RIGHT motor = GPIO 25+33. fwd/rev within each pair is a
+// best guess — if a wheel runs backwards, flip that side's INVERT_* below.
+#define LEFT_IN_FWD   26
 #define LEFT_IN_REV   27
-#define RIGHT_IN_FWD  26
+#define RIGHT_IN_FWD  25
 #define RIGHT_IN_REV  33
 #define LEFT_ENC      19
 #define RIGHT_ENC      5
@@ -82,6 +85,13 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define CMD_TIMEOUT_MS    500
 #define INVERT_LEFT  false
 #define INVERT_RIGHT false
+// Stiction deadband compensation: the gearmotors don't move below ~60% duty (only a
+// full-scale 0.4 m/s command — duty 0.63 after the v+w normalization — moved at all, and
+// in-place turns at 0.37 duty didn't). Remap any command above MOTOR_DEADZONE from
+// (0..1] to [MOTOR_MIN_DUTY..1] so slow speeds and tank turns still overcome friction.
+// Tune MOTOR_MIN_DUTY down to just below where the wheels reliably start on the ground.
+#define MOTOR_MIN_DUTY 0.55f
+#define MOTOR_DEADZONE 0.02f   // |duty| below this = intended stop, not a crawl
 
 // ---- closed-loop wheel velocity PID (OPTIONAL; OFF by default) ----------------
 // Holds each wheel's commanded linear speed (m/s) via a per-wheel PID on encoder-tick
@@ -420,8 +430,10 @@ static void zenohTask(void*){
 // ============================ real-time control (Core 1) ======================
 static void writeSide(int chf, int chr, float duty){
   duty = clampf(duty,-1,1);
-  if (duty>=0){ ledcWrite(chr,0); ledcWrite(chf,(uint32_t)(duty*PWM_MAX)); }
-  else        { ledcWrite(chf,0); ledcWrite(chr,(uint32_t)(-duty*PWM_MAX)); }
+  float m = fabsf(duty);
+  m = (m < MOTOR_DEADZONE) ? 0.0f : MOTOR_MIN_DUTY + m*(1.0f - MOTOR_MIN_DUTY);
+  if (duty>=0){ ledcWrite(chr,0); ledcWrite(chf,(uint32_t)(m*PWM_MAX)); }
+  else        { ledcWrite(chf,0); ledcWrite(chr,(uint32_t)(m*PWM_MAX)); }
 }
 static void applyMotors(float l, float r){
   writeSide(CH_LEFT_FWD, CH_LEFT_REV, INVERT_LEFT?-l:l);

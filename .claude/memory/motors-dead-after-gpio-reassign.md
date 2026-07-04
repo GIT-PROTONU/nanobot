@@ -1,11 +1,39 @@
 ---
 name: motors-dead-after-gpio-reassign
-description: 2026-07-04 motors dead after e60e99e GPIO reassign; drivers are 2x DRV8871 (no STBY — that theory dead); ALL 4 PWM channels incl. unchanged GPIO25 produce no motion → suspect VM power/ground/low battery; one ESP32 reboot seen mid-test
+description: RESOLVED 2026-07-04, TWO stacked causes — crossed fwd pins (real harness LEFT=26/27 RIGHT=25/33) + ~60% PWM stiction deadband (fixed by MOTOR_MIN_DUTY remap in writeSide); tank turns confirmed working
 metadata: 
   node_type: memory
   type: project
   originSessionId: 59a6f545-92fd-428c-bf44-72d88fcd903b
 ---
+
+**FULLY RESOLVED 2026-07-04 (user-confirmed working, incl. tank turns). TWO stacked causes:**
+
+1. **Crossed fwd pins** (below) — fixed, flashed, motors then moved but ONLY at the full
+   0.4 m/s web-UI setting, and in-place turns did nothing.
+2. **Stiction deadband**: duty is normalized to full-scale wheel speed
+   `MAX_LIN + MAX_ANG*SEP/2 = 0.64 m/s`, so 0.4 m/s = 62% duty (barely moved) and a
+   full-stick turn = ±0.24 m/s = 37% duty per wheel (below stiction → no turn). Fix:
+   `writeSide()` remaps |duty| in (MOTOR_DEADZONE..1] → [MOTOR_MIN_DUTY..1]
+   (0.55/0.02 defines next to INVERT_*). Trade-off: slowest crawl = whatever 55% duty
+   gives — tune MOTOR_MIN_DUTY down toward the real stiction point; the proper slow-speed
+   fix stays the blocked wheel PID ([[esp32-pid-velocity-pending]]).
+
+Still unverified: why both suspend switches (pins 4/21) read "suspended", and the one
+ESP32 reboot seen mid-test (possible brownout).
+
+--- pin-crossing diagnosis (cause 1) ---
+
+**Root cause (user-confirmed):** the e60e99e pin table was wrong. Actual harness:
+**LEFT motor = GPIO 26+27, RIGHT motor = GPIO 25+33** (two DRV8871 boards, one per motor —
+no STBY/enable pin, so the removed MOTOR_STBY code was irrelevant). Firmware had left=25/27
+right=26/33, i.e. the two fwd lines crossed sides → every command PWM'd one input on each
+driver → no drive. Fix in `main.cpp`: LEFT_IN_FWD 26 / LEFT_IN_REV 27 / RIGHT_IN_FWD 25 /
+RIGHT_IN_REV 33 (fwd/rev within each pair is a guess — flip INVERT_LEFT/INVERT_RIGHT if a
+wheel runs backward). Flashed + drive-tested 2026-07-04 — motors moved, but only at full
+scale until cause 2 (deadband) was also fixed. CLAUDE.md + nanopi-neo-plus2-pinmap.md updated.
+
+--- original diagnosis (superseded) ---
 
 **Open issue (2026-07-04):** joystick/`/cmd_vel` doesn't drive the wheels, starting right
 after commit `e60e99e` (reassign ESP32 GPIOs: motors→25/27/26/33, LDS PWM→18, right

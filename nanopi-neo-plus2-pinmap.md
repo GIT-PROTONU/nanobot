@@ -70,9 +70,10 @@ How these buses/pins are actually wired on this build (source of truth:
 | **ttyS2** (UART2) | PA0/PA1 | **LDS02RR scan** data @115200 (`lds_driver_py` → `/scan`) |
 | USB | — | BWT901CL **IMU** (`/dev/imu`, CH340), Logitech **C270** webcam+mic (`/dev/camera`) |
 
-ESP32-side GPIO (the coprocessor, not the H5): encoders L=19/R=26, off-ground
-switches L=18/R=27, motor STBY=23, H-bridge IN L=25/4 R=32/33, LED=2, UART2 link
-TX=17/RX=16, LDS data RX=GPIO14 (TX=13 unused), LDS spin-motor PWM=21.
+ESP32-side GPIO (the coprocessor, not the H5): encoders L=19/R=5, off-ground
+switches L=4/R=21, DRV8871 IN L=26/27 R=25/33 fwd/rev (one DRV8871 per motor, no
+STBY pin), LED=2, UART2 link TX=17/RX=16, LDS data RX=GPIO14 (TX=13 unused),
+LDS spin-motor PWM=18.
 
 Actual `armbianEnv.txt`: `overlays=analog-codec i2c0 i2c1 i2c2 uart1 uart2 usbhost0
 usbhost1 usbhost2 usbhost3` + `user_overlays=i2c0-400k` (the 400 kHz OLED bus).
