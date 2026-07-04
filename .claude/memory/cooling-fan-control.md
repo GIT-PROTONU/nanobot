@@ -30,6 +30,9 @@ pattern): **ESP32 is a dumb PWM actuator, the SBC owns the policy.**
   sliders); `/fan_pwm` is bridged at 1 Hz just for the readout (cheap). `syncFan()` pushes
   the UI state on (re)connect.
 
-**Not yet flashed/deployed** as of this note — firmware needs `pio run -t upload`
-([[esp32-build-flash-on-dev-pc]]) and the SBC needs a deploy + sensor_hub restart. Confirm
-GPIO22 against the actual wiring before trusting it.
+**Firmware + SBC side ARE deployed** (updated 2026-07-05): the fan code has shipped in every
+firmware flash since late June (the GPIO reassign kept CH_FAN=5 on GPIO22; motors were
+confirmed working on this firmware 2026-07-04) and sys_monitor publishes `/fan_pwm` on the
+board. Still unverified: the **physical fan/MOSFET wiring** — GPIO22 doesn't appear in
+`nanopi-neo-plus2-pinmap.md` (the canonical wiring doc), so confirm a fan is actually hooked
+up before trusting the duty readout to mean moving air.

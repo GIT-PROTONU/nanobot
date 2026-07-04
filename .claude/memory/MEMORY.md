@@ -22,7 +22,7 @@
 - [Behaviour layer plan](behavior-layer-plan.md) — supervisor/reflexes "feel alive"; Sismic statecharts. STEP 1 BUILT: src/behavior idle presence supervisor (expression-only OLED face, yields to other owners, no-op-safe, own process)
 - [Stack autoheal](stack-autoheal.md) — nano-heal.timer runs `stack.sh heal` every 20s to relaunch crashed nodes (idempotent do_up); gated on nano-stack.service; catches crashes not hangs
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then
-- [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; not yet flashed/deployed
+- [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; firmware+SBC deployed, physical fan wiring unconfirmed
 - [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — ready+no-ping-ever = no watchdog fires, ESP32 silent forever; hard reset cures; diagnose via ttyS1 in /proc/interrupts
 - [Motors dead after GPIO reassign](motors-dead-after-gpio-reassign.md) — RESOLVED 2026-07-04: crossed fwd pins (real harness L=26/27 R=25/33) + ~60% stiction deadband (MOTOR_MIN_DUTY remap); tank turns confirmed
 - [Health event log](health-event-log.md) — durable ESP32/LDS outage log at ~/.local/state/nanobot/health.log with classified causes; first stop for intermittent failures
