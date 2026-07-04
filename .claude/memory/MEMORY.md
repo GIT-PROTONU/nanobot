@@ -9,7 +9,7 @@
 - [RoboStack zenoh has no serial](robostack-zenoh-no-serial.md) — conda libzenohc built without transport_serial; needs a custom serial-capable zenohd for the ESP32 link
 - [ESP32 build+flash on dev PC](esp32-build-flash-on-dev-pc.md) — both building and flashing stay on the dev PC; don't propose SBC-side build or flash
 - [ESP32 flash setup (Ubuntu)](esp32-flash-setup-ubuntu.md) — PlatformIO venv + penv symlink; ESP32 = CP2102 /dev/ttyUSB0
-- [ESP32 WHEEL PID still pending](esp32-pid-velocity-pending.md) — wheel velocity PID unbuilt (blocked: single-channel encoders = no direction). The LDS spin-speed PID is separate & already done.
+- [ESP32 WHEEL PID still pending](esp32-pid-velocity-pending.md) — wheel velocity PID unbuilt (blocked: single-channel encoders = no direction). LDS spin PID done; straight-line drive now solved by NVS-persisted encoder trim autocal (2026-07-04, /motor_trim, /wheel_trim)
 - [slam_nav](slam-nav.md) — custom super-light 2D SLAM + click-to-go nav; was branch slam, now all merged into main (slam branch deleted 2026-06-22)
 - [SLAM map empty = lidar not spinning](slam-map-empty-lidar-spin.md) — slam_nav writes /map only on /scan; firmware auto-spins lidar on boot; rpm/hz=0 usually means lidar unpowered, not a bug
 - [LDS scan path is SBC-direct](lds-scan-path-sbc-direct.md) — web UI points come ONLY from SBC reading ttyS2/PA1; ESP reads RPM only & never relays scan; "ESP sees data but no points" = SBC RX wiring (prove with raw `cat /dev/ttyS2`)
@@ -24,4 +24,4 @@
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then
 - [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; not yet flashed/deployed
 - [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — ready+no-ping-ever = no watchdog fires, ESP32 silent forever; hard reset cures; diagnose via ttyS1 in /proc/interrupts
-- [Motors dead after GPIO reassign](motors-dead-after-gpio-reassign.md) — open 2026-07-04: 2x DRV8871 (no STBY pin, that theory dead); ALL 4 channels incl. unchanged GPIO25 dead → suspect VM/ground/battery-UVLO; one ESP32 reboot mid-test
+- [Motors dead after GPIO reassign](motors-dead-after-gpio-reassign.md) — RESOLVED 2026-07-04: crossed fwd pins (real harness L=26/27 R=25/33) + ~60% stiction deadband (MOTOR_MIN_DUTY remap); tank turns confirmed

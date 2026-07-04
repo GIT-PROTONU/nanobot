@@ -1,6 +1,6 @@
 ---
 name: esp32-pid-velocity-pending
-description: ESP32 PID WHEEL-velocity controller still pending (blocked on single-channel encoders = no direction). The separate LDS spin-speed PID is already built.
+description: ESP32 PID WHEEL-velocity controller still pending (blocked on single-channel encoders = no direction). The separate LDS spin-speed PID is already built; straight-line driving is solved separately by the 2026-07-04 encoder trim autocal.
 metadata: 
   node_type: memory
   type: project
@@ -50,3 +50,13 @@ flash, then tune KP/KI on hardware.** Still blind on reverse-through-zero/stall/
 
 **Why this matters:** the scaffolding is in; the remaining work is on-hardware tuning (and
 deciding whether the single-channel blind spots are acceptable). See [[esp32-zenoh-pico-integration]].
+
+**UPDATE (2026-07-04): the main *symptom* the wheel PID was wanted for — mismatched motors →
+robot won't drive straight — is now solved WITHOUT it** by a straight-line **trim autocal** in
+the open-loop path: `applyMotors` scales `l*=(1-trim), r*=(1+trim)`; during commanded straight
+drives (equal duties, wheels grounded, ≥40 ticks/200 ms window) the relative L/R tick-rate
+imbalance folds into the trim (gain 0.08 @5 Hz → converges in a few seconds of driving), value
+persisted in ESP32 NVS, manual set/reset via `/motor_trim` (Float32), telemetry on `/wheel_trim`.
+Flashed + boot-verified 2026-07-04. Trim is compiled out under `WHEEL_PID_ENABLED` (a velocity
+PID equalizes wheels itself). The wheel PID remains pending only for true speed-holding (slopes,
+carpet, slow crawl below the stiction remap).

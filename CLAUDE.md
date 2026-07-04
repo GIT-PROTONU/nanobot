@@ -149,7 +149,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   Subscribes `/cmd_vel` (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM), `/led`
   (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint), `/fan_pwm`
   (Float32 0..1 → SBC cooling-fan LEDC PWM; published by `sys_monitor` from the CPU-temp
-  curve, web-overridable). Publishes
+  curve, web-overridable), `/motor_trim` (Float32 manual straight-line trim set/reset —
+  see below). Publishes
   `/wheel_ticks` (Int64MultiArray `[L,R]`) from **single-channel** rising-edge GPIO-
   interrupt counts (**signed by commanded direction** — the encoders have no 2nd channel,
   so the ISR signs each tick by the last `/cmd_vel` wheel direction), `/left_wheel_suspended` +
@@ -161,6 +162,14 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (**tune on hardware**) holds `/lds_target_rpm` by driving the motor PWM, output on
   `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 1; UART1 is drained once
   per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
+- **Straight-line trim autocal**: the mismatched gearmotors are rebalanced by a single
+  trim factor in `applyMotors` (`l*=(1-t)`, `r*=(1+t)`; positive = robot was pulling
+  right). While a straight drive is commanded (equal duties, wheels on the ground, enough
+  ticks) the encoder L/R tick-rate imbalance is folded into the trim each 200 ms window —
+  **calibration = drive straight ahead for ~5 s**. Persisted to ESP32 NVS (survives
+  reboot/reflash; written only while stopped, rate-limited). Manual set/reset via
+  `/motor_trim` (Float32, 0 = reset); live value on `/wheel_trim` @1 Hz + the debug
+  status line. Tunables `TRIM_*` in `main.cpp`; compiled out if `WHEEL_PID_ENABLED`.
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,

@@ -7,7 +7,9 @@
 //   sub  led                   std_msgs/Bool             -> onboard LED
 //   sub  lds_target_rpm        std_msgs/Float32          -> LDS spin-speed PID setpoint
 //   sub  fan_pwm               std_msgs/Float32 (0..1)   -> SBC cooling fan PWM duty
+//   sub  motor_trim            std_msgs/Float32 (-0.3..0.3) -> manual L/R trim set/reset
 //   pub  wheel_ticks           std_msgs/Int64MultiArray  [L,R] raw cumulative counts
+//   pub  wheel_trim            std_msgs/Float32          active straight-line trim (1 Hz)
 //   pub  left/right_wheel_suspended std_msgs/Bool        per-wheel off-ground switch
 //   pub  esp32_temp            std_msgs/Float32          die temperature (C)
 //   pub  esp32_hall            std_msgs/Int32            internal hall sensor
@@ -41,6 +43,7 @@
 #include <zenoh-pico.h>
 #include <esp_system.h>   // esp_restart() — link-connect watchdog (see LINK_CONNECT_DEADLINE_MS)
 #include <driver/gpio.h>  // gpio_set_pull_mode() — float the LDS RX pin (shared line, see setup())
+#include <Preferences.h>  // NVS — persists the straight-line wheel trim across reboots
 #include <string.h>
 #include <math.h>
 
@@ -93,6 +96,28 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // Tune MOTOR_MIN_DUTY down to just below where the wheels reliably start on the ground.
 #define MOTOR_MIN_DUTY 0.55f
 #define MOTOR_DEADZONE 0.02f   // |duty| below this = intended stop, not a crawl
+
+// ---- straight-line trim (motor matching) --------------------------------------
+// The two gearmotors don't run the same speed at the same duty, so open-loop straight
+// commands arc. A single trim factor rebalances the sides in applyMotors():
+//   left *= (1 - trim), right *= (1 + trim)   -> POSITIVE trim = robot was pulling RIGHT
+// TRIM_AUTOCAL learns it from the encoders: whenever a straight drive is commanded
+// (equal duties, cmd fresh, wheels on the ground, enough ticks in the window), the
+// relative L/R tick-rate imbalance is folded into the trim a little each window, so a
+// few seconds of driving forward converges it — that IS the calibration procedure.
+// The result persists in NVS (survives reboot AND reflash). Manual path: publish
+// std_msgs/Float32 on /motor_trim to set it directly (0 = reset); current value is
+// republished on /wheel_trim at 1 Hz and in the status line below.
+// (Compiled out under WHEEL_PID_ENABLED — a velocity PID equalizes the wheels itself.)
+#define TRIM_AUTOCAL    1
+#define TRIM_MAX        0.30f   // |trim| clamp — beyond this something is broken, not unmatched
+#define TRIM_CAL_HZ     5       // adaptation windows/s (200 ms of ticks each)
+#define TRIM_CAL_GAIN   0.08f   // fraction of the measured imbalance folded in per window
+#define TRIM_ERR_CLAMP  0.5f    // per-window |imbalance| cap (limits spin-up transients)
+#define TRIM_MIN_TICKS  40      // per-wheel ticks/window below this = too slow/stalled, skip
+#define TRIM_MATCH_TOL  0.02f   // commanded duties must match within this = "straight"
+#define TRIM_SAVE_MS    10000   // NVS write rate limit (flash wear)
+#define TRIM_SAVE_DELTA 0.005f  // ...and only if it moved at least this much
 
 // ---- closed-loop wheel velocity PID (OPTIONAL; OFF by default) ----------------
 // Holds each wheel's commanded linear speed (m/s) via a per-wheel PID on encoder-tick
@@ -187,6 +212,11 @@ static volatile float    g_lds_rpm = 0, g_lds_duty = 0, g_lds_hz = 0;
 static volatile uint32_t g_lds_frames = 0, g_lds_last_ms = 0;
 static volatile float    g_lds_target = LDS_TARGET_RPM;
 static volatile float    g_fan_duty = FAN_BOOT_DUTY;   // /fan_pwm 0..1 (Core0 write, Core1 apply)
+// Straight-line trim: loaded from NVS in setup(), adapted on Core 1 (autocal), manually
+// set from the zenoh RX task (/motor_trim cb). Aligned-32-bit volatile = atomic enough.
+static volatile float    g_trim = 0;
+static Preferences       g_prefs;          // NVS handle (namespace "nano", key "trim")
+static float             g_trim_saved = 0; // last value written to NVS (Core 1 only)
 static volatile float    g_temp = 0;
 static volatile int32_t  g_hall = 0;
 static volatile bool     g_susp_l = false, g_susp_r = false;
@@ -244,7 +274,7 @@ static volatile bool ready = false;       // written Core 0 (zenohTask), read Co
 static volatile uint32_t g_boot_ms = 0;   // millis() at boot — link-connect watchdog reference
 // rmw_zenoh liveliness token = makes a publisher visible in the ROS graph. Format:
 // @ros2_lv/<domain>/<zid>/<nid>/<eid>/MP/%/%/<node>/%<topic>/<type>/<typehash>/<qos>
-static z_owned_liveliness_token_t g_lv[10]; static int g_lv_n = 0;
+static z_owned_liveliness_token_t g_lv[12]; static int g_lv_n = 0;
 static void declare_lv(const char* topic, const char* type, int eid){
   char ke[260];
   snprintf(ke, sizeof(ke),
@@ -256,7 +286,7 @@ static void declare_lv(const char* topic, const char* type, int eid){
 
 // one publisher + its rmw attachment identity
 struct ZPub { z_owned_publisher_t p; int64_t seq; uint8_t gid[16]; };
-static ZPub P_ticks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb;
+static ZPub P_ticks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim;
 
 // Single source of truth for every publisher: topic/type, the attachment GID tag
 // (last GID byte, unique per publisher) and the liveliness entity id (lv_eid, also
@@ -273,6 +303,7 @@ static const PubDef PUBS[] = {
   { &P_rpm,   "lds_rpm",               T_F32,  6, 7, true  },
   { &P_hz,    "lds_hz",                T_F32,  7, 8, true  },
   { &P_duty,  "lds_duty",              T_F32,  8, 9, true  },
+  { &P_trim,  "wheel_trim",            T_F32, 10, 10, false },
 };
 
 static void zpub_declare(ZPub& zp, const char* topic, const char* type, uint8_t tag){
@@ -344,6 +375,15 @@ static void ldstgt_cb(z_loaned_sample_t* sm, void*){
 static void fan_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_fan_duty = clampf(f,0,1); }
 }
+// /motor_trim (Float32): manual trim set/reset (0 clears). With TRIM_AUTOCAL on, the next
+// straight drive re-adapts from here — so this is mainly a reset, or THE knob when autocal
+// is compiled out. Persisted by the loop()'s rate-limited NVS save (within ~TRIM_SAVE_MS).
+static void trim_cb(z_loaned_sample_t* sm, void*){
+  uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){
+    float f; memcpy(&f,b+4,4);
+    if (!isnan(f)){ g_trim = clampf(f,-TRIM_MAX,TRIM_MAX); Serial.printf("[nano] manual trim=%.3f\n", (double)g_trim); }
+  }
+}
 #if LINK_RX_TIMEOUT_MS
 // /esp32_ping (Int32) from the SBC web_control node — payload ignored; arrival = link alive.
 static void ping_cb(z_loaned_sample_t*, void*){
@@ -368,7 +408,7 @@ static bool zenohConnect(){
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
-  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan;   // kept alive (static)
+  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim;   // kept alive (static)
   z_owned_closure_sample_t cl;
   z_view_keyexpr_t ke;
   z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
@@ -380,6 +420,9 @@ static bool zenohConnect(){
   z_view_keyexpr_from_str_unchecked(&ke, KE("fan_pwm",T_F32));
   z_closure_sample(&cl, fan_cb, NULL, NULL);
   z_declare_subscriber(z_session_loan(&s), &sub_fan, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_trim",T_F32));
+  z_closure_sample(&cl, trim_cb, NULL, NULL);
+  z_declare_subscriber(z_session_loan(&s), &sub_trim, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
 #if LINK_RX_TIMEOUT_MS
   static z_owned_subscriber_t sub_ping;
   z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
@@ -444,6 +487,7 @@ static void zenohTask(void*){
       zpub_put(P_hb,   buf, cdr_i32(buf, ++hb));
       zpub_put(P_suspL,buf, cdr_bool(buf, g_susp_l));
       zpub_put(P_suspR,buf, cdr_bool(buf, g_susp_r));
+      zpub_put(P_trim, buf, cdr_f32(buf, g_trim));
     }
     delay(2);
   }
@@ -458,6 +502,11 @@ static void writeSide(int chf, int chr, float duty){
   else        { ledcWrite(chf,0); ledcWrite(chr,(uint32_t)(m*PWM_MAX)); }
 }
 static void applyMotors(float l, float r){
+  // Straight-line trim: positive trim boosts RIGHT / cuts LEFT (robot was pulling right).
+  // Applied pre-remap so it stays monotonic through the stiction compensation; writeSide
+  // clamps, so a boosted side saturating just means the cut side does the correcting.
+  float t = clampf(g_trim, -TRIM_MAX, TRIM_MAX);
+  l *= (1.0f - t); r *= (1.0f + t);
   writeSide(CH_LEFT_FWD, CH_LEFT_REV, INVERT_LEFT?-l:l);
   writeSide(CH_RIGHT_FWD,CH_RIGHT_REV,INVERT_RIGHT?-r:r);
 }
@@ -521,6 +570,11 @@ void setup(){
   pinMode(LEFT_ENC,INPUT_PULLUP);  attachInterrupt(digitalPinToInterrupt(LEFT_ENC),leftEncISR,RISING);
   pinMode(RIGHT_ENC,INPUT_PULLUP); attachInterrupt(digitalPinToInterrupt(RIGHT_ENC),rightEncISR,RISING);
   pinMode(LEFT_SUSPEND_PIN,INPUT_PULLUP); pinMode(RIGHT_SUSPEND_PIN,INPUT_PULLUP);
+
+  // Straight-line trim from NVS (0 until the first calibration drive / manual set).
+  g_prefs.begin("nano", false);
+  g_trim = g_trim_saved = clampf(g_prefs.getFloat("trim", 0), -TRIM_MAX, TRIM_MAX);
+  Serial.printf("[nano] wheel trim from NVS: %.3f\n", (double)g_trim);
 
 #if LDS_ENABLED
   // LDS data on UART1 RX=GPIO14 (RX-only; UART2 is the zenoh link). Roomy RX buffer so a
@@ -618,6 +672,29 @@ void loop(){   // Core 1: real-time control
   }
 #endif
 
+#if TRIM_AUTOCAL && !WHEEL_PID_ENABLED
+  // Straight-line trim autocal: while a straight drive is commanded, fold the relative
+  // L/R encoder-rate imbalance into g_trim. Left faster => robot veers right => positive
+  // error => trim up (boost right / cut left). Skipped whenever the window isn't a clean
+  // straight run: stale cmd, unequal/near-zero duties (arc, pivot, stop), a lifted wheel,
+  // or too few ticks (stall/crawl — quantization would dominate).
+  static uint32_t last_cal=0; static int32_t cal_l=0, cal_r=0;
+  if (now-last_cal >= (uint32_t)(1000/TRIM_CAL_HZ)){
+    last_cal=now;
+    int32_t l=g_left_ticks, r=g_right_ticks;                 // atomic 32-bit reads
+    int32_t dl=labs(l-cal_l), dr=labs(r-cal_r); cal_l=l; cal_r=r;
+    float cl=g_left_duty, cr=g_right_duty;                   // commanded (pre-trim) duties
+    if (now-g_last_cmd_ms <= CMD_TIMEOUT_MS
+        && fabsf(cl-cr) <= TRIM_MATCH_TOL
+        && fabsf(cl) > MOTOR_DEADZONE && fabsf(cr) > MOTOR_DEADZONE
+        && !g_susp_l && !g_susp_r
+        && dl >= TRIM_MIN_TICKS && dr >= TRIM_MIN_TICKS){
+      float err = clampf((float)(dl-dr) / (0.5f*(float)(dl+dr)), -TRIM_ERR_CLAMP, TRIM_ERR_CLAMP);
+      g_trim = clampf(g_trim + TRIM_CAL_GAIN*err, -TRIM_MAX, TRIM_MAX);
+    }
+  }
+#endif
+
   if (now-last_ctl >= 10){                                  // motors + watchdog @100 Hz
     last_ctl=now;
     if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){ g_left_duty=0; g_right_duty=0; }
@@ -641,13 +718,23 @@ void loop(){   // Core 1: real-time control
     last_slow=now;
     g_temp = temperatureRead();
     g_hall = hallRead();
+    // Persist the trim, rate-limited (flash wear) and only while the motors are stopped —
+    // an NVS commit stalls flash cache for a few ms and shouldn't land mid-drive.
+    static uint32_t last_save=0;
+    if (now-g_last_cmd_ms > CMD_TIMEOUT_MS
+        && fabsf(g_trim - g_trim_saved) > TRIM_SAVE_DELTA
+        && now-last_save > TRIM_SAVE_MS){
+      last_save=now; g_trim_saved=g_trim;
+      g_prefs.putFloat("trim", g_trim_saved);
+      Serial.printf("[nano] trim %.3f saved to NVS\n", (double)g_trim_saved);
+    }
   }
 #if STATUS_PRINT_MS
   static uint32_t last_dbg=0;
   if (now-last_dbg >= STATUS_PRINT_MS){                     // debug-console health line
     last_dbg=now;
-    Serial.printf("[nano] ticks L=%ld R=%ld | lds rpm=%.0f hz=%.0f duty=%.2f | susp %d/%d\n",
-      (long)g_left_ticks,(long)g_right_ticks,
+    Serial.printf("[nano] ticks L=%ld R=%ld | trim %+.3f | lds rpm=%.0f hz=%.0f duty=%.2f | susp %d/%d\n",
+      (long)g_left_ticks,(long)g_right_ticks, (double)g_trim,
       g_lds_rpm, g_lds_hz, g_lds_duty, (int)g_susp_l,(int)g_susp_r);
 #if WHEEL_PID_ENABLED
     Serial.printf("[nano] wheel vel L=%.3f R=%.3f m/s | tgt L=%.3f R=%.3f | duty L=%.2f R=%.2f\n",
