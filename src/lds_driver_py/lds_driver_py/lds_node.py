@@ -143,23 +143,46 @@ class LdsNode(Node):
         if not HAVE_SERIAL:
             self.get_logger().error(f"pyserial unavailable: {_SERIAL_ERR}")
             return
-        try:
-            self.ser = serial.Serial(g("port").value, g("baud").value, timeout=0.2)
-            self.get_logger().info(f"LDS open on {g('port').value} @{g('baud').value}")
-        except Exception as exc:
-            self.get_logger().error(f"LDS open failed: {exc}")
-            return
+        self._port = g("port").value
+        self._baud = g("baud").value
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
+    def _open(self) -> bool:
+        try:
+            self.ser = serial.Serial(self._port, self._baud, timeout=0.2)
+            self.get_logger().info(f"LDS open on {self._port} @{self._baud}")
+            return True
+        except Exception as exc:
+            self.ser = None
+            self.get_logger().error(f"LDS open failed: {exc} (retrying)",
+                                    throttle_duration_sec=30.0)
+            return False
+
     def _reader(self):
+        # The port is opened (and re-opened) from here, not __init__: a transient
+        # kernel serial error or a busy/absent device must not kill the driver for
+        # the rest of the boot — close, drop the partial packet, retry. The health
+        # blob keeps reporting open/rx/err throughout, so an outage stays visible.
         while not self._stop.is_set():
+            if self.ser is None:
+                if not self._open():
+                    self._stop.wait(2.0)
+                    continue
             try:
                 chunk = self.ser.read(self.ser.in_waiting or 1)
             except Exception as exc:
-                if not self._stop.is_set():
-                    self.get_logger().error(f"serial read error: {exc}")
-                return
+                if self._stop.is_set():
+                    return
+                self.get_logger().error(f"serial read error: {exc}; reopening")
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                self.parser.buf.clear()
+                self._stop.wait(1.0)
+                continue
             if not chunk:
                 continue
             self._rx_bytes += len(chunk)

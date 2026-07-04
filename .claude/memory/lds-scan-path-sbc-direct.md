@@ -71,6 +71,23 @@ input — a hidden driver-default pull-up on ONE branch can corrupt or kill the 
 on the OTHER. (Marginal wiring from the same-day rewiring session may have contributed;
 the explicit-float config removes the bias variable permanently.)
 
+**2026-07-04 (night): user reports the outage was INTERMITTENT; software audit came back
+clean.** While working: 13.9 MB rx since boot with `err:0 lost:0`, ~9.9 kB/s, 5 Hz scans,
+ESP32 rpm 295 / 450 Hz — the parse path is byte-perfect when bytes arrive, and the parser
+can't latch (byte-at-a-time resync). Intermittent-and-self-healing fits the marginal
+shared-line/power hardware story above, not software. Next-failure discriminator via the
+health blob (`head -c 200 /dev/shm/nano_scan.bin` or the web readout):
+`stale:1, rx frozen, err flat` = no bytes at SBC (wiring/power/no-spin) · `rx` climbing +
+`err` climbing fast = electrical corruption · `rx` frozen + `open:1` + "serial read error"
+in sensors.log = driver fault. Cross-check `/lds_rpm`: ESP32 also 0 → upstream of both
+readers (power/motor); ESP32 fine → SBC branch only.
+**Driver hardened the same night:** `lds_node.py`'s reader thread used to DIE permanently
+on any serial-read exception (and a failed open at startup never retried). Now the port is
+opened/reopened from the reader loop: open failure retries every 2 s (throttled log), a
+read error closes + drops the partial packet + reopens; verified with a pty test
+(open-late / read-error / recover all pass). Deployed via single-file scp + sensor_hub
+restart (editable install).
+
 **Port-health proof — RX↔TX loopback (2026-06-23):** to test the UART itself, bridge
 the LDS's RX and TX pins, stop `sensor_hub` (it holds `/dev/ttyS2`; killing it was
 needed for *exclusive* access — a concurrent test gives **false negatives** because
