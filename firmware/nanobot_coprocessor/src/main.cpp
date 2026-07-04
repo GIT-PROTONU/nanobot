@@ -40,6 +40,7 @@
 #include <Arduino.h>
 #include <zenoh-pico.h>
 #include <esp_system.h>   // esp_restart() — link-connect watchdog (see LINK_CONNECT_DEADLINE_MS)
+#include <driver/gpio.h>  // gpio_set_pull_mode() — float the LDS RX pin (shared line, see setup())
 #include <string.h>
 #include <math.h>
 
@@ -526,6 +527,12 @@ void setup(){
   // burst of scan frames survives between PID ticks — we drain it only at the PID rate.
   Serial1.setRxBufferSize(1024);
   Serial1.begin(LDS_BAUD, SERIAL_8N1, LDS_RX_PIN, -1);
+  // The LDS TX line fans out to BOTH this pin and the SBC's UART2 RX (PA1) — the ESP
+  // reads RPM, the SBC reads the scan. uart_set_pin() (inside begin()) enables the
+  // internal ~45k pull-up on RX; on the shared line that biases the LDS's weak TX
+  // driver, which can corrupt the SBC's copy of the stream. Present a true
+  // high-impedance input instead (the SBC side floats PA1 too — see deploy/sbc-setup.sh).
+  gpio_set_pull_mode((gpio_num_t)LDS_RX_PIN, GPIO_FLOATING);
   ledcSetup(CH_LDS,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LDS_MOTOR_PIN,CH_LDS);
   Serial.printf("[nano] LDS on UART1 RX=%d, spin PID @%d Hz\n", LDS_RX_PIN, LDS_PID_HZ);
 #endif

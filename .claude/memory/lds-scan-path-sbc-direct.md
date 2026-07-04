@@ -56,6 +56,21 @@ a 2 s health heartbeat (`_health_tick`) writing a points-free blob
 as "port open failed" / "no RX data (wiring?)" / "RX stopped" / "RX garbled · err N" in red —
 so dead/garbled/stopped are now distinguishable at a glance, no ssh needed.
 
+**RESOLVED 2026-07-04 (evening): explicit floating RX inputs on BOTH branches fixed it.**
+The LDS's weak TX drives two receivers, and both had internal bias on their RX pin:
+the ESP32's UART driver (`uart_set_pin` inside `Serial1.begin`) silently enables the
+~45k pull-up on GPIO14, and the SBC's PA1 bias was unspecified. Fix: firmware now calls
+`gpio_set_pull_mode(LDS_RX_PIN, GPIO_FLOATING)` right after `Serial1.begin` (main.cpp),
+and the SBC gets a `uart2-rx-float` user overlay (`bias-disable` merged into the
+kernel's `&uart2_pins` label — PA0/PA1; built+installed by `deploy/sbc-setup.sh`, same
+pattern as i2c0-400k). After reflash + reboot: ttyS2 stream clean (`lost:0 err:0`,
+scan blob updating every rev, ~9 kB/s rx), ESP32 link fine. Verify the overlay took
+with `ls /proc/device-tree/soc/pinctrl@1c20800/uart2-pins/` → `bias-disable` present.
+Lesson: on a fanned-out weak TX line, every receiver pin must be a true high-impedance
+input — a hidden driver-default pull-up on ONE branch can corrupt or kill the stream
+on the OTHER. (Marginal wiring from the same-day rewiring session may have contributed;
+the explicit-float config removes the bias variable permanently.)
+
 **Port-health proof — RX↔TX loopback (2026-06-23):** to test the UART itself, bridge
 the LDS's RX and TX pins, stop `sensor_hub` (it holds `/dev/ttyS2`; killing it was
 needed for *exclusive* access — a concurrent test gives **false negatives** because

@@ -60,6 +60,30 @@ if grep -q '^user_overlays=' "$ENV"; then
 else
   echo 'user_overlays=i2c0-400k' >> "$ENV"
 fi
+
+# Explicitly float the UART2 pins (PA0/PA1, /dev/ttyS2 = LDS scan RX): bias-disable =
+# input with NO internal pull-up/pull-down. The LDS TX line fans out to both this pin
+# and the ESP32's LDS RX (GPIO14, floated in firmware) — any internal bias here loads
+# the LDS's weak TX driver and can corrupt the scan stream the SBC reads. Targets the
+# kernel's own uart2_pins pinctrl label so it survives node-name changes across
+# kernels; merged as a user overlay (applied after the stock uart2 overlay).
+cat > /tmp/uart2-rx-float.dts <<'DTS'
+/dts-v1/;
+/plugin/;
+/ {
+    compatible = "allwinner,sun50i-h5";
+    fragment@0 {
+        target = <&uart2_pins>;
+        __overlay__ { bias-disable; };
+    };
+};
+DTS
+dtc -I dts -O dtb -o /boot/overlay-user/uart2-rx-float.dtbo /tmp/uart2-rx-float.dts 2>/dev/null
+if grep -q '^user_overlays=' "$ENV"; then
+  grep -q 'uart2-rx-float' "$ENV" || sed -i 's/^user_overlays=.*/& uart2-rx-float/' "$ENV"
+else
+  echo 'user_overlays=uart2-rx-float' >> "$ENV"
+fi
 grep '^user_overlays=' "$ENV"
 
 echo "== 2/4  udev: non-root I2C access + port-independent USB device names =="
