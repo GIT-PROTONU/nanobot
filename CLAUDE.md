@@ -164,7 +164,7 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=26,
-  off-ground switches L=18 R=27, motor STBY=23, H-bridge IN L=25/4 R=32/33 (fwd/rev),
+  off-ground switches L=18 R=27, H-bridge IN L=25/4 R=32/33 (fwd/rev),
   onboard LED=2, **UART2 = zenoh link (TX=17, RX=16) → SBC `/dev/ttyS1`**, **LDS data on
   UART1 RX=GPIO14 (TX=GPIO13 unused)**, LDS spin-motor PWM=21, cooling-fan PWM=22 (via a
   logic-level MOSFET — the ESP can't source fan current). (SBC side: ESP32 link on

@@ -45,16 +45,15 @@
 
 // ============================ pin / tunable config ============================
 // Reassigned vs the micro-ROS build: GPIO16/17 are now the zenoh UART2 link, so the
-// LDS data RX moves 16->35 (input-only, RX-only) and MOTOR_STBY moves 17->23.
+// LDS data RX moves 16->35 (input-only, RX-only).
 #define LEFT_IN_FWD   25
-#define LEFT_IN_REV    4
-#define RIGHT_IN_FWD  32
+#define LEFT_IN_REV   27
+#define RIGHT_IN_FWD  26
 #define RIGHT_IN_REV  33
-#define MOTOR_STBY    23      // was 17 (now UART2 TX)
 #define LEFT_ENC      19
-#define RIGHT_ENC     26
-#define LEFT_SUSPEND_PIN  18
-#define RIGHT_SUSPEND_PIN 27
+#define RIGHT_ENC      5
+#define LEFT_SUSPEND_PIN   4
+#define RIGHT_SUSPEND_PIN 21
 #define SUSPEND_ACTIVE_HIGH true
 #define LED_PIN        2
 // LDS data link = UART1 (Serial1). UART1's default pins (9/10) are the SPI flash, but the
@@ -62,7 +61,7 @@
 // free — the LDS02RR only streams, we never transmit to it). 25/4 were rejected: they're
 // the left-motor PWM. UART2 stays the SBC zenoh link, UART0 the debug console.
 #define LDS_RX_PIN    14      // UART1 RX (was 35)
-#define LDS_MOTOR_PIN 21
+#define LDS_MOTOR_PIN 18
 
 // SBC cooling fan PWM. Driven by sys_monitor's /fan_pwm (duty 0..1 from the SBC CPU
 // temperature; web UI can override). GPIO22 is free here (it's the default I2C SCL, but
@@ -479,7 +478,6 @@ void setup(){
   for (int c=0;c<4;c++) ledcSetup(c,PWM_FREQ_HZ,PWM_RES_BITS);
   ledcAttachPin(LEFT_IN_FWD,CH_LEFT_FWD); ledcAttachPin(LEFT_IN_REV,CH_LEFT_REV);
   ledcAttachPin(RIGHT_IN_FWD,CH_RIGHT_FWD); ledcAttachPin(RIGHT_IN_REV,CH_RIGHT_REV);
-  pinMode(MOTOR_STBY,OUTPUT); digitalWrite(MOTOR_STBY,HIGH);
   applyMotors(0,0);
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
   // SBC cooling fan PWM — start at the boot duty so there's airflow before the SBC connects.
