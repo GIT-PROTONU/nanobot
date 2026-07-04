@@ -30,8 +30,10 @@ the `heal` subcommand is the hook to add it later. Especially relevant because s
 runs imu+sys+odom+lds in one executor — one crash takes all four down, now auto-revived
 within ~20s.
 
-**2026-07-04: NOT actually installed on the live board** — `systemctl status nano-heal.timer`
-returns "Unit could not be found" (a killed map_bridge stayed dead >10 min; behavior/mood_node
-was also found dead). Either `deploy/sbc-setup.sh` wasn't re-run after a reflash or the units
-were never pushed. Re-run `deploy/sbc-setup.sh` on the board to get autoheal back; until then a
-crashed node stays down until a manual `stack.sh up`.
+**2026-07-04: found NOT installed on the live board, now FIXED** — `nano-heal.timer`/
+`nano-heal.service` didn't exist (a killed map_bridge stayed dead >10 min; behavior/mood_node
+was also found dead — that one was a startup crash, see [[behavior-layer-plan]]: mood_node
+overwrote rclpy Node's private `_clock` with sismic's SimulatedClock, breaking create_timer;
+renamed to `_chart_clock`). Installed both units from `deploy/systemd/` and enabled the timer
+the same day (nano-stack.service was already present, so sbc-setup.sh had simply last run
+before the heal units existed).

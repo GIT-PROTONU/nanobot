@@ -110,3 +110,17 @@ zenohd ~8. Findings:
 - /imu/data still streams 100 Hz with zero consumers (unchanged from 2026-06-23).
 - Profiling tool now on the board: **`/tmp/py-spy`** (aarch64 binary from the v0.4.0 wheel;
   needs sudo, ptrace_scope=1; `--nonblocking` panics on this platform — use normal mode).
+
+**Same day, FIXED + deployed (user chose to fix all except the IMU rate):**
+- `map_bridge_node._tick` now (a) returns immediately when `/map` has no subscribers
+  (TRANSIENT_LOCAL cache serves late joiners) and (b) dedupes on an md5 of the grid *body*
+  (mtime alone is useless — slam_nav's header telemetry churns every write). 75-100% → **0.6%**.
+- `GridMap` gained a `rev` counter (bumped in `integrate`/`load`); `nav_node._write_map`
+  caches `occupancy_int8().tobytes()` + `coverage()` and only recomputes when `rev` moves —
+  the full-grid `np.exp` at 2 Hz was ~half of nav's CPU while paused. py-spy after: zero
+  occupancy.py samples; nav's remainder is rclpy executor/deserialize tax (~35%).
+- mood_node's `self._clock = SimulatedClock()` collision (see [[stack-autoheal]]) fixed →
+  behavior node now survives boot.
+- Result: idle-with-no-browser total ≈ **42% of one core** (was ~95% of four with the UI
+  open). rosbridge's ~0.9-core UI-open cost and the 100 Hz IMU stream remain untouched (the
+  IMU-rate lever was explicitly declined for now).
