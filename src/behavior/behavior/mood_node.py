@@ -38,7 +38,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, Int8
 from geometry_msgs.msg import Twist, PoseStamped
 
 from .presence import build_interpreter, clamp01, merge_beats
@@ -129,6 +129,7 @@ class MoodNode(Node):
         # --- signals updated by callbacks, read by the tick ---
         self._susp_l = False
         self._susp_r = False
+        self._susp_override = -1       # /pickup_override: -1 auto, 0 grounded, 1 lifted
         self._last_motion = -1e9       # monotonic time of last cmd_vel motion / goal
         self._speaking = False
         self._last_word_t = -1e9
@@ -185,7 +186,7 @@ class MoodNode(Node):
             skill_every=max(1, int(g("skill_every").value)),
             purpose_path=g("purpose_path").value, experiments_path=g("experiments_path").value,
             cog_log_path=g("cognition_log_path").value,
-            picked=lambda: self._susp_l and self._susp_r,
+            picked=self._picked,
             traits_snapshot=self._personality.live_traits,
             publish_purpose=lambda o: self.purpose_pub.publish(String(data=json.dumps(o))),
             publish_task=lambda p: self.task_pub.publish(String(data=json.dumps(p))),
@@ -210,6 +211,8 @@ class MoodNode(Node):
         self.create_subscription(String, "oled_face", self._on_face, 10)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
+        # test override for the off-ground switches (latched so a restart mid-test still sees it)
+        self.create_subscription(Int8, "pickup_override", self._on_pickup_override, latched)
         # Trait/registry updates proposed by the cognitive layer (slow LLM reflection).
         self.create_subscription(String, "cognition/evolve", self._on_evolve, 10)
         # Whether the LLM is actually usable right now (web_control: enabled + keyed) — gates the
@@ -414,6 +417,16 @@ class MoodNode(Node):
     def _on_susp_r(self, msg: Bool):
         self._susp_r = bool(msg.data)
 
+    def _on_pickup_override(self, msg: Int8):
+        v = int(msg.data)
+        self._susp_override = v if v in (0, 1) else -1
+
+    def _picked(self):
+        """Both wheels off the ground, honoring the /pickup_override test hook."""
+        if self._susp_override >= 0:
+            return self._susp_override == 1
+        return self._susp_l and self._susp_r
+
     # --- autonomous reflection-mode trigger ----------------------------------
     def _auto_reflect(self, now, stand):
         """Let the robot drift into reflection mode on its own after a long idle stretch, run
@@ -448,7 +461,7 @@ class MoodNode(Node):
         now = time.monotonic()
         self._chart_clock.time = now - self._t0
 
-        picked = self._susp_l and self._susp_r
+        picked = self._picked()
         manual = self._external_active
         speaking = self._speaking and (now - self._last_word_t) < self.speak_timeout
         active = (now - self._last_motion) < self.motion_hold

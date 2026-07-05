@@ -91,7 +91,7 @@ ACTION_FILE = "/dev/shm/nano_oled_action"
 # Staleness windows: a source is "alive" only if it arrived within this many
 # seconds. Generous enough to ride out one missed message at each topic's rate.
 ESP_TIMEOUT_S = 4.0    # /esp32_heartbeat ~1 Hz
-IMU_TIMEOUT_S = 1.5    # /imu/web ~15 Hz
+IMU_TIMEOUT_S = 2.5    # /imu/web can run as slow as 1 Hz (publish_rate default)
 LDS_TIMEOUT_S = 3.0    # /lds_hz a few Hz
 
 BLINK_DUR = 0.16       # seconds for one eyelid close+open

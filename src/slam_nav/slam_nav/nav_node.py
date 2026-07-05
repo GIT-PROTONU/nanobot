@@ -27,7 +27,7 @@ from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, String, Int64MultiArray
+from std_msgs.msg import Bool, String, Int8, Int64MultiArray
 
 from .occupancy import GridMap
 
@@ -190,6 +190,7 @@ class NavNode(Node):
         self._stuck_since = 0.0
         # pick-up + relocalization state
         self._susp_l = self._susp_r = False   # per-wheel off-ground switches (from the ESP)
+        self._susp_override = -1              # /pickup_override: -1 auto, 0 grounded, 1 lifted
         self._picked_up = False
         self._recovering = False     # actively re-searching for the pose (lost / set down)
         self._recover_until = 0.0
@@ -225,6 +226,10 @@ class NavNode(Node):
         # per-wheel off-ground switches from the ESP32 (pick-up detection)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
+        # test override for the switches (latched so a node restarted mid-test still sees it)
+        self.create_subscription(
+            Int8, "pickup_override", self._on_pickup_override,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         if self._trait_motion:                  # personality -> motion thresholds (clamped)
             latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
             self.create_subscription(String, "cognition/traits", self._on_traits, latched)
@@ -277,6 +282,21 @@ class NavNode(Node):
 
     def _on_susp_r(self, msg):
         self._susp_r = bool(msg.data)
+
+    def _on_pickup_override(self, msg):
+        v = int(msg.data)
+        self._susp_override = v if v in (0, 1) else -1
+        self.get_logger().warning(
+            "pickup override: " + {-1: "auto (real switches)", 0: "FORCED grounded",
+                                   1: "FORCED lifted"}[self._susp_override])
+
+    def _susp_eff(self):
+        """Effective off-ground switch pair, honoring the /pickup_override test hook."""
+        if self._susp_override == 0:
+            return False, False
+        if self._susp_override == 1:
+            return True, True
+        return self._susp_l, self._susp_r
 
     def _on_traits(self, msg):
         """Map the behaviour layer's `caution` trait (0..1) onto the reactive motion
@@ -529,7 +549,8 @@ class NavNode(Node):
         ground = picked up -> halt + freeze SLAM (the freeze itself is in _on_scan). On
         set-down, arm relocalization so the robot re-finds itself instead of driving on a
         stale pose."""
-        picked = self.pickup_pause and self._susp_l and self._susp_r
+        susp_l, susp_r = self._susp_eff()
+        picked = self.pickup_pause and susp_l and susp_r
         if picked == self._picked_up:
             return
         self._picked_up = picked

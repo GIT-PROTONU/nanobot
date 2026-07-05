@@ -28,7 +28,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from std_msgs.msg import Bool, Int32, Float32, String
+from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, Vector3Stamped
 
 from .jsonio import read_json, write_json
@@ -371,10 +371,13 @@ class WebServerNode(Node):
         self._roll = self._pitch = self._yaw = 0.0
         self._imu_at = self._eul_at = -1e9
         self._susp_l = self._susp_r = False
+        self._susp_override = -1        # /pickup_override: -1 auto, 0 grounded, 1 lifted
         self.create_subscription(Vector3Stamped, "imu/web", self._on_imu_web, 10)
         self.create_subscription(Vector3Stamped, "imu/euler", self._on_imu_euler, 10)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
+        # test override for the off-ground switches (latched so a restart mid-test still sees it)
+        self.create_subscription(Int8, "pickup_override", self._on_pickup_override, latched)
         self.get_logger().info(
             f"llm: {'enabled' if self._cog.available() else 'idle (no key / disabled)'}"
             f" model={self._cog.llm.model}")
@@ -797,7 +800,7 @@ class WebServerNode(Node):
         if not (self.get_parameter("reflect_enable").value and self._cog.available()):
             return
         now = time.monotonic()
-        picked = self._susp_l and self._susp_r
+        picked = all(self._susp_eff())
         if picked and not self._was_picked:            # a notable event -> reflect soon
             self._reflect_next = min(self._reflect_next, now + 5.0)
         self._was_picked = picked
@@ -837,6 +840,18 @@ class WebServerNode(Node):
     def _on_susp_r(self, msg: Bool):
         self._susp_r = bool(msg.data)
 
+    def _on_pickup_override(self, msg: Int8):
+        v = int(msg.data)
+        self._susp_override = v if v in (0, 1) else -1
+
+    def _susp_eff(self):
+        """Effective off-ground switch pair, honoring the /pickup_override test hook."""
+        if self._susp_override == 0:
+            return False, False
+        if self._susp_override == 1:
+            return True, True
+        return self._susp_l, self._susp_r
+
     def _cpu_percent_quick(self):
         """A short standalone CPU% sample for the snapshot — does NOT touch _cpu_prev
         (which belongs to the periodic stats announcer), so the two never interfere."""
@@ -872,9 +887,10 @@ class WebServerNode(Node):
                 parts.append(f"leaning slightly ({tilt:.0f} degrees)")
             else:
                 parts.append("sitting level")
-        if self._susp_l and self._susp_r:               # pick-up
+        susp_l, susp_r = self._susp_eff()
+        if susp_l and susp_r:                           # pick-up
             parts.append("lifted off the ground (being held)")
-        elif self._susp_l or self._susp_r:
+        elif susp_l or susp_r:
             parts.append("with one wheel off the ground")
         else:
             parts.append("resting on the ground")
@@ -891,7 +907,8 @@ class WebServerNode(Node):
         tilt = None
         if (now - self._eul_at) < 3.0:
             tilt = max(abs(self._roll), abs(self._pitch))
-        pickup = 2 if (self._susp_l and self._susp_r) else (1 if (self._susp_l or self._susp_r) else 0)
+        susp_l, susp_r = self._susp_eff()
+        pickup = 2 if (susp_l and susp_r) else (1 if (susp_l or susp_r) else 0)
         return {"cpu": cpu, "mem": mem, "temp": temp, "moving": moving,
                 "tilt": tilt, "pickup": pickup}
 

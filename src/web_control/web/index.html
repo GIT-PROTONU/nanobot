@@ -51,7 +51,7 @@
   canvas#cv{position:absolute;inset:0;width:100%;height:100%;display:block;
     touch-action:none;cursor:grab}
   canvas#cv:active{cursor:grabbing}
-  #mapWrap{position:absolute;inset:0;background:#000}
+  #mapWrap{position:absolute;inset:0;background:#000;touch-action:none;overflow:hidden}
   #mapWrap canvas{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
     max-width:100%;max-height:100%;image-rendering:pixelated}
   #mapWait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
@@ -245,6 +245,7 @@
             <div id="mapWait">waiting for map… is the lidar spinning?<br>
               (set <b>LDS target</b> &gt; 0 rpm in <b>Sensors</b>)</div>
           </div>
+          <button id="mapFit" class="overlay-btn">⤢ Fit</button>
         </div>
         <div id="view-cam" class="view">
           <img id="cam" alt="">
@@ -275,7 +276,8 @@
           <div id="mapStats"></div>
           <pre id="mapTestOut" style="display:none"></pre>
           <p class="hint" id="mapHint" style="display:none">2D occupancy map from
-            <b>slam_nav</b>, served raw from <b>/dev/shm</b>. <b>Tap the map to set a goal</b> —
+            <b>slam_nav</b>, served raw from <b>/dev/shm</b>. Scroll / pinch to zoom, drag to
+            pan, <b>⤢ Fit</b> recentres. <b>Tap the map to set a goal</b> —
             the green line is the plan. It only drives when <b>Motion</b> is on (else it just
             plans). Red = robot, yellow = goal, cyan = trail, ⌂ = home. <b>Auto-explore</b>
             drives to unmapped frontiers; <b>Save map</b> persists it.</p>
@@ -509,8 +511,8 @@
               <span>|gyro|</span><b id="imuG">–</b>
               <span>rate</span><b id="imuHz">–</b>
             </div>
-            <div class="field"><label>Publish rate <span id="imuRateV">100</span> Hz</label>
-              <input id="imuRate" type="range" min="1" max="200" step="1" value="100"></div>
+            <div class="field"><label>Publish rate <span id="imuRateV">1</span> Hz</label>
+              <input id="imuRate" type="range" min="1" max="200" step="1" value="1"></div>
             <p class="hint">BWT901CL via <b>/imu/web</b> + <b>/imu/euler</b>. Slider retunes the
               <b>/imu/data</b> rate live (device stream auto-follows). Angles °, accel m/s², gyro °/s.</p>
           </div>
@@ -570,8 +572,17 @@
             </div>
             <div class="field"><label>LDS target <span id="ldsTgtV">300</span> rpm</label>
               <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
+            <div class="field"><label>Wheels-up override</label>
+              <select id="pickupOv">
+                <option value="-1" selected>auto (real switches)</option>
+                <option value="0">force down — ignore pick-up</option>
+                <option value="1">force up — simulate pick-up</option>
+              </select></div>
             <p class="hint">Live from the ESP32 (zenoh-pico over UART). Slider publishes
-              <b>/lds_target_rpm</b> (PID spin setpoint).</p>
+              <b>/lds_target_rpm</b> (PID spin setpoint). The override publishes
+              <b>/pickup_override</b> so pick-up-gated behaviour (SLAM freeze, mood reflex)
+              can be tested off the ground; the L/R rows keep showing the real switches.
+              Resets to auto on page reload.</p>
           </div>
         </section>
 
@@ -701,7 +712,8 @@ let ros=null, odomTopic=null, cmdTopic=null, faceTopic=null, systemTopic=null,
     imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
 // ESP32 coprocessor topics
 let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
-    hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
+    hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null,
+    pickupOvTopic=null;
 // cooling fan: read /fan_pwm, override via /sys_monitor/set_parameters
 let fanTopic=null, fanParamSrv=null;
 // slam_nav view+plan state (read by the map panel script below)
@@ -753,6 +765,10 @@ $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
 function publishLdsTgt(){ if(ldsTgtTopic)
   ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); }
+// Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
+$("pickupOv").onchange=()=>publishPickupOv();
+function publishPickupOv(){ if(pickupOvTopic)
+  pickupOvTopic.publish(new ROSLIB.Message({data:Number($("pickupOv").value)})); }
 // Fan override -> sys_monitor fan_override param.
 // v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
 const setFanOverride=v=>setParam(fanParamSrv,"fan_override",v);
@@ -987,6 +1003,11 @@ function subscribe(){
     messageType:"std_msgs/msg/Float32",queue_length:1});
   ldsDutyTopic.subscribe(m=>$("espLdsDuty").textContent=(m.data*100).toFixed(0)+"%");
   ldsTgtTopic=new ROSLIB.Topic({ros,name:"/lds_target_rpm",messageType:"std_msgs/msg/Float32"});
+  pickupOvTopic=new ROSLIB.Topic({ros,name:"/pickup_override",
+    messageType:"std_msgs/msg/Int8",latch:true});
+  // Re-assert the page's choice on every (re)connect: an override survives a stack restart
+  // while the page is open, and a fresh page load publishes auto (clears any stale override).
+  publishPickupOv();
   // slam_nav: click-to-go goal, the planned path overlay, and the motion toggle.
   goalTopic=new ROSLIB.Topic({ros,name:"/goal_pose",messageType:"geometry_msgs/msg/PoseStamped"});
   homeTopic=new ROSLIB.Topic({ros,name:"/slam_nav/go_home",messageType:"std_msgs/msg/Bool"});
@@ -1662,12 +1683,59 @@ connect();   // auto-connect on load
     } else { clearInterval(timer); timer=null; }
   });
 
-  // click the map -> goal in world metres (account for CSS scaling + the y-flip)
-  cv.addEventListener("click",e=>{
-    if(!lastMeta) return;
+  // ---- pan / zoom (scroll or pinch to zoom, drag to pan, ⤢ Fit resets) ----
+  // Done as a CSS transform on the canvas so the goal-click math below keeps
+  // working unchanged: getBoundingClientRect() returns the post-transform box.
+  const wrap=$("mapWrap");
+  let zoom=1, panX=0, panY=0, moved=0;
+  const ptrs=new Map(); let pinchD=0;
+  function applyView(){
+    cv.style.transform=`translate(-50%,-50%) translate(${panX}px,${panY}px) scale(${zoom})`;
+  }
+  function zoomAt(f,sx,sy){            // zoom keeping the screen point (sx,sy) fixed
+    const r=wrap.getBoundingClientRect();
+    const z=Math.min(16,Math.max(1,zoom*f)); f=z/zoom; zoom=z;
+    const ox=sx-(r.left+r.width/2), oy=sy-(r.top+r.height/2);
+    panX=ox*(1-f)+f*panX; panY=oy*(1-f)+f*panY;
+    applyView();
+  }
+  wrap.addEventListener("wheel",e=>{ e.preventDefault();
+    zoomAt(e.deltaY<0?1.15:1/1.15,e.clientX,e.clientY); },{passive:false});
+  wrap.addEventListener("pointerdown",e=>{
+    wrap.setPointerCapture(e.pointerId);
+    ptrs.set(e.pointerId,[e.clientX,e.clientY]); moved=0;
+    if(ptrs.size===2){ const a=[...ptrs.values()];
+      pinchD=Math.hypot(a[0][0]-a[1][0],a[0][1]-a[1][1]); }
+  });
+  wrap.addEventListener("pointermove",e=>{
+    if(!ptrs.has(e.pointerId)) return;
+    const [px,py]=ptrs.get(e.pointerId);
+    ptrs.set(e.pointerId,[e.clientX,e.clientY]);
+    if(ptrs.size===1){
+      panX+=e.clientX-px; panY+=e.clientY-py;
+      moved+=Math.abs(e.clientX-px)+Math.abs(e.clientY-py);
+      applyView();
+    }else if(ptrs.size===2){
+      const a=[...ptrs.values()];
+      const d=Math.hypot(a[0][0]-a[1][0],a[0][1]-a[1][1]);
+      if(pinchD>0) zoomAt(d/pinchD,(a[0][0]+a[1][0])/2,(a[0][1]+a[1][1])/2);
+      pinchD=d; moved=99;
+    }
+  });
+  const ptrEnd=e=>{ ptrs.delete(e.pointerId); pinchD=0; };
+  wrap.addEventListener("pointerup",ptrEnd);
+  wrap.addEventListener("pointercancel",ptrEnd);
+  $("mapFit").addEventListener("click",()=>{ zoom=1; panX=panY=0; applyView(); });
+
+  // tap the map -> goal in world metres (account for CSS scale/zoom + the y-flip).
+  // Listens on the wrap, not the canvas: pointer capture retargets the click here.
+  // A drag/pinch (moved) is not a goal tap, nor is a tap outside the canvas.
+  wrap.addEventListener("click",e=>{
+    if(!lastMeta||moved>6) return;
     const rect=cv.getBoundingClientRect();
     const cx=(e.clientX-rect.left)*cv.width/rect.width;
     const cy=(e.clientY-rect.top)*cv.height/rect.height;
+    if(cx<0||cy<0||cx>=cv.width||cy>=cv.height) return;
     const m=lastMeta;
     mapSetGoal(m.ox+cx*m.res, m.oy+(cv.height-1-cy)*m.res);
   });
@@ -1757,7 +1825,7 @@ window.OLED=(function(){
   function clock(){ return new Date().toTimeString().slice(0,8); }
   function dashboard(){
     const t=performance.now();
-    const espUp=t-tel.espAt<4000, imuUp=t-tel.imuAt<1500,
+    const espUp=t-tel.espAt<4000, imuUp=t-tel.imuAt<2500,
           ldsUp=(t-tel.ldsAt<3000)&&tel.lds>0.1;
     clear();
     rect(0,0,W-1,11,1);                                       // header bar (inverted)

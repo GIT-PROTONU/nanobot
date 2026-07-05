@@ -155,7 +155,11 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   interrupt counts (**signed by commanded direction** — the encoders have no 2nd channel,
   so the ISR signs each tick by the last `/cmd_vel` wheel direction), `/left_wheel_suspended` +
   `/right_wheel_suspended` (Bool per-wheel off-ground microswitch, **published on change**
-  for low latency + a 1 Hz heartbeat republish), `/esp32_temp` (Float32) + `/esp32_hall`
+  for low latency + a 1 Hz heartbeat republish; the SBC consumers — slam_nav pickup
+  freeze, mood_node pickup reflex, web_control snapshot — all honor a **latched
+  `/pickup_override` test hook** (Int8: -1 auto, 0 force-grounded, 1 force-lifted; ESP32
+  1 Hz heartbeat makes overriding at the source impossible), set from the web
+  Coprocessor card, auto-cleared on page reload), `/esp32_temp` (Float32) + `/esp32_hall`
   (Int32) on-die telemetry, and `/esp32_heartbeat` (Int32). Also reads a **spin-lidar**
   (LDS02RR) → `/lds_rpm` (Float32, RPM only — scan data ignored; 0 when stale) + `/lds_hz`
   (valid-frame rate, 0 = not receiving), and closed-loop-controls its spin motor: a PID

@@ -156,8 +156,9 @@ imu_driver:
     port: "/dev/imu"          # stable udev symlink (CH340 by VID:PID, any USB port)
     baud: 115200              # BWT901CL is fixed at 115200
     frame_id: "imu_link"
-    publish_rate: 100.0       # Hz; /imu/data rate (default 100, slider max 200). The
-                              # device stream rate auto-follows this (lowering cuts CPU).
+    publish_rate: 1.0         # Hz; /imu/data rate (slider 1..200; raise live for tuning).
+                              # The device stream rate auto-follows this (1 Hz = minimal
+                              # CPU/serial load; also caps euler/web/mag output below).
     euler_rate: 25.0          # Hz; /imu/euler only feeds the web angle display
     mag_rate: 10.0            # Hz; /imu/mag is slow-moving + unused by the UI
     web_rate: 15.0            # Hz; /imu/web (|accel|,|gyro|,rate) summary for the UI so
