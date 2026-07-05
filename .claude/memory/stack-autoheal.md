@@ -38,6 +38,14 @@ renamed to `_chart_clock`). Installed both units from `deploy/systemd/` and enab
 the same day (nano-stack.service was already present, so sbc-setup.sh had simply last run
 before the heal units existed).
 
+**2026-07-05: heal timer can RACE a `stack.sh restart` → duplicate node.** After a deploy
+restart the board had TWO `mood_node` processes, same age, both PPID 1: the heal tick's
+`pgrep` guard ran in the window where restart's `do_up` hadn't spawned the node yet, so both
+launched one. Fix when seen: `kill` one PID (heal won't relaunch while the other lives).
+Post-restart check: `pgrep -af 'behavior/bin/mood_node'` etc. — and beware `pgrep -fc` run
+via `ssh nano "bash -c ..."` **counts the remote shell itself** (its cmdline contains the
+pattern), showing N+1; use `pgrep -a` and read the list.
+
 **2026-07-04 (later): heal could START nodes but they died seconds later — `KillMode` bug,
 now FIXED.** `nano-heal.service` lacked `KillMode=process` (defaulted to `control-group`):
 the `setsid`-detached nodes heal relaunched stayed in the oneshot's cgroup, and systemd

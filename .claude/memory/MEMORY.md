@@ -20,7 +20,7 @@
 - [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
 - [TTS / speech](tts-speech.md) — robot speaks (en) via espeak-ng in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh)
 - [Behaviour layer plan](behavior-layer-plan.md) — supervisor/reflexes "feel alive"; Sismic statecharts. STEP 1 BUILT: src/behavior idle presence supervisor (expression-only OLED face, yields to other owners, no-op-safe, own process)
-- [Stack autoheal](stack-autoheal.md) — nano-heal.timer runs `stack.sh heal` every 20s to relaunch crashed nodes (idempotent do_up); gated on nano-stack.service; catches crashes not hangs
+- [Stack autoheal](stack-autoheal.md) — nano-heal.timer runs `stack.sh heal` every 20s to relaunch crashed nodes (idempotent do_up); gated on nano-stack.service; catches crashes not hangs; heal can race `restart` → duplicate node (kill the extra)
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then
 - [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; firmware+SBC deployed, physical fan wiring unconfirmed
 - [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — ready+no-ping-ever = no watchdog fires, ESP32 silent forever; hard reset cures; diagnose via ttyS1 in /proc/interrupts
