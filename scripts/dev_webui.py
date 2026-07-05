@@ -1017,6 +1017,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         p = self.path.split("?", 1)[0]
         s = self.state
+        if p == "/drive":
+            # HTTP teleop no-op: accept the page's {v,w} POSTs so the joystick doesn't
+            # fall back to (absent) rosbridge; there are no motors here to move.
+            return self._json({"status": "ok", "dev": True})
         if p == "/llm/say":
             if not s.llm.available():
                 return self._text(503, "llm unavailable")

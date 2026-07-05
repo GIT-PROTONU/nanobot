@@ -61,6 +61,9 @@ class NavNode(Node):
             ("match_points", 90),        # scan points used for matching (decimated)
             ("min_match_score", 1.0),    # below this, keep the prior (no good overlap)
             ("use_imu_yaw", True),       # IMU yaw delta for rotation (else wheel odom)
+            ("still_skip", True),        # parked (odom+IMU unchanged) -> skip match+integrate
+            ("still_lin", 0.005),        # m translation since last processed scan = "moved"
+            ("still_ang", 0.005),        # rad (~0.3 deg) yaw delta = "moved" (fires on pure rotation)
             ("map_write_rate", 2.0),     # Hz to (re)write the /dev/shm map file
             # --- navigation (Stages 2/3) ---
             ("enable_motion", False),    # SAFETY: when false, plan+show path but DON'T drive
@@ -111,6 +114,9 @@ class NavNode(Node):
         self.match_pts = int(g("match_points").value)
         self.min_score = float(g("min_match_score").value)
         self.use_imu = bool(g("use_imu_yaw").value)
+        self.still_skip = bool(g("still_skip").value)
+        self.still_lin = float(g("still_lin").value)
+        self.still_ang = float(g("still_ang").value)
         self._write_period = 1.0 / max(0.2, float(g("map_write_rate").value))
 
         # navigation params
@@ -352,6 +358,30 @@ class NavNode(Node):
                 self._last_write = now
                 self._write_map()
             return
+
+        # Stationary skip: when odom AND IMU agree we haven't moved since the last
+        # PROCESSED scan, the pose+map can't change — skip the match+integrate (the
+        # bulk of parked idle CPU). The _prev_* trackers are deliberately NOT updated
+        # here, so motion (or slow drift) keeps accumulating against the last processed
+        # scan and full SLAM resumes on the very first scan past the thresholds — a
+        # pure rotation fires via the yaw delta. Never skips while seeding (above),
+        # recovering (pose uncertain), or self-testing; pose + map telemetry are still
+        # re-published at the map-write cadence so TF/web readouts stay fresh.
+        if (self.still_skip and not self._recovering and not self._test_active
+                and self._odom is not None and self._prev_odom is not None):
+            ox, oy, oth = self._odom
+            pox, poy, poth = self._prev_odom
+            if self.use_imu and self._imu_yaw is not None and self._prev_imu is not None:
+                dth = _wrap(self._imu_yaw - self._prev_imu)
+            else:
+                dth = _wrap(oth - poth)
+            if math.hypot(ox - pox, oy - poy) < self.still_lin and abs(dth) < self.still_ang:
+                now = time.monotonic()
+                if now - self._last_write >= self._write_period:
+                    self._last_write = now
+                    self._publish_pose()
+                    self._write_map()
+                return
 
         px, py, pth = self._predict(self.px, self.py, self.pth)
 

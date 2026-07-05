@@ -1,17 +1,23 @@
 """Tiny static-file HTTP server for the control page, plus an MJPEG webcam stream.
 
 Kept as a ROS node so it starts/stops with the rest of the launch and shows up
-in `ros2 node list`. It serves the package's installed `web/` directory (which
-contains index.html). The page talks to ROS over the rosbridge websocket, not to
-this server — this only delivers the HTML/JS and the camera stream.
+in `ros2 node list`. It serves the package's installed `web/` directory
+(index.html + style.css + the per-panel *.js). The page talks to ROS over the
+rosbridge websocket for the light topics; the heavy/hot paths go through this
+server instead:
 
-`/stream.mjpg` serves the USB webcam as multipart/x-mixed-replace, fed by a
-zero-dependency V4L2 MJPEG passthrough (see mjpeg_camera). `/audio.pcm` streams
-the webcam mic as raw PCM via arecord (see mic_audio). Both the camera and the
-mic are started only while a client is connected, so they cost nothing idle.
-
-`POST /tts` ({"voice","text"}) speaks a line via SVOX Pico (see tts) and streams
-its words to the OLED on /oled_word so they appear/disappear as they're said.
+- `POST /drive` ({"v","w"}) — HTTP teleop. Publishes /cmd_vel directly with a
+  node-side 10 Hz keepalive + dead-man, keeping rosbridge's latency spikes out
+  of the control loop (see the drive_* params).
+- `/map`, `/scan.bin` — the /dev/shm blobs slam_nav / lds_driver_py write,
+  served same-origin so the big messages never cross rosbridge.
+- `/stream.mjpg` — USB webcam as multipart/x-mixed-replace via a zero-dependency
+  V4L2 MJPEG passthrough (mjpeg_camera); `/snapshot.jpg` is one still frame.
+- `/audio.pcm` — the webcam mic as raw PCM via arecord (mic_audio). Camera and
+  mic run only while a client is connected, so they cost nothing idle.
+- `POST /tts` ({"text","voice"?}) — speaks via espeak-ng (see tts) and streams
+  the words to the OLED on /oled_word as they're said.
+- `GET /health/log` — tail of sys_monitor's durable ESP32/LDS outage log.
 """
 import array
 import functools
@@ -241,6 +247,26 @@ class WebServerNode(Node):
         self._ping_seq = 0
         self.create_timer(1.0, self._publish_ping)
 
+        # ---- HTTP teleop (POST /drive) -------------------------------------------
+        # rosbridge is the busiest process on the board, so driving through it adds
+        # latency spikes that can outlast the ESP32's 500 ms /cmd_vel watchdog — the
+        # motors cut out and the drive stutters. The page POSTs {v,w} here over its
+        # existing kept-alive HTTP socket instead; we publish /cmd_vel immediately and
+        # then keep a steady 10 Hz keepalive from THIS node while the command is
+        # non-zero, so the firmware sees fresh commands regardless of browser jank.
+        # A dead-man zeroes the motors if the page stops refreshing (tab killed,
+        # network drop). The page falls back to rosbridge if /drive is absent.
+        self.declare_parameter("drive_max_lin", 0.4)    # m/s clamp (ESP32 maps 0.4 to full PWM)
+        self.declare_parameter("drive_max_ang", 3.0)    # rad/s clamp
+        self.declare_parameter("drive_timeout", 0.6)    # s without a POST -> stop
+        # Same default as sys_monitor's health_log_path (it writes, we serve).
+        self.declare_parameter("health_log_path", "~/.local/state/nanobot/health.log")
+        self._drive_pub = self.create_publisher(Twist, "cmd_vel", 10)
+        self._drive_lock = threading.Lock()
+        self._drive_v = self._drive_w = 0.0
+        self._drive_at = 0.0                            # monotonic of last POST; 0 = idle
+        self.create_timer(0.1, self._drive_tick)
+
         # ---- Cognition core (shared, ROS-free) ----------------------------------
         # ALL the LLM-personality logic lives in web_control.cognition.CognitionCore, shared
         # verbatim with the dev harness (scripts/dev_webui.py) — one base to maintain. We build
@@ -395,6 +421,63 @@ class WebServerNode(Node):
         self._announce_tick()                          # piggy-backs on this 1 Hz tick
         self._reflect_tick()                           # ditto (cheap when not due)
         self._llm_health_tick()                        # persistent "AI offline" indicator
+
+    # ---- HTTP teleop ---------------------------------------------------------
+    def drive(self, data):
+        """POST /drive {"v","w"}: clamp, publish /cmd_vel now, and arm the 10 Hz
+        keepalive until the page stops refreshing (dead-man) or sends zero."""
+        g = self.get_parameter
+        max_lin = float(g("drive_max_lin").value)
+        max_ang = float(g("drive_max_ang").value)
+        try:
+            # NOT tts.clamp — that one rounds to int, which would turn 0.2 m/s into 0.
+            v = min(max_lin, max(-max_lin, float(data.get("v", 0.0))))
+            w = min(max_ang, max(-max_ang, float(data.get("w", 0.0))))
+        except (TypeError, ValueError):
+            v = w = 0.0
+        with self._drive_lock:
+            self._drive_v, self._drive_w = v, w
+            self._drive_at = time.monotonic() if (v or w) else 0.0
+        self._publish_drive(v, w)
+        return {"status": "ok", "v": v, "w": w}
+
+    def _publish_drive(self, v, w):
+        tw = Twist()
+        tw.linear.x = float(v)
+        tw.angular.z = float(w)
+        self._drive_pub.publish(tw)
+
+    def _drive_tick(self):
+        """10 Hz: re-assert the active HTTP-teleop command (the ESP32 stops the motors
+        if /cmd_vel goes stale) and dead-man-stop when the page vanishes mid-drive."""
+        with self._drive_lock:
+            if not self._drive_at:
+                return
+            stale = (time.monotonic() - self._drive_at
+                     > float(self.get_parameter("drive_timeout").value))
+            if stale:
+                self._drive_v = self._drive_w = 0.0
+                self._drive_at = 0.0
+            v, w = self._drive_v, self._drive_w
+        self._publish_drive(v, w)                      # a stale drive publishes one stop
+
+    # ---- health-event log (written by sys_monitor, served for the web card) ----
+    def get_health_log(self, limit=200):
+        """Tail of the durable ESP32/LDS outage log — the first stop for diagnosing
+        intermittent failures, now visible without an ssh session."""
+        path = os.path.expanduser(self.get_parameter("health_log_path").value
+                                  or "~/.local/state/nanobot/health.log")
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                start = max(0, f.tell() - 64 * 1024)   # last 64 KB is plenty for a tail
+                f.seek(start)
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return {"lines": [], "path": path}
+        if start and lines:
+            lines = lines[1:]                          # drop the line the seek cut in half
+        return {"lines": lines[-int(limit):], "path": path}
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -930,6 +1013,10 @@ class WebServerNode(Node):
         finally:
             self._cam.remove_viewer()
 
+    def snapshot(self):
+        """One JPEG from the webcam for GET /snapshot.jpg (ref-counted capture)."""
+        return self._capture_frame()
+
     # --- lifecycle speech (offline-safe via the phrase bank, done by the core) ----
     def system_announce(self, action):
         """Speak the matching farewell/restart line just before a stack/board action."""
@@ -1070,22 +1157,63 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._node = node
         super().__init__(*args, **kwargs)
 
+    # ---- route tables ---------------------------------------------------------
+    # Plain JSON endpoints dispatch through these (path -> node call); endpoints that
+    # validate input, speak, stream, or act on the OS keep explicit branches below.
+    # The node is never None in production (main() always passes it) — the 503 guard
+    # is belt-and-braces for tests.
+    GET_JSON = {
+        "/tts/config": lambda n: n.get_settings(),      # page restores controls on load
+        "/llm/config": lambda n: n.get_llm_settings(),
+        "/llm/log": lambda n: n.get_cog_log(),
+        "/llm/phrases": lambda n: n.get_phrasebank(),
+        "/skills": lambda n: n.get_skills(),
+        "/skills/workshop": lambda n: n.brain_workshop(),
+        "/health/log": lambda n: n.get_health_log(),
+    }
+    POST_JSON = {
+        "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
+        "/tts/config": lambda n, d: n.update_settings(d),
+        "/llm/config": lambda n, d: n.update_llm_settings(d),
+        "/llm/phrases/regenerate": lambda n, d: n.regenerate_phrasebank(),
+        "/skills/reload": lambda n, d: n.reload_skills(),
+        "/skills/like": lambda n, d: n.like_skill(d),   # {"name","delta":±1}
+        "/skills/workshop/keep": lambda n, d: n.workshop_keep(d),
+        "/skills/workshop/kill": lambda n, d: n.workshop_kill(d),
+        "/brain/reward": lambda n, d: n.brain_reward(d),
+        "/brain/reflect": lambda n, d: n.brain_reflect(d),
+    }
+    # LLM generation endpoints: all gated on llm_available(), all blocking on the
+    # OpenRouter call (handler thread), all replying {say,mood} or an error.
+    POST_LLM = {
+        "/llm/say": lambda n, d: n.llm_say(d.get("prompt") or ""),
+        "/llm/chat": lambda n, d: n.llm_chat((d.get("message") or "").strip()),
+        "/llm/observe": lambda n, d: n.llm_observe(),
+        "/llm/look": lambda n, d: n.llm_look(),
+    }
+    # /system/*: (OLED end-screen hint, spoken line, detached command, HTTP reply).
+    # Detached + new session so the command survives do_down killing this very web
+    # server; the 3 s delay lets the response flush + the spoken line play first.
+    # Reboot/poweroff need the scoped NOPASSWD sudo rule for systemctl (sbc-setup.sh).
+    POST_SYSTEM = {
+        "/system/restart": ("restart", "restart",
+                            'cd "$HOME/Nano" && "$HOME/.pixi/bin/pixi" run bash '
+                            'scripts/stack.sh restart', "restarting stack"),
+        "/system/reboot": ("reboot", "reboot",
+                           "sudo -n /usr/bin/systemctl reboot", "rebooting"),
+        "/system/shutdown": ("shutdown", "shutdown",
+                             "sudo -n /usr/bin/systemctl poweroff", "shutting down"),
+    }
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
-        if path == "/tts/config":
-            # Current persisted settings, so the page can restore its controls on load.
-            return self._respond_json(self._node.get_settings() if self._node else {})
-        if path == "/llm/config":
-            return self._respond_json(self._node.get_llm_settings() if self._node else {})
-        if path == "/llm/log":
-            return self._respond_json(self._node.get_cog_log() if self._node else {"entries": []})
-        if path == "/llm/phrases":
-            return self._respond_json(self._node.get_phrasebank() if self._node else {})
-        if path == "/skills":
-            return self._respond_json(self._node.get_skills() if self._node else {"skills": []})
-        if path == "/skills/workshop":
-            return self._respond_json(
-                self._node.brain_workshop() if self._node else {"trials": []})
+        route = self.GET_JSON.get(path)
+        if route:
+            if self._node is None:
+                return self._respond(503, "no node")
+            return self._respond_json(route(self._node))
+        if path == "/snapshot.jpg":
+            return self._serve_snapshot()
         if path == "/stream.mjpg":
             return self._stream_mjpeg()
         if path == "/audio.pcm":
@@ -1102,154 +1230,53 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # would otherwise desync on endpoints that ignore the body (or on a payload
         # larger than _read_json would have read).
         self._body = self._read_body()
+        if self._node is None:
+            return self._respond(503, "no node")
+        route = self.POST_JSON.get(path)
+        if route:
+            return self._respond_json(route(self._node, self._read_json()))
+        route = self.POST_LLM.get(path)
+        if route:
+            if not self._node.llm_available():
+                return self._respond(503, "llm unavailable")
+            data = self._read_json()
+            if path == "/llm/chat" and not (data.get("message") or "").strip():
+                return self._respond(400, "empty message")
+            return self._respond_json(route(self._node, data) or {"error": "no reply"})
+        system = self.POST_SYSTEM.get(path)
+        if system:
+            oled, line, cmd, reply = system
+            self._set_oled_action(oled)        # which end-screen the OLED shows
+            self._node.system_announce(line)   # speak the farewell/restart line first
+            self._run_detached(cmd, delay=3)
+            return self._respond(200, reply)
         if path == "/tts":
             # Speak a line and karaoke its words to the OLED. Body: {"text","voice"?}.
             data = self._read_json()
             text = (data.get("text") or "").strip()
-            voice = (data.get("voice") or "").strip() or None
             if self._tts is None or not self._tts.available():
-                self._respond(503, "tts unavailable")
-            elif not text:
-                self._respond(400, "empty text")
-            else:
-                self._tts.say(text, voice=voice)
-                self._respond(200, "speaking")
-        elif path == "/tts/config":
-            # Update + persist live settings (voice/volume/speed/pitch/announce/interval).
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.update_settings(self._read_json()))
-        elif path == "/tts/announce":
+                return self._respond(503, "tts unavailable")
+            if not text:
+                return self._respond(400, "empty text")
+            self._tts.say(text, voice=(data.get("voice") or "").strip() or None)
+            return self._respond(200, "speaking")
+        if path == "/tts/announce":
             # Speak the system stats once, right now (independent of the periodic toggle).
-            if self._node is None or self._tts is None or not self._tts.available():
-                self._respond(503, "tts unavailable")
-            else:
-                self._node.announce_now()
-                self._respond(200, "announcing")
-        elif path == "/tts/stop":
+            if self._tts is None or not self._tts.available():
+                return self._respond(503, "tts unavailable")
+            self._node.announce_now()
+            return self._respond(200, "announcing")
+        if path == "/tts/stop":
             if self._tts is not None:
                 self._tts.stop()
-            self._respond(200, "stopped")
-        elif path == "/llm/say":
-            # Generate one in-character spoken line + mood and perform it. Optional
-            # {"prompt"} steers it. Blocks on the OpenRouter call (handler thread).
-            if self._node is None or not self._node.llm_available():
-                self._respond(503, "llm unavailable")
-            else:
-                reply = self._node.llm_say((self._read_json().get("prompt") or ""))
-                self._respond_json(reply or {"error": "no reply"})
-        elif path == "/llm/chat":
-            # Conversational turn: {"message"} -> the robot replies (speaks + emotes)
-            # with short rolling context. Returns the reply so the UI can show it.
-            if self._node is None or not self._node.llm_available():
-                self._respond(503, "llm unavailable")
-            else:
-                msg = (self._read_json().get("message") or "").strip()
-                if not msg:
-                    self._respond(400, "empty message")
-                else:
-                    reply = self._node.llm_chat(msg)
-                    self._respond_json(reply or {"error": "no reply"})
-        elif path == "/llm/observe":
-            # Snapshot the robot's own sensors (CPU/RAM/temp, IMU motion/tilt, pick-up)
-            # and have it comment in character on how it feels. Speaks + emotes.
-            if self._node is None or not self._node.llm_available():
-                self._respond(503, "llm unavailable")
-            else:
-                reply = self._node.llm_observe()
-                self._respond_json(reply or {"error": "no reply"})
-        elif path == "/llm/look":
-            # Capture a camera frame (+ sensors) and have the robot comment on what it
-            # SEES, via the vision model. Speaks + emotes.
-            if self._node is None or not self._node.llm_available():
-                self._respond(503, "llm unavailable")
-            else:
-                reply = self._node.llm_look()
-                self._respond_json(reply or {"error": "no reply"})
-        elif path == "/llm/config":
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.update_llm_settings(self._read_json()))
-        elif path == "/llm/phrases/regenerate":
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.regenerate_phrasebank())
-        elif path == "/skills/invoke":
-            # Run one skill from the library now: {"name": "<skill>"}. Blocks on any LLM /
-            # express call (like the /llm/* endpoints) and returns the outcome.
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                name = (self._read_json().get("name") or "").strip()
-                if not name:
-                    self._respond(400, "empty name")
-                else:
-                    self._respond_json(self._node.invoke_skill(name))
-        elif path == "/skills/reload":
-            # Re-scan the skills directory so a freshly-added .md shows up without a restart.
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.reload_skills())
-        elif path == "/skills/like":
-            # 👍 a skill so the brain favours it (repeatable): {"name":"<skill>","delta":±1}.
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.like_skill(self._read_json()))
-        elif path == "/skills/workshop/keep":
-            # Manually adopt a trial skill now: {"name":"<skill>"} (Keep button).
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.workshop_keep(self._read_json()))
-        elif path == "/skills/workshop/kill":
-            # Manually discard a trial skill now: {"name":"<skill>"} (Kill button).
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.workshop_kill(self._read_json()))
-        elif path == "/brain/reward":
-            # Reward the current behaviour: {"value":±1,"scope":"contextual"|"global","target"?}.
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.brain_reward(self._read_json()))
-        elif path == "/brain/reflect":
-            # Toggle reflection mode (consolidation + skill forging): {"on":bool}.
-            if self._node is None:
-                self._respond(503, "no node")
-            else:
-                self._respond_json(self._node.brain_reflect(self._read_json()))
-        elif path == "/system/restart":
-            # Restart the whole ROS stack. Detached + new session so it survives
-            # do_down killing this very web server, then do_up brings it back.
-            self._set_oled_action("restart")   # tells the OLED to show "Restarting stack"
-            if self._node:
-                self._node.system_announce("restart")   # speak the restart line first
-            self._run_detached(
-                'cd "$HOME/Nano" && "$HOME/.pixi/bin/pixi" run bash scripts/stack.sh restart',
-                delay=3)                       # let the spoken line play before teardown
-            self._respond(200, "restarting stack")
-        elif path == "/system/reboot":
-            # Reboot the whole SBC (needs the scoped NOPASSWD sudo rule for systemctl).
-            self._set_oled_action("reboot")    # tells the OLED to show "Restarting"
-            if self._node:
-                self._node.system_announce("reboot")
-            self._run_detached("sudo -n /usr/bin/systemctl reboot", delay=3)
-            self._respond(200, "rebooting")
-        elif path == "/system/shutdown":
-            # Power off the SBC (needs the scoped NOPASSWD sudo rule for systemctl).
-            self._set_oled_action("shutdown")  # tells the OLED to show "Shutting down" + go dark
-            if self._node:
-                self._node.system_announce("shutdown")  # speak the farewell line first
-            self._run_detached("sudo -n /usr/bin/systemctl poweroff", delay=3)
-            self._respond(200, "shutting down")
-        else:
-            self.send_error(404)
+            return self._respond(200, "stopped")
+        if path == "/skills/invoke":
+            # Run one skill from the library now: {"name"}. Blocks on any LLM call.
+            name = (self._read_json().get("name") or "").strip()
+            if not name:
+                return self._respond(400, "empty name")
+            return self._respond_json(self._node.invoke_skill(name))
+        self.send_error(404)
 
     @staticmethod
     def _set_oled_action(action):
@@ -1383,6 +1410,23 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             pass                       # client stopped listening / write timed out
         finally:
             self._audio.remove_listener(q)
+
+    def _serve_snapshot(self):
+        # One still JPEG from the webcam (starts the camera if nobody's streaming,
+        # stops it after) — for the 📸 button / quick checks without the MJPEG stream.
+        jpeg = self._node.snapshot() if self._node else None
+        if not jpeg:
+            self.send_error(503, "no camera")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(jpeg)))
+        self.end_headers()
+        try:
+            self.wfile.write(jpeg)
+        except OSError:
+            pass
 
     def _serve_map(self):
         # The slam_nav node writes the live occupancy map to a RAM file (/dev/shm);

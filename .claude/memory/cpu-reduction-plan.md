@@ -1,6 +1,6 @@
 ---
 name: cpu-reduction-plan
-description: "Actionable idle-CPU reduction plan for the Nano stack (3 tiers, all keep sensor rates+functionality); user to pick scope"
+description: "Idle-CPU reduction plan for the Nano stack — STATUS 2026-07-05: tier 2 (SLAM still-skip) + tier 3a (OLED np.packbits) implemented; tier 1 obsolete (IMU already 1 Hz); tier 3b (oled-into-sensor_hub) still open"
 metadata: 
   node_type: memory
   type: project
@@ -9,8 +9,27 @@ metadata:
 
 Plan from the 2026-06-23 profiling session (measurements in [[sbc-cpu-profile]]). Goal the
 user set: **reduce CPU without reducing any sensor data rate or functionality.** Idle
-baseline ≈ 83% of one core. **Nothing implemented yet** — user said "I'll decide and
-continue later." When resuming, RE-PROFILE first (board state may differ) before editing.
+baseline ≈ 83% of one core.
+
+**STATUS (2026-07-05, user asked to "optimise for low cpu and ram"):**
+- **Tier 1 (IMU auto-rate): OBSOLETE, do not build.** robot.yaml now ships
+  `publish_rate: 1.0` (commit 7f346c3) and the device stream follows it, so the reader
+  already parses ~5 frames/s. A subscriber-count-keyed rate would FIGHT the web slider's
+  "raise live for tuning" contract (it was started and deliberately reverted this session).
+- **Tier 2 (SLAM skip-when-stationary): IMPLEMENTED** in `nav_node._on_scan` —
+  `still_skip`/`still_lin` (5 mm)/`still_ang` (~0.3°) params in robot.yaml; skips
+  match+integrate when odom+IMU deltas since the last PROCESSED scan are under threshold
+  (prev-trackers deliberately not updated so drift accumulates and eventually processes);
+  never skips while seeding/recovering/self-testing; pose+map telemetry re-published at
+  the map-write cadence. NOT yet re-profiled on the board.
+- **Tier 3a (OLED np.packbits): IMPLEMENTED** — `display_node._patch_fast_display`
+  overrides luma's per-pixel pack (~10 ms) with np.packbits (verified byte-identical
+  vs luma's offsets/mask on random frames). Tier 3b (merge oled into sensor_hub, kills
+  the cross-process sub tax) still open.
+- Also relevant: web teleop moved OFF rosbridge entirely (`POST /drive` in web_control,
+  see CLAUDE.md) — trims the UI-open rosbridge cost and fixed the drive stutter.
+- When next on the board, RE-PROFILE (per-process /proc jiffies or /tmp/py-spy) to
+  confirm the tier-2 win when parked.
 
 Three tiers (escalating impact + risk). All preserve every sensor rate + feature:
 

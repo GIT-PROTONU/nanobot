@@ -85,6 +85,13 @@ slam_nav:
     match_points: 90               # scan beams used for matching (decimated)
     min_match_score: 1.0           # reject matches with no real map overlap
     use_imu_yaw: true              # IMU yaw delta for rotation (vs wheel odom)
+    # Parked = skip: when odom AND IMU both say the robot hasn't moved since the last
+    # processed scan, skip the scan-match + map-integrate (the bulk of parked idle
+    # CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
+    # fires via the yaw delta. Never skips while seeding/recovering/self-testing.
+    still_skip: true
+    still_lin: 0.005               # m: odom translation that counts as "moved"
+    still_ang: 0.005               # rad (~0.3 deg): yaw delta that counts as "moved"
     map_write_rate: 2.0            # Hz to refresh the /dev/shm map file
     # --- navigation (click-to-go) ---
     enable_motion: false           # SAFETY: false = plan + show path but DON'T drive.
@@ -296,6 +303,17 @@ web_control:
   ros__parameters:
     web_port: 8080            # http://<robot-ip>:8080
     rosbridge_port: 9090      # websocket roslib connects to
+    # HTTP teleop: the page POSTs /drive {v,w} (same-origin) instead of publishing
+    # /cmd_vel through rosbridge; this node publishes immediately + keeps a steady
+    # 10 Hz keepalive while the command is non-zero, with a dead-man stop when the
+    # page stops refreshing. Keeps rosbridge's latency spikes out of the control
+    # loop (they could outlast the ESP32's 500 ms /cmd_vel watchdog = stutter).
+    drive_max_lin: 0.4        # m/s clamp (the ESP32 maps 0.4 to full PWM)
+    drive_max_ang: 3.0        # rad/s clamp
+    drive_timeout: 0.6        # s without a fresh POST -> publish one stop
+    # Served on GET /health/log for the web "Health events" card (sys_monitor writes
+    # it; keep in sync with sys_monitor.health_log_path above).
+    health_log_path: "~/.local/state/nanobot/health.log"
     # Text-to-speech (English + German only). The web page POSTs /tts; the server
     # synthesises with espeak-ng (install via deploy/install-espeakng.sh; NOT on conda-forge), plays it
     # through aplay, and streams the words to the OLED (/oled_word) as they're said.

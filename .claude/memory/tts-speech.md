@@ -1,8 +1,10 @@
 ---
 name: tts-speech
-description: Robot TTS (espeak-ng, apt-only) + OLED karaoke; audio out = H5 internal codec; stack.sh bin/ vs lib/ path gotcha
-metadata:
+description: "Robot TTS (espeak-ng, apt-only) + OLED karaoke; audio out = H5 internal codec; stack.sh bin/ vs lib/ path gotcha"
+metadata: 
+  node_type: memory
   type: project
+  originSessionId: a23aab8f-6b00-4f75-ab77-206aa9807c22
 ---
 
 # TTS speech (espeak-ng)
@@ -32,6 +34,12 @@ karaoke onto the OLED via `/oled_word`. See [[oled-display-perf]], [[project-ove
 - aplay: `/usr/bin/aplay` (alsa-utils, part of base image)
 
 ## Gotchas
+
+- **First word clipped on the first utterance** (a repeat right after is fine): the H5
+  codec/amp powers up when aplay opens the PCM and swallows the first ~0.2-0.3 s.
+  Fixed 2026-07-05: `tts.py` prepends `LEAD_SILENCE` (0.35 s) to every clip on the
+  aplay path so the wake-up ramp burns silence, and the karaoke word timing is
+  offset by the pad. If a first word EVER clips again, raise `LEAD_SILENCE`.
 
 - `stack.sh` launches nodes from `install/<pkg>/bin/` not `lib/<pkg>/`.
   On this RoboStack colcon install, Python `console_scripts` entry points

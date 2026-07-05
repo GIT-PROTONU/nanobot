@@ -282,14 +282,30 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   `web/` are symlinked into `install/`, so pushing src updates them too.
 - **`rmw_zenoh` ordering matters:** a node started before `rmw_zenohd` runs islanded
   (won't appear in the graph). `stack.sh up` handles this (router first, then waits).
-- **`web_control` static server**: serves `web/index.html`; `/stream.mjpg` is a
-  zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`); `/audio.pcm` is the webcam
-  mic as raw PCM via `arecord` (`mic_audio.py`). Both are ref-counted (only run
-  while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
-  (browsers don't stream an HTTP/1.0 body to `fetch`).
+- **`web_control` static server**: serves `web/` — `index.html` (markup only) plus
+  `style.css` and one JS file per former inline block (`app.js` main page,
+  `map.js` SLAM panel, `oled.js` OLED mirror, `chrome.js` tabs/joystick, `sim.js`
+  in-browser sim, `devtools.js` dev-harness sensors; kept as separate `<script>`s
+  on purpose — error isolation + per-file strict mode match the old inline blocks).
+  `/stream.mjpg` is a zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`);
+  `/snapshot.jpg` is one still frame (📸 button); `/audio.pcm` is the webcam
+  mic as raw PCM via `arecord` (`mic_audio.py`). Both streams are ref-counted (only
+  run while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
+  (browsers don't stream an HTTP/1.0 body to `fetch`). `GET /health/log` serves the
+  tail of sys_monitor's durable outage log for the web "Health events" card.
+- **HTTP teleop (`POST /drive`)**: the joystick/WASD path does NOT go through
+  rosbridge anymore. The page POSTs `{v,w}` same-origin; `web_server` clamps
+  (`drive_max_lin`/`drive_max_ang`), publishes `/cmd_vel` immediately, and re-asserts
+  it at 10 Hz while non-zero with a `drive_timeout` dead-man — so rosbridge latency
+  spikes can't outlast the ESP32's 500 ms cmd watchdog and stutter the drive. The
+  page falls back to rosbridge publishing if `/drive` 404s (old build); the dev
+  harness accepts it as a no-op.
 - **Text-to-speech** (`tts.py`): `POST /tts {text,voice?}` synthesises with
   `espeak-ng` (install via `deploy/install-espeakng.sh`; NOT on conda-forge so must be
-  apt-installed on the board separately) to a `/dev/shm` WAV, plays it with `aplay`, and
+  apt-installed on the board separately) to a `/dev/shm` WAV, prepends `LEAD_SILENCE`
+  (0.35 s) so the H5 codec's power-up ramp can't swallow the first word (it wakes on
+  PCM open; a back-to-back utterance was never clipped because it was still awake),
+  plays it with `aplay`, and
   publishes the words one at a time on **`/oled_word`** timed to the clip duration
   (espeak emits no word marks, so timing is length-weighted). `oled_display` shows
   each word big+centred as it's spoken ("karaoke"); `""` returns to the dashboard.

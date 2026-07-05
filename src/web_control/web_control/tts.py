@@ -48,6 +48,12 @@ _SCRATCH = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
 WAV_PATH = os.path.join(_SCRATCH, "nano_tts.wav")
 _TXT_PATH = os.path.join(_SCRATCH, "nano_tts.txt")   # for the macOS `say -f` backend
 MAX_CHARS = 300                      # hard cap on a single utterance (also bounds synth time)
+# Silence prepended to each clip on the aplay path: the H5 codec/amp only powers up
+# when aplay opens the PCM and swallows the first ~0.2-0.3 s of samples while it
+# ramps — which clipped the first spoken word (an immediate follow-up utterance was
+# fine because the codec was still awake). Waking it over silence costs a barely
+# noticeable delay instead of a word.
+LEAD_SILENCE = 0.35                  # seconds
 
 # Hard clamps for the markup levels (percent; 100 = normal). The UI exposes
 # friendlier sub-ranges, but anything out of these is clamped here regardless.
@@ -215,6 +221,26 @@ class TtsEngine:
         except Exception:
             return 0.0
 
+    def _pad_lead_silence(self, secs=LEAD_SILENCE):
+        """Prepend `secs` of silence to WAV_PATH (same format), so the codec's
+        power-up ramp can't eat the first word (see LEAD_SILENCE). Returns the pad
+        actually added — 0.0 on any error, in which case playback just proceeds
+        with the unpadded clip."""
+        if secs <= 0:
+            return 0.0
+        try:
+            with contextlib.closing(wave.open(WAV_PATH, "rb")) as w:
+                params = w.getparams()
+                frames = w.readframes(w.getnframes())
+            n = int(params.framerate * secs)
+            with contextlib.closing(wave.open(WAV_PATH, "wb")) as w:
+                w.setparams(params)
+                w.writeframes(b"\x00" * (n * params.sampwidth * params.nchannels))
+                w.writeframes(frames)
+            return n / float(params.framerate)
+        except Exception:
+            return 0.0
+
     def _synth(self, voice, text, levels):
         """Run the active backend to write WAV_PATH. Returns the clip duration (s)."""
         try:
@@ -334,6 +360,8 @@ class TtsEngine:
         if dur <= 0.0:
             self._on_word("")
             return
+        # Robot/aplay path only — dev-PC backends (SAPI/afplay) don't clip the start.
+        pad = self._pad_lead_silence() if self._backend == "espeak" else 0.0
 
         words = display_text.split()
         # Start fraction of each word = cumulative length / total length. Each word
@@ -355,7 +383,7 @@ class TtsEngine:
             return
         self._log(f"tts: speaking {len(words)} words in {voice} (~{dur:.1f}s)")
 
-        t0 = time.monotonic()
+        t0 = time.monotonic() + pad                   # words start after the wake-up pad
         for i, word in enumerate(words):
             if not _wait_until(stop, t0 + dur * starts[i]):
                 break                                 # cancelled

@@ -1853,3 +1853,5 @@
 {"t": 1782909870.0140607, "trigger": "reflect", "state": "", "camera": false, "model": "google/gemma-4-31b-it:free", "prompt": "", "say": "", "mood": "", "status": "no-reply", "detail": "", "ms": 422}
 {"t": 1782909886.1262186, "trigger": "beat:wondering", "state": "wondering", "camera": false, "model": "phrasebank", "prompt": "", "say": "Just taking a quiet moment, everything feels steady.", "mood": "happy", "status": "bank", "detail": "idle", "ms": 0}
 {"t": 1782909896.6934795, "trigger": "beat:pursuing", "state": "pursuing", "camera": true, "model": "", "prompt": "", "say": "", "mood": "", "status": "skipped-busy", "detail": "", "ms": 0}
+{"t": 1783287350.055007, "trigger": "life:offline", "state": "", "camera": false, "model": "phrasebank", "prompt": "", "say": "Cannot think deep. Sorry.", "mood": "sleepy", "status": "spoke", "detail": "", "ms": 0}
+{"t": 1783287351.054049, "trigger": "life:greeting", "state": "", "camera": false, "model": "phrasebank", "prompt": "", "say": "Hey there, ready to help.", "mood": "", "status": "spoke", "detail": "", "ms": 0}
