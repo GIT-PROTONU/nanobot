@@ -53,6 +53,31 @@ stack.sh refuses with a pointer. **Not yet deployed/verified on the live board a
 2026-07-06** (board was unreachable); verified on the dev PC end-to-end (app_hub hosting
 3 nodes, SSE frames incl. latched purpose, whitelist rejects, /publish→OLED face flowed).
 
+**Hardening tier (same day, second pass):**
+- **systemd watchdog**: nano-app/sensors/nav are `Type=notify` + `WatchdogSec=90`; each
+  main sends READY=1 then pets WATCHDOG=1 from a **5 s executor timer** (`_sd_notify`,
+  deliberately duplicated ~10 lines per main — no cross-package util dep). A wedged
+  executor (stuck callback) stops petting → systemd restarts the hub. This is the hang
+  coverage `Restart=on-failure` lacks. Verified against a fake NOTIFY_SOCKET.
+- **Router readiness**: nano-router's ExecStartPost is a bash /dev/tcp probe on :7447
+  (up to 30 s) instead of a blind sleep — After= now means "router accepts".
+- **MemoryMax** per unit (app 450M / sensors+nav 300M / router+map 150M): a leak
+  restarts one hub instead of invoking the kernel OOM killer on the 1 GB board.
+- **Vitals blob** `/dev/shm/nano_vitals.json`: sys_monitor writes ONE aggregated body
+  snapshot per tick (cpu/mem/temp/disk + imu a/g/hz/tilt + lds hz + esp hb/temp,
+  NaN→null because it re-enters browser JSON, per-source ages + wall-clock `t`).
+  oled_display's 5 telemetry subs are GONE (dashboard reads the blob, /proc fallback
+  when stale); web_control's imu/web+imu/euler subs are GONE (cognition snapshot +
+  frame imu/eul read the blob). sys_monitor is the only IMU subscriber left and is
+  co-resident with imu_driver → IMU samples never cross a process. Page staleness
+  thresholds were loosened (imu age <3 s) since vitals tick at 1 Hz.
+  Convention: one writer per /dev/shm nano_* file, atomic os.replace.
+- **`pixi run smoke`** (`scripts/smoke_test.py`): boots router+sys_monitor+app_hub for
+  real and asserts the frame keys, whitelists, face echo, cross-process diag, vitals,
+  and clean SIGTERM. THE check for the untyped telemetry.py<->app.js frame contract —
+  run before deploying. All 12 checks green on the dev PC 2026-07-06.
+
 **How to apply:** any new browser-visible readout goes in `TelemetryHub._build` (+ lazy sub);
 any new page write goes through the /publish or /param whitelist — never a new transport.
+Slow consumers of fast topics read a /dev/shm blob instead of subscribing.
 New processes = new fault domains only; otherwise join a hub.

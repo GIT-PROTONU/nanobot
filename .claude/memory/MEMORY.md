@@ -1,5 +1,5 @@
 - [Project overview](project-overview.md) — Nano robot: NanoPi NEO Plus2 + ROS 2 Humble (pixi/RoboStack, rmw_zenoh), web UI served by web_control (rosbridge GONE since 2026-07-06)
-- [Architecture: two planes, three hubs](architecture-two-planes-three-hubs.md) — 2026-07-06 overhaul: rosbridge→SSE /telemetry gateway (lazy subs), app_hub (web+oled+behavior one process), systemd nano-robot.target supervision; deploy needs one sbc-setup.sh re-run
+- [Architecture: two planes, three hubs](architecture-two-planes-three-hubs.md) — 2026-07-06 overhaul: rosbridge→SSE /telemetry gateway (lazy subs), app_hub (web+oled+behavior one process), systemd nano-robot.target + watchdog/MemoryMax, vitals blob (OLED/web IMU subs gone), `pixi run smoke` contract test; deploy needs one sbc-setup.sh re-run
 - [Memory in git](memory-in-git.md) — user ALWAYS wants memory committed to git; ~/.claude memory dir is symlinked to repo .claude/memory; commit memory changes
 - [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
 - [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy from Ubuntu via ssh/scp (plink/pscp refs are stale); web UI + stack auto-start
