@@ -1,11 +1,17 @@
 ---
 name: sbc-cpu-profile
-description: "Where the NanoPi H5's CPU goes; rosbridge w/ open web UI is the dominant cost; remaining lever is the unthrottled /imu/data sub"
+description: "Where the NanoPi H5's CPU goes (2026-06 profiles); rosbridge was the dominant UI-open cost — DELETED 2026-07-06 (SSE gateway replaced it); numbers below predate the 3-hub overhaul"
 metadata: 
   node_type: memory
   type: project
   originSessionId: f0a4bf50-cc12-4361-a366-bfe320e5ba22
 ---
+
+**2026-07-06 UPDATE: rosbridge no longer exists** — the browser now rides web_control's
+SSE /telemetry gateway (lazy subs, one shared frame; see
+[[architecture-two-planes-three-hubs]]), so the "dominant UI-open cost" below is gone by
+construction and the process list changed (3 hubs). The measurements below remain the
+reference for the PRE-overhaul stack; re-profile for new baselines.
 
 Profiled the SBC at ~50% CPU (2026-06-20). It's not one runaway — it's the whole
 rclpy/rosbridge stack on the weak quad H5. Steady-state breakdown (of 400% = 4 cores):

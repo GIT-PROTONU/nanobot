@@ -1,6 +1,6 @@
 ---
 name: cpu-reduction-plan
-description: "Idle-CPU reduction plan for the Nano stack — STATUS 2026-07-05: tier 2 (SLAM still-skip) + tier 3a (OLED np.packbits) implemented; tier 1 obsolete (IMU already 1 Hz); tier 3b (oled-into-sensor_hub) still open"
+description: "Idle-CPU reduction plan — STATUS 2026-07-06: tier 2 (SLAM still-skip) + 3a (np.packbits) built; tier 1 obsolete; tier 3b landed differently (oled merged into app_hub, NOT sensor_hub — cross-process sub tax remains); UI-open cost killed by rosbridge removal"
 metadata: 
   node_type: memory
   type: project
@@ -26,10 +26,18 @@ baseline ≈ 83% of one core.
   overrides luma's per-pixel pack (~10 ms) with np.packbits (verified byte-identical
   vs luma's offsets/mask on random frames). Tier 3b (merge oled into sensor_hub, kills
   the cross-process sub tax) still open.
-- Also relevant: web teleop moved OFF rosbridge entirely (`POST /drive` in web_control,
-  see CLAUDE.md) — trims the UI-open rosbridge cost and fixed the drive stutter.
+- **2026-07-06 (architecture overhaul, see [[architecture-two-planes-three-hubs]]):**
+  rosbridge is DELETED (the dominant UI-open cost, ~a full core — replaced by the SSE
+  /telemetry gateway with lazy subs, ~zero idle cost), and oled_display was merged into
+  the new **app_hub** (with web_control + mood_node) — that's tier 3b's RAM half.
+  CAVEAT: the cross-process /imu/web + /lds_hz sub tax the plan wanted to kill by
+  merging OLED into *sensor_hub* is NOT eliminated (rclpy has no intra-process
+  shortcut; those topics still cross processes into app_hub). If a future profile
+  shows it still matters, the fix is display_node reading a sensor_hub-written
+  /dev/shm vitals blob (or moving those two subs' data into sensor-side shm), not
+  more process merging.
 - When next on the board, RE-PROFILE (per-process /proc jiffies or /tmp/py-spy) to
-  confirm the tier-2 win when parked.
+  confirm the tier-2 win when parked AND the new idle/UI-open baselines post-overhaul.
 
 Three tiers (escalating impact + risk). All preserve every sensor rate + feature:
 

@@ -1,4 +1,5 @@
-- [Project overview](project-overview.md) — Nano robot: NanoPi NEO Plus2 + ROS 2 Humble (pixi/RoboStack, rmw_zenoh), mixed Python/Rust, rosbridge web UI
+- [Project overview](project-overview.md) — Nano robot: NanoPi NEO Plus2 + ROS 2 Humble (pixi/RoboStack, rmw_zenoh), web UI served by web_control (rosbridge GONE since 2026-07-06)
+- [Architecture: two planes, three hubs](architecture-two-planes-three-hubs.md) — 2026-07-06 overhaul: rosbridge→SSE /telemetry gateway (lazy subs), app_hub (web+oled+behavior one process), systemd nano-robot.target supervision; deploy needs one sbc-setup.sh re-run
 - [Memory in git](memory-in-git.md) — user ALWAYS wants memory committed to git; ~/.claude memory dir is symlinked to repo .claude/memory; commit memory changes
 - [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
 - [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy from Ubuntu via ssh/scp (plink/pscp refs are stale); web UI + stack auto-start
@@ -15,12 +16,12 @@
 - [LDS scan path is SBC-direct](lds-scan-path-sbc-direct.md) — web UI points come ONLY from SBC reading ttyS2/PA1; ESP reads RPM only & never relays scan; "ESP sees data but no points" = SBC RX wiring (prove with raw `cat /dev/ttyS2`)
 - [SLAM autonomy: pick-up + relocalize](slam-autonomy-pickup-relocalize.md) — pick-up freeze via off-ground switches + lost-robot self-recovery (wide scan-match + spin); LOCAL recovery only (~0.5m), not global kidnap; main only
 - [OLED display perf + face mode](oled-display-perf.md) — SSD1306 is I2C-bus-bound (flush=79% wait/21% CPU); i2c-0 raised to 400kHz; CPU∝flush count not bus speed; animated-eyes moods + shutdown/restart screens via /oled_face + /oled_system
-- [SBC CPU profile](sbc-cpu-profile.md) — ~50% CPU is mostly rosbridge while the web UI is open; CBOR=bandwidth-not-CPU; real win = don't bridge heavy topics (/imu/web summary); 2026-06-23 adds the web-CLOSED idle baseline (~83% of 1 core) per-process+per-thread
-- [CPU reduction plan](cpu-reduction-plan.md) — 3-tier idle-CPU plan; 2026-07-05: SLAM still-skip + OLED np.packbits BUILT, IMU auto-rate obsolete (already 1 Hz), oled-into-sensor_hub still open; re-profile on board pending
+- [SBC CPU profile](sbc-cpu-profile.md) — pre-overhaul profiles: UI-open cost was rosbridge (now deleted); web-CLOSED idle baseline ~83% of 1 core per-process+per-thread; re-profile pending
+- [CPU reduction plan](cpu-reduction-plan.md) — 3-tier idle-CPU plan; SLAM still-skip + OLED np.packbits BUILT; 2026-07-06: rosbridge deleted, oled merged into app_hub (cross-process sub tax remains — shm vitals blob is the future fix); re-profile on board pending
 - [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
 - [TTS / speech](tts-speech.md) — robot speaks (en) via espeak-ng in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh); first-word clipping fixed via 0.35 s LEAD_SILENCE pad
 - [Behaviour layer plan](behavior-layer-plan.md) — supervisor/reflexes "feel alive"; Sismic statecharts. STEP 1 BUILT: src/behavior idle presence supervisor (expression-only OLED face, yields to other owners, no-op-safe, own process)
-- [Stack autoheal](stack-autoheal.md) — nano-heal.timer runs `stack.sh heal` every 20s to relaunch crashed nodes (idempotent do_up); gated on nano-stack.service; catches crashes not hangs; heal can race `restart` → duplicate node (kill the extra)
+- [Stack autoheal](stack-autoheal.md) — RETIRED 2026-07-06 (systemd Restart=on-failure replaced the heal timer); keeps the old failure history + still-true "catches crashes not hangs"
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then
 - [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; firmware+SBC deployed, physical fan wiring unconfirmed
 - [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — ready+no-ping-ever = no watchdog fires, ESP32 silent forever; hard reset cures; diagnose via ttyS1 in /proc/interrupts
