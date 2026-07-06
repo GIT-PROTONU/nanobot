@@ -24,6 +24,6 @@
 - [Stack autoheal](stack-autoheal.md) — RETIRED 2026-07-06 (systemd Restart=on-failure replaced the heal timer); keeps the old failure history + still-true "catches crashes not hangs"
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then
 - [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; firmware+SBC deployed, physical fan wiring unconfirmed
-- [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — ready+no-ping-ever = no watchdog fires, ESP32 silent forever; hard reset cures; diagnose via ttyS1 in /proc/interrupts
+- [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — RESOLVED 2026-07-04 (LINK_FIRST_PING_DEADLINE_MS, fixed+flashed+verified); keeps the ttyS1 /proc/interrupts diagnosis recipe
 - [Motors dead after GPIO reassign](motors-dead-after-gpio-reassign.md) — RESOLVED 2026-07-04: crossed fwd pins (real harness L=26/27 R=25/33) + ~60% stiction deadband (MOTOR_MIN_DUTY remap); tank turns confirmed
 - [Health event log](health-event-log.md) — durable ESP32/LDS outage log at ~/.local/state/nanobot/health.log with classified causes; first stop for intermittent failures
