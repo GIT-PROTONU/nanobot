@@ -2,7 +2,7 @@
 - [Architecture: two planes, three hubs](architecture-two-planes-three-hubs.md) — 2026-07-06 overhaul: rosbridge→SSE /telemetry gateway (lazy subs), app_hub (web+oled+behavior one process), systemd nano-robot.target + watchdog/MemoryMax, vitals blob (OLED/web IMU subs gone), `pixi run smoke` contract test; deploy needs one sbc-setup.sh re-run
 - [Memory in git](memory-in-git.md) — user ALWAYS wants memory committed to git; ~/.claude memory dir is symlinked to repo .claude/memory; commit memory changes
 - [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
-- [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy from Ubuntu via ssh/scp (plink/pscp refs are stale); web UI + stack auto-start
+- [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy from Ubuntu via ssh/scp; systemd nano-robot.target auto-start; PENDING: one sbc-setup.sh re-run for the 2026-07-06 units; bring-up log is historical
 - [Dev host is Ubuntu](dev-host-is-ubuntu.md) — native Ubuntu 24.04 now; repo Windows/WSL/COM-port docs are stale; passwordless `ssh nano`/`scp nano:` alias (RSA host-key forced; creds git-ignored in .nano-deploy.env)
 - [Pin / bus map](pin-bus-map.md) — current SBC bus/port + ESP32 GPIO assignments; LDS=ttyS2, ESP32 link=ttyS1, OLED=i2c-0; canonical doc = nanopi-neo-plus2-pinmap.md
 - [ESP32 coprocessor](esp32-coprocessor.md) — native zenoh-pico (not micro-ROS) coprocessor in firmware/nanobot_coprocessor; single-channel encoders signed by commanded dir
@@ -15,12 +15,12 @@
 - [SLAM map empty = lidar not spinning](slam-map-empty-lidar-spin.md) — slam_nav writes /map only on /scan; firmware auto-spins lidar on boot; rpm/hz=0 usually means lidar unpowered, not a bug
 - [LDS scan path is SBC-direct](lds-scan-path-sbc-direct.md) — web UI points come ONLY from SBC reading ttyS2/PA1; ESP reads RPM only & never relays scan; "ESP sees data but no points" = SBC RX wiring (prove with raw `cat /dev/ttyS2`)
 - [SLAM autonomy: pick-up + relocalize](slam-autonomy-pickup-relocalize.md) — pick-up freeze via off-ground switches + lost-robot self-recovery (wide scan-match + spin); LOCAL recovery only (~0.5m), not global kidnap; main only
-- [OLED display perf + face mode](oled-display-perf.md) — SSD1306 is I2C-bus-bound (flush=79% wait/21% CPU); i2c-0 raised to 400kHz; CPU∝flush count not bus speed; animated-eyes moods + shutdown/restart screens via /oled_face + /oled_system
+- [OLED display perf + face mode](oled-display-perf.md) — SSD1306 is I2C-bus-bound (flush=79% wait/21% CPU); i2c-0 @400kHz; CPU∝flush count not bus speed; np.packbits pack; telemetry subs replaced by the vitals blob 2026-07-06; runs inside app_hub
 - [SBC CPU profile](sbc-cpu-profile.md) — pre-overhaul profiles: UI-open cost was rosbridge (now deleted); web-CLOSED idle baseline ~83% of 1 core per-process+per-thread; re-profile pending
 - [CPU reduction plan](cpu-reduction-plan.md) — 3-tier idle-CPU plan; SLAM still-skip + OLED np.packbits BUILT; 2026-07-06: rosbridge deleted, oled merged into app_hub (cross-process sub tax remains — shm vitals blob is the future fix); re-profile on board pending
-- [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI now: the SBC-served web_control; any other/earlier UI is obsolete
+- [Single web UI from SBC](single-webui-from-sbc.md) — only one web UI: the SBC-served web_control page (SSE gateway); dev_webui.py is a harness, not a second UI
 - [TTS / speech](tts-speech.md) — robot speaks (en) via espeak-ng in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh); first-word clipping fixed via 0.35 s LEAD_SILENCE pad
-- [Behaviour layer plan](behavior-layer-plan.md) — supervisor/reflexes "feel alive"; Sismic statecharts. STEP 1 BUILT: src/behavior idle presence supervisor (expression-only OLED face, yields to other owners, no-op-safe, own process)
+- [Behaviour layer plan](behavior-layer-plan.md) — Sismic behaviour layer FULLY BUILT (chart+brain+evolution+time awareness, runs inside app_hub); memory kept for the why-Sismic rationale + architecture rules
 - [Stack autoheal](stack-autoheal.md) — RETIRED 2026-07-06 (systemd Restart=on-failure replaced the heal timer); keeps the old failure history + still-true "catches crashes not hangs"
 - [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 idle in stack; ES2-only (no OpenCL/compute); only real future use = webcam/vision processing; leave idle until then
 - [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; firmware+SBC deployed, physical fan wiring unconfirmed

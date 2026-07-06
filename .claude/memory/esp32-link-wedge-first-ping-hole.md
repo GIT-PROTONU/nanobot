@@ -29,9 +29,10 @@ non-SW resets), preserving the original fail-safe (no boot loop if pings are
 legitimately absent). Verified: reconnects + heartbeat on the graph after flash.
 
 Related gotcha found while verifying: the web page re-publishes its lidar slider on
-every rosbridge (re)connect (`syncLdsTgt`, web/index.html) — an open tab with the
-slider at 0 silently commands `/lds_target_rpm=0` to a freshly-rebooted ESP32, so
-"lidar won't spin after ESP reboot" can just be a forgotten browser tab, not firmware.
+every telemetry-stream (re)connect (`syncLdsTgt` in web/app.js; rosbridge-era originally)
+— an open tab with the slider at 0 silently commands `/lds_target_rpm=0` to a
+freshly-rebooted ESP32, so "lidar won't spin after ESP reboot" can just be a forgotten
+browser tab, not firmware.
 
 Diagnosis recipe (fast): `grep ttyS1 /proc/interrupts` twice on the board — climbing =
 traffic, 0/frozen = ESP32 silent. ESP32 console via dev-PC USB: reset with RTS pulse

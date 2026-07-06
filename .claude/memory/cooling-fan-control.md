@@ -26,9 +26,9 @@ pattern): **ESP32 is a dumb PWM actuator, the SBC owns the policy.**
   (NaN). All params in `robot.yaml` under `sys_monitor:`, retunable live.
 - **Web UI override**: a "Fan" panel (Auto checkbox + % slider + live duty readout). Auto
   on → sets param `fan_override = -1` (curve). Auto off → `fan_override = 0..1` forced.
-  Slider calls `/sys_monitor/set_parameters` over rosbridge (same pattern as the rate
-  sliders); `/fan_pwm` is bridged at 1 Hz just for the readout (cheap). `syncFan()` pushes
-  the UI state on (re)connect.
+  Slider calls `/sys_monitor/set_parameters` via `POST /param` (same pattern as the rate
+  sliders; was rosbridge before 2026-07-06); `/fan_pwm` rides the telemetry frame for the
+  readout. `syncFan()` pushes the UI state on (re)connect.
 
 **Firmware + SBC side ARE deployed** (updated 2026-07-05): the fan code has shipped in every
 firmware flash since late June (the GPIO reassign kept CH_FAN=5 on GPIO22; motors were

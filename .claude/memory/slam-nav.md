@@ -62,5 +62,6 @@ loop = heaviest CPU spot. Still needs the on-board run (deploy → show map → 
 Chosen knobs (user picked): scan-matching tier, whole-floor coverage, plan+pursuit+replan.
 SLAM quality depends on the signed-tick firmware fix (now applied) — see [[esp32-coprocessor]].
 I cannot build/flash from the Windows dev host (colcon runs in the board's pixi env; pio in
-~/pio-venv). Deferred big RAM wins NOT done: consolidating the 6 rclpy nodes into one process,
-and replacing rosbridge — both high-risk refactors needing on-board verification.
+~/pio-venv). (The "deferred big RAM wins" noted here — node consolidation and replacing
+rosbridge — were BOTH done since: sensor_hub/app_hub + the SSE gateway, see
+[[architecture-two-planes-three-hubs]].)

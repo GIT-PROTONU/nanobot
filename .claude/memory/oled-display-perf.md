@@ -35,8 +35,17 @@ face timer is **cancelled when not in face mode** (zero idle wakeups) and a per-
 **dirty-check** skips the 38ms flush when the picture is unchanged (`anim_fps`=20, under
 the 26fps ceiling). Title/brand is "NANOBOT", overridable via `/oled_text`.
 
-**Shutdown/restart end-screens** (so the panel doesn't freeze on its last frame): the web
-UI publishes **`/oled_system` ("restart"|"shutdown")** the instant the button is clicked, so
+**2026-07-06 updates:** luma's per-pixel frame-pack replaced with `np.packbits`
+(`_patch_fast_display`, ~10 ms → ~0.6 ms/frame); the node's five telemetry subscriptions
+(esp hb/temp, imu/web, imu/euler, lds_hz) are GONE — the dashboard reads sys_monitor's
+**vitals blob** (`/dev/shm/nano_vitals.json`, read only while the dashboard is pinned,
+local /proc fallback when stale), so face mode costs zero cross-process deserialize; the
+node now runs inside **app_hub** (SIGTERM end-screen preserved in the hub main). The
+`/oled_system` end-screen trigger is now published by the SERVER on POST /system/* (the
+page no longer publishes topics directly).
+
+**Shutdown/restart end-screens** (so the panel doesn't freeze on its last frame): 
+**`/oled_system` ("restart"|"shutdown")** is published the instant the button is clicked, so
 the node switches screens immediately (not after teardown). "shutdown" → "Shutting down"
 screen then SSD1306 **display-off** (`hide()`, panel dark) done in the SIGTERM-graceful main
 loop; "restart" → a "Restarting" screen left up for the relaunched node to redraw over (no

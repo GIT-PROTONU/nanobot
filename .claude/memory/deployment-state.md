@@ -1,6 +1,6 @@
 ---
 name: deployment-state
-description: "Live state of the Nano robot board — how to reach it, what's installed/running, what's left"
+description: "Live state of the Nano robot board — how to reach it, what's installed/running; 2026-06-17 bring-up log below is historical (plink/nano-stack/rosbridge bits superseded)"
 metadata: 
   node_type: memory
   type: project
@@ -8,6 +8,15 @@ metadata:
 ---
 
 The robot board is **live at 192.168.178.141**, user `ibster` (sudo). See [[project-overview]] and [[robostack-build-gotchas]].
+
+**CURRENT (2026-07-06):**
+- Access from the **Ubuntu dev host**: passwordless `ssh nano` / `scp nano:` ([[dev-host-is-ubuntu]]) — every plink/pscp/Windows note below is historical.
+- Supervision: **per-unit systemd under `nano-robot.target`** (Restart=on-failure + sd_notify watchdog + MemoryMax); `stack.sh` is a systemctl wrapper; logs in journald. nano-stack.service/nano-heal.* are gone ([[architecture-two-planes-three-hubs]], [[stack-autoheal]]).
+- **After deploying the 2026-07-06 overhaul, run `sudo bash deploy/sbc-setup.sh` once** (installs the new units + sudoers; not yet done — board was unreachable that day).
+- The stack is 3 hubs (sensor_hub / slam_nav / app_hub) + router + map bridge; rosbridge is deleted.
+- The "Left to do" list at the bottom is ALL done (LDS spins via ESP32 PID, encoders live via ESP32, systemd installed).
+
+---- historical bring-up log (2026-06-17/18) below ----
 
 **Access (Windows host):** no OpenSSH password automation available; use PuTTY `plink`/`pscp` at `C:\Program Files\PuTTY\` with `-pw <redacted> -hostkey '<redacted>'`. For multi-line remote commands use `plink -m <localscript>` (avoids PowerShell→bash quoting hell). NOTE: the auto-classifier **blocked installing a persistent SSH key** (wasn't asked for), so it's password-per-command for now — a local key exists at `~/.ssh/nano_robot` but is NOT installed on the board.
 

@@ -1,10 +1,19 @@
 ---
 name: behavior-layer-plan
-description: Plan for the robot behaviour/supervisor layer — leaning Sismic statecharts; design + why-not alternatives
-metadata:
+description: "Behaviour layer — Sismic chosen and FULLY BUILT (presence chart + brain + evolution + time awareness, runs inside app_hub); kept for the why-Sismic rationale + architecture rules"
+metadata: 
   node_type: memory
   type: project
+  originSessionId: cb34647d-a54a-4283-895b-3f5b2e1a7a22
 ---
+
+**STATUS 2026-07-06: built far beyond the plan below** — the presence chart grew beats/
+lottery/drives/reflection, `brain.py` added the Purpose Engine + A/B bandit, evolution +
+time awareness (night tempo) are live, and the node now runs **inside `app_hub`** (with
+web_control + oled_display, one executor — the "fold into an existing executor" next-step
+happened, just into the app fault domain rather than sensor_hub; see
+[[architecture-two-planes-three-hubs]]). CLAUDE.md + `docs/brain.md` are the current docs.
+This memory stays for the **why-Sismic rationale** and the **architecture rules** below.
 
 Planning a **behaviour / supervisor layer** to coordinate modes + reflexes and make the
 robot "feel alive". Decided direction (2026-06-24): **Sismic** (pure-Python statechart

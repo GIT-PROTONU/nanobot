@@ -8,9 +8,11 @@ metadata:
 ---
 
 As of June 2026 there is **only one web UI**: the one served from the SBC by `web_control`
-(rosbridge + static `web/index.html`, plus the MJPEG + mic passthrough). Any reference to a
-second/alternate web UI (e.g. a dev-host-served page) is obsolete — treat the SBC-served one
-as the single source of truth for the operator UI.
+(static `web/index.html` + the SSE `/telemetry` gateway + MJPEG/mic passthrough — rosbridge
+was removed 2026-07-06). Any reference to a second/alternate web UI (e.g. a dev-host-served
+page) is obsolete — treat the SBC-served one as the single source of truth for the operator
+UI. (`scripts/dev_webui.py` serves the same page off-robot for AI/TTS dev — a harness, not
+a second UI.)
 
 This is what shows live robot data (wheel_ticks, lds_rpm, suspension, camera, etc.), so it's
 the real end-to-end test that the ESP32→[[esp32-zenoh-pico-integration]] link is healthy.
