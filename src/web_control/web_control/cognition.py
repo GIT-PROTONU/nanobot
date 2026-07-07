@@ -124,6 +124,49 @@ def clamp01(v, lo=0.0, hi=1.0):
         return lo
 
 
+# ---- time awareness ------------------------------------------------------------
+# The robot knows what time of day it is: `time_context()` is folded into the
+# autonomous prompts (beats / skill picks / observe) so lines fit the moment, and
+# `in_quiet_hours` mutes AUTONOMOUS speech at night (beats, lifecycle greetings, the
+# stats announcer, reflection bookends) while user-initiated speech (chat, /tts, a
+# manually invoked skill) still talks — the user is present and asked.
+DAYPARTS = ((5, 8, "early morning"), (8, 12, "morning"),
+            (12, 17, "afternoon"), (17, 22, "evening"))   # else: night
+
+
+def daypart(hour=None):
+    """Coarse local time-of-day name ("morning" .. "night") for prompts/guards."""
+    h = time.localtime().tm_hour if hour is None else float(hour) % 24
+    for lo, hi, name in DAYPARTS:
+        if lo <= h < hi:
+            return name
+    return "night"
+
+
+def in_quiet_hours(start, end, hour=None):
+    """True inside the [start, end) local-hour window, wrap-aware (22..8 spans
+    midnight). Disabled (False) when either bound is negative or they're equal."""
+    try:
+        s, e = float(start), float(end)
+    except (TypeError, ValueError):
+        return False
+    if s < 0 or e < 0 or s == e:
+        return False
+    if hour is None:
+        lt = time.localtime()
+        hour = lt.tm_hour + lt.tm_min / 60.0
+    h = float(hour) % 24
+    return (h >= s or h < e) if s > e else (s <= h < e)
+
+
+def time_context(now=None):
+    """One plain-English line about the local time, for the LLM prompts —
+    e.g. "It is Tuesday 21:47, in the evening."."""
+    lt = time.localtime(now)
+    return "It is %s %02d:%02d, in the %s." % (
+        time.strftime("%A", lt), lt.tm_hour, lt.tm_min, daypart(lt.tm_hour))
+
+
 class CognitionCore:
     """The shared LLM-personality brain. See the module docstring for the adapter contract."""
 
@@ -146,7 +189,8 @@ class CognitionCore:
                  workshop_retire_errors=2, workshop_retire_net_neg=2,
                  workshop_adopt_quiet_runs=5, workshop_trial_ttl=172800.0,
                  workshop_trial_bias=0.5, reflect_announce=True,
-                 skill_likes_path=None, skill_like_bias=0.6):
+                 skill_likes_path=None, skill_like_bias=0.6,
+                 quiet_start=-1.0, quiet_end=-1.0):
         self.llm = llm
         self.tts = tts
         self.persona = (persona or "").strip()
@@ -166,6 +210,10 @@ class CognitionCore:
         self._log = logger or (lambda *_: None)
         self._persist_settings = persist_settings
         self._face_hold = float(face_hold)
+        # Quiet hours (local time, wrap-aware; negative = disabled): autonomous speech is
+        # muted inside the window — see quiet_now() and the gates on the beat paths.
+        self._quiet_start = float(quiet_start)
+        self._quiet_end = float(quiet_end)
         # decision log (ring buffer backed by a JSON-lines file, shared with the robot/dev)
         self._cog_log_path = cog_log_path or os.path.expanduser(
             "~/.local/state/nanobot/cognition.log")
@@ -367,6 +415,14 @@ class CognitionCore:
                  f"{e.get('say') or e.get('detail') or ''}".rstrip() for e in entries]
         return "\n".join(lines) or "(no recent events)"
 
+    # ---- time awareness ------------------------------------------------------
+    def quiet_now(self):
+        """True during the configured quiet hours — autonomous speech (idle beats, skill
+        beats, boot greeting, offline line, stats announcer, reflection bookends) is muted;
+        user-initiated speech (chat/say/observe/look, POST /tts, a manually invoked skill)
+        keeps talking. Faces/beats still animate — the robot goes quiet, not dormant."""
+        return in_quiet_hours(self._quiet_start, self._quiet_end)
+
     # ---- express + generate -------------------------------------------------
     def express(self, mood, say, base_face=""):
         """Show a mood on the face and speak the line. `base_face` is the action's eye-shape (set
@@ -495,9 +551,9 @@ class CognitionCore:
             return bank
         snap = self._sensor_snapshot()
         self._log(f"llm observe: {snap}")
-        prompt = (f"Your own body's sensors report right now: {snap}. In character, say "
-                  "one short spoken line reacting to how you physically feel or what your "
-                  "sensors notice, and pick a fitting mood.")
+        prompt = (f"Your own body's sensors report right now: {snap}. {time_context()} "
+                  "In character, say one short spoken line reacting to how you physically "
+                  "feel or what your sensors notice, and pick a fitting mood.")
         return self.generate(prompt, trigger=trigger, state=state, prelude=True)
 
     def llm_look(self, trigger="look", state=""):
@@ -526,6 +582,9 @@ class CognitionCore:
         hears for an `audio` beat), generate + express. An audio beat always goes live (the
         cached bank isn't sound-aware). `face` is the beat's action eye-shape (e.g. "looking" /
         "focused"); the emotion rides it as an accent so the robot keeps its action eyes."""
+        if self.quiet_now():                            # night: the beat stays a silent face
+            self.log_decision(trigger, state, camera, status="quiet-hours")
+            return
         frame = None
         if camera:
             if not self.llm.available():                # no LLM to process the frame at all
@@ -541,7 +600,8 @@ class CognitionCore:
         elif not audio and self.bank_say(trigger, state, base_face=face):  # cached line
             return                                       # (free/instant/offline; no LLM call)
         full = (prompt + " Your current personality (0..1) is " + self.traits_phrase()
-                + ", and your body senses: " + self._sensor_snapshot())
+                + ", and your body senses: " + self._sensor_snapshot()
+                + ". " + time_context())
         if audio:
             full += " Through your microphone you hear: " + self._audio_summary() + "."
         # Camera beats already spoke the peek line; only the non-camera (audio) beat needs the
@@ -720,6 +780,9 @@ class CognitionCore:
     def run_skill_beat(self, state="acting"):
         """Autonomous skill beat: ask the cheap model to pick the most fitting offered skill
         for this moment (or none), then perform it. Best-effort — no pick = a silent beat."""
+        if self.quiet_now():                            # night: no autonomous performances
+            self.log_decision("beat:skill", state, status="quiet-hours")
+            return
         if not self.skills_enable:
             self.log_decision("beat:skill", state, status="skills-disabled")
             return
@@ -756,9 +819,11 @@ class CognitionCore:
                   'moment, or none. Reply with ONLY compact JSON {"skill": "<name>"} using '
                   'an EXACT name from the list, or {"skill": ""} to do nothing. No prose.')
         liked_hint = self._liked_skills_hint()
-        user = ("Capabilities:\n%s\n\nYour body senses: %s.\nYour personality (0..1): %s.\n%s"
+        user = ("Capabilities:\n%s\n\nYour body senses: %s.\n%s\n"
+                "Your personality (0..1): %s.\n%s"
                 "Pick the single most fitting capability to do now, or none."
-                % (cat, self._sensor_snapshot(), self.traits_phrase(), liked_hint))
+                % (cat, self._sensor_snapshot(), time_context(),
+                   self.traits_phrase(), liked_hint))
         content = self.llm.complete(system, user, json_object=True)
         skill = self._skills.choose(content or "", self.skills_allow_actions)
         if skill is None:
@@ -1112,7 +1177,14 @@ class CognitionCore:
     # ---- lifecycle speech ---------------------------------------------------
     def speak_lifecycle(self, category, face=None):
         """Speak a pre-generated lifecycle line (greeting/farewell/restarting/offline) and
-        optionally set a face. Offline-safe (phrase bank FALLBACK_LINES), best-effort."""
+        optionally set a face. Offline-safe (phrase bank FALLBACK_LINES), best-effort.
+        The autonomous categories (a 3 am boot greeting, the offline lament) respect quiet
+        hours; farewell/restarting are user-initiated (a power button was clicked) and speak."""
+        if category in ("greeting", "offline") and self.quiet_now():
+            if face:
+                self._face(face)                       # the face still tells the story
+            self.log_decision("life:" + category, status="quiet-hours")
+            return ""
         try:
             reply = self._bank.pick(None, name=self.persona_name, category=category)
         except Exception:
@@ -1209,6 +1281,9 @@ class CognitionCore:
         expression-only — a no-op if announcements are off, there's no line, or TTS is absent."""
         line = (line or "").strip()
         if not (self._reflect_announce and line):
+            return
+        if self.quiet_now():                            # reflections at night stay silent
+            self.log_decision("reflect:%s" % kind, status="quiet-hours")
             return
         self.express(mood, line)
         self.log_decision("reflect:%s" % kind, status="spoke", model="reflect", say=line[:160])

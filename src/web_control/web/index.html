@@ -5,9 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b0e14">
 <title>Nano · Control</title>
-<!-- roslib: talks to rosbridge_server over websocket. For a fully offline robot,
-     download this file into web/ and change the src to "roslib.min.js". -->
-<script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+<!-- No external scripts: telemetry + control ride the same-origin HTTP server
+     (SSE /telemetry, POST /publish|/param|/drive) — rosbridge/roslib are gone. -->
 <link rel="stylesheet" href="style.css">
 </head>
 <body class="no-tips">
@@ -386,11 +385,9 @@
         <section id="panel-system" class="panel">
           <div class="card">
             <h2>Connection</h2>
-            <div class="field"><label>rosbridge</label>
-              <div class="row"><span class="prefix">ws://</span><input id="host" class="grow"></div></div>
             <button id="connect" class="btn primary">Connect</button>
-            <p class="hint">rosbridge websocket. The page auto-connects on load and reconnects
-              after a stack reset / reboot.</p>
+            <p class="hint">Live telemetry stream (same-origin /telemetry). The page
+              auto-connects on load and reconnects after a stack reset / reboot.</p>
           </div>
           <div class="card">
             <h2>View</h2>

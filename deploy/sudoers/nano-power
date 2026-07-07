@@ -1,4 +1,8 @@
-# Lets the web UI "Shutdown" / reset controls power the board off/reboot without
-# a password — scoped to ONLY these two systemctl verbs, nothing else.
+# Lets the stack user manage the robot without a password — scoped to EXACTLY these
+# systemctl invocations, nothing else (no wildcards: systemctl accepts multiple unit
+# args, so a glob like "nano-*" would let extra unit names ride along).
+#   * poweroff/reboot        — the web UI Shutdown/Reboot buttons
+#   * start/stop/restart of nano-robot.target — scripts/stack.sh {up|down|restart}
 # Installed to /etc/sudoers.d/nano-power (mode 0440) by deploy/sbc-setup.sh.
 ibster ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot
+ibster ALL=(root) NOPASSWD: /usr/bin/systemctl start nano-robot.target, /usr/bin/systemctl stop nano-robot.target, /usr/bin/systemctl restart nano-robot.target

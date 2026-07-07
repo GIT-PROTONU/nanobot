@@ -16,16 +16,16 @@ web UI "🧠 Decision log".
 
 The **🧠 Brain card** (AI tab) is fully wired here too: this harness runs the real
 ROS-free brain (`behavior.brain`: Purpose Engine + Pursuit driver + A/B bandit),
-serves the readouts the robot publishes over rosbridge (`/purpose`,
-`/task_current`, `/experiments`) over plain HTTP (the page polls them when rosbridge is
-absent), and handles `/brain/reward` + `/brain/reflect`. So you can reward the current
+serves the readouts the robot streams in its /telemetry frame (`/purpose`,
+`/task_current`, `/experiments`) over plain HTTP (the page polls them when the telemetry
+stream is absent), and handles `/brain/reward` + `/brain/reflect`. So you can reward the current
 line (👍/👎 → the A/B bandit learns), watch the reward weights drift, and toggle
 reflection mode — all without the board. With `--behavior` the idle `musing` beat upgrades to a
 `pursuing` beat (planner task → webcam observation), so 👍/👎 becomes *contextual* and
 credits the chosen variant. (All dev state — the personality "soul" + decision log + goal/
 reward state — persists to the project-local `memory/` folder; delete it for a clean slate.)
 
-Telemetry/joystick/map show offline (no rosbridge), but the hero's **OLED** view works: it's
+Telemetry/joystick/map show offline (no /telemetry stream), but the hero's **OLED** view works: it's
 a client-side mirror of the physical panel and reads the current face/word from GET /oled/state
 (served here), so you can watch the same screen the robot's SSD1306 would show. The API key
 comes from $OPENROUTER_API_KEY, or (if unset) a one-line memory/openrouter_key file
@@ -352,7 +352,11 @@ class DevState:
             workshop_trial_bias=float(cfg.get("workshop_trial_bias", 0.5)),
             skill_likes_path=(cfg.get("skill_likes_path") or "").strip() or _dev_state("skill_likes.json"),
             skill_like_bias=float(cfg.get("skill_like_bias", 0.6)),
-            reflect_announce=bool(cfg.get("reflect_announce", True)))
+            reflect_announce=bool(cfg.get("reflect_announce", True)),
+            # Quiet hours (same robot.yaml values as the robot, so the dev harness goes
+            # quiet at night too — the decision log shows "quiet-hours" when it does).
+            quiet_start=float(cfg.get("quiet_start", -1.0)),
+            quiet_end=float(cfg.get("quiet_end", -1.0)))
         self._pending_evolve = None                         # reflection -> chart (drained by loop)
         self._lock_pe = threading.Lock()
         # --- Purpose Engine + Pursuit driver (the real ROS-free brain orchestration) -----
@@ -537,6 +541,8 @@ class DevState:
         if now < self._announce_next:
             return
         self._announce_next = now + float(self._settings["announce_interval"])
+        if self.cog.quiet_now():            # the periodic announcer respects quiet hours
+            return
         self.announce_now()
 
     def announce_now(self):
@@ -798,6 +804,19 @@ def run_behavior(state, idle_secs, reflect_secs):
         return
     b = _load_cfg("behavior")
     camera_beats = bool(b.get("camera_beats", True))
+    # Night idle slowdown (parity with mood_node._tempo): stretch the idle cadence inside
+    # the quiet window. Speech muting rides the cognition core's quiet_start/quiet_end.
+    q_s, q_e = float(b.get("quiet_start", -1.0)), float(b.get("quiet_end", -1.0))
+    n_tempo = max(1.0, float(b.get("night_tempo", 2.0)))
+
+    def tempo():
+        if n_tempo <= 1.0 or q_s < 0 or q_e < 0 or q_s == q_e:
+            return 1.0
+        lt = time.localtime()
+        h = lt.tm_hour + lt.tm_min / 60.0
+        in_q = (h >= q_s or h < q_e) if q_s > q_e else (q_s <= h < q_e)
+        return n_tempo if in_q else 1.0
+
     auto_on = bool(b.get("reflect_auto_enable", True))   # autonomously drift into reflection mode
     auto_idle = max(0.0, float(b.get("reflect_auto_idle", 1200.0)))
     auto_secs = max(1.0, float(b.get("reflect_auto_secs", 120.0)))
@@ -816,7 +835,7 @@ def run_behavior(state, idle_secs, reflect_secs):
         attend_secs=float(b.get("attend_secs", 2.0)), feel_secs=float(b.get("feel_secs", 2.5)),
         attend_face=str(b.get("attend_face", "looking")),
         alpha=float(b.get("smoothing_alpha", 0.1)), clock=clock,
-        chart_path=CHART_PATH, beats=BEATS)
+        chart_path=CHART_PATH, beats=BEATS, tempo=tempo)
     state._personality.attach(interp)          # bind so it can read/persist the live soul
     print(f"[behavior] statechart running — idle_secs={idle_secs}, camera_beats="
           f"{camera_beats}, reflect_secs={reflect_secs}. "
@@ -1004,8 +1023,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        # Brain readouts — the robot serves these over rosbridge (latched topics); the dev
-        # harness serves them over HTTP and the page polls them when rosbridge is absent.
+        # Brain readouts — the robot streams these in its /telemetry frame; the dev
+        # harness serves them over HTTP and the page polls them while disconnected.
         if p == "/purpose":
             return self._json(self.state.get_purpose())
         if p == "/task_current":
@@ -1018,8 +1037,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         p = self.path.split("?", 1)[0]
         s = self.state
         if p == "/drive":
-            # HTTP teleop no-op: accept the page's {v,w} POSTs so the joystick doesn't
-            # fall back to (absent) rosbridge; there are no motors here to move.
+            # HTTP teleop no-op: accept the page's {v,w} POSTs (there are no motors
+            # here to move) so the joystick UI behaves normally off-robot.
             return self._json({"status": "ok", "dev": True})
         if p == "/llm/say":
             if not s.llm.available():

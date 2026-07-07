@@ -45,6 +45,26 @@ def _wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
+def _sd_notify(msg):
+    """Best-effort systemd notification (Type=notify units): READY on start, then
+    WATCHDOG pets from an executor timer — if a callback wedges the executor the pets
+    stop and systemd restarts the node (WatchdogSec in nano-nav.service). No-op outside
+    systemd. (Deliberately duplicated in each supervised main: ~10 dependency-free
+    lines beat a cross-package util import.)"""
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path:
+        return
+    try:
+        import socket
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.sendto(msg.encode(), "\0" + path[1:] if path.startswith("@") else path)
+        finally:
+            s.close()
+    except OSError:
+        pass
+
+
 class NavNode(Node):
     def __init__(self):
         super().__init__("slam_nav")
@@ -900,6 +920,8 @@ class NavNode(Node):
 def main():
     rclpy.init()
     node = NavNode()
+    _sd_notify("READY=1")
+    node.create_timer(5.0, lambda: _sd_notify("WATCHDOG=1"))
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

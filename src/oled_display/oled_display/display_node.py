@@ -33,12 +33,12 @@ Efficiency (the face must be near-free on a 1 GB / quad-A53 board):
   * Blink/glance timing is randomized, so the animation never looks like it is
     replaying a fixed loop.
 
-Data sources (all lightweight — no heavy message is deserialized per frame):
-    /esp32_heartbeat (Int32)          → ESP32 liveness
-    /esp32_temp      (Float32)        → ESP32 temperature
-    /imu/web   (Vector3Stamped) z=measured /imu/data Hz → IMU liveness + rate
-    /imu/euler (Vector3Stamped) x=roll y=pitch (deg)    → dashboard tilt readout
-    /lds_hz          (Float32)        → LDS valid-frame rate (0/stale = offline)
+Data sources (all lightweight — NO telemetry topics are subscribed anymore):
+    /dev/shm/nano_vitals.json         → ESP32 liveness+temp, IMU rate/tilt, LDS hz,
+                                        CPU%/RAM%/SBC-temp — the one aggregated body
+                                        snapshot sys_monitor writes each tick (read
+                                        only while the dashboard is pinned, ≤1 Hz);
+                                        falls back to local /proc reads when stale
     /oled_text       (String)         → optional brand override (web UI textbox)
     /oled_face       (String)         → mood name / "" for the resting idle face (web UI)
     /oled_dashboard  (Bool)           → pin the status dashboard always (web UI toggle; default
@@ -54,6 +54,7 @@ Data sources (all lightweight — no heavy message is deserialized per frame):
 Subscribe-only and best-effort: if the panel or luma isn't present the node still
 runs and just logs once, so the rest of the stack is unaffected.
 """
+import json
 import math
 import os
 import random
@@ -64,8 +65,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, Int32, String
-from geometry_msgs.msg import Vector3Stamped
+from std_msgs.msg import Bool, String
 
 try:
     from luma.core.interface.serial import i2c
@@ -109,6 +109,9 @@ def _patch_fast_display(device):
 IP_REFRESH_S = 30.0    # re-resolve the outbound IP at most this often
 TEMP_REFRESH_S = 2.0   # re-read the SBC thermal zone at most this often
 SYS_REFRESH_S = 2.0    # re-sample CPU% + RAM at most this often (also the CPU% window)
+VITALS_FILE = "/dev/shm/nano_vitals.json"  # sys_monitor's aggregated body snapshot
+VITALS_REFRESH_S = 1.0 # re-read the vitals blob at most this often
+VITALS_FRESH_S = 5.0   # older than this (writer down) -> local /proc fallback
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"  # cpu-thermal (millidegrees)
 MEMINFO_PATH = "/proc/meminfo"                          # RAM totals (kB)
 STAT_PATH = "/proc/stat"                                # cpu jiffies for busy %
@@ -241,11 +244,9 @@ class DisplayNode(Node):
         else:
             self.get_logger().error(f"luma.oled unavailable: {_LUMA_ERR}")
 
-        self.create_subscription(Int32, "esp32_heartbeat", self._on_esp_beat, 10)
-        self.create_subscription(Float32, "esp32_temp", self._on_esp_temp, 10)
-        self.create_subscription(Vector3Stamped, "imu/web", self._on_imu_web, 10)
-        self.create_subscription(Vector3Stamped, "imu/euler", self._on_imu_euler, 10)
-        self.create_subscription(Float32, "lds_hz", self._on_lds_hz, 10)
+        # Telemetry comes from the vitals blob (see the module docstring), not topics —
+        # this node subscribes ONLY to its own /oled_* control topics.
+        self._vitals_due = 0.0
         self.create_subscription(String, "oled_text", self._on_text, 10)
         self.create_subscription(String, "oled_face", self._on_face, 10)
         self.create_subscription(Bool, "oled_dashboard", self._on_dashboard, 10)
@@ -374,26 +375,51 @@ class DisplayNode(Node):
             else:                           # 'restart' = stack only, 'reboot' = whole board
                 self._restart_screen("Restarting stack" if s == "restart" else "Restarting")
 
-    def _on_esp_beat(self, _msg: Int32):
-        self.esp_at = time.monotonic()
+    def _refresh_vitals(self, now):
+        """Fold the vitals blob into the telemetry fields (throttled file read; only
+        called from the dashboard tick, so face mode costs nothing). Per-source ages in
+        the blob are wall-clock-adjusted by the file's own age, so a dead sensor_hub
+        naturally ages every row into 'off'. Returns True when the blob is fresh enough
+        to also trust its CPU/RAM/temp (else the caller falls back to local /proc)."""
+        if now < self._vitals_due:
+            return getattr(self, "_vitals_fresh", False)
+        self._vitals_due = now + VITALS_REFRESH_S
+        self._vitals_fresh = False
+        try:
+            with open(VITALS_FILE) as f:
+                v = json.load(f)
+        except (OSError, ValueError):
+            return False
+        file_age = max(0.0, time.time() - float(v.get("t", 0)))
+        if file_age > VITALS_FRESH_S:
+            return False
+        self._vitals_fresh = True
+        esp = v.get("esp") or {}
+        if esp.get("hb_age") is not None:
+            self.esp_at = now - (esp["hb_age"] + file_age)
+        if esp.get("temp") is not None:
+            self.esp_temp = float(esp["temp"])
+        imu = v.get("imu") or {}
+        if imu.get("hz") is not None:
+            self.imu_hz = float(imu["hz"])
+            self.imu_at = now - (float(imu.get("age", 0)) + file_age)
+        eul = v.get("eul") or {}
+        if eul.get("r") is not None:
+            self.imu_roll = float(eul["r"])
+            self.imu_pitch = float(eul.get("p") or 0.0)
+        lds = v.get("lds") or {}
+        if lds.get("hz") is not None:
+            self.lds_hz = float(lds["hz"])
+            self.lds_at = now - (float(lds.get("age", 0)) + file_age)
+        if v.get("temp") is not None:
+            self._sbc = float(v["temp"])
+        if v.get("cpu") is not None:
+            self._cpu_pct = float(v["cpu"])
+        if v.get("mem") is not None:
+            self._mem_pct = float(v["mem"])
+        return True
 
-    def _on_esp_temp(self, msg: Float32):
-        self.esp_temp = msg.data
-        self.esp_at = time.monotonic()      # temp arriving also proves the ESP is alive
-
-    def _on_imu_web(self, msg: Vector3Stamped):
-        self.imu_hz = msg.vector.z          # z = measured /imu/data publish rate
-        self.imu_at = time.monotonic()
-
-    def _on_imu_euler(self, msg: Vector3Stamped):
-        self.imu_roll = msg.vector.x        # roll/pitch (deg) for the dashboard tilt readout
-        self.imu_pitch = msg.vector.y       # (yaw=z drifts on a magless IMU, so it's not shown)
-
-    def _on_lds_hz(self, msg: Float32):
-        self.lds_hz = msg.data
-        self.lds_at = time.monotonic()
-
-    # ---- cached, non-blocking reads for the render loop ----
+    # ---- cached, non-blocking reads for the render loop (vitals fallback) ----
     def _cached_ip(self) -> str:
         now = time.monotonic()
         if now >= self._ip_due:
@@ -464,6 +490,7 @@ class DisplayNode(Node):
         if not self.device or self._mood or self.speak_word or self._sys:
             return                                           # face/speech/system owns it
         now = time.monotonic()
+        vitals = self._refresh_vitals(now)   # feeds the esp/imu/lds fields + SBC stats
         esp_up = (now - self.esp_at) < ESP_TIMEOUT_S
         imu_up = (now - self.imu_at) < IMU_TIMEOUT_S
         lds_up = (now - self.lds_at) < LDS_TIMEOUT_S and self.lds_hz > 0.1
@@ -480,7 +507,7 @@ class DisplayNode(Node):
             # IP (left) + SBC CPU temp (right).
             if self.show_ip:
                 draw.text((2, 14), self._cached_ip(), font=self.font, fill=255)
-            sbc = self._cached_sbc_temp()
+            sbc = self._sbc if vitals else self._cached_sbc_temp()
             if sbc == sbc:                       # not NaN
                 s = f"{sbc:.0f}C"
                 draw.text((W - 2 - self._text_w(s), 14), s, font=self.font, fill=255)
@@ -496,7 +523,8 @@ class DisplayNode(Node):
             # SBC vitals (right column, below the temp): CPU busy % + RAM used %.
             # Right-aligned with a 3px margin and an x>=0 clamp so a wide value
             # (e.g. "CPU 100%") can never run off the right edge.
-            cpu_pct, mem_pct = self._cached_sys()
+            cpu_pct, mem_pct = ((self._cpu_pct, self._mem_pct) if vitals
+                                else self._cached_sys())
             for y, val in ((28, cpu_pct), (40, mem_pct)):
                 if val != val:               # NaN -> not ready yet
                     continue

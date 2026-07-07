@@ -5,7 +5,7 @@ description = "Lightweight ROS 2 Humble robot stack for a NanoPi NEO Plus2 (H5):
 authors = ["ib <ib.elfaramawy@gmail.com>"]
 channels = ["conda-forge", "robostack-staging"]
 # linux-aarch64 = the board (Armbian on the H5). linux-64 kept so you can develop
-# the non-hardware bits (msgs, web, rosbridge) on a desktop too.
+# the non-hardware bits (msgs, web, sim) on a desktop too.
 platforms = ["linux-aarch64", "linux-64"]
 
 # rmw_zenoh is dramatically lighter on RAM/discovery than the default FastDDS,
@@ -23,7 +23,8 @@ CMAKE_GENERATOR = "Ninja"
 # --- ROS 2 Humble core (ros-base = no Rviz/Gazebo/GUI, keeps the footprint small) ---
 ros-humble-ros-base = "*"
 ros-humble-rmw-zenoh-cpp = "*"
-ros-humble-rosbridge-suite = "*"
+# NOTE: rosbridge is GONE. The browser talks only to web_control's own HTTP server
+# (SSE /telemetry + POST /publish|/param|/drive) — see web_control/telemetry.py.
 # common_interfaces (sensor_msgs/nav_msgs/geometry_msgs) + tf2 ship with ros-base.
 ros-humble-tf-transformations = "*"
 # NOTE: no micro-ROS agent dependency. The ESP32 coprocessor now talks NATIVE
@@ -87,8 +88,8 @@ build = "bash scripts/build.sh"
 # rmw_zenoh needs its router running for discovery. Start it (own terminal / service).
 zenohd = "ros2 run rmw_zenoh_cpp rmw_zenohd"
 
-# Bring up the full robot (real hardware; ros2-launch debug alternative to stack.sh,
-# which is what actually runs in production — see robot_bringup/launch/bringup.launch.py).
+# Bring up the full robot (real hardware; ros2-launch debug alternative to the systemd
+# units that run in production — see robot_bringup/launch/bringup.launch.py).
 bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup bringup.launch.py'", depends-on = ["build"] }
 
 # Dev-PC-only: the same node graph as `bringup`, but with lds_driver_py/imu_driver/the
@@ -96,11 +97,14 @@ bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bring
 sim = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup bringup.launch.py sim:=true rviz:=true'", depends-on = ["build"] }
 
 # Dev-PC-only: RViz watching the REAL robot live over the shared zenoh graph (robot runs
-# its own stack.sh unchanged) -- NOT a simulation. See scripts/rviz_remote.sh.
+# its own systemd stack unchanged) -- NOT a simulation. See scripts/rviz_remote.sh.
 visualize = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup visualize.launch.py'", depends-on = ["build"] }
 
-# Web control page + rosbridge only (handy for UI dev). Web UI on :8080, ws on :9090.
+# Web control page only (handy for UI dev). Web UI + telemetry on :8080.
 web = { cmd = "bash -c 'source install/setup.bash && ros2 launch web_control web.launch.py'", depends-on = ["build"] }
+# End-to-end smoke test of the browser gateway + hubs (the telemetry-frame contract,
+# publish/param whitelists, vitals blob, SIGTERM path). Run before deploying.
+smoke = { cmd = "bash -c 'source install/setup.bash && python scripts/smoke_test.py'", depends-on = ["build"] }
 
 # Convenience: open a shell with everything sourced.
 shell = "bash -c 'source install/setup.bash 2>/dev/null; exec bash'"

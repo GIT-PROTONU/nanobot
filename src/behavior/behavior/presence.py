@@ -248,13 +248,16 @@ statechart:
           # whether this cycle perks up into the focus-gated "attending" state; the two outgoing
           # guards then read that flag so they stay mutually exclusive (Sismic forbids two
           # simultaneously-enabled eventless transitions from one state).
+          # tempo() is a live time-of-day pacing factor injected by the node (1.0 by day,
+          # night_tempo at night) — a sleepier robot after hours without touching the
+          # LLM-owned traits/drives.
           - name: resting
             on entry: face(''); decide_attend()
             transitions:
               - target: attending
-                guard: after(idle_secs * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and attend_next()
+                guard: after(idle_secs * tempo() * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and attend_next()
               - target: performing
-                guard: after(idle_secs * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and not attend_next()
+                guard: after(idle_secs * tempo() * (1.4 - 0.8 * traits['extraversion']) * (1.3 - 0.6 * drives['energy'])) and not attend_next()
           # Attention: briefly perk up with the alert face before acting (focus-driven). A
           # short, expressive "I noticed something" pause that precedes the beat.
           - name: attending
@@ -333,7 +336,8 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
                       perform_secs=4.0, camera_beats=True,
                       traits=None, registry=None, drives=None, alpha=0.1, clock=None,
                       reflect_face="focused", greet_face="happy", attend_face="looking",
-                      attend_secs=2.0, feel_secs=2.5, rng=None, chart_path="", beats=None):
+                      attend_secs=2.0, feel_secs=2.5, rng=None, chart_path="", beats=None,
+                      tempo=None):
     """Parse + validate the chart and return (interpreter, clock), already advanced into
     `greeting`. `traits`/`registry`/`drives` seed the live personality (merged over the frozen
     defaults); `alpha` is the exponential-smoothing rate for `evolve`. `rng` (injected for
@@ -345,12 +349,16 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
     bool OR a zero-arg callable re-checked on every draw — the latter lets a caller wire it to a
     LIVE signal (e.g. "is the LLM actually available right now") so the chooser stops offering
     camera beats ("looking") the moment there's no LLM to process the frame, without rebuilding
-    the interpreter. Sismic is imported lazily so importing this module never needs it."""
+    the interpreter. `tempo` is an optional zero-arg callable returning a live idle-cadence
+    multiplier (>1 = sleepier), re-read on every guard evaluation — the node wires it to local
+    time-of-day so the robot naturally slows down at night (default: constant 1.0). Sismic is
+    imported lazily so importing this module never needs it."""
     from sismic.interpreter import Interpreter
     from sismic.clock import SimulatedClock
 
     beats = beats if beats is not None else BEATS
     camera_beats_fn = camera_beats if callable(camera_beats) else (lambda: bool(camera_beats))
+    tempo_fn = tempo if callable(tempo) else (lambda: 1.0)
 
     # Live dicts (deep-copied so they never alias the frozen defaults).
     live_traits = copy.deepcopy(DEFAULT_TRAITS)
@@ -434,6 +442,7 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
         "face": face,
         "do_beat": do_beat or (lambda _name: None),
         "pick_beat": pick_beat,
+        "tempo": tempo_fn,
         "decide_attend": decide_attend,
         "attend_next": attend_next,
         "decide_next": decide_next,

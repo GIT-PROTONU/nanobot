@@ -1,183 +1,65 @@
 #!/usr/bin/env bash
-# Nano robot runtime stack manager. Run ON THE BOARD via:
-#   ~/.pixi/bin/pixi run bash scripts/stack.sh {up|down|restart|status}
+# Nano robot runtime stack manager — now a thin wrapper over systemd.
 #
-# Two hard-won lessons are baked in:
-#  * rmw_zenoh ordering: a node started BEFORE `rmw_zenohd` checks for a router
-#    once, then runs islanded (never appears in the graph). So `up` starts the
-#    ROUTER first, waits, then the web stack, then the nodes.
-#  * pkill/pgrep -f are SAFE here because this runs as a script *file* (the
-#    shell's argv is just the path). That's the opposite of `plink -m`, where the
-#    script text becomes the remote shell's argv, so a `pkill -f <node>` pattern
-#    matches — and kills — the running shell itself (seen as plink exit 128).
+#   bash scripts/stack.sh {up|down|restart|status}     (no pixi env needed)
+#
+# The stack runs as five systemd units (installed by deploy/sbc-setup.sh):
+#   nano-router    serial-capable zenohd (rmw_zenoh graph + the ESP32 UART link)
+#   nano-app       app_hub: web_control + oled_display + behavior in ONE process
+#   nano-sensors   sensor_hub: imu + sys_monitor + wheel_odometry + lds in ONE process
+#   nano-nav       slam_nav
+#   nano-map       map_bridge_node (/dev/shm map blob -> /map for remote RViz)
+# grouped under nano-robot.target. What each unit execs lives in ONE place:
+# scripts/unit_exec.sh (env activation + the installed-executable command table).
+#
+# systemd replaced the old hand-rolled pgrep supervision AND nano-heal.timer:
+# ordering is After=nano-router.service (the rmw_zenoh island gotcha), crash
+# recovery is Restart=on-failure (no heal-vs-restart duplicate-node race), and
+# stop/kill/verify is systemd's. Logs: journalctl -u nano-app (etc.) — the old
+# .run/*.log files are no more, except the router config still generated there.
+#
+# The scoped NOPASSWD sudoers rules for exactly these systemctl verbs are installed
+# by deploy/sbc-setup.sh (deploy/sudoers/nano-power).
 set -u
 
-# glibc gives each thread its own malloc arena (up to ~8*cores*64 MB of address space,
-# with real RSS creep). The threaded Python nodes (imu/lds/web/nav serial+HTTP readers)
-# are exactly that pattern, so cap the arenas — a cheap RSS win on the 1 GB board. Every
-# node is launched as a child of this script, so the export is inherited by all of them.
-export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+TARGET="nano-robot.target"
+UNITS=(nano-router nano-app nano-sensors nano-nav nano-map)
+SYSTEMCTL="/usr/bin/systemctl"
 
-NANO="${NANO:-$HOME/Nano}"
-LOG="$NANO/.run"; mkdir -p "$LOG"
-PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/robot.yaml"
-# ESP32 coprocessor: runs zenoh-pico over a direct UART (NO micro-ROS agent). The
-# serial-capable zenohd LISTENs on this UART so the ESP32 joins the zenoh graph
-# directly (/cmd_vel,/led,/lds_target_rpm in; /wheel_ticks,/lds_*,/esp32_* etc out).
-# Build the binary on a dev host: firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh aarch64
-ESP32_UART="${ESP32_UART:-/dev/ttyS1}"
-ESP32_BAUD="${ESP32_BAUD:-115200}"
-ZENOHD_SERIAL="${ZENOHD_SERIAL:-$NANO/bin/zenohd-serial}"
+installed() { "$SYSTEMCTL" list-unit-files "$TARGET" --no-legend 2>/dev/null | grep -q nano-robot; }
 
-# The ROS overlay's setup scripts reference unset vars (e.g. COLCON_TRACE);
-# relax nounset just around the source so `set -u` can stay on for our logic.
-if [ -f "$NANO/install/setup.bash" ]; then
-  set +u; source "$NANO/install/setup.bash"; set -u
-fi
-cd "$NANO" || exit 1
-
-# launch NAME "command…"  — detached, own session, logged to .run/NAME.log
-launch() {
-  setsid bash -c "exec $2" >"$LOG/$1.log" 2>&1 </dev/null &
-  echo "  $1: started -> $LOG/$1.log"
+need_units() {
+  installed && return 0
+  echo "nano-robot.target is not installed. Run once:  sudo bash deploy/sbc-setup.sh" >&2
+  exit 1
 }
 
-do_up() {
-  # Launch every node DIRECTLY by its installed executable, not via `ros2 run` /
-  # `ros2 launch`: each of those leaves a ~27-40 MB Python CLI wrapper resident
-  # for the lifetime of the node. On the 970 MB board that overhead added up to
-  # ~175 MB across the stack. rosapi is also dropped — the web page talks to known
-  # topics and never enumerates, so it isn't needed (~65 MB more).
-  local ros="$CONDA_PREFIX/lib"     # ROS package libexec dirs in the pixi env
-  local own="$NANO/install"         # our colcon packages
-  # ROUTER: the serial-capable zenohd (built with --features transport_serial; the
-  # conda libzenohc has NO serial support). It LISTENs on TCP for the rmw_zenoh stack
-  # AND on the ESP32's UART, so the ESP32 (running zenoh-pico, NO micro-ROS agent, NO
-  # DDS) joins the graph directly. Replaces conda rmw_zenohd + micro_ros_agent.
-  #
-  # It MUST run with rmw_zenoh's own ROUTER config (not zenohd defaults): the default
-  # routing lets the ROS peers gossip into a direct mesh that bypasses delivery of the
-  # ESP32 (a zenoh CLIENT) data to them. We generate that config + add the serial listen
-  # endpoint, and set exit_on_failure:false so a transient serial desync can't kill the
-  # router. (The ESP32 firmware also disables its LDS UART so it can keep the zenoh
-  # serial link fed under the rmw config's tighter transport timings.)
-  # Regenerate the router config + (re)launch zenohd ONLY when it's down. Kept inside
-  # the guard so a periodic `heal` tick (nano-heal.timer) spawns no python when healthy.
-  local rcfg="$LOG/router_serial.json5"
-  pgrep -x 'zenohd-serial' >/dev/null || {
-    python - "$rcfg" "$ESP32_UART" "$ESP32_BAUD" <<'PY'
-import sys, os
-out, uart, baud = sys.argv[1], sys.argv[2], sys.argv[3]
-src = f"{os.environ['CONDA_PREFIX']}/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_ROUTER_CONFIG.json5"
-t = open(src).read()
-old = '    endpoints: [\n      "tcp/[::]:7447"\n    ],'
-new = f'    endpoints: [\n      "tcp/[::]:7447",\n      "serial/{uart}#baudrate={baud}"\n    ],'
-assert t.count(old) == 1, "router config listen-endpoints block not found as expected"
-open(out, "w").write(t.replace(old, new).replace("exit_on_failure: true", "exit_on_failure: false"))
-PY
-    launch zenohd "$ZENOHD_SERIAL -c $rcfg"; sleep 6;
-  }
-  pgrep -f 'rosbridge_websocket' >/dev/null \
-    || launch rosbridge "$ros/rosbridge_server/rosbridge_websocket --ros-args -p port:=9090"
-  pgrep -f 'web_control/lib/web_control' >/dev/null \
-    || launch web "$own/web_control/lib/web_control/web_server --ros-args --params-file $PARAMS -p web_port:=8080 -p rosbridge_port:=9090"
-  pgrep -f 'oled_display/lib/oled_display' >/dev/null \
-    || launch oled "$own/oled_display/lib/oled_display/display_node --ros-args --params-file $PARAMS"
-  # Behaviour layer (Sismic statechart): idle "feel alive" presence supervisor. Drives
-  # the OLED face during true idle only; expression-only (never /cmd_vel). No-op if
-  # sismic/params disabled, so it's safe to always launch.
-  pgrep -f 'behavior/bin/mood_node' >/dev/null \
-    || launch behavior "$own/behavior/bin/mood_node --ros-args --params-file $PARAMS"
-  # Sensor hub: imu_driver + sys_monitor + wheel_odometry + lds_driver_py in ONE process
-  # (one executor) to save ~100+ MB of RAM vs four separate interpreters on the 1 GB board.
-  # Same node names/topics/params, so /odom, /diagnostics, /scan, /imu/*, the live-retune
-  # services and the LDS scan blob (/dev/shm) are all unchanged. The LDS data wire fans out
-  # to the ESP32 (UART1 RX=GPIO14, RPM->spin PID) AND the SBC's UART2 (/dev/ttyS2, full
-  # scan); UART2 needs the `uart2` overlay (deploy/sbc-setup.sh) + a reboot to exist.
-  pgrep -f 'sensor_hub/lib/sensor_hub' >/dev/null \
-    || launch sensors "$own/sensor_hub/lib/sensor_hub/sensor_hub --ros-args --params-file $PARAMS"
-  # SLAM/mapping: builds an occupancy grid from /scan + /odom + /imu/euler and writes
-  # /dev/shm/nano_map.bin for the web map panel. Started last (needs scan + odom flowing).
-  pgrep -f 'slam_nav/lib/slam_nav' >/dev/null \
-    || launch nav "$own/slam_nav/lib/slam_nav/nav_node --ros-args --params-file $PARAMS"
-  # Republishes the /dev/shm/nano_map.bin blob above as a real nav_msgs/OccupancyGrid on
-  # /map. /dev/shm is per-machine RAM, so this MUST run on the board (not the dev PC) for
-  # a remote RViz (robot_bringup/launch/visualize.launch.py, over the shared zenoh graph)
-  # to see the map. Cheap (one rclpy node, no Gazebo deps) — always safe to run.
-  pgrep -f 'sim_hardware/bin/map_bridge_node' >/dev/null \
-    || launch map "$own/sim_hardware/bin/map_bridge_node --ros-args --params-file $PARAMS"
-}
-
-# Node path substrings match whether launched directly or via ros2 run/launch.
-# rosapi_node + ros2cli.daemon sweep up anything left by older launches or by
-# `ros2 ...` CLI probes (each spawns a ~60 MB daemon).
-# sensor_hub now hosts imu/sys/odom/lds in one process, but the old per-node patterns are
-# kept here too so `down`/`restart` also sweeps up stragglers from a pre-merge deploy.
-NODE_PATS=(
-  'slam_nav/lib/slam_nav'
-  'sim_hardware/bin/map_bridge_node'
-  'sensor_hub/lib/sensor_hub'
-  'lds_driver_py/lib/lds_driver_py'
-  'wheel_odometry/lib/wheel_odometry'
-  'sys_monitor/lib/sys_monitor'
-  'imu_driver/lib/imu_driver'
-  'oled_display/lib/oled_display'
-  'behavior/bin/mood_node'
-  'web_control/lib/web_control'
-  'rosbridge_websocket' 'rosapi_node' 'ros2cli.daemon'
-)
-
-# true while ANY managed process is still alive (nodes by -f pattern, router by exact name)
-any_alive() {
-  local p
-  for p in "${NODE_PATS[@]}"; do pgrep -f "$p" >/dev/null && return 0; done
-  pgrep -x 'zenohd-serial' >/dev/null && return 0
-  return 1
-}
-
-do_down() {
-  # The old version sent ONE SIGTERM then slept a fixed 1-2 s. A node slow to exit
-  # survived, and then do_up's pgrep guard saw it still running and SKIPPED relaunch —
-  # leaving a stale process holding the port / serving old code (the "change didn't
-  # take" foot-gun in CLAUDE.md). Now: SIGTERM all, WAIT for actual exit, then SIGKILL
-  # any straggler and verify.
-  local p
-  for p in "${NODE_PATS[@]}"; do pkill -f "$p" 2>/dev/null; done
-  pkill -x 'zenohd-serial' 2>/dev/null    # router holds the ESP32 UART; kill by exact name
-
-  # Poll up to ~6 s, returning as soon as everything is gone.
-  local i
-  for i in $(seq 1 30); do any_alive || break; sleep 0.2; done
-
-  # SIGKILL whatever ignored SIGTERM, then report anything still standing.
-  for p in "${NODE_PATS[@]}"; do
-    pgrep -f "$p" >/dev/null && { echo "  forcing kill: $p"; pkill -9 -f "$p" 2>/dev/null; }
-  done
-  pgrep -x 'zenohd-serial' >/dev/null && { echo "  forcing kill: zenohd-serial"; pkill -9 -x 'zenohd-serial' 2>/dev/null; }
-  sleep 0.3
-  any_alive && echo "  WARNING: a managed process is still alive after SIGKILL"
+ctl() {  # ctl <verb> — root runs it directly; the stack user goes through sudo -n
+  if [ "$(id -u)" -eq 0 ]; then "$SYSTEMCTL" "$1" "$TARGET"
+  else
+    sudo -n "$SYSTEMCTL" "$1" "$TARGET" || {
+      echo "sudo denied — re-run deploy/sbc-setup.sh to install the nano-power sudoers rules" >&2
+      exit 1
+    }
+  fi
 }
 
 status() {
-  for s in "zenohd:zenohd-serial" "rosbridge:rosbridge_websocket" \
-           "web:web_control/lib/web_control" "oled:oled_display/lib/oled_display" \
-           "behavior:behavior/bin/mood_node" \
-           "sensors:sensor_hub/lib/sensor_hub" \
-           "nav:slam_nav/lib/slam_nav" \
-           "map:sim_hardware/bin/map_bridge_node"; do
-    if pgrep -f "${s#*:}" >/dev/null; then echo "  ${s%%:*}: UP"; else echo "  ${s%%:*}: down"; fi
+  for u in "${UNITS[@]}"; do
+    if [ "$("$SYSTEMCTL" is-active "$u" 2>/dev/null)" = "active" ]; then
+      echo "  $u: UP"
+    else
+      echo "  $u: down"
+    fi
   done
 }
 
 case "${1:-status}" in
-  up)      echo "stack up…";      do_up;   sleep 5; status ;;
-  down)    echo "stack down…";    do_down; status ;;          # do_down now blocks until gone
-  restart) echo "stack restart…"; do_down; do_up; sleep 5; status ;;
-  # heal: same idempotent launch as `up`, run periodically by nano-heal.timer.
-  # do_up's pgrep guards make it a NO-OP when everything is alive (no relaunch, no
-  # output); a crashed/missing node gets relaunched and `launch` logs the one line.
-  # No trailing status/sleep so a healthy tick is silent in the journal.
-  heal)    do_up ;;
+  up)      need_units; echo "stack up…";      ctl start;   status ;;
+  down)    need_units; echo "stack down…";    ctl stop;    status ;;
+  restart) need_units; echo "stack restart…"; ctl restart; sleep 2; status ;;
   status)  status ;;
-  *) echo "usage: $0 {up|down|restart|heal|status}"; exit 2 ;;
+  heal)    ;;  # retired: systemd Restart=on-failure does this natively. No-op so a
+               # stale nano-heal.timer tick during an upgrade window can't error.
+  *) echo "usage: $0 {up|down|restart|status}"; exit 2 ;;
 esac

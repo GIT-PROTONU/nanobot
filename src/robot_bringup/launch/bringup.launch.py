@@ -1,7 +1,8 @@
 """Top-level bringup: the one node graph shared by the real robot and the Gazebo dev-sim.
 
-Nodes that run identically either way (real robot hardware or Gazebo): web_control (+
-rosbridge), oled_display, behavior (mood_node), sys_monitor, wheel_odometry, slam_nav,
+Nodes that run identically either way (real robot hardware or Gazebo): web_control
+(the browser's telemetry/control gateway — no rosbridge), oled_display, behavior
+(mood_node), sys_monitor, wheel_odometry, slam_nav,
 robot_state_publisher. Only the lowest hardware-transducer layer is swapped by `sim`:
 
     sim:=false (default) -- the real LDS02RR (lds_driver_py) + BWT901CL IMU (imu_driver).
@@ -53,7 +54,7 @@ def generate_launch_description():
         DeclareLaunchArgument("rviz", default_value="false",
                               description="Also start RViz2 with the checked-in config."),
         DeclareLaunchArgument("web", default_value="true",
-                              description="Also start rosbridge + the web control page."),
+                              description="Also start the web control page/gateway."),
 
         # ---- always: the shared node graph -----------------------------------------
         Node(package="wheel_odometry", executable="encoder_node",

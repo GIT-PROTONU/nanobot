@@ -36,7 +36,7 @@
   // (matches the keyboard mapping). Speed scales with how far it's pushed; the
   // global 10 Hz publisher keeps streaming /cmd_vel while it's held off-centre.
   // Publishes during a drag are capped at ~15 Hz: pointermove fires at 60-120+ Hz
-  // and forwarding every event floods rosbridge + the 115200-baud ESP32 link, so
+  // and forwarding every event floods the server + the 115200-baud ESP32 link, so
   // delivery gaps blow past the ESP32's 500 ms cmd watchdog and driving stutters.
   (function(){
     const joy=$("joy"), knob=$("joyKnob"); if(!joy) return;

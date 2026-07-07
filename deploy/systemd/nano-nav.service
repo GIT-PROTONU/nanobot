@@ -1,0 +1,19 @@
+[Unit]
+Description=Nano SLAM/navigation (slam_nav)
+# After sensors so /scan + /odom are flowing when the matcher starts.
+After=nano-router.service nano-sensors.service
+Wants=nano-router.service
+PartOf=nano-robot.target
+
+[Service]
+# Type=notify + watchdog: executor-liveness pets from a 5 s timer (see nav_node.main).
+Type=notify
+WatchdogSec=90
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh nav
+Restart=on-failure
+RestartSec=3
+MemoryMax=300M
+
+[Install]
+WantedBy=nano-robot.target

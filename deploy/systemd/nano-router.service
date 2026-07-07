@@ -1,0 +1,20 @@
+[Unit]
+Description=Nano zenoh router (serial-capable zenohd: rmw_zenoh graph + ESP32 UART link)
+After=network-online.target
+Wants=network-online.target
+PartOf=nano-robot.target
+
+[Service]
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh router
+# rmw_zenoh ordering: a node that starts before the router is listening runs islanded
+# (never appears in the graph). Hold "started" until the router actually ACCEPTS on
+# :7447 (bash /dev/tcp probe, no tools needed) so After=nano-router.service in the
+# node units means "router is ready", not "router was forked".
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/7447) 2>/dev/null && exit 0; sleep 0.5; done; echo "router never opened :7447" >&2; exit 1'
+Restart=on-failure
+RestartSec=3
+MemoryMax=150M
+
+[Install]
+WantedBy=nano-robot.target

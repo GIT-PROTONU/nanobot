@@ -20,6 +20,9 @@ drivers self-heal (reconnect on their own threads) and the hot paths guard their
 exceptions, so the common failure (a USB/UART device vanishing) is handled without
 taking the process down.
 """
+import os
+import socket
+
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 
@@ -30,6 +33,25 @@ from lds_driver_py.lds_node import LdsNode
 
 # No inter-node dependencies, so construction order is irrelevant.
 NODE_CLASSES = (ImuNode, MonitorNode, EncoderNode, LdsNode)
+
+
+def _sd_notify(msg):
+    """Best-effort systemd notification (Type=notify units): READY on start, then
+    WATCHDOG pets from an executor timer — if any callback wedges the executor the
+    pets stop and systemd restarts the hub (WatchdogSec in nano-sensors.service).
+    No-op outside systemd. (Deliberately duplicated in each hub main: ~10
+    dependency-free lines beat a cross-package util import.)"""
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path:
+        return
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.sendto(msg.encode(), "\0" + path[1:] if path.startswith("@") else path)
+        finally:
+            s.close()
+    except OSError:
+        pass
 
 
 def main():
@@ -46,6 +68,9 @@ def main():
         ex.add_node(n)
     print(f"[sensor_hub] hosting {len(nodes)} nodes: "
           f"{', '.join(n.get_name() for n in nodes)}", flush=True)
+    _sd_notify("READY=1")
+    if nodes:                       # executor-liveness watchdog pet (see _sd_notify)
+        nodes[0].create_timer(5.0, lambda: _sd_notify("WATCHDOG=1"))
     try:
         ex.spin()
     except KeyboardInterrupt:

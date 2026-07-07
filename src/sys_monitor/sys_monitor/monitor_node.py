@@ -9,7 +9,17 @@ A single DiagnosticStatus named "system" carries KeyValue fields:
     wifi_iface, wifi_ssid, wifi_signal_dbm, wifi_quality_pct
 and a level (OK/WARN) flagged when temp/mem/disk cross soft thresholds. The web
 UI renders these in a System panel.
+
+Also writes the **vitals blob** (`/dev/shm/nano_vitals.json`, once per tick): the
+one aggregated body snapshot — CPU/RAM/temp/disk + IMU motion/tilt/rate + LDS hz +
+ESP32 liveness/temp — that the slow consumers (oled_display's dashboard, web_control's
+telemetry frame + cognition body snapshot) READ instead of each subscribing to the
+15 Hz IMU topics they only sample at 1-2 Hz. This node is the only subscriber left on
+/imu/web + /imu/euler, so those messages never cross a process boundary (imu_driver is
+co-resident in sensor_hub). Values are written NaN-free (null instead) because the
+blob is re-emitted into browser JSON. One writer per /dev/shm file, atomic replace.
 """
+import json
 import os
 import socket
 import subprocess
@@ -18,9 +28,12 @@ import time
 import rclpy
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from geometry_msgs.msg import Vector3Stamped
 from std_msgs.msg import Float32, Int32
 
 from .health_log import HealthWatch, read_scan_blob_header
+
+VITALS_FILE = "/dev/shm/nano_vitals.json"
 
 # Soft thresholds -> status WARN (purely advisory, shown in the UI).
 TEMP_WARN_C = 75.0
@@ -89,6 +102,14 @@ class MonitorNode(Node):
         self.create_subscription(Int32, "/esp32_heartbeat", self._on_hb, 10)
         self.create_subscription(Float32, "/lds_rpm", self._on_rpm, 10)
         self.create_subscription(Float32, "/lds_hz", self._on_hz, 10)
+        # Vitals-blob inputs beyond the /proc reads: IMU summary/tilt (in-process — the
+        # driver is co-resident in sensor_hub) + the ESP32 die temp. Latest-value only.
+        self._imu = None                    # (|a| m/s^2, |g| rad/s, hz, monotonic at)
+        self._eul = None                    # (roll, pitch, yaw deg, monotonic at)
+        self._esp_temp = None               # (°C, monotonic at)
+        self.create_subscription(Vector3Stamped, "/imu/web", self._on_imu_web, 10)
+        self.create_subscription(Vector3Stamped, "/imu/euler", self._on_imu_euler, 10)
+        self.create_subscription(Float32, "/esp32_temp", self._on_esp_temp, 10)
         up = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
         self.watch.write([f"monitor start (boot uptime {up:.0f}s)"])
 
@@ -233,6 +254,54 @@ class MonitorNode(Node):
 
         self._publish_fan(cpu_t)
         self._health_tick()
+        self._write_vitals(cpu_pct, mem_pct, cpu_t, disk_pct)
+
+    def _write_vitals(self, cpu_pct, mem_pct, cpu_t, disk_pct):
+        """Write the aggregated body snapshot to /dev/shm (atomic replace). `t` is wall
+        clock so readers in other processes can add the file's staleness to the per-source
+        ages recorded here. NaN -> null (the blob ends up in browser JSON)."""
+        def num(x, nd=1):
+            return None if x is None or x != x else round(float(x), nd)
+
+        now = time.monotonic()
+        v = {"t": time.time(),
+             "cpu": num(cpu_pct), "mem": num(mem_pct),
+             "temp": num(cpu_t), "disk": num(disk_pct)}
+        if self._imu is not None:
+            a, g, hz, at = self._imu
+            v["imu"] = {"a": num(a, 2), "g": num(g, 3), "hz": num(hz),
+                        "age": round(now - at, 2)}
+        if self._eul is not None:
+            r, p, y, at = self._eul
+            v["eul"] = {"r": num(r), "p": num(p), "y": num(y),
+                        "age": round(now - at, 2)}
+        hz, hz_at = self._hz
+        if hz == hz:
+            v["lds"] = {"hz": num(hz, 2), "age": round(now - hz_at, 2)}
+        esp = {}
+        if self._hb_at is not None:
+            esp["hb_age"] = round(now - self._hb_at, 2)
+        if self._esp_temp is not None:
+            esp["temp"] = num(self._esp_temp[0])
+            esp["temp_age"] = round(now - self._esp_temp[1], 2)
+        if esp:
+            v["esp"] = esp
+        try:
+            tmp = VITALS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(v, f, separators=(",", ":"))
+            os.replace(tmp, VITALS_FILE)
+        except OSError:
+            pass                              # /dev/shm unavailable: never fatal
+
+    def _on_imu_web(self, msg):              # x=|accel|, y=|gyro|, z=actual /imu/data Hz
+        self._imu = (msg.vector.x, msg.vector.y, msg.vector.z, time.monotonic())
+
+    def _on_imu_euler(self, msg):            # x=roll, y=pitch, z=yaw (deg)
+        self._eul = (msg.vector.x, msg.vector.y, msg.vector.z, time.monotonic())
+
+    def _on_esp_temp(self, msg):
+        self._esp_temp = (msg.data, time.monotonic())
 
     def _on_hb(self, _msg):
         self._hb_at = time.monotonic()

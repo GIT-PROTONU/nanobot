@@ -1,0 +1,19 @@
+[Unit]
+Description=Nano sensor hub (IMU + sys_monitor + wheel odometry + LDS, one process)
+After=nano-router.service
+Wants=nano-router.service
+PartOf=nano-robot.target
+
+[Service]
+# Type=notify + watchdog: executor-liveness pets from a 5 s timer (see hub.py) —
+# a wedged executor stops petting and systemd restarts the hub.
+Type=notify
+WatchdogSec=90
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh sensors
+Restart=on-failure
+RestartSec=3
+MemoryMax=300M
+
+[Install]
+WantedBy=nano-robot.target

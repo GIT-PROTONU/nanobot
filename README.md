@@ -18,34 +18,55 @@ Hardware:
 | **BWT901CL** IMU | USB-serial (`/dev/imu`, CH340) | `imu_driver` | `/imu/data`, `/imu/web` |
 | **Logitech C270** webcam + mic | USB | `web_control` | `/stream.mjpg`, `/audio.pcm` |
 | **PCA9685** PWM | I2C1 (`/dev/i2c-1`, 0x40) | — (retired; ESP32 owns motors) | — |
-| Web control + map | — | `web_control` + rosbridge | browser |
+| Web control + map | — | `web_control` (HTTP + SSE gateway) | browser |
 
 ## Architecture
 
-Each subsystem is its own ROS 2 node, wired together **only through topics** — the
-same separation ROS 2 itself encourages, so any node can be launched, restarted, or
-debugged in isolation. Packages live under `src/`:
+Each subsystem is its own ROS 2 node wired through topics, but **on the board the
+nodes run packed into three single-process "hubs" matching the three fault domains**
+(each hub = one executor = one interpreter's RAM, supervised by its own systemd unit):
 
 ```
-robot_msgs        custom interfaces (WheelEncoders, MotorCommand)         [ament_cmake]
+nano-router    zenohd-serial — the rmw_zenoh graph + the ESP32's UART link
+nano-sensors   sensor_hub:  imu_driver + sys_monitor + wheel_odometry + lds_driver_py
+nano-nav       slam_nav:    super-light 2D SLAM + click-to-go navigation
+nano-app       app_hub:     web_control + oled_display + behavior (the personality)
+nano-map       map_bridge:  /dev/shm map blob -> /map OccupancyGrid (for remote RViz)
+```
+
+Packages under `src/`:
+
+```
+robot_msgs        custom interfaces                                       [ament_cmake]
 robot_bringup     launch files + the single config/robot.yaml             [ament_python]
-lds_driver_py     serial LDS02RR -> /scan                                 [rclpy]
-lds_driver        abandoned Rust/r2r LDS node (doesn't build; kept for ref) [Rust / r2r]
+lds_driver_py     serial LDS02RR -> /scan + /dev/shm scan blob            [rclpy]
+imu_driver        BWT901CL IMU -> /imu/data, /imu/euler, /imu/web         [rclpy]
 wheel_odometry    /wheel_ticks (from ESP32) -> /odom + TF                 [rclpy]
+sys_monitor       /diagnostics + fan curve + health log + vitals blob     [rclpy]
+slam_nav          scan-matching SLAM, planner, pure-pursuit control       [rclpy]
+oled_display      SSD1306 dashboard + animated-eyes faces                 [rclpy]
+behavior          Sismic presence statechart + purpose/A-B "brain"        [rclpy]
+web_control       static control page + the browser's telemetry/control
+                  gateway (SSE /telemetry, POST /publish|/param|/drive),
+                  TTS, camera/mic, the LLM cognition core + skill library [rclpy]
+sensor_hub        single-process host for the four sensor nodes           [rclpy]
+app_hub           single-process host for web+oled+behavior               [rclpy]
+sim_hardware      dev-PC Gazebo stand-ins + the map bridge                [rclpy]
+lds_driver        abandoned Rust/r2r LDS node (doesn't build; reference)  [Rust / r2r]
 motor_control     retired (ESP32 owns /cmd_vel->motors; PCA9685 aux only) [rclpy]
-oled_display      status dashboard -> SSD1306                             [rclpy]
-web_control       rosbridge websocket + static control/visualiser page   [rclpy]
 ```
 
-Topic graph:
+Data flows over **two planes**: the typed ROS/zenoh graph carries the small control
+messages (incl. the ESP32 via zenoh-pico), while heavy/browser data rides `/dev/shm`
+blobs + HTTP — the scan and map blobs are polled by the page, one SSE stream
+(`/telemetry`) carries every light readout, and `sys_monitor`'s vitals blob feeds the
+OLED dashboard + the cognition body snapshot without any fast subscriptions.
 
 ```
- lds_driver ──/scan──┐                         ┌──> oled_display
-                     ├──> web_control (rosbridge ws) ──> browser
- wheel_odometry ─/odom┘                         │ teleop
-        ▲                                       └──/cmd_vel──> motor_control ──> PCA9685
-        └ TF odom->base_link                                          │
-                                                            (optional) └ LDS spin motor
+ lds_driver_py ─/scan──> slam_nav ─/dev/shm map─┐            ┌─> browser
+ wheel_odometry ─/odom─> slam_nav   scan blob ──┼─ web_control┤   (one origin:
+        ▲                           vitals blob─┘  (HTTP+SSE) │    page + telemetry
+        └/wheel_ticks── ESP32 <──/cmd_vel── teleop POST /drive┘    + media + control)
 ```
 
 ## 1. Prepare Armbian (enable the buses)
@@ -53,9 +74,11 @@ Topic graph:
 > **Reflash recovery / one-shot:** `sudo bash deploy/sbc-setup.sh` applies all the
 > OS-level config automatically and idempotently — device-tree overlays
 > (`i2c0 i2c1 i2c2 uart1 usbhost1 usbhost2`), the I2C udev rule, the `dialout` +
-> `video` group memberships, and the scoped passwordless `poweroff`/`reboot` sudoers
-> rule the web UI's **Shutdown** button uses. Then `sudo reboot` and continue at §2.
-> The rest of this section is the manual equivalent / explanation.
+> `video` group memberships, the scoped passwordless sudoers rules (poweroff/reboot
+> for the web UI's power buttons + start/stop/restart of `nano-robot.target` for
+> `stack.sh`), and the per-process systemd units that auto-start the stack on boot.
+> Then `sudo reboot` and continue at §2. The rest of this section is the manual
+> equivalent / explanation.
 
 The H5 buses must be muxed before Linux exposes `/dev/i2c-*`, `/dev/ttyS1`, etc.
 See [`nanopi-neo-plus2-pinmap.md`](nanopi-neo-plus2-pinmap.md) for the full mapping.
@@ -126,43 +149,65 @@ entirely and everything else still runs — it just reports "unavailable".
 
 Nano has an autonomous personality layer — a statechart that decides *when* to act and an
 OpenRouter LLM that decides *what* to say (spoken line + OLED face), with traits that evolve
-over time. It's entirely best-effort: no key / no network = silent, and it can never make the
+over time. It knows the time of day (prompts carry it; during the configured quiet hours it
+mutes its autonomous chatter and idles at a sleepier cadence — user-initiated speech still
+works). It's entirely best-effort: no key / no network = silent, and it can never make the
 robot unsafe. See **[docs/brain.md](docs/brain.md)** for the full picture, and test it
 off-robot with `scripts/dev_webui.py --behavior`.
 
 ## 4. Run
 
-`rmw_zenoh` needs its router for discovery. In one terminal:
+**On the robot** the stack runs as systemd units (installed by `deploy/sbc-setup.sh`,
+auto-started on boot). `scripts/stack.sh` is the day-to-day wrapper:
 
 ```bash
-pixi run zenohd
+bash scripts/stack.sh up|down|restart|status   # = systemctl ... nano-robot.target
+journalctl -u nano-app -f                       # logs (also nano-sensors/nav/router/map)
 ```
 
-In another:
-
-```bash
-pixi run bringup     # launches all nodes + the web stack
-```
+Crashes restart via `Restart=on-failure`; hangs via the systemd watchdog (each hub
+pets `WATCHDOG=1` from an executor timer, so a wedged callback gets the hub
+restarted); a per-unit `MemoryMax` keeps a leak from taking down the 1 GB board.
 
 Open **`http://<robot-ip>:8080`** (the OLED shows the IP). The page auto-connects to
-rosbridge on `:9090`, draws the live `/scan`, and teleops via the on-screen pad or
-`WASD`/arrow keys.
+the same-origin `/telemetry` stream, draws the live `/scan`, and teleops via the
+on-screen pad or `WASD`/arrow keys — everything on one port, no rosbridge.
 
-Useful subsets:
+**Debug / dev alternatives** (same node graph, separate processes, via ros2 launch):
 
 ```bash
-pixi run web         # just rosbridge + the control page (UI development)
+pixi run zenohd      # the rmw_zenoh router (own terminal), then:
+pixi run bringup     # all nodes + the web gateway (real hardware)
+pixi run sim         # dev PC: Gazebo stand-ins for lidar/IMU/ESP32 + RViz
+pixi run visualize   # dev PC: RViz watching the REAL robot over zenoh
+pixi run web         # just the control page/gateway (UI development)
+pixi run smoke       # end-to-end gateway/whitelist/vitals/shutdown checks
 pixi run shell       # a shell with everything sourced, for ad-hoc ros2 commands
+python scripts/dev_webui.py --behavior   # the AI/personality layer with NO ROS at all
 ```
 
 ## Configuration
 
-Everything tunable lives in **`src/robot_bringup/config/robot.yaml`**: serial port,
-I2C addresses, encoder GPIO numbers, ticks/rev, wheel geometry, PCA9685 channel
-mapping, drive limits, OLED size, web ports. **Set the encoder GPIO numbers and
-PCA9685 channels to match your wiring before driving** — the defaults are
-placeholders. GPIO numbers are *global* libgpiod offsets (`bank*32 + pin`); confirm
-against the pinmap and avoid lines it lists as already claimed.
+Everything SBC-side lives in **`src/robot_bringup/config/robot.yaml`**: serial ports,
+I2C addresses, ticks/rev, wheel geometry, drive limits, publish rates, SLAM/nav
+tuning, OLED size, web port, TTS/LLM/behaviour settings, quiet hours. Python packages
+install editable and `robot.yaml`/`web/` are symlinked, so a source edit + a stack
+restart applies it — no rebuild.
+
+The ESP32 side (motor pins, encoder GPIOs, PID gains, watchdog timings) is `#define`d
+at the top of `firmware/nanobot_coprocessor/src/main.cpp` and flashed from a dev PC
+(`pio run -t upload`) — keep its diff-drive limits in sync with `robot.yaml`.
+
+## Deploying to the board (from a dev PC)
+
+```bash
+scripts/deploy.sh [pkgs…]    # push src+scripts, colcon build on the board, restart
+```
+
+Credentials come from the environment / `.nano-deploy.env` (never committed). By
+default it also pushes the dev-made "soul" (`memory/personality.json` + phrase bank)
+over the robot's — set `DEPLOY_SOUL=0` to keep the robot's evolved personality. Run
+`pixi run smoke` before deploying.
 
 ## Notes / gotchas
 
@@ -172,11 +217,11 @@ against the pinmap and avoid lines it lists as already claimed.
   does not compile against this RoboStack Humble. `lds_driver_py` replaced it. Its
   build toolchain (rust/clang/llvm, ~1.6 GB) is deliberately excluded from
   `pixi.toml`; re-add those deps only if you revive the node.
-- **Offline robot:** `web/index.html` loads `roslib` from a CDN. For a robot with no
-  internet, download `roslib.min.js` into `src/web_control/web/` and change the
-  `<script src>` to a local path, then rebuild.
-- **Run as a service:** once it works, wrap `zenohd` + `bringup` in systemd units (or
-  a single `pixi run` unit) so the robot comes up headless on power-on.
+- **Fully offline:** the page loads no external scripts (roslib/rosbridge are gone),
+  so the UI works with no internet at all.
+- **Run as a service:** `deploy/sbc-setup.sh` installs per-process systemd units under
+  `nano-robot.target` (with `Restart=on-failure`), so the robot comes up headless on
+  power-on; `scripts/stack.sh` wraps `systemctl {start|stop|restart}` of the target.
 - **`LDS_Visualizer.html`** (repo root) is the original Web-Serial bench tool — plug
   the LDS straight into a laptop to sanity-check the sensor independently of ROS.
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Nano map bridge (/dev/shm map blob -> /map OccupancyGrid for remote RViz)
+After=nano-router.service nano-nav.service
+Wants=nano-router.service
+PartOf=nano-robot.target
+
+[Service]
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh map
+Restart=on-failure
+RestartSec=3
+MemoryMax=150M
+
+[Install]
+WantedBy=nano-robot.target

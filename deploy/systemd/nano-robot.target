@@ -1,0 +1,9 @@
+# The whole Nano stack as one systemd target. The nano-*.service units are
+# WantedBy= this target (start) and PartOf= it (stop), so:
+#   systemctl {start|stop|restart} nano-robot.target   drives everything
+# (scripts/stack.sh wraps exactly that). Enabled at boot by deploy/sbc-setup.sh.
+[Unit]
+Description=Nano robot stack (zenoh router + node hubs + web UI)
+
+[Install]
+WantedBy=multi-user.target

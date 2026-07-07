@@ -8,72 +8,48 @@ let dragging=false,dsx=0,dsy=0,dpx=0,dpy=0;
 let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
 
-// ---- ROS state ----
-let ros=null, odomTopic=null, cmdTopic=null, faceTopic=null, systemTopic=null,
-    imuTopic=null, eulTopic=null, sysTopic=null,
-    imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
-// ESP32 coprocessor topics
-let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
-    hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null,
-    pickupOvTopic=null;
-// cooling fan: read /fan_pwm, override via /sys_monitor/set_parameters
-let fanTopic=null, fanParamSrv=null;
-// slam_nav view+plan state (read by the map panel script below)
-let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
-let homeTopic=null, saveTopic=null, testTopic=null, testResTopic=null;
-// Brain: purpose / current task / A/B experiment stats (latched, from the behaviour node)
-let purposeTopic=null, taskTopic=null, expTopic=null;
-// OLED mirror feed: the same inputs the physical panel renders from (face/word/text)
-let wordTopic=null, textTopic=null, dashTopic=null, wordsTopic=null;
-$("host").value = `${location.hostname||"localhost"}:9090`;
+// ---- server link state (SSE /telemetry — there is no rosbridge anymore) ----
+let connected=false;                     // the /telemetry stream is live
+// slam_nav view+plan state (read by the map panel script)
+let mapPlan=[], mapGoal=null;
 
 $("connect").onclick=()=>connected?disconnect():connect();
-$("host").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();
-  if(connected) disconnect(); connect(); } });
 $("fit").onclick=autoFit;
 $("lin").oninput=()=>$("linv").textContent=$("lin").value;
 $("ang").oninput=()=>$("angv").textContent=$("ang").value;
 
-// set one parameter on a node live via its own /<node>/set_parameters service
-// (rcl_interfaces/SetParameters — works without rosapi). JS boolean -> type 1 (bool),
-// JS number -> type 3 (double). All the tuning sliders/toggles funnel through here.
-function setParam(srv,name,value){
-  if(!srv) return;
-  const isB=typeof value==="boolean";
-  srv.callService(new ROSLIB.ServiceRequest({parameters:[{name,
-    value:{type:isB?1:3,bool_value:isB?value:false,integer_value:0,
-      double_value:isB?0:value,string_value:"",
-      byte_array_value:[],bool_array_value:[],integer_array_value:[],
-      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
+// set one WHITELISTED parameter on a node live via POST /param (the server calls the
+// node's /<node>/set_parameters service). All the tuning sliders/toggles funnel here.
+function setParam(node,name,value){
+  fetch("/param",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({node,name,value})}).catch(()=>{});
 }
-const setNodeRate=(srv,hz)=>setParam(srv,"publish_rate",hz);
+// publish on a WHITELISTED topic via POST /publish (see telemetry.py's whitelist).
+function pub(topic,value){
+  fetch("/publish",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({topic,value})}).catch(()=>{});
+}
+const setNodeRate=(node,hz)=>setParam(node,"publish_rate",hz);
 $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
-$("imuRate").onchange=()=>setNodeRate(imuParamSrv,Number($("imuRate").value));
+$("imuRate").onchange=()=>setNodeRate("imu_driver",Number($("imuRate").value));
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
-$("ldsRate").onchange=()=>setNodeRate(ldsParamSrv,Number($("ldsRate").value));
+$("ldsRate").onchange=()=>setNodeRate("lds_driver",Number($("ldsRate").value));
 $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
-$("odoRate").onchange=()=>setNodeRate(odoParamSrv,Number($("odoRate").value));
+$("odoRate").onchange=()=>setNodeRate("wheel_odometry",Number($("odoRate").value));
 // publish a navigation goal in the map frame; slam_nav plans a path toward it.
-function mapSetGoal(wx,wy){
-  if(!goalTopic) return;
-  goalTopic.publish(new ROSLIB.Message({header:{frame_id:"map"},
-    pose:{position:{x:wx,y:wy,z:0},orientation:{x:0,y:0,z:0,w:1}}}));
-  mapGoal=[wx,wy];
-}
-const setNavMotion=on=>setParam(navMotionSrv,"enable_motion",on);
-const setNavExplore=on=>setParam(navMotionSrv,"auto_explore",on);
+function mapSetGoal(wx,wy){ pub("/goal_pose",{x:wx,y:wy}); mapGoal=[wx,wy]; }
+const setNavMotion=on=>setParam("slam_nav","enable_motion",on);
+const setNavExplore=on=>setParam("slam_nav","auto_explore",on);
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
-function publishLdsTgt(){ if(ldsTgtTopic)
-  ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); }
+function publishLdsTgt(){ pub("/lds_target_rpm",Number($("ldsTgt").value)); }
 // Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
 $("pickupOv").onchange=()=>publishPickupOv();
-function publishPickupOv(){ if(pickupOvTopic)
-  pickupOvTopic.publish(new ROSLIB.Message({data:Number($("pickupOv").value)})); }
+function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value)); }
 // Fan override -> sys_monitor fan_override param.
 // v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
-const setFanOverride=v=>setParam(fanParamSrv,"fan_override",v);
+const setFanOverride=v=>setParam("sys_monitor","fan_override",v);
 function fanApply(){
   const auto=$("fanAuto").checked;
   $("fanOv").disabled=auto;
@@ -171,21 +147,19 @@ function micStop(){
 $("micOn").addEventListener("change",e=>{ e.target.checked ? micStart() : micStop(); });
 
 // Power controls -> POST to the web server (same origin). Both are confirmed.
+// The server publishes /oled_system itself so the physical panel flips immediately.
 $("btnReset").onclick=()=>{
   if(!confirm("Restart the whole ROS stack? The page will reconnect in a few seconds.")) return;
-  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"restart"}));  // OLED switches now
   fetch("/system/restart",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
 $("btnReboot").onclick=()=>{
   if(!confirm("REBOOT the SBC?\nThe whole board restarts — the page reconnects once it boots back up.")) return;
-  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"reboot"}));   // OLED switches now
   fetch("/system/reboot",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
 $("btnShutdown").onclick=()=>{
   if(!confirm("SHUT DOWN the SBC?\nIt powers off completely — you must turn it back on by hand.")) return;
-  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"shutdown"}));  // OLED switches now
   fetch("/system/shutdown",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
@@ -210,9 +184,14 @@ $("camShot").onclick=()=>window.open("/snapshot.jpg?t="+Date.now(),"_blank");
   });
 })();
 
-// Auto-reconnect: rosbridge drops on a stack reset / reboot, so retry with a gentle
-// backoff until it's back. A manual Disconnect (wantConn=false) stops the retrying.
-let wantConn=true, reconnT=null, reconnDelay=1000;
+// Live telemetry: ONE EventSource on /telemetry replaces every rosbridge
+// subscription — the server pushes a compact JSON frame ~5x/s with all the light
+// readouts (odom/IMU/diagnostics/ESP32/LDS/OLED mirror/brain). /scan and /map stay
+// on their /dev/shm+HTTP polls (heaviest data, unchanged). Auto-reconnects with a
+// gentle backoff across a stack restart / reboot; manual Disconnect stops retrying.
+// On the dev harness /telemetry doesn't exist, so the page shows disconnected and
+// the HTTP pollers (brain card, OLED mirror) take over — same behaviour as before.
+let es=null, wantConn=true, reconnT=null, reconnDelay=1000;
 function scheduleReconnect(){
   if(!wantConn || reconnT) return;
   $("conn").textContent="reconnecting…";
@@ -222,15 +201,27 @@ function scheduleReconnect(){
 function connect(){
   wantConn=true;
   if(reconnT){ clearTimeout(reconnT); reconnT=null; }
-  ros=new ROSLIB.Ros({url:`ws://${$("host").value}`});
-  ros.on("connection",()=>{connected=true;reconnDelay=1000;setConn(true);subscribe();syncLdsTgt();syncFan();});
-  ros.on("close",()=>{connected=false;setConn(false);scheduleReconnect();});
-  ros.on("error",()=>{setConn(false);});
+  if(es){ es.close(); es=null; }
+  es=new EventSource("/telemetry");
+  es.onopen=()=>{
+    connected=true; reconnDelay=1000; setConn(true);
+    OLED.tel({ip:location.hostname||"robot"});
+    // Re-assert the page's authoritative state on every (re)connect: LDS setpoint,
+    // fan override, pickup override (a fresh load publishes auto = clears stale
+    // overrides), and the OLED dashboard/words toggles.
+    syncLdsTgt(); syncFan(); publishPickupOv(); sendDash(); sendWords();
+  };
+  es.onmessage=e=>{ try{ onFrame(JSON.parse(e.data)); }catch(err){} };
+  es.onerror=()=>{
+    if(es){ es.close(); es=null; }
+    connected=false; setConn(false); scheduleReconnect();
+  };
 }
 function disconnect(){
   wantConn=false;
   if(reconnT){ clearTimeout(reconnT); reconnT=null; }
-  if(ros) ros.close(); connected=false; setConn(false);
+  if(es){ es.close(); es=null; }
+  connected=false; setConn(false);
 }
 function setConn(ok){
   $("dot").classList.toggle("ok",ok);
@@ -239,133 +230,49 @@ function setConn(ok){
   $("connect").classList.toggle("primary",!ok);
 }
 
-function subscribe(){
-  // NB: /scan is NOT bridged here — it's the heaviest message (360 floats) and
-  // dominated rosbridge CPU. The lidar driver writes a compact blob to /dev/shm and we
-  // poll it over HTTP (see pollScan below), same update rate, no rosbridge cost.
-  odomTopic=new ROSLIB.Topic({ros,name:"/odom",messageType:"nav_msgs/msg/Odometry",
-    throttle_rate:100,queue_length:1});
-  odomTopic.subscribe(onOdom);
-  cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
-  // (TTS/speech goes over HTTP POST /tts, not rosbridge — see sendOled.)
-  faceTopic=new ROSLIB.Topic({ros,name:"/oled_face",messageType:"std_msgs/msg/String"});
-  systemTopic=new ROSLIB.Topic({ros,name:"/oled_system",messageType:"std_msgs/msg/String"});
-  // Dashboard pin + spoken-text toggle (the OLED node + the mirror both honour these).
-  dashTopic=new ROSLIB.Topic({ros,name:"/oled_dashboard",messageType:"std_msgs/msg/Bool"});
-  wordsTopic=new ROSLIB.Topic({ros,name:"/oled_show_words",messageType:"std_msgs/msg/Bool"});
-  // Mirror the OLED panel: subscribe to the exact inputs it renders from. We also
-  // publish on /oled_face and /oled_system elsewhere — subscribing just reflects what the
-  // panel sees (our own publishes + the behaviour/cognition layer's). Heavy lifting is
-  // client-side (see the OLED module); these only feed it state.
-  faceTopic.subscribe(m=>OLED.setFace(m.data));
-  systemTopic.subscribe(m=>OLED.setSystem(m.data));
-  dashTopic.subscribe(m=>{ $("dashOn").checked=!!m.data; OLED.setDashboard(!!m.data); });
-  wordsTopic.subscribe(m=>{ $("wordsOn").checked=!!m.data; OLED.setShowWords(!!m.data); });
-  // Push our current toggle state up once connected (the topics are ephemeral, so a fresh
-  // OLED node adopts what the page shows — matching how sendFace re-asserts the mood).
-  sendDash(); sendWords();
-  wordTopic=new ROSLIB.Topic({ros,name:"/oled_word",messageType:"std_msgs/msg/String",
-    throttle_rate:0,queue_length:1});
-  wordTopic.subscribe(m=>OLED.setWord(m.data));
-  textTopic=new ROSLIB.Topic({ros,name:"/oled_text",messageType:"std_msgs/msg/String"});
-  textTopic.subscribe(m=>OLED.setBrand(m.data));
-  OLED.tel({ip:($("host").value||"").split(":")[0]});
-  // /imu/web is a tiny summary (|accel|,|gyro|,actual /imu/data Hz) the node emits at
-  // ~15 Hz, so we don't make rosbridge bridge the full 50 Hz /imu/data just for a readout.
-  imuTopic=new ROSLIB.Topic({ros,name:"/imu/web",messageType:"geometry_msgs/msg/Vector3Stamped",
-    throttle_rate:0,queue_length:1});
-  imuTopic.subscribe(onImu);
-  eulTopic=new ROSLIB.Topic({ros,name:"/imu/euler",messageType:"geometry_msgs/msg/Vector3Stamped",
-    throttle_rate:100,queue_length:1});
-  eulTopic.subscribe(onEul);
-  sysTopic=new ROSLIB.Topic({ros,name:"/diagnostics",messageType:"diagnostic_msgs/msg/DiagnosticArray",
-    throttle_rate:1000,queue_length:1});
-  sysTopic.subscribe(onDiag);
-  imuParamSrv=new ROSLIB.Service({ros,name:"/imu_driver/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  ldsParamSrv=new ROSLIB.Service({ros,name:"/lds_driver/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  odoParamSrv=new ROSLIB.Service({ros,name:"/wheel_odometry/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  // cooling fan: live duty readout + override service (sys_monitor owns the curve).
-  fanTopic=new ROSLIB.Topic({ros,name:"/fan_pwm",messageType:"std_msgs/msg/Float32",
-    throttle_rate:1000,queue_length:1});
-  fanTopic.subscribe(m=>$("fanDuty").textContent=(m.data*100).toFixed(0)+"%");
-  fanParamSrv=new ROSLIB.Service({ros,name:"/sys_monitor/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-
-  // ---- ESP32 coprocessor (native zenoh-pico over UART, in the rmw_zenoh graph) ----
-  hbTopic=new ROSLIB.Topic({ros,name:"/esp32_heartbeat",
-    messageType:"std_msgs/msg/Int32",throttle_rate:0,queue_length:1});
-  hbTopic.subscribe(onHb);
-  ticksTopic=new ROSLIB.Topic({ros,name:"/wheel_ticks",
-    messageType:"std_msgs/msg/Int64MultiArray",throttle_rate:100,queue_length:1});
-  ticksTopic.subscribe(onTicks);
-  suspLTopic=new ROSLIB.Topic({ros,name:"/left_wheel_suspended",
-    messageType:"std_msgs/msg/Bool",queue_length:1});
-  suspLTopic.subscribe(m=>suspTxt("espSuspL",m.data));
-  suspRTopic=new ROSLIB.Topic({ros,name:"/right_wheel_suspended",
-    messageType:"std_msgs/msg/Bool",queue_length:1});
-  suspRTopic.subscribe(m=>suspTxt("espSuspR",m.data));
-  tempTopic=new ROSLIB.Topic({ros,name:"/esp32_temp",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  tempTopic.subscribe(m=>{ $("espTemp").textContent=m.data.toFixed(1)+"°C";
-    OLED.tel({espTemp:m.data}); });
-  hallTopic=new ROSLIB.Topic({ros,name:"/esp32_hall",
-    messageType:"std_msgs/msg/Int32",queue_length:1});
-  hallTopic.subscribe(m=>$("espHall").textContent=m.data);
-  ldsRpmTopic=new ROSLIB.Topic({ros,name:"/lds_rpm",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  ldsRpmTopic.subscribe(m=>$("espLdsRpm").textContent=m.data.toFixed(0)+" rpm");
-  ldsHzTopic=new ROSLIB.Topic({ros,name:"/lds_hz",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  ldsHzTopic.subscribe(m=>{ $("espLdsHz").textContent=m.data.toFixed(1)+" Hz";
-    OLED.tel({lds:m.data}); });
-  ldsDutyTopic=new ROSLIB.Topic({ros,name:"/lds_duty",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  ldsDutyTopic.subscribe(m=>$("espLdsDuty").textContent=(m.data*100).toFixed(0)+"%");
-  ldsTgtTopic=new ROSLIB.Topic({ros,name:"/lds_target_rpm",messageType:"std_msgs/msg/Float32"});
-  pickupOvTopic=new ROSLIB.Topic({ros,name:"/pickup_override",
-    messageType:"std_msgs/msg/Int8",latch:true});
-  // Re-assert the page's choice on every (re)connect: an override survives a stack restart
-  // while the page is open, and a fresh page load publishes auto (clears any stale override).
-  publishPickupOv();
-  // slam_nav: click-to-go goal, the planned path overlay, and the motion toggle.
-  goalTopic=new ROSLIB.Topic({ros,name:"/goal_pose",messageType:"geometry_msgs/msg/PoseStamped"});
-  homeTopic=new ROSLIB.Topic({ros,name:"/slam_nav/go_home",messageType:"std_msgs/msg/Bool"});
-  saveTopic=new ROSLIB.Topic({ros,name:"/slam_nav/save_map",messageType:"std_msgs/msg/Bool"});
-  // calibration self-test: trigger on /selftest (Bool), read the report on /selftest_result
-  testTopic=new ROSLIB.Topic({ros,name:"/selftest",messageType:"std_msgs/msg/Bool"});
-  testResTopic=new ROSLIB.Topic({ros,name:"/selftest_result",
-    messageType:"std_msgs/msg/String",throttle_rate:0,queue_length:1});
-  testResTopic.subscribe(m=>{ const el=$("mapTestOut"); el.style.display="block"; el.textContent=m.data; });
-  navMotionSrv=new ROSLIB.Service({ros,name:"/slam_nav/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  planTopic=new ROSLIB.Topic({ros,name:"/plan",messageType:"nav_msgs/msg/Path",
-    throttle_rate:200,queue_length:1});
-  planTopic.subscribe(m=>{ mapPlan=(m.poses||[]).map(p=>[p.pose.position.x,p.pose.position.y]); });
-  // Brain: purpose / current task / experiment stats (latched JSON strings from the
-  // behaviour node; it also republishes on a ~5 s heartbeat so we don't miss the latch).
-  purposeTopic=new ROSLIB.Topic({ros,name:"/purpose",messageType:"std_msgs/msg/String"});
-  purposeTopic.subscribe(m=>renderPurpose(m.data));
-  taskTopic=new ROSLIB.Topic({ros,name:"/task_current",messageType:"std_msgs/msg/String"});
-  taskTopic.subscribe(m=>renderTask(m.data));
-  expTopic=new ROSLIB.Topic({ros,name:"/experiments",messageType:"std_msgs/msg/String"});
-  expTopic.subscribe(m=>renderExperiments(m.data));
+// ---- telemetry frame fan-out: one frame updates every readout ----------------
+let rawPurpose="", rawTask="", rawExp="", rawSelftest="";
+function onFrame(f){
+  if(f.odom) onOdom(f.odom);
+  if(f.imu) onImu(f.imu);
+  if(f.eul) onEul(f.eul);
+  if(f.diag) onDiag(f.diag);
+  onEsp(f.esp||{}, f.susp||[]);
+  onLds(f.lds||{});
+  if(f.fan!==undefined) $("fanDuty").textContent=(f.fan*100).toFixed(0)+"%";
+  if(f.plan) mapPlan=f.plan;
+  if(f.selftest && f.selftest!==rawSelftest){ rawSelftest=f.selftest;
+    const el=$("mapTestOut"); el.style.display="block"; el.textContent=f.selftest; }
+  // Brain readouts arrive as the same latched JSON strings the behaviour node
+  // publishes; only re-render when they actually change (frames tick ~5 Hz).
+  if(f.purpose && f.purpose!==rawPurpose){ rawPurpose=f.purpose; renderPurpose(f.purpose); }
+  if(f.task && f.task!==rawTask){ rawTask=f.task; renderTask(f.task); }
+  if(f.experiments && f.experiments!==rawExp){ rawExp=f.experiments; renderExperiments(f.experiments); }
+  // OLED mirror: feed the client-side panel copy the same inputs the physical
+  // panel renders from. (Dashboard/words toggles are page-owned — sendDash/sendWords.)
+  const o=f.oled||{};
+  OLED.setFace(o.face||""); OLED.setWord(o.word||""); OLED.setBrand(o.brand||"");
+  if(o.system) OLED.setSystem(o.system);
 }
 
 // ---- ESP32 coprocessor handlers ----
-let espTickCount=0, espTickHzT=performance.now(), lastHb=null, lastHbT=0;
-function onHb(msg){ lastHb=msg.data; lastHbT=performance.now(); OLED.tel({espBeat:1}); }
-function onTicks(msg){
-  const d=msg.data||[];
-  $("espTicks").textContent = d.length>=2 ? `${d[0]} / ${d[1]}` : "–";
-  espTickCount++;
-  const now=performance.now();
-  if(now-espTickHzT>=1000){
-    $("espTickHz").textContent=(espTickCount*1000/(now-espTickHzT)).toFixed(0)+" Hz";
-    espTickCount=0; espTickHzT=now;
+let lastHb=null, lastHbT=0;
+function onEsp(e, susp){
+  if(e.hb!=null && e.hb_age<2.5){
+    lastHb=e.hb; lastHbT=performance.now()-e.hb_age*1000; OLED.tel({espBeat:1});
   }
+  if(e.ticks) $("espTicks").textContent=`${e.ticks[0]} / ${e.ticks[1]}`;
+  if(e.tick_hz!=null) $("espTickHz").textContent=e.tick_hz.toFixed(0)+" Hz";
+  suspTxt("espSuspL",susp[0]); suspTxt("espSuspR",susp[1]);
+  if(e.temp!=null && e.temp_age<5){
+    $("espTemp").textContent=e.temp.toFixed(1)+"°C"; OLED.tel({espTemp:e.temp});
+  }
+  if(e.hall!=null) $("espHall").textContent=e.hall;
+}
+function onLds(l){
+  if(l.rpm!=null) $("espLdsRpm").textContent=l.rpm.toFixed(0)+" rpm";
+  if(l.hz!=null){ $("espLdsHz").textContent=l.hz.toFixed(1)+" Hz"; OLED.tel({lds:l.hz}); }
+  if(l.duty!=null) $("espLdsDuty").textContent=(l.duty*100).toFixed(0)+"%";
 }
 // suspension: green = on the ground (ready to drive), amber = up/suspended.
 function suspTxt(id,val){
@@ -384,26 +291,29 @@ setInterval(()=>{
 },1000);
 
 let lastImuT=0;
-function onImu(msg){
-  // /imu/web Vector3Stamped: x=|accel| m/s^2, y=|gyro| rad/s, z=actual /imu/data Hz
-  lastImuT=performance.now();
-  $("imuA").textContent=msg.vector.x.toFixed(2);
-  $("imuG").textContent=(msg.vector.y*180/Math.PI).toFixed(1);
-  const el=$("imuHz"); el.textContent=msg.vector.z.toFixed(0)+" Hz"; el.style.color="";
-  OLED.tel({imuHz:msg.vector.z});
+function onImu(m){
+  // frame imu: {a:|accel| m/s^2, g:|gyro| rad/s, hz:actual /imu/data Hz, age:s}.
+  // Sourced from sys_monitor's 1 Hz vitals blob, so a healthy age can reach ~2 s.
+  if(m.age>=3 || m.a==null) return;        // stale: the "lost" watchdog below owns the text
+  lastImuT=performance.now()-m.age*1000;
+  $("imuA").textContent=m.a.toFixed(2);
+  $("imuG").textContent=(m.g*180/Math.PI).toFixed(1);
+  const el=$("imuHz"); el.textContent=m.hz.toFixed(0)+" Hz"; el.style.color="";
+  OLED.tel({imuHz:m.hz});
 }
-// IMU connectivity: /imu/web streams ~15 Hz whenever the IMU is up. If it stops (USB
-// unplugged, or the driver lost the port) the rate readout goes red "lost" — so even
-// with the sensor nodes merged into one process you can still see the IMU drop out.
+// IMU connectivity: if the IMU stream stops (USB unplugged, or the driver lost the
+// port) the rate readout goes red "lost" — so even with the sensor nodes merged into
+// one process you can still see the IMU drop out.
 setInterval(()=>{
-  if(lastImuT && performance.now()-lastImuT<2000) return;   // fresh: onImu owns the text
+  if(lastImuT && performance.now()-lastImuT<3500) return;   // fresh: onImu owns the text
   const el=$("imuHz"); el.textContent="lost"; el.style.color="var(--red)";
 },1000);
-function onEul(msg){
-  $("imuR").textContent=msg.vector.x.toFixed(1)+"°";
-  $("imuP").textContent=msg.vector.y.toFixed(1)+"°";
-  $("imuY").textContent=msg.vector.z.toFixed(1)+"°";
-  OLED.tel({roll:msg.vector.x, pitch:msg.vector.y});
+function onEul(m){
+  if(m.age>=4 || m.r==null) return;
+  $("imuR").textContent=m.r.toFixed(1)+"°";
+  $("imuP").textContent=m.p.toFixed(1)+"°";
+  $("imuY").textContent=m.y.toFixed(1)+"°";
+  OLED.tel({roll:m.r, pitch:m.p});
 }
 
 function fmtUptime(s){
@@ -429,9 +339,8 @@ function renderCores(s){
     const b=$("corev"+i); if(b) b.textContent=v.toFixed(0)+"%";
   });
 }
-function onDiag(msg){
-  const st=(msg.status||[]).find(s=>s.name==="system"); if(!st) return;
-  const kv={}; for(const p of st.values) kv[p.key]=p.value;
+function onDiag(kv){
+  // frame diag: the /diagnostics "system" status as a flat {key: value} dict
   $("sysCpu").textContent=(kv.cpu_percent??"–")+"%";
   OLED.tel({cpu:Number(kv.cpu_percent), mem:Number(kv.mem_percent), sbc:Number(kv.cpu_temp_c)});
   renderCores(kv.cpu_cores);
@@ -453,8 +362,8 @@ function onDiag(msg){
 }
 
 // ---- Speech (TTS) ---- POSTs to web_control, which speaks via espeak-ng and
-// streams the words to the OLED (/oled_word). Not over rosbridge — keeps the bridge
-// light and lets the server own the audio + word timing in one place. Voice/volume/
+// streams the words to the OLED (/oled_word), owning the audio + word timing in
+// one place. Voice/volume/
 // speed/pitch + the stats-announcer are persisted server-side (survive a reboot),
 // so the page just mirrors them: GET them on load, POST /tts/config on change.
 function sendOled(){
@@ -729,9 +638,9 @@ if($("reflectOn")) $("reflectOn").addEventListener("change",()=>{
   fetch("/brain/reflect",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({on:$("reflectOn").checked})}).catch(()=>{});
 });
-// No-rosbridge fallback (the dev_webui harness): when not connected to rosbridge, poll the
-// brain readouts over plain HTTP. On the real robot these come over rosbridge (and the GETs
-// 404), so this only does anything on the dev host while disconnected.
+// Dev-harness fallback (scripts/dev_webui.py): with no /telemetry stream, poll the
+// brain readouts over plain HTTP. On the real robot these come in the telemetry frame
+// (and these GETs 404), so this only does anything on the dev host while disconnected.
 function pollBrainHttp(){
   if(connected) return;
   fetch("/purpose").then(r=>r.ok?r.text():null).then(s=>{ if(s) renderPurpose(s); }).catch(()=>{});
@@ -742,33 +651,32 @@ setInterval(pollBrainHttp, 3000); pollBrainHttp();
 
 // ---- OLED face / mood ---- empty string = the resting idle face, else the selected mood.
 function sendFace(){
-  if(!faceTopic){ return; }
   const mood=$("faceOn").checked ? $("faceMood").value : "";
-  faceTopic.publish(new ROSLIB.Message({data:mood}));
+  pub("/oled_face",mood);
 }
 $("faceOn").addEventListener("change",sendFace);
 $("faceMood").addEventListener("change",()=>{ if($("faceOn").checked) sendFace(); });
 
 // ---- OLED dashboard pin + spoken-text toggle ----
-// Each updates the client-side mirror immediately AND (when connected) publishes the Bool so
-// the physical panel follows. Off-robot (dev harness) the publish is a no-op and the mirror is
-// the only display, so the local set is what makes the toggle work there.
+// Each updates the client-side mirror immediately AND publishes the Bool (via /publish)
+// so the physical panel follows. Off-robot (dev harness) the publish 404s harmlessly and
+// the mirror is the only display, so the local set is what makes the toggle work there.
 function sendDash(){
   const on=$("dashOn").checked; OLED.setDashboard(on);
-  if(dashTopic) dashTopic.publish(new ROSLIB.Message({data:on}));
+  pub("/oled_dashboard",on);
 }
 function sendWords(){
   const on=$("wordsOn").checked; OLED.setShowWords(on);
-  if(wordsTopic) wordsTopic.publish(new ROSLIB.Message({data:on}));
+  pub("/oled_show_words",on);
 }
 $("dashOn").addEventListener("change",sendDash);
 $("wordsOn").addEventListener("change",sendWords);
 
-// ---- lidar scan over HTTP (same-origin /dev/shm), not rosbridge ----
+// ---- lidar scan over HTTP (same-origin /dev/shm) ----
 // /scan.bin = a JSON header line ({seq,amin,ainc,n}), '\n', then n raw float32 ranges
 // (inf = no hit). The driver rewrites it per scan; we poll a touch faster and skip
-// unchanged seqs, so the canvas + point count + scan-Hz readouts are identical to the
-// old rosbridge path, minus the LaserScan deserialization that dominated rosbridge CPU.
+// unchanged seqs. Deliberately NOT in the telemetry frame: it's the heaviest data and
+// polling lets the page control the rate per view (see the interval below).
 let lastScanSeq=-1, lastScanErr=null, lastScanRx=null;
 const scanDec=new TextDecoder();
 let curHeroView="lidar";     // tracked by the hero view switcher (showView)
@@ -828,45 +736,35 @@ setInterval(()=>{
   if(document.hidden) return;
   if(curHeroView==="lidar" || (++scanTick % 12)===0) pollScan();
 },80);
-function onOdom(msg){
-  const p=msg.pose.pose.position, q=msg.pose.pose.orientation;
-  const yaw=Math.atan2(2*(q.w*q.z),1-2*(q.z*q.z));
-  $("px").textContent=p.x.toFixed(2); $("py").textContent=p.y.toFixed(2);
+function onOdom(o){
+  const [x,y,yaw]=o;
+  $("px").textContent=x.toFixed(2); $("py").textContent=y.toFixed(2);
   $("pth").textContent=(yaw*180/Math.PI).toFixed(0);
-  $("odoX").textContent=p.x.toFixed(2)+" m"; $("odoY").textContent=p.y.toFixed(2)+" m";
+  $("odoX").textContent=x.toFixed(2)+" m"; $("odoY").textContent=y.toFixed(2)+" m";
   $("odoTh").textContent=(yaw*180/Math.PI).toFixed(0)+"°";
 }
 
 // ---- teleop ----
-// HTTP-first: POST /drive to the web server, which publishes /cmd_vel itself and runs
-// its OWN 10 Hz keepalive + dead-man on the board. That keeps rosbridge — the board's
-// busiest process — out of the control loop, so its latency spikes can't outlast the
-// ESP32's 500 ms /cmd_vel watchdog and stutter the drive. Falls back to publishing
-// over rosbridge if /drive isn't served (older robot build).
-let curV=0, curW=0, driveHttp=true, driveBusy=false;
+// POST /drive to the web server, which publishes /cmd_vel itself and runs its OWN
+// 10 Hz keepalive + dead-man on the board, so browser jank can't outlast the ESP32's
+// 500 ms /cmd_vel watchdog and stutter the drive. The dev harness accepts it as a no-op.
+let curV=0, curW=0, driveBusy=false;
 function setCmd(v,w){ curV=v; curW=w; }
 function publishCmd(){
   const v=curV*Number($("lin").value), w=curW*Number($("ang").value);
-  if(driveHttp) sendDrive(v,w); else publishCmdRos(v,w);
-}
-function publishCmdRos(v,w){
-  if(!cmdTopic) return;
-  cmdTopic.publish(new ROSLIB.Message({
-    linear:{x:v,y:0,z:0}, angular:{x:0,y:0,z:w}}));
+  sendDrive(v,w);
 }
 function sendDrive(v,w){
   if(driveBusy) return;              // one POST in flight; the 10 Hz tick re-sends
   driveBusy=true;
   fetch("/drive",{method:"POST",body:JSON.stringify({v:v,w:w})})
-    .then(r=>{ if(!r.ok) throw 0; })
-    .catch(()=>{ driveHttp=false; publishCmdRos(v,w); })  // no /drive -> rosbridge
+    .catch(()=>{})
     .finally(()=>{ driveBusy=false; });
 }
-// 10 Hz refresh while moving: the server's dead-man (HTTP path) / the ESP32's watchdog
-// (rosbridge path) both stop the motors if commands stop arriving. Skip it when the
-// tab is backgrounded; and if we get hidden mid-drive, send one stop right away so
-// the robot halts immediately instead of coasting to the watchdog.
-setInterval(()=>{ if(!document.hidden && (curV||curW) && (driveHttp||connected)) publishCmd(); },100);
+// 10 Hz refresh while moving: the server's dead-man stops the motors if commands stop
+// arriving. Skip it when the tab is backgrounded; and if we get hidden mid-drive, send
+// one stop right away so the robot halts immediately instead of coasting to the watchdog.
+setInterval(()=>{ if(!document.hidden && (curV||curW)) publishCmd(); },100);
 document.addEventListener("visibilitychange",()=>{
   if(document.hidden && (curV||curW)){ setCmd(0,0); publishCmd(); }
 });

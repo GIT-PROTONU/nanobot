@@ -1,8 +1,8 @@
 // ---- SLAM map panel ----------------------------------------------------------
 // Self-contained, pure HTTP: poll the raw occupancy map from /map (same-origin,
-// written by slam_nav to /dev/shm) and render it — no rosbridge involved. The map
-// file is a JSON metadata line, '\n', then raw int8 occupancy (-1 unknown, 0 free ..
-// 100 occupied; row 0 = origin_y). Canvas clicks -> /goal_pose.
+// written by slam_nav to /dev/shm) and render it. The map file is a JSON metadata
+// line, '\n', then raw int8 occupancy (-1 unknown, 0 free .. 100 occupied; row 0 =
+// origin_y). Canvas clicks -> POST /publish /goal_pose (app.js mapSetGoal).
 (function(){
   "use strict";
   const $=id=>document.getElementById(id);
@@ -148,18 +148,17 @@
   });
   $("mapMotion").addEventListener("change",e=>setNavMotion(e.target.checked));
   $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));
-  $("mapHome").addEventListener("click",()=>{ if(homeTopic) homeTopic.publish(new ROSLIB.Message({data:true})); });
-  $("mapSave").addEventListener("click",()=>{ if(saveTopic) saveTopic.publish(new ROSLIB.Message({data:true})); });
+  $("mapHome").addEventListener("click",()=>pub("/slam_nav/go_home",true));
+  $("mapSave").addEventListener("click",()=>pub("/slam_nav/save_map",true));
   $("mapTest").addEventListener("click",()=>{
     if(!$("mapMotion").checked){ alert("Enable Motion first — the self-test drives the robot."); return; }
     if(!confirm("Run the calibration self-test?\nThe robot will drive forward, back, then spin in place.")) return;
     const el=$("mapTestOut"); el.style.display="block"; el.textContent="running self-test…";
-    if(testTopic) testTopic.publish(new ROSLIB.Message({data:true}));
+    pub("/selftest",true);
   });
   $("mapStop").addEventListener("click",()=>{
     $("mapMotion").checked=false; setNavMotion(false);
     $("mapExplore").checked=false; setNavExplore(false);   // also halt auto-exploration
-    if(cmdTopic) cmdTopic.publish(new ROSLIB.Message(
-      {linear:{x:0,y:0,z:0},angular:{x:0,y:0,z:0}}));   // belt-and-braces halt
+    sendDrive(0,0);                                        // belt-and-braces halt
   });
 })();

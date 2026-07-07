@@ -6,17 +6,20 @@ Guidance for working in this repo. See `README.md` for the human-facing setup.
 **Nano** — a mobile robot on a **NanoPi NEO Plus2 (Allwinner H5, aarch64, 1 GB RAM)**
 running **Armbian**, with **ROS 2 Humble** installed as conda packages via
 **pixi + RoboStack** (channel `robostack-staging`). Middleware is **`rmw_zenoh`**
-(chosen for low RAM; needs `rmw_zenohd` running). The web UI is **rosbridge + a
-static HTML page** (`web_control`), not Foxglove.
+(chosen for low RAM; needs `rmw_zenohd` running). The web UI is **a static HTML page
+served by `web_control`, which is also the browser's only gateway** — there is **NO
+rosbridge** (removed 2026-07-06; it cost ~a full core with the UI open).
 
-> **zenoh vs rosbridge are different layers, not competitors.** `rmw_zenoh` is the
-> node-to-node RMW (incl. the ESP32 via zenoh-pico through `zenohd-serial`). A browser
-> can't speak zenoh/DDS, so `rosbridge_websocket` (a Python rclpy node *on* the zenoh
-> graph) bridges ROS↔browser over a WebSocket on `:9090` for roslib. Heavy topics
-> (`/scan`, `/map`) bypass rosbridge entirely via `/dev/shm`+HTTP, so what's left on it
-> is light. Going zenoh-all-the-way to the browser is possible (zenoh-ts + a router
-> plugin) but not worth it — you'd lose ROS typing and hand-decode CDR in JS. See the
-> rosbridge-vs-zenoh-transport memory.
+> **Two planes.** The typed ROS/zenoh graph is the *control plane* (small messages,
+> few Hz; incl. the ESP32 via zenoh-pico through `zenohd-serial`). Heavy/browser data
+> is the *data plane*: `/dev/shm` blobs + HTTP (`/scan.bin`, `/map`, camera, mic, TTS)
+> and ONE Server-Sent-Events stream (`GET /telemetry`, `web_control/telemetry.py`)
+> carrying every light readout as a ~5 Hz JSON frame built once and fanned out to all
+> viewers. Writes from the page are whitelisted POSTs: `/drive` (teleop), `/publish`
+> (topic pokes, clamped per topic), `/param` (live-tune sliders). The telemetry
+> subscriptions are created only while a browser is connected, so a closed page costs
+> nothing. Going zenoh-all-the-way to the browser (zenoh-ts) was considered and
+> rejected — you'd hand-decode CDR in JS.
 
 Hardware: Roborock **LDS02RR** lidar (scan on **UART2 `/dev/ttyS2`**; RPM also read by
 the ESP32), single-channel **wheel
@@ -41,7 +44,7 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32, or from `sim_hardware` in
   Gazebo dev-sim) into `/odom`+TF; no longer reads GPIO.
 - `motor_control` — **retired** (PCA9685 path). The ESP32 owns `/cmd_vel`→motors;
-  not launched by `stack.sh`/`bringup.launch.py`. Kept for the optional PCA9685
+  not launched by the systemd units/`bringup.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
 - `sim_hardware` — **dev-PC-only**, not built/launched on the board (linux-aarch64). Two
@@ -137,10 +140,28 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     propose `drives`; `mood_node`/`dev_webui` carry them through evolve; `robot.yaml` has
     `attend_face`/`attend_secs`/`feel_secs`. Regenerate the chart diagram with
     `scripts/export_statechart_puml.py` (→ `docs/presence.puml`).
+  - **Time awareness.** The chart's idle cadence is multiplied by a live `tempo()`
+    callable (injected by `mood_node._tempo`; re-read on every guard evaluation): inside
+    the `behavior.quiet_start`/`quiet_end` window it returns `night_tempo` (2.0 = beats
+    fire half as often), so the robot is naturally sleepier after hours — without touching
+    the LLM-owned traits/drives. The matching SPEECH muting lives in the cognition core
+    (web_control `quiet_start`/`quiet_end` — **keep the two yaml windows in sync**):
+    autonomous speech (beats, skill beats, boot greeting, offline line, stats announcer,
+    reflection bookends) is silenced and logged as `quiet-hours`; user-initiated speech
+    (chat/say/observe/look, POST /tts, a manually invoked skill) always talks. Faces still
+    animate at night — quiet, not dormant. `cognition.time_context()` ("It is Tuesday
+    21:47, in the evening.") is folded into the beat/skill-pick/observe prompts so lines
+    fit the moment. Helpers (`daypart`/`in_quiet_hours`) are pure + unit-tested
+    (`test_time_awareness.py`, `test_tempo.py`).
 - `sensor_hub` — **runs `imu_driver` + `sys_monitor` + `wheel_odometry` + `lds_driver_py`
   in ONE process** (one executor) to save ~100+ MB RAM on the 1 GB board. Same node
-  names/topics/params/services — purely an packaging change. `stack.sh` launches this
-  instead of those four separately. Trade-off: they no longer crash/restart independently.
+  names/topics/params/services — purely an packaging change. Trade-off: they no longer
+  crash/restart independently.
+- `app_hub` — the same move for the expression/cognition layer: **runs `web_control` +
+  `oled_display` + `behavior` (mood_node) in ONE process**. The board now runs exactly
+  **three node hubs matching the three fault domains** — `sensor_hub` (the body),
+  `slam_nav` (spatial), `app_hub` (expression/web/brain) — plus the zenoh router.
+  app_hub's main also preserves the OLED SIGTERM end-screen (restart/shutdown glyph).
 
 ## ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
 - **Native zenoh-pico over a direct UART link** (PlatformIO + Arduino) — NO micro-ROS,
@@ -186,8 +207,9 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   `/dev/i2c-0`/PA11-PA12 @400kHz.) Keep diff-drive limits synced to `robot.yaml`.
 - **The link needs a serial-capable `zenohd`** — the conda `libzenohc` is built without
   `transport_serial`, so stock `rmw_zenohd` can't open the UART. Build one with
-  `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; `stack.sh`
-  runs it on the board so the ESP32 (serial) and the rmw_zenoh nodes (TCP) share a graph.
+  `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; the
+  `nano-router` systemd unit (via `scripts/unit_exec.sh router`) runs it on the board
+  so the ESP32 (serial) and the rmw_zenoh nodes (TCP) share a graph.
   See [[robostack-zenoh-no-serial]] and [[esp32-zenoh-pico-integration]].
 - Build/flash from the dev PC: `cd firmware/nanobot_coprocessor && pio run -t upload`
   (pio lives in `~/pio-venv`). **Don't build the firmware on the board.**
@@ -195,19 +217,34 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 ## Build / run
 - Build: `pixi run build` (colcon, msgs + all python pkgs). There is **no
   `build-lds`/`build-all`** — the Rust node and its toolchain are intentionally gone.
-- Run the stack: **`scripts/stack.sh {up|down|restart|status}`** (run via
-  `pixi run bash scripts/stack.sh ...`). It starts router → agent → rosbridge → web
-  → oled → **sensors** (one `sensor_hub` process = imu+sys+odom+lds) → nav → **map**
-  (`sim_hardware.map_bridge_node`, republishing `/dev/shm/nano_map.bin` as a real
-  `nav_msgs/OccupancyGrid` for a remote RViz — see "Remote RViz" below) in order,
-  idempotent (pgrep-guarded), logs to `.run/*.log`. `down`/`restart` SIGTERM→wait→SIGKILL
-  and verify (also sweeps pre-merge per-node stragglers). (The agent is skipped if
-  `$AGENT_DEV` isn't plugged in.)
-  Nodes are launched by their installed executables directly (not `ros2 run`) to
-  keep RAM down.
-- On the board the stack **auto-starts on boot** via systemd `nano-stack.service`.
-- OS-level setup (overlays, udev, groups, sudoers, systemd) is scripted in
-  **`deploy/sbc-setup.sh`** (idempotent; run once after a reflash + reboot).
+- **`pixi run smoke`** (`scripts/smoke_test.py`) — the end-to-end contract check: boots
+  the real router + sys_monitor + app_hub on the dev PC and asserts the /telemetry
+  frame keys, the publish/param whitelists, the OLED-face echo, the vitals blob, and
+  the SIGTERM shutdown path. **Run it before deploying** — the telemetry frame is a
+  typed-nowhere contract between `telemetry.py` and `app.js`, and this is what catches
+  a drift.
+- Run the stack: **`scripts/stack.sh {up|down|restart|status}`** — now a thin wrapper
+  over **systemd**. The stack is five units under **`nano-robot.target`**:
+  `nano-router` (zenohd-serial) → `nano-app` (app_hub = web+oled+behavior) /
+  `nano-sensors` (sensor_hub = imu+sys+odom+lds) / `nano-nav` (slam_nav) /
+  `nano-map` (map_bridge_node, `/dev/shm/nano_map.bin` → `/map` for a remote RViz).
+  Ordering (`After=nano-router.service` + the router unit's ExecStartPost probe that
+  waits for :7447 to actually accept) encodes the rmw_zenoh island gotcha; **crash
+  recovery is `Restart=on-failure`**, and **hang recovery is the systemd watchdog**:
+  app/sensors/nav are `Type=notify` and pet `WATCHDOG=1` every 5 s from an *executor
+  timer* (`_sd_notify` in each main), so an alive-but-wedged executor (a stuck
+  callback) stops petting and gets restarted (`WatchdogSec=90`). Each unit also has a
+  `MemoryMax` cap so a leak restarts that hub instead of waking the kernel OOM killer.
+  (The old `nano-heal.timer` polling — and its heal-vs-restart duplicate-node race —
+  is gone.)
+  What each unit execs lives in ONE place: **`scripts/unit_exec.sh`** (pixi env
+  activation via `pixi shell-hook`, then `exec` of the installed executable — no
+  resident wrapper, no `ros2 run` RAM overhead). Logs: `journalctl -u nano-app` etc.
+- On the board the stack **auto-starts on boot** via `nano-robot.target`.
+- OS-level setup (overlays, udev, groups, sudoers, systemd units) is scripted in
+  **`deploy/sbc-setup.sh`** (idempotent; run once after a reflash + reboot, and
+  **re-run once after deploying this systemd migration**). stack.sh's start/stop/
+  restart go through scoped NOPASSWD sudoers rules it installs (deploy/sudoers).
 
 ## Dev/prod ROS parity + Gazebo sim
 There are now **two dev paths**, not one, serving different purposes:
@@ -236,8 +273,10 @@ There are now **two dev paths**, not one, serving different purposes:
     `robot.launch.py`, which still referenced the abandoned Rust LDS node +
     `micro_ros_agent`) is the single launch description for both: `sim:=false` (default)
     launches the real `lds_driver_py`/`imu_driver` — a `ros2 launch`-based **debug**
-    alternative to `stack.sh` (which stays the production launcher, unchanged, for its
-    RAM-saving direct-executable approach); `sim:=true` swaps those for Gazebo +
+    alternative to the systemd units (which stay the production launcher, for their
+    RAM-saving direct-executable approach; note the launch path runs the nodes as
+    separate processes, not the hubs — same graph, more RAM, fine on a dev PC);
+    `sim:=true` swaps those for Gazebo +
     `ros_gz_bridge` + `sim_hardware`. `rviz:=true` also opens RViz2
     (`robot_bringup/rviz/nano.rviz`: RobotModel/TF/LaserScan/Map/Odometry).
   - The Gazebo/RViz/`ros_gz_*`/`xacro`/`robot_state_publisher` deps live under
@@ -251,7 +290,7 @@ There are now **two dev paths**, not one, serving different purposes:
 
 ### Remote RViz (the REAL robot, not a simulation)
 A third option, orthogonal to the two dev paths above: watch the **physical robot live**
-in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo, no sim.
+in RViz from the dev PC while it runs its own systemd stack unchanged — no Gazebo, no sim.
 - `scripts/rviz_remote.sh` (optionally `--connect <robot-ip>`) / `pixi run visualize` runs
   `robot_bringup/launch/visualize.launch.py`, which starts **only**
   `robot_state_publisher` + `rviz2` — deliberately NOT `wheel_odometry`/`slam_nav`/
@@ -261,8 +300,8 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   graph.
 - **`/dev/shm` is per-machine RAM**, so `sim_hardware.map_bridge_node` (republishing
   `slam_nav`'s map blob as a real `nav_msgs/OccupancyGrid`) has to run **on the board**,
-  not the dev PC, for a remote RViz to see `/map` — `stack.sh up` now also starts it
-  (after `nav`; harmless/cheap, no Gazebo deps).
+  not the dev PC, for a remote RViz to see `/map` — the `nano-map` unit runs it on the
+  board (after `nav`; harmless/cheap, no Gazebo deps).
 - **Cross-host zenoh discovery**: `ROS_DOMAIN_ID`/`RMW_IMPLEMENTATION` already match by
   construction (both machines activate the same `pixi.toml`). Same-LAN zenoh multicast
   scouting usually finds the robot's `zenohd-serial` router with no extra config; if not
@@ -281,24 +320,37 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   A *new* module file still imports fine via the egg-link. `config/robot.yaml` and
   `web/` are symlinked into `install/`, so pushing src updates them too.
 - **`rmw_zenoh` ordering matters:** a node started before `rmw_zenohd` runs islanded
-  (won't appear in the graph). `stack.sh up` handles this (router first, then waits).
-- **`web_control` static server**: serves `web/` — `index.html` (markup only) plus
-  `style.css` and one JS file per former inline block (`app.js` main page,
-  `map.js` SLAM panel, `oled.js` OLED mirror, `chrome.js` tabs/joystick, `sim.js`
-  in-browser sim, `devtools.js` dev-harness sensors; kept as separate `<script>`s
-  on purpose — error isolation + per-file strict mode match the old inline blocks).
+  (won't appear in the graph). The systemd units handle this (`After=nano-router.service`
+  + the router unit's settle sleep).
+- **`web_control` static server**: serves `web/` — `index.html` (markup only, NO
+  external scripts — roslib is gone) plus `style.css` and one JS file per former
+  inline block (`app.js` main page, `map.js` SLAM panel, `oled.js` OLED mirror,
+  `chrome.js` tabs/joystick, `sim.js` in-browser sim, `devtools.js` dev-harness
+  sensors; kept as separate `<script>`s on purpose — error isolation + per-file
+  strict mode match the old inline blocks).
   `/stream.mjpg` is a zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`);
   `/snapshot.jpg` is one still frame (📸 button); `/audio.pcm` is the webcam
   mic as raw PCM via `arecord` (`mic_audio.py`). Both streams are ref-counted (only
   run while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
   (browsers don't stream an HTTP/1.0 body to `fetch`). `GET /health/log` serves the
   tail of sys_monitor's durable outage log for the web "Health events" card.
-- **HTTP teleop (`POST /drive`)**: the joystick/WASD path does NOT go through
-  rosbridge anymore. The page POSTs `{v,w}` same-origin; `web_server` clamps
-  (`drive_max_lin`/`drive_max_ang`), publishes `/cmd_vel` immediately, and re-asserts
-  it at 10 Hz while non-zero with a `drive_timeout` dead-man — so rosbridge latency
-  spikes can't outlast the ESP32's 500 ms cmd watchdog and stutter the drive. The
-  page falls back to rosbridge publishing if `/drive` 404s (old build); the dev
+- **Browser telemetry+control gateway (`telemetry.py`, replaced rosbridge)**:
+  `GET /telemetry` is ONE SSE stream (browser `EventSource`, native auto-reconnect)
+  of a compact JSON frame at `telemetry_rate` (5 Hz) with every light readout —
+  odom, IMU, `/diagnostics`, ESP32 (hb/ticks/susp/temp/hall), LDS rpm/hz/duty, fan,
+  plan (downsampled), latched brain strings (purpose/task/experiments), selftest,
+  and the OLED-mirror inputs (face/word/brand/system). The frame is built ONCE per
+  tick and fanned out; the underlying subscriptions are **lazy** (created on the
+  first client — on the executor thread via the tick timer — dropped `SUB_LINGER`
+  after the last), so idle cost is ~zero. Writes: `POST /publish {topic,value}`
+  (whitelisted + clamped per topic: goal_pose, lds_target_rpm, pickup_override,
+  selftest, go_home/save_map, oled_*) and `POST /param {node,name,value}`
+  (whitelisted nodes/params via `/<node>/set_parameters`, fire-and-forget). The
+  power buttons only POST `/system/*`; the server itself publishes `/oled_system`.
+- **HTTP teleop (`POST /drive`)**: the page POSTs `{v,w}` same-origin; `web_server`
+  clamps (`drive_max_lin`/`drive_max_ang`), publishes `/cmd_vel` immediately, and
+  re-asserts it at 10 Hz while non-zero with a `drive_timeout` dead-man — so browser
+  jank can't outlast the ESP32's 500 ms cmd watchdog and stutter the drive. The dev
   harness accepts it as a no-op.
 - **Text-to-speech** (`tts.py`): `POST /tts {text,voice?}` synthesises with
   `espeak-ng` (install via `deploy/install-espeakng.sh`; NOT on conda-forge so must be
@@ -311,7 +363,7 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   each word big+centred as it's spoken ("karaoke"); `""` returns to the dashboard.
   Both binaries run **only while speaking** (zero idle cost). The web "Speak" box
   reuses the old OLED-text field; it no longer publishes `/oled_text` (that brand
-  override still works if published manually). Off rosbridge on purpose (HTTP POST).
+  override still works if published manually). HTTP POST on purpose (server owns audio+timing).
   - **Voice/volume/speed/pitch** are tuned in the UI and applied directly to
     espeak-ng's `-v`/`-a`/`-s` flags. They + the stats announcer are **persisted**
     to `~/.local/state/nanobot/tts.json` (override with
@@ -332,7 +384,7 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   **real `web/index.html`** on a dev PC (ROS-free stand-in for `web_server`) and runs
     the **same `CognitionCore`** (so there's one base, not two — see below), wiring `/llm/*`,
     `/skills/*`, `/tts*` + the brain card, so the AI/Skills/Brain cards + Speak box can be
-    tested in a browser locally (telemetry/joystick/map show offline — no rosbridge). Reads
+    tested in a browser locally (telemetry/joystick/map show offline — no /telemetry). Reads
     the persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`, or —
     if unset — a one-line `memory/openrouter_key` file (gitignored; `_load_openrouter_key()`
     in `dev_webui.py`/`dev_tts_test.py`/`personality_creator.py`/`pregenerate_phrases.py`,
@@ -389,8 +441,8 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   keep real keys out of the committed yaml. To set it up: copy
   `memory/openrouter_key.example` to `memory/openrouter_key`, replace with your real
   OpenRouter key (one line, no quotes), and the key is picked up by **every entry point**
-  (`scripts/dev_webui.py`, `scripts/sim_run.sh`, `scripts/stack.sh`, and all `pixi run`
-  tasks) — see `scripts/stack.sh` / `pixi.toml` for the inline bash resolution. The LLM
+  (`scripts/dev_webui.py`, `scripts/sim_run.sh`, `scripts/unit_exec.sh` for the systemd
+  units, and all `pixi run` tasks). The LLM
   **auto-enables** when a key is detected (`web_server.py` + `dev_webui.py` override
   `llm_enabled: false` to `true`), so no web UI toggle needed on first run. UI toggles
   (enable/model/persona) persist to `~/.local/state/nanobot/llm.json` (never the key).
@@ -483,15 +535,25 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
 - **Interaction fillers fire BEFORE the LLM call.** On a skill beat the instant "thinking"
   prelude is spoken before the (slow) skill-pick `complete()` call, not after (so TTS feels
   instant); the chosen skill then runs with `prelude=False` to avoid a double filler.
-- **Heavy topics go over HTTP, not rosbridge:** rosbridge's cost is rclpy building a
-  Python msg per *incoming* sample (throttle_rate doesn't help — see [[sbc-cpu-profile]]),
-  so the two biggest messages are served same-origin from `/dev/shm` and polled: `/map`
-  (occupancy grid, written by `slam_nav`) and `/scan.bin` (compact lidar blob = JSON
-  header + raw float32 ranges, written by `lds_driver_py`). The page polls these like
-  files; `/scan` is **not** bridged. Also publishes `/esp32_ping` @1 Hz (ESP liveness).
+- **Heavy topics stay OFF the telemetry frame:** the two biggest messages are served
+  same-origin from `/dev/shm` and polled by the page: `/map` (occupancy grid, written
+  by `slam_nav`) and `/scan.bin` (compact lidar blob = JSON header + raw float32
+  ranges, written by `lds_driver_py`) — the page controls the poll rate per view.
+  Everything light rides the ONE `/telemetry` SSE frame (see the gateway note above).
+  web_control also publishes `/esp32_ping` @1 Hz (ESP liveness, always on).
+- **The vitals blob (`/dev/shm/nano_vitals.json`)**: sys_monitor writes ONE aggregated
+  body snapshot per tick — CPU/RAM/temp/disk + IMU |a|/|g|/rate/tilt + LDS hz + ESP32
+  liveness/temp, NaN-free, with per-source ages + a wall-clock `t` so readers add the
+  file's own staleness. The slow consumers READ it instead of subscribing:
+  `oled_display`'s dashboard (its telemetry topic subs are gone; local /proc fallback
+  when the blob is stale) and `web_control` (cognition body snapshot + the frame's
+  imu/eul sections). sys_monitor is now the only /imu/web + /imu/euler subscriber, and
+  it's co-resident with imu_driver in sensor_hub — so IMU samples never cross a
+  process boundary. **/dev/shm convention: one writer per `nano_*` file, atomic
+  `os.replace`, JSON (or JSON-header+binary) payload.**
 - Tune live: `imu_driver`/`lds_driver_py` expose `publish_rate` as a settable param;
-  the web UI sliders call `/<node>/set_parameters` over rosbridge. The IMU's device
-  stream rate auto-follows `publish_rate` (`output_rate_hz: 0`).
+  the web UI sliders POST `/param`, which calls `/<node>/set_parameters` (whitelisted).
+  The IMU's device stream rate auto-follows `publish_rate` (`output_rate_hz: 0`).
 
 ## Deploying to the live board (from a dev host)
 - One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — copies `src/`+`scripts/`,
@@ -502,14 +564,14 @@ in RViz from the dev PC while it runs its own `stack.sh` unchanged — no Gazebo
   into the board's `~/.local/state/nanobot/` — **ON by default for now**
   (`DEPLOY_SOUL=1`), which **overwrites** the robot's own persisted personality (discarding
   any evolved trait drift). Set **`DEPLOY_SOUL=0`** to skip and keep the robot's evolved soul.
-- From Windows, remote shell is PuTTY `plink`/`pscp`. **`plink -m <localfile>` sends
-  the file's text as the remote shell's argv**, so any `pkill -f`/`pgrep -f` (or a
-  `/proc/*/cmdline` scan) whose pattern appears in the script will match and kill the
-  controlling shell. Fix: `pscp` the script and run it **by path** (`plink ... "bash
-  /tmp/x.sh"`).
-- **`stack.sh restart` is currently unreliable at killing the old node** (can leave a
-  stale process holding the port / serving old code). If a change "doesn't take",
-  check for a duplicate node and do a clean `down` → verify with a python `/proc`
-  scan → `up`.
+- The dev host is native Ubuntu with a passwordless `ssh nano`/`scp nano:` alias
+  (creds git-ignored in `.nano-deploy.env`). (Historical, if ever deploying from
+  Windows again: **`plink -m <localfile>` sends the file's text as the remote shell's
+  argv**, so any `pkill -f`/`pgrep -f` pattern appearing in the script kills the
+  controlling shell — `pscp` the script and run it by path instead.)
+- `stack.sh restart` is now `systemctl restart nano-robot.target` — systemd owns
+  stop/kill/verify, so the old "stale process serving old code" failure mode (and the
+  heal-timer duplicate-node race) is gone by construction. If a change "doesn't take",
+  check `journalctl -u nano-app` (etc.) and `systemctl status nano-robot.target`.
 - The board has only ~1 GB RAM and a 7 GB rootfs — watch memory and disk. Don't run
   heavy compiles on it.

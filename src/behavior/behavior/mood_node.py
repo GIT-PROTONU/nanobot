@@ -97,6 +97,14 @@ class MoodNode(Node):
             ("attend_face", "looking"),     # OLED face for the focus-driven "attending" perk-up
             ("attend_secs", 2.0),           # s the alert "attending" pause holds before a beat
             ("feel_secs", 2.5),             # s the baseline-mood "feeling" state holds after a beat
+            # --- time awareness: a sleepier idle cadence at night ---------------------
+            # Inside the quiet window (local hours, wrap-aware; negative = disabled) the
+            # chart's idle cadence is stretched by night_tempo (2.0 = beats half as often).
+            # Speech muting during the same window is web_control's job (cognition
+            # quiet_start/quiet_end in robot.yaml — keep the two windows in sync).
+            ("quiet_start", -1.0),
+            ("quiet_end", -1.0),
+            ("night_tempo", 2.0),
             # --- autonomous reflection mode: enter on long idle, run a fixed stretch, wake ---
             ("reflect_auto_enable", True),  # let the robot enter reflection mode on its own
             ("reflect_auto_idle", 1200.0),  # s of continuous idle before auto-entering reflection
@@ -125,6 +133,9 @@ class MoodNode(Node):
         self._reflect_auto_enable = bool(g("reflect_auto_enable").value)
         self._reflect_auto_idle = max(0.0, float(g("reflect_auto_idle").value))
         self._reflect_auto_secs = max(1.0, float(g("reflect_auto_secs").value))
+        self._quiet_start = float(g("quiet_start").value)
+        self._quiet_end = float(g("quiet_end").value)
+        self._night_tempo = max(1.0, float(g("night_tempo").value))
 
         # --- signals updated by callbacks, read by the tick ---
         self._susp_l = False
@@ -258,7 +269,7 @@ class MoodNode(Node):
                 feel_secs=float(g("feel_secs").value),
                 rng=random.Random(),          # the idle-beat lottery + burst/attend gates
                 chart_path=_state_path(g("chart_path").value, "presence_chart.yaml"),
-                beats=self._beats)
+                beats=self._beats, tempo=self._tempo)
             self._personality.attach(self._interp)
             self.get_logger().info(
                 f"behavior up: presence statechart (personality '{self._personality.name}', "
@@ -266,6 +277,18 @@ class MoodNode(Node):
         except Exception as exc:
             self._interp = None
             self.get_logger().error(f"statechart init failed: {exc} — running as no-op")
+
+    def _tempo(self):
+        """The chart's live idle-cadence multiplier (re-read on every guard evaluation):
+        night_tempo inside the local quiet window, 1.0 otherwise/when disabled. Cadence
+        only — muting the autonomous speech during the same window is cognition's job."""
+        s, e = self._quiet_start, self._quiet_end
+        if self._night_tempo <= 1.0 or s < 0 or e < 0 or s == e:
+            return 1.0
+        lt = time.localtime()
+        h = lt.tm_hour + lt.tm_min / 60.0
+        in_quiet = (h >= s or h < e) if s > e else (s <= h < e)
+        return self._night_tempo if in_quiet else 1.0
 
     # --- the injected face action + the node's own release path --------------
     def _emit_face(self, mood):

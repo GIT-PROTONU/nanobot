@@ -290,6 +290,13 @@ behavior:
     pursue_min_interval: 180.0  # s, min gap between goal-pursuit ("pursuing") beats
     ab_epsilon: 0.2             # A/B bandit exploration rate (0..1; higher = explores more)
     reflect_face: "focused"     # OLED face shown while in reflection mode
+    # Time awareness: inside the quiet window the idle cadence is stretched by night_tempo
+    # (2.0 = beats fire half as often), so the robot is naturally sleepier after hours.
+    # Speech muting for the same window is web_control's quiet_start/quiet_end below —
+    # KEEP THE TWO WINDOWS IN SYNC. Negative = disabled.
+    quiet_start: 22.0           # local hour the quiet window opens (wrap-aware)
+    quiet_end: 8.0              # local hour it closes
+    night_tempo: 2.0            # idle-cadence multiplier inside the window (>=1)
     # Autonomous reflection mode: drift into it on a long idle, run a fixed stretch, then wake.
     reflect_auto_enable: true   # let the robot enter reflection mode on its own
     reflect_auto_idle: 600.0    # s of continuous idle before auto-entering reflection
@@ -298,16 +305,19 @@ behavior:
     experiments_path: ""        # "" = ~/.local/state/nanobot/experiments.json
     cognition_log_path: ""      # shared decision log (read-only); "" = ~/.local/state/nanobot/cognition.log
 
-# ---- Web control (rosbridge websocket + static page) ------------------------
+# ---- Web control (static page + SSE telemetry gateway; no rosbridge) --------
 web_control:
   ros__parameters:
     web_port: 8080            # http://<robot-ip>:8080
-    rosbridge_port: 9090      # websocket roslib connects to
-    # HTTP teleop: the page POSTs /drive {v,w} (same-origin) instead of publishing
-    # /cmd_vel through rosbridge; this node publishes immediately + keeps a steady
-    # 10 Hz keepalive while the command is non-zero, with a dead-man stop when the
-    # page stops refreshing. Keeps rosbridge's latency spikes out of the control
-    # loop (they could outlast the ESP32's 500 ms /cmd_vel watchdog = stutter).
+    # SSE telemetry: GET /telemetry streams one JSON frame with every light readout
+    # at this rate. The frame is built once per tick and shared by all viewers, and
+    # the underlying subscriptions exist only while a browser is connected — a
+    # closed page costs nothing. (This replaced rosbridge entirely.)
+    telemetry_rate: 5.0
+    # HTTP teleop: the page POSTs /drive {v,w} (same-origin); this node publishes
+    # /cmd_vel immediately + keeps a steady 10 Hz keepalive while the command is
+    # non-zero, with a dead-man stop when the page stops refreshing (browser jank
+    # could otherwise outlast the ESP32's 500 ms /cmd_vel watchdog = stutter).
     drive_max_lin: 0.4        # m/s clamp (the ESP32 maps 0.4 to full PWM)
     drive_max_ang: 3.0        # rad/s clamp
     drive_timeout: 0.6        # s without a fresh POST -> publish one stop
@@ -445,6 +455,13 @@ web_control:
     camera_announce: true      # false = capture silently (no pre-look line)
     camera_face: "looking"     # OLED face shown the instant the camera is used (the wide,
                                # scanning "peeking" eyes); "" = leave the face unchanged
+    # Quiet hours (local time, wrap-aware; negative = off): AUTONOMOUS speech — idle/skill
+    # beats, the boot greeting, the offline line, the stats announcer, reflection bookends —
+    # is muted inside the window (logged as "quiet-hours" in the decision log). User-
+    # initiated speech (chat/say/observe/look, the Speak box, a manually run skill) still
+    # talks. Keep in sync with behavior.quiet_start/quiet_end (the night idle slowdown).
+    quiet_start: 22.0
+    quiet_end: 8.0
     # Lifecycle speech + the persistent "AI offline" indicator. All offline-safe (the phrase
     # bank ships built-in fallback lines), so they work with no key / no network.
     startup_greeting: true     # speak a greeting line a few seconds after boot

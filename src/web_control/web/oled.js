@@ -2,8 +2,8 @@
 // Renders the SAME screen the panel shows (dashboard / mood face / TTS karaoke / shutdown),
 // from the SAME inputs: /oled_face, /oled_word, /oled_text, /oled_system + live telemetry.
 // This is a faithful port of src/oled_display/oled_display/display_node.py — all the drawing
-// happens here in the browser, so it works identically on the robot (state over rosbridge)
-// and on the dev harness (state polled from /oled/state; see scripts/dev_webui.py). Blink &
+// happens here in the browser, so it works identically on the robot (state in the SSE
+// telemetry frame) and on the dev harness (state polled from /oled/state; dev_webui.py). Blink &
 // gaze are animated locally with their own RNG, so they aren't frame-identical to the panel,
 // but the mode / mood / words / dashboard all mirror exactly.
 window.OLED=(function(){
@@ -288,9 +288,9 @@ window.OLED=(function(){
   };
 })();
 OLED.init();
-// Dev harness (no rosbridge): poll the panel state the robot would publish over topics.
-// On the robot we're `connected`, so this never fires (topics drive the mirror); a 404 here
-// is harmless.
+// Dev harness (no /telemetry stream): poll the panel state the robot would stream.
+// On the robot we're `connected`, so this never fires (the telemetry frame drives the
+// mirror); a 404 here is harmless.
 setInterval(()=>{
   if(typeof connected!=="undefined" && connected) return;
   fetch("/oled/state").then(r=>r.ok?r.json():null).then(s=>{

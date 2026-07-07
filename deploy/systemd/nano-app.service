@@ -1,0 +1,24 @@
+[Unit]
+Description=Nano app hub (web UI/gateway + OLED + behaviour statechart, one process)
+After=nano-router.service
+Wants=nano-router.service
+PartOf=nano-robot.target
+
+[Service]
+# Type=notify: the hub sends READY=1 once up, then pets WATCHDOG=1 every 5 s from an
+# executor timer — so an alive-but-wedged executor (a stuck callback) stops petting
+# and systemd restarts the hub. Crashes are Restart=on-failure as before.
+Type=notify
+WatchdogSec=90
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh app
+# SIGTERM lets the OLED draw its restart/shutdown end-screen before exiting.
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3
+# A leak (LLM/cognition is the likely candidate) kills and restarts THIS hub instead
+# of inviting the kernel OOM killer to pick a victim on the 1 GB board.
+MemoryMax=450M
+
+[Install]
+WantedBy=nano-robot.target

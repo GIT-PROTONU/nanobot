@@ -187,7 +187,7 @@ can reach for a capability, but physics/safety always wins.
 **Two ways a skill runs:**
 
 1. **Autonomously** — every `skill_every`-th idle body beat becomes a `skill` beat (an upgrade
-   of `musing`, just like `pursuing`). `web_server._run_skill_beat` shows the offered catalogue
+   of `musing`, just like `pursuing`). `CognitionCore.run_skill_beat` shows the offered catalogue
    (names + descriptions + triggers) to the *cheap* model, which **picks the most fitting one**
    for the moment (or none), and Nano performs it.
 2. **On demand** — the web UI's "🛠 Skills" card lists every file with an *Invoke* button
@@ -280,6 +280,51 @@ baseline personality** — not generic defaults, but *who this robot was configu
 reactions are *not* in the registry, by design. So no matter how the personality drifts, the
 robot keeps its safe, alive base behaviour.
 
+## Drives — the LLM's extra levers (new *states*, not just weights)
+
+Beyond the four traits there are three smoothed 0..1 **drives** + one categorical face, all
+steerable by the same `evolve` event (same guardrails: clamped, smoothed, reverted on
+`brain_lost`, expression-only):
+
+- **energy** — paces the idle cadence and can trigger an *energetic burst* (the `performing`
+  state chains a second beat);
+- **focus** — gates a brief alert **`attending`** perk-up (the "I noticed something" pause)
+  before a beat;
+- **introspection** — how readily it drifts into reflection mode on a long idle;
+- **mood** — a baseline face worn briefly (the **`feeling`** state) between beats.
+
+`0.5` is the neutral "off" point: at the defaults none of the new states ever fire, so
+behaviour is unchanged until reflection pushes a drive above it.
+
+## Purpose & goals (the "why" layer)
+
+`behavior/brain.py` (ROS-free, shared verbatim with the dev harness) adds a slow goal layer
+on top of the beats: a **Purpose Engine** holds an objective + intrinsic-reward weights
+(reflected deterministically from the decision log), and a **Pursuit driver** occasionally
+upgrades the `musing` slot into a **`pursuing`** beat that narrates the current task —
+with an **A/B bandit** trying style variants. The web UI's 👍/👎 credits the variant that
+just ran (contextual) or shapes the reward weights (global). Latched readouts:
+`/purpose`, `/task_current`, `/experiments` (the web "🧠 Brain" card). Like everything else
+it is narrative-only — goals are things to *say and look at*, never motion commands.
+
+## Time awareness (routines)
+
+Nano knows what time it is, in three small ways (all off by default; enabled by the
+`quiet_start`/`quiet_end` windows in `robot.yaml` — one under `behavior:`, one under
+`web_control:`, kept in sync):
+
+1. **Prompts carry the clock** — `cognition.time_context()` ("It is Tuesday 21:47, in the
+   evening.") is folded into the beat / skill-pick / observe prompts, so a morning musing
+   reads different from a midnight one.
+2. **Quiet hours mute autonomous speech** — inside the window, idle/skill beats, the boot
+   greeting, the offline lament, the stats announcer and the reflection bookends stay
+   silent (logged as `quiet-hours` in the decision log). **User-initiated speech always
+   works** — chat, the Speak box, a manually invoked skill: you asked, it answers. Faces
+   still animate: quiet, not dormant. Night reflections become silent "sleep consolidation".
+3. **A sleepier idle cadence at night** — the chart's idle guard is multiplied by a live
+   `tempo()` callable (`night_tempo`, default 2.0 = beats half as often inside the window),
+   deliberately separate from the LLM-owned traits/drives so evolution is untouched.
+
 ## Model tiers (and the cost caps)
 
 Three tiers in `llm.py`, each **free-first**: every text tier tries one or more **free**
@@ -360,7 +405,8 @@ On Windows, `scripts/start-dev.ps1` finds a real Python, loads the key, and laun
 | Concern | File |
 |---|---|
 | Statechart (when) | `src/behavior/behavior/presence.py` (+ `test/`) |
-| ROS wrapper, fast-rule evolution | `src/behavior/behavior/mood_node.py` |
+| Purpose Engine + Pursuit + A/B bandit + Personality orchestration | `src/behavior/behavior/brain.py` |
+| ROS wrapper, fast-rule evolution, night tempo | `src/behavior/behavior/mood_node.py` |
 | OpenRouter client (what) | `src/web_control/web_control/llm.py` |
 | **Cognition core** (execution, reflection, log — shared robot+dev) | `src/web_control/web_control/cognition.py` |
 | Pre-generated phrase bank | `src/web_control/web_control/phrasebank.py` (+ `scripts/pregenerate_phrases.py`) |

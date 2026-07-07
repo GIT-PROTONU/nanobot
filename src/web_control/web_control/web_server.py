@@ -1,14 +1,16 @@
-"""Tiny static-file HTTP server for the control page, plus an MJPEG webcam stream.
+"""The robot's ONLY browser gateway: static control page + telemetry + control + media.
 
 Kept as a ROS node so it starts/stops with the rest of the launch and shows up
 in `ros2 node list`. It serves the package's installed `web/` directory
-(index.html + style.css + the per-panel *.js). The page talks to ROS over the
-rosbridge websocket for the light topics; the heavy/hot paths go through this
-server instead:
+(index.html + style.css + the per-panel *.js). There is NO rosbridge anymore —
+the page talks exclusively to this server:
 
+- `GET /telemetry` — ONE Server-Sent-Events stream carrying every light readout
+  (odom/IMU/diagnostics/ESP32/LDS/OLED mirror/brain) as a compact JSON frame at
+  `telemetry_rate` Hz. `POST /publish` + `POST /param` are the whitelisted write
+  paths (goal, setpoints, OLED owners, tuning sliders). See telemetry.py.
 - `POST /drive` ({"v","w"}) — HTTP teleop. Publishes /cmd_vel directly with a
-  node-side 10 Hz keepalive + dead-man, keeping rosbridge's latency spikes out
-  of the control loop (see the drive_* params).
+  node-side 10 Hz keepalive + dead-man (see the drive_* params).
 - `/map`, `/scan.bin` — the /dev/shm blobs slam_nav / lds_driver_py write,
   served same-origin so the big messages never cross rosbridge.
 - `/stream.mjpg` — USB webcam as multipart/x-mixed-replace via a zero-dependency
@@ -35,11 +37,12 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
-from geometry_msgs.msg import Twist, Vector3Stamped
+from geometry_msgs.msg import Twist
 
 from .jsonio import read_json, write_json
 from .mjpeg_camera import CameraStream
 from .mic_audio import AudioStream
+from .telemetry import TelemetryHub
 from .tts import TtsEngine, VOICES, clamp
 from .llm import LlmClient
 from .skills import resolve_skills_dir
@@ -94,6 +97,7 @@ THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
 STAT_PATH = "/proc/stat"
 MEMINFO_PATH = "/proc/meminfo"
 SCAN_FILE = "/dev/shm/nano_scan.bin"          # compact lidar blob (for the read-lidar skill)
+VITALS_FILE = "/dev/shm/nano_vitals.json"     # sys_monitor's aggregated body snapshot
 
 # The GATED "action tier" for topic-skills: the ONLY ROS topics a skill may publish, each
 # with a hard clamp. Anything else is refused. Motion is ALSO clamped reflexively by
@@ -109,7 +113,9 @@ class WebServerNode(Node):
     def __init__(self):
         super().__init__("web_control")
         self.declare_parameter("web_port", 8080)
-        self.declare_parameter("rosbridge_port", 9090)
+        # SSE telemetry frame rate for GET /telemetry (the rosbridge replacement —
+        # see telemetry.py). Costs nothing while no browser is connected.
+        self.declare_parameter("telemetry_rate", 5.0)
         self.declare_parameter("cam_device", "")      # "" = auto-detect the UVC cam
         self.declare_parameter("cam_width", 640)
         self.declare_parameter("cam_height", 480)
@@ -192,6 +198,12 @@ class WebServerNode(Node):
         self.declare_parameter("skill_likes_path", "")         # 👍 likes ledger; "" -> XDG state dir
         self.declare_parameter("skill_like_bias", 0.6)         # P(a skill beat picks a liked skill by weight)
         self.declare_parameter("reflect_announce", True)       # speak reflection conclusions out loud
+        # Quiet hours (local time, wrap-aware; negative = off): autonomous speech —
+        # idle/skill beats, boot greeting, offline line, stats announcer, reflection
+        # bookends — is muted inside the window; user-initiated speech still talks.
+        # Keep in sync with behavior.quiet_start/quiet_end (the night idle slowdown).
+        self.declare_parameter("quiet_start", -1.0)
+        self.declare_parameter("quiet_end", -1.0)
         # Lifecycle speech + the persistent "AI offline" indicator (all offline-safe via the
         # phrase bank's FALLBACK_LINES, so they work with no key / no network).
         self.declare_parameter("startup_greeting", True)   # speak a greeting line on boot
@@ -360,7 +372,9 @@ class WebServerNode(Node):
             workshop_trial_bias=float(g("workshop_trial_bias").value),
             skill_likes_path=(g("skill_likes_path").value or None),
             skill_like_bias=float(g("skill_like_bias").value),
-            reflect_announce=bool(g("reflect_announce").value))
+            reflect_announce=bool(g("reflect_announce").value),
+            quiet_start=float(g("quiet_start").value),
+            quiet_end=float(g("quiet_end").value))
         # Statechart-driven enrichment requests: the behaviour node decides when/what, the
         # core executes (capture frame if asked, add sensors, generate, speak + emote).
         self.create_subscription(String, "cognition/request", self._on_cog, 10)
@@ -390,20 +404,22 @@ class WebServerNode(Node):
         # The behaviour node can ask us to enter reflection mode on its own (long idle); we turn
         # that request into the same brain_reflect() the web toggle calls, so there's one path.
         self.create_subscription(Bool, "reflect_request", self._on_reflect_request, 10)
-        # Sensor snapshot for the "Observe" feature (light: we just store the latest
-        # value from each, with its arrival time for staleness). CPU/RAM/temp come from
-        # the same cheap /proc reads the announcer uses; these add IMU + pick-up.
-        self._imu_accel = self._imu_gyro = 0.0
-        self._roll = self._pitch = self._yaw = 0.0
-        self._imu_at = self._eul_at = -1e9
+        # Sensor state for the "Observe" feature + the telemetry frame. IMU motion/tilt
+        # comes from sys_monitor's vitals blob (read, not subscribed — see vitals());
+        # only the event-driven pick-up switches remain topics here. CPU/RAM/temp come
+        # from the same cheap /proc reads the announcer uses.
+        self._vitals_cache = ({}, -1e9)
         self._susp_l = self._susp_r = False
         self._susp_override = -1        # /pickup_override: -1 auto, 0 grounded, 1 lifted
-        self.create_subscription(Vector3Stamped, "imu/web", self._on_imu_web, 10)
-        self.create_subscription(Vector3Stamped, "imu/euler", self._on_imu_euler, 10)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
         # test override for the off-ground switches (latched so a restart mid-test still sees it)
         self.create_subscription(Int8, "pickup_override", self._on_pickup_override, latched)
+        # Browser gateway (the rosbridge replacement): GET /telemetry SSE + POST
+        # /publish + POST /param. Its browser-only subscriptions are lazy — created on
+        # the first connected client, dropped after the last — so it costs ~nothing idle.
+        self._system_pub = self.create_publisher(String, "oled_system", 5)
+        self.telemetry = TelemetryHub(self, rate=float(g("telemetry_rate").value))
         self.get_logger().info(
             f"llm: {'enabled' if self._cog.available() else 'idle (no key / disabled)'}"
             f" model={self._cog.llm.model}")
@@ -535,6 +551,8 @@ class WebServerNode(Node):
         if now < self._announce_next:
             return
         self._announce_next = now + float(self._settings["announce_interval"])
+        if self._cog.quiet_now():           # the periodic announcer respects quiet hours
+            return                          # (POST /tts/announce — user-initiated — doesn't)
         self.announce_now()
 
     def announce_now(self):
@@ -909,13 +927,32 @@ class WebServerNode(Node):
                  "drives": res.get("drives", {})})))
 
     # --- sensor snapshot (the core's ROS-backed adapters) --------------------
-    def _on_imu_web(self, msg: Vector3Stamped):     # x=|accel| m/s^2, y=|gyro| rad/s
-        self._imu_accel, self._imu_gyro = msg.vector.x, msg.vector.y
-        self._imu_at = time.monotonic()
-
-    def _on_imu_euler(self, msg: Vector3Stamped):   # x=roll, y=pitch, z=yaw (degrees)
-        self._roll, self._pitch, self._yaw = msg.vector.x, msg.vector.y, msg.vector.z
-        self._eul_at = time.monotonic()
+    def vitals(self):
+        """sys_monitor's aggregated body snapshot (/dev/shm/nano_vitals.json), with the
+        per-source ages adjusted by the file's own staleness so a dead writer ages
+        everything out naturally. Cached ~0.5 s; {} when absent/unreadable."""
+        now = time.monotonic()
+        cached, at = self._vitals_cache
+        if now - at < 0.5:
+            return cached
+        v = {}
+        try:
+            with open(VITALS_FILE) as f:
+                v = json.load(f)
+            file_age = max(0.0, time.time() - float(v.get("t", 0)))
+            for k in ("imu", "eul", "lds"):
+                sec = v.get(k)
+                if isinstance(sec, dict) and sec.get("age") is not None:
+                    sec["age"] = round(float(sec["age"]) + file_age, 2)
+            esp = v.get("esp")
+            if isinstance(esp, dict):
+                for k in ("hb_age", "temp_age"):
+                    if esp.get(k) is not None:
+                        esp[k] = round(float(esp[k]) + file_age, 2)
+        except (OSError, ValueError, TypeError):
+            v = {}
+        self._vitals_cache = (v, now)
+        return v
 
     def _on_susp_l(self, msg: Bool):
         self._susp_l = bool(msg.data)
@@ -947,6 +984,19 @@ class WebServerNode(Node):
                 return 100.0 * (1.0 - di / dt)
         return float("nan")
 
+    def _imu_state(self):
+        """(moving, tilt) from the vitals blob — either may be None when the source is
+        missing/stale (>4 s: one vitals write period + margin)."""
+        v = self.vitals()
+        moving = tilt = None
+        imu = v.get("imu") or {}
+        if imu.get("age", 1e9) < 4.0 and imu.get("g") is not None:
+            moving = imu["g"] > 0.3 or abs((imu.get("a") or 9.81) - 9.81) > 1.5
+        eul = v.get("eul") or {}
+        if eul.get("age", 1e9) < 4.0 and eul.get("r") is not None:
+            tilt = max(abs(eul["r"]), abs(eul.get("p") or 0.0))
+        return moving, tilt
+
     def _sensor_snapshot(self):
         """A short plain-English description of how the robot's body feels right now,
         for the LLM to react to. Only includes sources that are present + fresh."""
@@ -958,12 +1008,10 @@ class WebServerNode(Node):
             parts.append(f"memory {mem:.0f}% used")
         if temp == temp:
             parts.append(f"main board {temp:.0f} degrees C")
-        now = time.monotonic()
-        if (now - self._imu_at) < 3.0:                  # moving / being jostled?
-            moving = self._imu_gyro > 0.3 or abs(self._imu_accel - 9.81) > 1.5
+        moving, tilt = self._imu_state()
+        if moving is not None:                          # moving / being jostled?
             parts.append("being moved or jostled" if moving else "physically still")
-        if (now - self._eul_at) < 3.0:                  # tilt from roll/pitch
-            tilt = max(abs(self._roll), abs(self._pitch))
+        if tilt is not None:                            # tilt from roll/pitch
             if tilt > 25:
                 parts.append(f"tilted over at about {tilt:.0f} degrees")
             elif tilt > 10:
@@ -982,14 +1030,8 @@ class WebServerNode(Node):
     def _sensor_signals(self):
         """The same body state as _sensor_snapshot(), but structured for the phrase bank's
         classifier (NaN/None where a source is missing or stale)."""
-        now = time.monotonic()
         cpu, mem, temp = self._cpu_percent_quick(), self._mem_percent(), self._cpu_temp()
-        moving = None
-        if (now - self._imu_at) < 3.0:
-            moving = self._imu_gyro > 0.3 or abs(self._imu_accel - 9.81) > 1.5
-        tilt = None
-        if (now - self._eul_at) < 3.0:
-            tilt = max(abs(self._roll), abs(self._pitch))
+        moving, tilt = self._imu_state()
         susp_l, susp_r = self._susp_eff()
         pickup = 2 if (susp_l and susp_r) else (1 if (susp_l or susp_r) else 0)
         return {"cpu": cpu, "mem": mem, "temp": temp, "moving": moving,
@@ -1019,7 +1061,11 @@ class WebServerNode(Node):
 
     # --- lifecycle speech (offline-safe via the phrase bank, done by the core) ----
     def system_announce(self, action):
-        """Speak the matching farewell/restart line just before a stack/board action."""
+        """Speak the matching farewell/restart line just before a stack/board action, and
+        flip the OLED to its end-screen immediately (the page used to publish /oled_system
+        over rosbridge for this; now the server owns it)."""
+        if action in ("restart", "reboot", "shutdown"):
+            self._system_pub.publish(String(data=action))
         cat = "farewell" if action in ("shutdown", "poweroff") else "restarting"
         return self._cog.speak_lifecycle(cat)
 
@@ -1173,6 +1219,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     }
     POST_JSON = {
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
+        "/publish": lambda n, d: n.telemetry.publish_json(d),   # whitelisted topic pokes
+        "/param": lambda n, d: n.telemetry.set_param_json(d),   # whitelisted live-tune params
         "/tts/config": lambda n, d: n.update_settings(d),
         "/llm/config": lambda n, d: n.update_llm_settings(d),
         "/llm/phrases/regenerate": lambda n, d: n.regenerate_phrasebank(),
@@ -1197,8 +1245,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     # Reboot/poweroff need the scoped NOPASSWD sudo rule for systemctl (sbc-setup.sh).
     POST_SYSTEM = {
         "/system/restart": ("restart", "restart",
-                            'cd "$HOME/Nano" && "$HOME/.pixi/bin/pixi" run bash '
-                            'scripts/stack.sh restart', "restarting stack"),
+                            'bash "$HOME/Nano/scripts/stack.sh" restart',
+                            "restarting stack"),
         "/system/reboot": ("reboot", "reboot",
                            "sudo -n /usr/bin/systemctl reboot", "rebooting"),
         "/system/shutdown": ("shutdown", "shutdown",
@@ -1212,6 +1260,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             if self._node is None:
                 return self._respond(503, "no node")
             return self._respond_json(route(self._node))
+        if path == "/telemetry":
+            return self._stream_telemetry()
         if path == "/snapshot.jpg":
             return self._serve_snapshot()
         if path == "/stream.mjpg":
@@ -1369,6 +1419,39 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             pass                       # client closed the stream / write timed out
         finally:
             self._stream.remove_viewer()
+
+    def _stream_telemetry(self):
+        """GET /telemetry: Server-Sent Events. One JSON frame per telemetry tick, shared
+        across all clients (built once in TelemetryHub). Chunked like /audio.pcm so the
+        browser surfaces events live; a comment line keeps idle connections alive."""
+        if self._node is None:
+            self.send_error(503, "no node")
+            return
+        hub = self._node.telemetry
+        hub.add_client()
+        self.close_connection = True   # never-ending stream: no keep-alive reuse
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            seq = 0
+            while True:
+                new_seq, frame = hub.wait_frame(seq, timeout=5.0)
+                if new_seq == seq:
+                    chunk = b": ping\n\n"              # SSE comment = keepalive
+                else:
+                    seq = new_seq
+                    chunk = b"data: " + frame + b"\n\n"
+                self.wfile.write(b"%X\r\n" % len(chunk))
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except OSError:
+            pass                       # client left / write timed out
+        finally:
+            hub.remove_client()
 
     def _stream_audio(self):
         if self._audio is None:
