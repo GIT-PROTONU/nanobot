@@ -52,8 +52,13 @@ MAX_CHARS = 300                      # hard cap on a single utterance (also boun
 # when aplay opens the PCM and swallows the first ~0.2-0.3 s of samples while it
 # ramps — which clipped the first spoken word (an immediate follow-up utterance was
 # fine because the codec was still awake). Waking it over silence costs a barely
-# noticeable delay instead of a word.
+# noticeable delay instead of a word. The exact ramp time is hardware/temperature
+# dependent and can't be measured from here, so it's live-tunable (web "Lead
+# silence" slider -> configure(lead_silence=...)) instead of a fixed guess — if
+# clipping is still audible, raise it; if the pause before speech feels long, lower
+# it. LEAD_SILENCE is just the seed value before any UI/persisted override.
 LEAD_SILENCE = 0.35                  # seconds
+LEAD_SILENCE_RANGE = (0.0, 2.0)      # seconds; hard clamp regardless of caller
 
 # Hard clamps for the markup levels (percent; 100 = normal). The UI exposes
 # friendlier sub-ranges, but anything out of these is clamped here regardless.
@@ -118,6 +123,7 @@ class TtsEngine:
         self._flutter = 0
         self._roughness = 0
         self._cap_pitch = 0
+        self._lead_silence = LEAD_SILENCE
 
         self._lock = threading.Lock()
         self._thread = None
@@ -145,7 +151,8 @@ class TtsEngine:
         return self._available
 
     def configure(self, voice=None, volume=None, speed=None, pitch=None,
-                  base_pitch=None, flutter=None, roughness=None, cap_pitch=None):
+                  base_pitch=None, flutter=None, roughness=None, cap_pitch=None,
+                  lead_silence=None):
         """Update the current voice and markup levels (each optional). Clamped."""
         if voice is not None and voice in VOICES:
             self._voice = voice
@@ -163,6 +170,12 @@ class TtsEngine:
             self._roughness = clamp(roughness, *ROUGHNESS_RANGE)
         if cap_pitch is not None:
             self._cap_pitch = clamp(cap_pitch, *CAP_PITCH_RANGE)
+        if lead_silence is not None:
+            try:
+                self._lead_silence = max(LEAD_SILENCE_RANGE[0],
+                                          min(LEAD_SILENCE_RANGE[1], float(lead_silence)))
+            except (TypeError, ValueError):
+                pass
 
     @property
     def voice(self):
@@ -221,11 +234,14 @@ class TtsEngine:
         except Exception:
             return 0.0
 
-    def _pad_lead_silence(self, secs=LEAD_SILENCE):
-        """Prepend `secs` of silence to WAV_PATH (same format), so the codec's
-        power-up ramp can't eat the first word (see LEAD_SILENCE). Returns the pad
-        actually added — 0.0 on any error, in which case playback just proceeds
-        with the unpadded clip."""
+    def _pad_lead_silence(self, secs=None):
+        """Prepend `secs` (default: the live-tunable self._lead_silence) of silence
+        to WAV_PATH (same format), so the codec's power-up ramp can't eat the first
+        word (see LEAD_SILENCE). Returns the pad actually added — 0.0 on any error
+        or a non-positive duration, in which case playback just proceeds with the
+        unpadded clip."""
+        if secs is None:
+            secs = self._lead_silence
         if secs <= 0:
             return 0.0
         try:

@@ -426,6 +426,7 @@ bindSlider("ttsVol","ttsVolV","volume");
 bindSlider("ttsSpeed","ttsSpeedV","speed");
 bindSlider("ttsPitch","ttsPitchV","pitch");
 bindSlider("ttsCap","ttsCapV","cap_pitch");
+bindSlider("ttsLead","ttsLeadV","lead_silence");
 $("ttsVoice").addEventListener("change",()=>saveTts({voice:$("ttsVoice").value}));
 $("announceOn").addEventListener("change",()=>saveTts({announce:$("announceOn").checked}));
 $("announceInterval").addEventListener("change",
@@ -438,9 +439,11 @@ function loadTts(){
     if(!s) return;
     const set=(id,v)=>{ if($(id)) $(id).value=v; };
     set("ttsVoice",s.voice); set("ttsVol",s.volume); set("ttsSpeed",s.speed);
-    set("ttsPitch",s.pitch); set("ttsCap",s.cap_pitch); set("announceInterval",s.announce_interval);
+    set("ttsPitch",s.pitch); set("ttsCap",s.cap_pitch); set("ttsLead",s.lead_silence);
+    set("announceInterval",s.announce_interval);
     $("ttsVolV").textContent=s.volume; $("ttsSpeedV").textContent=s.speed;
-    $("ttsPitchV").textContent=s.pitch; $("ttsCapV").textContent=s.cap_pitch; $("announceOn").checked=!!s.announce;
+    $("ttsPitchV").textContent=s.pitch; $("ttsCapV").textContent=s.cap_pitch;
+    $("ttsLeadV").textContent=s.lead_silence; $("announceOn").checked=!!s.announce;
   }).catch(()=>{});
 }
 loadTts();

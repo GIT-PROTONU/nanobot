@@ -35,11 +35,19 @@ karaoke onto the OLED via `/oled_word`. See [[oled-display-perf]], [[project-ove
 
 ## Gotchas
 
-- **First word clipped on the first utterance** (a repeat right after is fine): the H5
+- **First word/part clipped on the first utterance** (a repeat right after is fine): the H5
   codec/amp powers up when aplay opens the PCM and swallows the first ~0.2-0.3 s.
   Fixed 2026-07-05: `tts.py` prepends `LEAD_SILENCE` (0.35 s) to every clip on the
   aplay path so the wake-up ramp burns silence, and the karaoke word timing is
-  offset by the pad. If a first word EVER clips again, raise `LEAD_SILENCE`.
+  offset by the pad. **2026-07-08: still clipping on hardware at 0.35 s** — the ramp
+  time is apparently hardware/temperature dependent and not fully covered by a fixed
+  guess, so the pad is now **live-tunable** instead of a hardcoded constant: web UI
+  Speak card → "Lead silence" slider (0-1500 ms, persisted to `tts.json` alongside
+  volume/speed/pitch), `TtsEngine.configure(lead_silence=seconds)`,
+  `SETTINGS_DEFAULTS["lead_silence"]` in `web_server.py` (ms, default 350). If it
+  still clips, raise the slider from the robot's own web UI while listening — no
+  redeploy needed. `LEAD_SILENCE`/`LEAD_SILENCE_RANGE` in `tts.py` are just the seed/
+  clamp now, not the effective value.
 
 - `stack.sh` launches nodes from `install/<pkg>/bin/` not `lib/<pkg>/`.
   On this RoboStack colcon install, Python `console_scripts` entry points

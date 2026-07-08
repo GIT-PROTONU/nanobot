@@ -58,6 +58,10 @@ SETTINGS_DEFAULTS = {
     "pitch": 100,
     "base_pitch": 50,         # espeak -p 0-99, default 50 (normal)
     "cap_pitch": 0,           # espeak -k 0-100, 0=off
+    "lead_silence": 350,      # ms of silence prepended so the H5 codec's power-up
+                               # ramp can't clip the first word (tts.LEAD_SILENCE);
+                               # live-tunable here since the right value is hardware/
+                               # temperature dependent and can only be judged by ear.
     "announce": False,        # speak CPU/RAM/temp every `announce_interval` s
     "announce_interval": 30,  # seconds (clamped to >= ANNOUNCE_MIN)
 }
@@ -554,7 +558,8 @@ class WebServerNode(Node):
         s = self._settings
         self._tts.configure(voice=s["voice"], volume=s["volume"],
                             speed=s["speed"], pitch=s["pitch"],
-                            base_pitch=s["base_pitch"], cap_pitch=s["cap_pitch"])
+                            base_pitch=s["base_pitch"], cap_pitch=s["cap_pitch"],
+                            lead_silence=s["lead_silence"] / 1000.0)
 
     def get_settings(self):
         return dict(self._settings)
@@ -1212,6 +1217,7 @@ def _sanitize_settings(s):
     out["pitch"] = clamp(out["pitch"], 50, 200)
     out["base_pitch"] = clamp(out["base_pitch"], 0, 99)
     out["cap_pitch"] = clamp(out["cap_pitch"], 0, 100)
+    out["lead_silence"] = clamp(out["lead_silence"], 0, 2000)
     out["announce"] = bool(out["announce"])
     out["announce_interval"] = clamp(out["announce_interval"], ANNOUNCE_MIN, ANNOUNCE_MAX)
     return out
