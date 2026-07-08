@@ -141,8 +141,10 @@
               <span class="hint-inline">Pitch rise on capital letters (0=off)</span></div>
             <div class="field"><label>Lead silence <span id="ttsLeadV">350</span>ms</label>
               <input id="ttsLead" type="range" min="0" max="1500" step="50" value="350">
-              <span class="hint-inline">Silence before speech, so the speaker's power-up
-                can't eat the first word — raise if it still clips</span></div>
+              <span class="hint-inline">Pause before a COLD first utterance, so the speaker's
+                power-up can't eat the first word — raise if it still clips. Skipped
+                automatically on back-to-back speech (amp's already warm), so it won't add a
+                pause to normal chatter</span></div>
             <p class="hint">Speaks aloud (espeak-ng) and karaokes each word onto the OLED.
               English only; all settings persist across a reboot. <b>Volume</b> trims the
               synthesis (100% = cleanest) — for loudness use the speaker's hardware mixer.

@@ -47,7 +47,19 @@ karaoke onto the OLED via `/oled_word`. See [[oled-display-perf]], [[project-ove
   `SETTINGS_DEFAULTS["lead_silence"]` in `web_server.py` (ms, default 350). If it
   still clips, raise the slider from the robot's own web UI while listening — no
   redeploy needed. `LEAD_SILENCE`/`LEAD_SILENCE_RANGE` in `tts.py` are just the seed/
-  clamp now, not the effective value.
+  clamp now, not the effective value. **Verified on hardware 2026-07-08**: padding
+  genuinely is written into `/dev/shm/nano_tts.wav` (frame count differs by exactly
+  the configured pad) and `aplay` genuinely plays the full padded duration (timed,
+  no ALSA xrun) — a max (1500 ms) pad does fix the clip, confirming the original
+  power-up-ramp theory was right, it just needed more headroom than 0.35 s on this
+  unit. Trade-off: a big pad adds an audible pause before a COLD first utterance.
+  **Fix: the pad only applies when cold.** `TtsEngine` now tracks
+  `_last_speech_end` (monotonic) and skips the pad (`warm` check) if the amp/codec
+  spoke within `LEAD_SILENCE_KEEPALIVE` (8 s, hardcoded) of now — matches the
+  already-known fact that a back-to-back utterance never clipped (amp still warm).
+  So only the first utterance after a real gap (boot greeting, first line after a
+  long idle) pays the pause; normal chatter (beats/chat/skills) is back-to-back
+  enough to skip it.
 
 - `stack.sh` launches nodes from `install/<pkg>/bin/` not `lib/<pkg>/`.
   On this RoboStack colcon install, Python `console_scripts` entry points

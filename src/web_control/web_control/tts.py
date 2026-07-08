@@ -59,6 +59,13 @@ MAX_CHARS = 300                      # hard cap on a single utterance (also boun
 # it. LEAD_SILENCE is just the seed value before any UI/persisted override.
 LEAD_SILENCE = 0.35                  # seconds
 LEAD_SILENCE_RANGE = (0.0, 2.0)      # seconds; hard clamp regardless of caller
+# If we already spoke within this many seconds, the amp/codec is still warm from
+# that utterance (a back-to-back utterance was never clipped — see LEAD_SILENCE
+# above), so the wake-up pad is skipped: it would only add a perceptible dead-air
+# pause with no benefit. Only a genuinely cold start (first speech in a while) pays
+# the pad. Chatty behaviour (idle beats, chat replies, stats announcer) is usually
+# well within this window after the first utterance of a session.
+LEAD_SILENCE_KEEPALIVE = 8.0         # seconds
 
 # Hard clamps for the markup levels (percent; 100 = normal). The UI exposes
 # friendlier sub-ranges, but anything out of these is clamped here regardless.
@@ -124,6 +131,7 @@ class TtsEngine:
         self._roughness = 0
         self._cap_pitch = 0
         self._lead_silence = LEAD_SILENCE
+        self._last_speech_end = 0.0    # monotonic; 0 = never spoken yet (cold)
 
         self._lock = threading.Lock()
         self._thread = None
@@ -377,7 +385,11 @@ class TtsEngine:
             self._on_word("")
             return
         # Robot/aplay path only — dev-PC backends (SAPI/afplay) don't clip the start.
-        pad = self._pad_lead_silence() if self._backend == "espeak" else 0.0
+        # Skip the pad if we're still warm from a recent utterance (see
+        # LEAD_SILENCE_KEEPALIVE) — no benefit, just a needless pause.
+        warm = (self._last_speech_end > 0
+                and (time.monotonic() - self._last_speech_end) < LEAD_SILENCE_KEEPALIVE)
+        pad = self._pad_lead_silence() if (self._backend == "espeak" and not warm) else 0.0
 
         words = display_text.split()
         # Start fraction of each word = cumulative length / total length. Each word
@@ -415,6 +427,7 @@ class TtsEngine:
                 self._proc.wait(timeout=1.0)          # reap so it doesn't linger
             except Exception:
                 pass
+        self._last_speech_end = time.monotonic()      # amp/codec is warm until KEEPALIVE elapses
         self._on_word("")                             # hand the panel back
 
 
