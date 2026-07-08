@@ -47,7 +47,7 @@ PARAM_WHITELIST = {
     "lds_driver": {"publish_rate"},
     "wheel_odometry": {"publish_rate"},
     "slam_nav": {"enable_motion", "auto_explore"},
-    "sys_monitor": {"fan_override"},
+    "sys_monitor": {"fan_override", "fan_temp_min"},
 }
 
 

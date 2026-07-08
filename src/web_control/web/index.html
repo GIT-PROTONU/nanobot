@@ -186,6 +186,12 @@
             <p class="hint" id="llmStatus">checking…</p>
             <label class="switch"><input type="checkbox" id="llmOn"><span class="track"></span>
               Enable</label>
+            <div class="field"><label>OpenRouter API key <span id="llmKeyStatus" class="hint-inline"></span></label>
+              <input id="llmApiKey" type="password" maxlength="200" autocomplete="off"
+                placeholder="sk-or-v1-… (blank = keep the saved key)"></div>
+            <div class="row">
+              <button id="llmKeyClear" class="btn grow">🗑 Clear saved key</button>
+            </div>
             <input id="llmPrompt" type="text" maxlength="200" placeholder="(optional) steer what it says…">
             <div class="row">
               <button id="llmSay" class="btn primary grow">✨ Say something</button>
@@ -225,8 +231,10 @@
               <input id="llmPersona" type="text" readonly
                 placeholder="run scripts/personality_creator.py, then restart"></div>
             <p class="hint">Generates a spoken line <b>+ a matching OLED face</b> via OpenRouter.
-              Needs an API key (robot.yaml / <code>OPENROUTER_API_KEY</code>). No key or offline =
-              silent. Autonomous chatter is driven by the behaviour statechart (configured in
+              Needs an API key — paste one above (saved on the robot, survives a reboot, and is
+              <b>never shown back</b> to the browser once set) or set it in robot.yaml /
+              <code>OPENROUTER_API_KEY</code>; a key saved here wins. No key or offline = silent.
+              Autonomous chatter is driven by the behaviour statechart (configured in
               <code>robot.yaml</code>), not here.</p>
             <details class="logbox">
               <summary>🧠 Decision log</summary>
@@ -346,10 +354,13 @@
             </div>
             <label class="switch"><input type="checkbox" id="fanAuto" checked><span class="track"></span>
               Auto (track CPU temp)</label>
+            <div class="field"><label>Fan starts at <span id="fanStartV">45</span> °C</label>
+              <input id="fanStart" type="range" min="30" max="65" step="1" value="45"></div>
             <div class="field"><label>Override <span id="fanOvV">50</span> %</label>
               <input id="fanOv" type="range" min="0" max="100" step="5" value="50" disabled></div>
-            <p class="hint">SBC fan PWM on the ESP32 (<b>/fan_pwm</b>). Auto ramps with CPU temp;
-              turn it off to force a fixed speed.</p>
+            <p class="hint">SBC fan PWM on the ESP32 (<b>/fan_pwm</b>). Auto ramps from 0% at
+              <b>Fan starts at</b> up to full at 70°C; turn Auto off to force a fixed speed
+              instead.</p>
           </div>
           <div class="card">
             <h2>Coprocessor (ESP32)</h2>
@@ -406,6 +417,27 @@
             <p class="hint">The durable outage log <b>sys_monitor</b> keeps on the board
               (ESP32-link / lidar transitions with a classified cause) — the first stop for
               diagnosing an intermittent failure, without needing ssh.</p>
+          </div>
+          <div class="card">
+            <h2>Stress test</h2>
+            <div class="kv">
+              <span>status</span><b id="stressStatus">idle</b>
+              <span>workers</span><b id="stressWorkers">–</b>
+              <span>remaining</span><b id="stressRemaining">–</b>
+            </div>
+            <div class="field"><label>Duration <span id="stressDurV">30</span> s</label>
+              <input id="stressDur" type="range" min="5" max="300" step="5" value="30"></div>
+            <div class="row">
+              <button id="stressStart" class="btn primary grow">🔥 Start stress test</button>
+              <button id="stressStop" class="btn danger">■ Stop</button>
+            </div>
+            <p class="hint">Pegs every CPU core with low-priority (niced) worker processes
+              for the chosen duration — a real-world check that the systemd watchdogs and
+              fan curve hold up under load. Workers run at the lowest OS scheduling
+              priority, so this page and the rest of the stack keep responding throughout;
+              the run auto-stops at the duration regardless (capped at 5&nbsp;minutes) so a
+              forgotten test can't run forever. Watch <b>System health</b> above for live
+              CPU%/temp while it runs.</p>
           </div>
           <div class="card">
             <h2>Power</h2>

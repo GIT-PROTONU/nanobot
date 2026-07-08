@@ -47,6 +47,7 @@ from .tts import TtsEngine, VOICES, clamp
 from .llm import LlmClient
 from .skills import resolve_skills_dir
 from .cognition import CognitionCore
+from .stress import StressTest
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
@@ -75,6 +76,8 @@ LLM_DEFAULTS = {
     "vision_fallback_model": "",  # optional PAID vision fallback ("" -> none)
     "free_model": "",         # "" -> llm.DEFAULT_FREE_MODEL
     "free_smart_model": "",   # "" -> llm.DEFAULT_FREE_SMART_MODEL
+    "api_key": "",            # "" -> $OPENROUTER_API_KEY (see cognition.get_llm_settings:
+                               # never echoed back to the browser, only an api_key_set flag)
 }
 # Each LLM "variant" (normal / deep-think / vision) has a PRIMARY (free-first) and a
 # SECONDARY (paid fallback). The robot.yaml param feeding each settings key as its default.
@@ -86,6 +89,7 @@ LLM_PARAM_FOR = {
     "vision_fallback_model": "llm_vision_fallback_model",  # vision secondary (paid fallback)
     "free_model": "llm_free_model",             # normal primary (free-first)
     "free_smart_model": "llm_free_smart_model", # deep-think primary (free-first)
+    "api_key": "llm_api_key",                   # seeds from robot.yaml; a UI-saved key wins later
 }
 # NOTE: the persona is NOT here — it's single-sourced from personality.json (written by
 # scripts/personality_creator.py, the same file the behaviour node loads), falling back to
@@ -279,6 +283,20 @@ class WebServerNode(Node):
         self._drive_at = 0.0                            # monotonic of last POST; 0 = idle
         self.create_timer(0.1, self._drive_tick)
 
+        # ---- Stress test mode (POST /stress/start|stop, GET /stress/status) -----------
+        # Deliberately loads every CPU core to validate the hardening tier (systemd
+        # watchdogs, MemoryMax, the fan curve) under real load — see stress.py for why
+        # niced worker subprocesses can't starve this web server. Auto-stops at
+        # stress_max_duration (a forgotten test can't run forever) and can abort early on
+        # temperature via stress_temp_abort_c (0 = no thermal abort).
+        self.declare_parameter("stress_max_duration", 300.0)  # s hard cap on any run
+        self.declare_parameter("stress_temp_abort_c", 82.0)   # 0 = disable the thermal abort
+        self._stress = StressTest(
+            logger=self.get_logger().info,
+            max_duration=float(g("stress_max_duration").value),
+            abort_temp_c=float(g("stress_temp_abort_c").value),
+            read_temp=self._cpu_temp)
+
         # ---- Cognition core (shared, ROS-free) ----------------------------------
         # ALL the LLM-personality logic lives in web_control.cognition.CognitionCore, shared
         # verbatim with the dev harness (scripts/dev_webui.py) — one base to maintain. We build
@@ -293,7 +311,7 @@ class WebServerNode(Node):
         self._face_pub = self.create_publisher(String, "oled_face", 10)
         ls = self._llm_settings   # merged robot.yaml defaults + persisted UI changes
         llm = LlmClient(
-            enabled=ls["enabled"], api_key=g("llm_api_key").value,
+            enabled=ls["enabled"], api_key=ls["api_key"],
             model=ls["model"], base_url=g("llm_base_url").value,
             persona=self._persona, vision_model=ls["vision_model"],
             smart_model=ls["smart_model"], free_model=ls["free_model"],
@@ -309,7 +327,7 @@ class WebServerNode(Node):
         # without also having to toggle the web UI switch. The web UI can still
         # turn it off explicitly (which persists to llm.json and survives a restart).
         if not ls["enabled"]:
-            raw_key = (g("llm_api_key").value or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+            raw_key = (ls["api_key"] or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
             if raw_key:
                 self.get_logger().info("llm: key detected, auto-enabling")
                 ls["enabled"] = True
@@ -495,6 +513,25 @@ class WebServerNode(Node):
             lines = lines[1:]                          # drop the line the seek cut in half
         return {"lines": lines[-int(limit):], "path": path}
 
+    # ---- stress test mode (see stress.py) ------------------------------------
+    def stress_start(self, data):
+        data = data or {}
+        try:
+            duration = float(data.get("duration", 30.0))
+        except (TypeError, ValueError):
+            duration = 30.0
+        try:
+            workers = int(data.get("workers", 0))
+        except (TypeError, ValueError):
+            workers = 0
+        return self._stress.start(duration=duration, workers=workers)
+
+    def stress_stop(self):
+        return self._stress.stop()
+
+    def stress_status(self):
+        return self._stress.status()
+
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
         p = self.get_parameter("tts_settings_path").value
@@ -617,10 +654,11 @@ class WebServerNode(Node):
         return "Nano"
 
     def _save_llm_settings(self, settings):
-        """The core's `persist_settings` adapter: write the UI {enabled,model} to llm.json
-        (never the API key). Atomic via jsonio.write_json."""
+        """The core's `persist_settings` adapter: write the UI settings (enabled/model ids
+        + the OpenRouter API key, if the user set one here) to llm.json so they survive a
+        reboot. The key is never sent back to the browser (see cognition.get_llm_settings);
+        llm.json lives under ~/.local/state, outside the git-tracked repo. Atomic write."""
         self._llm_settings = dict(settings)
-        # note: never contains the API key
         if not write_json(self._llm_settings_file(), self._llm_settings):
             self.get_logger().warning("llm: could not persist settings")
 
@@ -1154,6 +1192,10 @@ class WebServerNode(Node):
 
     def destroy_node(self):
         try:
+            self._stress.stop()
+        except Exception:
+            pass
+        try:
             self._httpd.shutdown()
         except Exception:
             pass
@@ -1183,6 +1225,7 @@ def _sanitize_llm_settings(s):
     for k in ("model", "smart_model", "vision_model", "vision_fallback_model",
               "free_model", "free_smart_model"):
         out[k] = str(out.get(k) or "")[:120]
+    out["api_key"] = str(out.get("api_key") or "").strip()[:200]
     return out
 
 
@@ -1216,11 +1259,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/skills": lambda n: n.get_skills(),
         "/skills/workshop": lambda n: n.brain_workshop(),
         "/health/log": lambda n: n.get_health_log(),
+        "/stress/status": lambda n: n.stress_status(),
     }
     POST_JSON = {
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
         "/publish": lambda n, d: n.telemetry.publish_json(d),   # whitelisted topic pokes
         "/param": lambda n, d: n.telemetry.set_param_json(d),   # whitelisted live-tune params
+        "/stress/start": lambda n, d: n.stress_start(d),
+        "/stress/stop": lambda n, d: n.stress_stop(),
         "/tts/config": lambda n, d: n.update_settings(d),
         "/llm/config": lambda n, d: n.update_llm_settings(d),
         "/llm/phrases/regenerate": lambda n, d: n.regenerate_phrasebank(),

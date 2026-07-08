@@ -334,6 +334,22 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   run while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
   (browsers don't stream an HTTP/1.0 body to `fetch`). `GET /health/log` serves the
   tail of sys_monitor's durable outage log for the web "Health events" card.
+- **Stress test mode** (`stress.py`, ROS-free; web "Stress test" card in System):
+  `POST /stress/start {duration,workers?}` / `POST /stress/stop` / `GET /stress/status`.
+  Deliberately loads every CPU core to validate the hardening tier (systemd watchdogs,
+  MemoryMax, the fan curve) under real load — **without starving the web server that
+  has to keep answering the browser during the test**. Workers are separate, NICED
+  (19, the lowest scheduling priority) subprocesses running a tight busy loop; they
+  aren't pinned away from any core, so an idle board gets genuinely pegged to 100% on
+  every core, but the kernel's CFS scheduler always prefers a normal-priority process
+  (this web server, the other ROS hubs) the instant it has work — same trick as
+  `nice -19 stress --cpu N`, no core reservation needed. A background watchdog
+  auto-stops the run at `stress_max_duration` (300 s default; a forgotten test can't
+  run forever) regardless of the caller, and can abort early past `stress_temp_abort_c`
+  (82°C default, 0 = off). CPU-only by design — no memory allocation, so there's no
+  risk of tripping app_hub's own systemd `MemoryMax` and getting the web server's unit
+  OOM-killed mid-test. Single-flight (one run at a time); `destroy_node` stops an active
+  run on shutdown. Shared verbatim with `scripts/dev_webui.py` (same `StressTest` class).
 - **Browser telemetry+control gateway (`telemetry.py`, replaced rosbridge)**:
   `GET /telemetry` is ONE SSE stream (browser `EventSource`, native auto-reconnect)
   of a compact JSON frame at `telemetry_rate` (5 Hz) with every light readout —
@@ -437,16 +453,20 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   if asked, append the sensor snapshot, `_generate`). The old standalone idle-chatter timer
   was retired (one brain). Best-effort: **no key / no network = silent no-op**, never on
   the critical path. All config is in `robot.yaml` (`llm_*`, and the `behavior:` beat
-  knobs); the **key is read from `llm_api_key` or, when blank, `$OPENROUTER_API_KEY`** —
-  keep real keys out of the committed yaml. To set it up: copy
+  knobs); the **key is read from `llm_api_key` or, when blank, `$OPENROUTER_API_KEY`,
+  or — winning over both — a key pasted into the web "AI" card**. To set it up: copy
   `memory/openrouter_key.example` to `memory/openrouter_key`, replace with your real
   OpenRouter key (one line, no quotes), and the key is picked up by **every entry point**
   (`scripts/dev_webui.py`, `scripts/sim_run.sh`, `scripts/unit_exec.sh` for the systemd
   units, and all `pixi run` tasks). The LLM
   **auto-enables** when a key is detected (`web_server.py` + `dev_webui.py` override
   `llm_enabled: false` to `true`), so no web UI toggle needed on first run. UI toggles
-  (enable/model/persona) persist to `~/.local/state/nanobot/llm.json` (never the key).
-  Calls run off the ROS executor thread and are one-at-a-time guarded.
+  (enable/model ids/persona) **and now the API key itself** persist to
+  `~/.local/state/nanobot/llm.json` (outside git) so they survive a reboot; the key field
+  is a write-only password input — `GET /llm/config` never echoes the saved secret back,
+  only an `api_key_set` boolean (`LlmClient.has_key`) the page shows as "saved"/"not set".
+  A key saved via the UI takes priority over `llm_api_key`/`$OPENROUTER_API_KEY` on the
+  next load. Calls run off the ROS executor thread and are one-at-a-time guarded.
   - **Decision log** (`GET /llm/log`, web "🧠 Decision log" panel): every generation path
     (`say`/`chat`/`observe`/`look`/`beat:*`) records a `CognitionLog` entry (trigger,
     state, camera, model, status, say/mood, latency) — incl. skip reasons
@@ -554,6 +574,9 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
 - Tune live: `imu_driver`/`lds_driver_py` expose `publish_rate` as a settable param;
   the web UI sliders POST `/param`, which calls `/<node>/set_parameters` (whitelisted).
   The IMU's device stream rate auto-follows `publish_rate` (`output_rate_hz: 0`).
+  `sys_monitor.fan_temp_min` (the "Fan starts at" slider on the web Cooling fan card) is
+  whitelisted the same way — the °C below which the auto curve idles the fan at 0% duty
+  before ramping up to `fan_temp_max`=70°C.
 
 ## Deploying to the live board (from a dev host)
 - One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — copies `src/`+`scripts/`,

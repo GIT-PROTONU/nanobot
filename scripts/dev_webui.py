@@ -62,6 +62,7 @@ from web_control.tts import TtsEngine, VOICES, clamp                 # noqa: E40
 from web_control.llm import LlmClient                        # noqa: E402
 from web_control.skills import resolve_skills_dir            # noqa: E402
 from web_control.jsonio import read_json, write_json         # noqa: E402  (atomic dev-state I/O)
+from web_control.stress import StressTest                    # noqa: E402  (ROS-free CPU stress)
 # The SAME cognition core the robot runs — one base to maintain (see cognition.py).
 from web_control.cognition import CognitionCore              # noqa: E402
 # The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Pursuit
@@ -127,7 +128,7 @@ DEV_SENSORS_FILE = _dev_state("dev_sensors.json")
 # here so UI changes survive a dev restart, exactly like the robot's ~/.local/state/nanobot/llm.json.
 DEV_LLM_FILE = _dev_state("llm.json")
 LLM_SETTINGS_KEYS = ("enabled", "model", "smart_model", "vision_model",
-                     "vision_fallback_model", "free_model", "free_smart_model")
+                     "vision_fallback_model", "free_model", "free_smart_model", "api_key")
 # field -> editable spec (drives coercion AND the auto-generated /dev form, so they never drift).
 SENSOR_FIELDS = {
     "cpu":      {"label": "CPU %",            "type": "int",   "min": 0,    "max": 100},
@@ -275,12 +276,13 @@ class DevState:
             "vision_fallback_model": cfg.get("llm_vision_fallback_model", ""),
             "free_model": cfg.get("llm_free_model", ""),
             "free_smart_model": cfg.get("llm_free_smart_model", ""),
+            "api_key": "",           # "" -> $OPENROUTER_API_KEY; a UI-saved key (below) wins
         }
         saved_llm = read_json(DEV_LLM_FILE, {}) or {}
         if isinstance(saved_llm, dict):
             llm_settings.update({k: v for k, v in saved_llm.items() if k in LLM_SETTINGS_KEYS})
         self.llm = LlmClient(
-            enabled=bool(llm_settings["enabled"]), api_key="",  # key from $OPENROUTER_API_KEY
+            enabled=bool(llm_settings["enabled"]), api_key=llm_settings["api_key"],
             model=llm_settings["model"], persona=persona,
             vision_model=llm_settings["vision_model"],
             smart_model=llm_settings["smart_model"],
@@ -293,7 +295,9 @@ class DevState:
             hard_deadline=float(cfg.get("llm_hard_deadline", 45.0)),
             logger=lambda m: print(f"[llm] {m}", file=sys.stderr))
         # Auto-enable when a key is present (the persisted llm.json may have disabled it).
-        if not llm_settings["enabled"] and os.environ.get("OPENROUTER_API_KEY", "").strip():
+        if not llm_settings["enabled"] and (
+                (llm_settings["api_key"] or "").strip()
+                or os.environ.get("OPENROUTER_API_KEY", "").strip()):
             llm_settings["enabled"] = True
             self.llm.configure(enabled=True)
             print("[llm] key detected, auto-enabling", file=sys.stderr)
@@ -375,6 +379,10 @@ class DevState:
             read_cog_log=lambda: self.cog.get_cog_log()["entries"],
             traits_snapshot=lambda: dict(self.cog.traits),
             logger=lambda m: print(f"[brain] {m}", file=sys.stderr))
+        # Same ROS-free stress-test manager the robot's web_server uses, so the System
+        # tab's Stress test card works on the dev harness too (niced CPU busy loops, no
+        # ROS/cgroup involved off-robot). No thermal abort here — no real sensor to trip it.
+        self.stress = StressTest(logger=lambda m: print(f"[stress] {m}", file=sys.stderr))
         print(f"[dev] TTS backend ready={self.tts.available()}  "
               f"LLM ready={self.llm.available()} (model {self.llm.model})", file=sys.stderr)
         if not self.llm.available():
@@ -633,6 +641,24 @@ class DevState:
 
     def update_llm_config(self, data):
         return self.cog.update_llm_settings(data)
+
+    def stress_start(self, data):
+        data = data or {}
+        try:
+            duration = float(data.get("duration", 30.0))
+        except (TypeError, ValueError):
+            duration = 30.0
+        try:
+            workers = int(data.get("workers", 0))
+        except (TypeError, ValueError):
+            workers = 0
+        return self.stress.start(duration=duration, workers=workers)
+
+    def stress_stop(self):
+        return self.stress.stop()
+
+    def stress_status(self):
+        return self.stress.status()
 
     def llm_say(self, prompt):
         return self.cog.llm_say(prompt)
@@ -1009,6 +1035,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.get_skills())
         if p == "/skills/workshop":
             return self._json(self.state.brain_workshop())
+        if p == "/stress/status":
+            return self._json(self.state.stress_status())
         if p == "/tts/config":
             return self._json(self.state.get_tts_settings())
         if p == "/oled/state":
@@ -1076,6 +1104,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.workshop_keep(self._body()))
         if p == "/skills/workshop/kill":
             return self._json(s.workshop_kill(self._body()))
+        if p == "/stress/start":
+            return self._json(s.stress_start(self._body()))
+        if p == "/stress/stop":
+            return self._json(s.stress_stop())
         if p == "/dev/sensors":
             return self._json(s.set_sensors(self._body()))
         if p == "/brain/reward":

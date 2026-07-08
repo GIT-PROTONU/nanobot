@@ -59,6 +59,10 @@ function fanApply(){
 $("fanAuto").onchange=fanApply;
 $("fanOv").oninput=()=>$("fanOvV").textContent=$("fanOv").value;
 $("fanOv").onchange=()=>{ if(!$("fanAuto").checked) setFanOverride(Number($("fanOv").value)/100); };
+// Fan start temperature -> sys_monitor fan_temp_min param (°C below which the auto
+// curve idles at 0% duty; the ramp runs from here up to fan_temp_max=70°C).
+$("fanStart").oninput=()=>$("fanStartV").textContent=$("fanStart").value;
+$("fanStart").onchange=()=>setParam("sys_monitor","fan_temp_min",Number($("fanStart").value));
 // On (re)connect, push the current Auto/override state once so the node matches the UI.
 function syncFan(){ setFanOverride($("fanAuto").checked?-1:Number($("fanOv").value)/100); }
 // On (re)connect, push the slider's current value once so the robot's spin setpoint
@@ -163,6 +167,38 @@ $("btnShutdown").onclick=()=>{
   fetch("/system/shutdown",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
+
+// ---- Stress test mode ---- pegs every CPU core with niced (lowest-priority) worker
+// processes server-side (see stress.py) to validate the watchdog/fan-curve hardening
+// under real load; the niceness is what keeps this very page responding throughout, not
+// a reserved core. Status is polled only while a run might be active (started here, or
+// left running by another tab/reload — one poll on load picks that up).
+let stressTimer=null;
+function stressRender(d){
+  const st=$("stressStatus");
+  if(!d || !d.active){
+    st.textContent="idle"; $("stressWorkers").textContent="–"; $("stressRemaining").textContent="–";
+    if(stressTimer){ clearInterval(stressTimer); stressTimer=null; }
+    return;
+  }
+  st.textContent="running";
+  $("stressWorkers").textContent=d.cpu_workers;
+  $("stressRemaining").textContent=Math.ceil(d.remaining)+"s";
+  if(!stressTimer) stressTimer=setInterval(stressPoll,1000);
+}
+function stressPoll(){
+  fetch("/stress/status").then(r=>r.ok?r.json():null).then(stressRender).catch(()=>{});
+}
+$("stressDur").oninput=()=>$("stressDurV").textContent=$("stressDur").value;
+$("stressStart").onclick=()=>{
+  fetch("/stress/start",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({duration:Number($("stressDur").value)})})
+    .then(r=>r.json()).then(d=>{ if(d&&d.error){ alert(d.error); return; } stressRender(d); })
+    .catch(()=>{});
+};
+$("stressStop").onclick=()=>fetch("/stress/stop",{method:"POST"})
+  .then(r=>r.json()).then(stressRender).catch(()=>{});
+stressPoll();
 
 // Camera snapshot: one still JPEG in a new tab (the server ref-counts the camera,
 // so this works with the live stream off). Cache-busted so each click is a new grab.
@@ -425,6 +461,7 @@ function llmApply(s){
   set("llmFreeModel",s.free_model);
   set("llmFreeSmartModel",s.free_smart_model);
   set("llmPersona",s.persona);
+  if($("llmKeyStatus")) $("llmKeyStatus").textContent = s.api_key_set ? "· saved" : "· not set";
   if($("llmStatus")) $("llmStatus").textContent =
     s.available ? ("ready · "+(s.model_effective||"")) :
     (s.enabled ? "enabled but no API key configured" : "disabled");
@@ -464,6 +501,21 @@ $("llmVisionModel").addEventListener("change",()=>llmSave({vision_model:$("llmVi
 $("llmVisionFallbackModel").addEventListener("change",()=>llmSave({vision_fallback_model:$("llmVisionFallbackModel").value.trim()}));
 $("llmFreeModel").addEventListener("change",()=>llmSave({free_model:$("llmFreeModel").value.trim()}));
 $("llmFreeSmartModel").addEventListener("change",()=>llmSave({free_smart_model:$("llmFreeSmartModel").value.trim()}));
+// API key: never pre-filled (the server never sends the saved key back — see llmApply),
+// so the field starts blank. Typing one + leaving the field saves it (persists server-side,
+// survives a reboot); the field is cleared right after so the secret doesn't linger in the
+// DOM. There's no way to "blank out" via the field itself (blur with no edits is a no-op),
+// so clearing a saved key is a dedicated action.
+$("llmApiKey").addEventListener("change",()=>{
+  const v=$("llmApiKey").value;
+  if(!v) return;
+  llmSave({api_key:v});
+  $("llmApiKey").value="";
+});
+$("llmKeyClear").onclick=()=>{
+  if(!confirm("Clear the saved OpenRouter API key?")) return;
+  llmSave({api_key:""});
+};
 // Persona is read-only here — it's single-sourced from personality.json (the creator's
 // output). Edit it by re-running scripts/personality_creator.py and restarting.
 fetch("/llm/config").then(r=>r.ok?r.json():null).then(llmApply).catch(()=>{});

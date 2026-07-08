@@ -318,6 +318,12 @@ class LlmClient:
     def persona(self):
         return self._persona
 
+    @property
+    def has_key(self):
+        """Whether a key is configured (UI-set, robot.yaml, or $OPENROUTER_API_KEY) —
+        for the web UI to show status without ever echoing the secret itself."""
+        return bool(self._key)
+
     def set_self_note(self, text):
         """Set the durable self-narrative folded into the system prompt (see `_self_note`)."""
         self._self_note = (text or "").strip()

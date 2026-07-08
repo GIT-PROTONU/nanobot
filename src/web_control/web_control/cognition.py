@@ -1384,6 +1384,8 @@ class CognitionCore:
     # ---- LLM settings (web-tunable; persisted by the adapter) ----------------
     def get_llm_settings(self):
         s = dict(self.settings)
+        s.pop("api_key", None)          # never echo the secret back to the browser
+        s["api_key_set"] = self.llm.has_key
         s["available"] = self.llm.available()           # enabled AND a key is configured
         s["configured"] = self.llm.available()
         s["model_effective"] = self.llm.model
@@ -1412,9 +1414,15 @@ class CognitionCore:
             self.settings["free_model"] = str(data["free_model"] or "")[:120]
         if "free_smart_model" in data:
             self.settings["free_smart_model"] = str(data["free_smart_model"] or "")[:120]
+        # The key field is never pre-filled with the real secret (see get_llm_settings), so
+        # it's only ever present in a patch when the user actually typed/cleared it — a
+        # settings save for an unrelated field (enable toggle, a model id) can't wipe it.
+        if "api_key" in data:
+            self.settings["api_key"] = str(data["api_key"] or "").strip()[:200]
         self.llm.configure(
             enabled=self.settings["enabled"],
             model=self.settings["model"],
+            api_key=self.settings.get("api_key", ""),
             smart_model=self.settings.get("smart_model"),
             vision_model=self.settings.get("vision_model"),
             vision_fallback_model=self.settings.get("vision_fallback_model"),

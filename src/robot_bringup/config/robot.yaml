@@ -206,7 +206,8 @@ sys_monitor:
     health_log_path: "~/.local/state/nanobot/health.log"
     # Cooling fan: publishes a PWM duty (0..1) on /fan_pwm that the ESP32 actuates
     # (firmware FAN_PIN). Auto curve ramps the fan with the SBC CPU temperature; the
-    # web UI Fan slider overrides it (sets fan_override). All retunable live.
+    # web UI Fan card overrides it (sets fan_override) and can retune where the ramp
+    # starts (sets fan_temp_min, the "Fan starts at" slider). All retunable live.
     fan_temp_min: 45.0        # °C: below this the fan idles at fan_min_duty
     fan_temp_max: 70.0        # °C: at/above this the fan runs at fan_max_duty
     fan_min_duty: 0.0         # 0..1 duty at/below fan_temp_min (raise if the fan stalls low)
@@ -324,6 +325,11 @@ web_control:
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"
+    # Stress test mode (web "Stress test" card, POST /stress/start|stop): niced (lowest
+    # priority) CPU busy-loop worker subprocesses that peg every core without starving
+    # this web server (see web_control/stress.py). Auto-stops regardless of the caller.
+    stress_max_duration: 300.0   # s hard cap on any run, however long the UI asks for
+    stress_temp_abort_c: 82.0    # abort early if CPU temp reaches this (0 = disable)
     # Text-to-speech (English + German only). The web page POSTs /tts; the server
     # synthesises with espeak-ng (install via deploy/install-espeakng.sh; NOT on conda-forge), plays it
     # through aplay, and streams the words to the OLED (/oled_word) as they're said.
@@ -345,9 +351,10 @@ web_control:
     # tab (say/observe/look buttons, chat box, enable toggle, decision log).
     llm_enabled: false         # master switch (also flippable + persisted from the web UI)
     # API KEY. NOTE: robot.yaml is version-controlled — DON'T commit a real key here.
-    # Leave it "" and instead export OPENROUTER_API_KEY in the environment (e.g. in the
-    # systemd unit / your shell), which is used whenever this is blank. If you do paste
-    # a key here, keep it out of git (it's your secret to guard).
+    # Leave it "" and instead either paste one into the web UI's "AI" card (persists to
+    # ~/.local/state/nanobot/llm.json, outside git, survives a reboot, and is never sent
+    # back to the browser once saved — a UI-saved key wins over everything below) or
+    # export OPENROUTER_API_KEY in the environment (e.g. the systemd unit / your shell).
     llm_api_key: ""            # "" -> $OPENROUTER_API_KEY
     # FREE-FIRST routing: each text tier tries one or more FREE OpenRouter models (comma-
     # separated, in order) and only falls back to the PAID DeepSeek model below when ALL the
