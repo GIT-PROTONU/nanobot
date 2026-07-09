@@ -27,3 +27,4 @@
 - [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — RESOLVED 2026-07-04 (LINK_FIRST_PING_DEADLINE_MS, fixed+flashed+verified); keeps the ttyS1 /proc/interrupts diagnosis recipe
 - [Motors dead after GPIO reassign](motors-dead-after-gpio-reassign.md) — RESOLVED 2026-07-04: crossed fwd pins (real harness L=26/27 R=25/33) + ~60% stiction deadband (MOTOR_MIN_DUTY remap); tank turns confirmed
 - [Health event log](health-event-log.md) — durable ESP32/LDS outage log at ~/.local/state/nanobot/health.log with classified causes; first stop for intermittent failures
+- [Skill offline fallback](skill-offline-fallback.md) — 2026-07-09: skill *picking* can need the LLM even when the picked action doesn't; run_skill_beat now falls back to local topic-only picks; added `expand-offline` meta skill to grow that pool

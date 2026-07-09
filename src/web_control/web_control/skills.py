@@ -37,6 +37,11 @@ Action kinds (the ``action.kind`` field):
                   lines (LLM) to the most under-filled situation. Like ``workshop`` it's a
                   self-improvement "meta" kind (operates on the robot's own state, not picked
                   autonomously); the same growth runs by itself during reflection mode.
+  - ``offline`` : mint ONE new pure ``topic`` capability via the same workshop pipeline,
+                  constrained so the result needs NO language model to run at all — growing
+                  the local-only fallback pool the autonomous skill beat draws on when the
+                  LLM is unreachable. Needs the LLM to invent it now (like ``workshop``/
+                  ``phrases``, a self-improvement "meta" kind, never auto-picked).
 
 Everything degrades safely: a missing directory, a malformed file, or no PyYAML => that
 skill (or the whole library) is simply absent. The brain is a garnish, never load-bearing.
@@ -52,7 +57,7 @@ NARRATIVE_KINDS = ("say", "observe", "look")
 ACTION_KINDS = ("topic",)
 # "Meta" kinds run an internal cognition routine rather than speaking or publishing. They're
 # always enabled (not gated like the topic tier) but excluded from autonomous selection.
-META_KINDS = ("workshop", "phrases")
+META_KINDS = ("workshop", "phrases", "offline")
 KNOWN_KINDS = NARRATIVE_KINDS + ACTION_KINDS + META_KINDS
 
 

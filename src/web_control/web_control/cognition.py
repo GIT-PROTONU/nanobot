@@ -791,29 +791,46 @@ class CognitionCore:
             self.log_decision("beat:skill", state, status="no-skills")
             return
         offered = self._skills.offered(self.skills_allow_actions)
+        llm_up = self.llm.available()
+        # Skills runnable with NO model call at all: the gated `topic` (action) tier — narrative
+        # (say/observe/look) always needs `generate()` to produce a line, so it's excluded
+        # whenever the LLM is down (an offline attempt would just log a silent "no reply").
+        local_offered = [s for s in offered if s.is_action]
         # Probation: with probability `workshop_trial_bias`, exercise a freshly forged trial
         # skill instead of asking the model to pick — the picker rarely lands on a brand-new
         # skill, so this is how a trial accrues the runs its adopt/retire gate needs. Only when
         # the LLM is up (a narrative trial needs it to generate; an offline run would mis-count
         # as an error). No due trial -> fall through to the normal pick.
         trial = None
-        if self.llm.available() and random.random() < self._workshop_trial_bias:
+        if llm_up and random.random() < self._workshop_trial_bias:
             trial = self._due_trial_skill()
         # Likes bias: a human can 👍 a skill (repeatedly) to make the brain favour it. With
         # probability `skill_like_bias`, short-circuit the model pick and choose by a like-
         # weighted lottery, so a liked skill is performed more often the more it's liked. No
         # liked skill on offer -> None, and we fall through to the normal contextual pick.
+        # Restricted to `local_offered` while the LLM is down, same reasoning as the trial bias.
         liked = None
         if trial is None and random.random() < self._skill_like_bias:
-            liked = self._liked_skill_pick(offered)
+            liked = self._liked_skill_pick(offered if llm_up else local_offered)
         chosen = trial or liked
         # Say an instant "thinking" filler BEFORE the (slow) pick call, so the beat feels
         # responsive instead of going silent while the model chooses. The chosen skill is then
         # performed with prelude=False so we don't double up on fillers.
-        if self._prelude_enable and self.llm.available():
+        if self._prelude_enable and llm_up:
             self._speak_prelude()
         if chosen is not None:
             self._invoke_skill(chosen, trigger="skill:" + chosen.name, state=state, prelude=False)
+            return
+        if not llm_up:
+            # No model available to pick with `complete()` below — fall back to a plain random
+            # pick among the action-tier skills we can actually run offline, so a beat still DOES
+            # something physical instead of going silent just because the LLM is unreachable.
+            if local_offered:
+                chosen = random.choice(local_offered)
+                self._invoke_skill(chosen, trigger="skill:" + chosen.name, state=state,
+                                   prelude=False)
+            else:
+                self.log_decision("beat:skill", state, status="llm-unavailable")
             return
         system = ("You choose which ONE of a small robot's capabilities best fits this "
                   'moment, or none. Reply with ONLY compact JSON {"skill": "<name>"} using '
@@ -871,6 +888,8 @@ class CognitionCore:
         if skill.is_meta:                                # self-improvement (operates on own state)
             if skill.kind == "phrases":                  # grow the offline phrase bank
                 return self._do_phrases_skill(skill, trigger, state, prelude)
+            if skill.kind == "offline":                   # grow the LLM-free fallback pool
+                return self._do_offline_skill(skill, trigger, state, prelude)
             return self._do_workshop_skill(skill, trigger, state, prelude)
         frame = None
         if skill.camera:
@@ -911,6 +930,18 @@ class CognitionCore:
                           detail=f"{res.get('category', '')}+{res.get('added', '')}")
         return res
 
+    def _do_offline_skill(self, skill, trigger, state, prelude=True):
+        """Grow the LLM-free fallback pool on demand (the `offline` meta kind): forge one new
+        pure `topic` capability so `run_skill_beat`'s local-only fallback has more to draw on
+        the next time the LLM is unreachable. Same forge pipeline as the `workshop` kind, just
+        constrained to one action kind."""
+        if prelude and self._prelude_enable and self.llm.available():
+            self._speak_prelude()
+        res = self.expand_offline_skills()
+        self.log_decision(trigger, state, status=res.get("status", ""), model="workshop",
+                          detail=json.dumps(res.get("rounds", ""))[:160])
+        return res
+
     def _do_topic_skill(self, skill, trigger, state):
         """Execute a gated topic-skill: publish a whitelisted, clamped message (+ an optional
         literal face/line). Refused unless actions are permitted AND the skill is enabled. The
@@ -933,13 +964,18 @@ class CognitionCore:
         return {"status": "acted" if ok else "error", "detail": detail, "name": skill.name}
 
     # ---- skill workshop (reflection mode's self-improvement loop) -----------
-    def run_skill_workshop(self, rounds=None):
+    def run_skill_workshop(self, rounds=None, offline=False):
         """Reflection mode's skill-synthesis loop: mine experience -> propose ONE new/adapted skill
         -> deterministic check -> rehearse once -> smart-model critique -> commit on trial.
         Then sweep the gate so ripe trials adopt/retire. Best-effort + one-at-a-time guarded;
-        a no-op without the LLM or with the workshop disabled. Returns a small status dict."""
+        a no-op without the LLM or with the workshop disabled. `offline=True` (the `offline`
+        meta skill) constrains the proposal to a pure `topic` capability that needs no LLM to
+        run, so it's a no-op if actions aren't permitted at all. Returns a small status dict."""
         if not self._workshop_enable:
             return {"status": "disabled"}
+        if offline and not self.skills_allow_actions:
+            self.log_decision("workshop", status="actions-disabled")
+            return {"status": "actions-disabled"}
         if not self.llm.available():
             self.log_decision("workshop", status="llm-unavailable")
             return {"status": "llm-unavailable"}
@@ -951,15 +987,23 @@ class CognitionCore:
         out = []
         try:
             for _ in range(rounds):
-                out.append(self._workshop_round())
+                out.append(self._workshop_round(offline=offline))
         finally:
             self._workshop_busy = False
         self.sweep_workshop()                      # adopt/retire any trial that has earned it
         return {"status": "ok", "rounds": out}
 
-    def _workshop_round(self):
+    def expand_offline_skills(self, rounds=None):
+        """On-demand (the `offline` meta skill): mint ONE new pure `topic` capability so the
+        local-only fallback pool `run_skill_beat` draws on when the LLM is unreachable keeps
+        growing over time. Reuses the exact propose->check->rehearse->critique->trial pipeline
+        as the general workshop, just constrained to the one action kind that needs no model
+        call to execute."""
+        return self.run_skill_workshop(rounds=rounds, offline=True)
+
+    def _workshop_round(self, offline=False):
         """One propose->check->rehearse->critique->trial cycle. Returns a per-round status."""
-        spec = self._suggest_skill()
+        spec = self._suggest_skill(offline=offline)
         if not spec:
             self.log_decision("workshop:suggest", status="no-reply",
                               model=(self.llm.last_model or self.llm.smart_model))
@@ -995,18 +1039,29 @@ class CognitionCore:
             "forge", f"I've thought up a new little knack — {desc}. I'll give it a try.")
         return {"status": "trialing", "name": name}
 
-    def _suggest_skill(self):
+    def _suggest_skill(self, offline=False):
         """Ask the smart model to invent ONE small new capability or improve an existing one,
-        grounded in the recent decision log (gaps, repeated 'no-pick'/'stumped', requests)."""
+        grounded in the recent decision log (gaps, repeated 'no-pick'/'stumped', requests).
+        `offline=True` constrains the proposal to a pure `topic` action — a whitelisted ROS
+        publish that needs NO language model to run — so it grows the local-only fallback pool
+        `run_skill_beat` uses when the LLM itself is unreachable. A reply that ignores the
+        constraint is discarded rather than silently accepted."""
         cat = self._skills.format_catalogue(self.skills_allow_actions) or "(none yet)"
-        kinds = "say, observe, look" + (", topic" if self.skills_allow_actions else "")
+        kinds = "topic" if offline else ("say, observe, look"
+                                         + (", topic" if self.skills_allow_actions else ""))
         selfctx = (f" You have become: {self.self_narrative}." if self.self_narrative else "")
+        offline_note = (
+            " It MUST use action.kind \"topic\" — a whitelisted ROS publish (e.g. /led, "
+            "/fan_pwm, /lds_target_rpm) with a literal face/say if you like — because it needs "
+            "to keep working even if your mind (the language model) goes offline. Do not "
+            "propose anything that requires generating a spoken line to run."
+            if offline else "")
         system = (
             f"You are the quiet, self-improving mind of a small robot named "
             f"{self.persona_name} during reflection. From its recent experience you invent ONE "
             "small new capability, or improve an existing one, so it serves the people around "
             "it a little better. A capability is a short instruction the robot follows to speak "
-            "or act. Reply ONLY compact JSON: "
+            f"or act.{offline_note} Reply ONLY compact JSON: "
             '{"mode":"new"|"adapt","target":"<existing name, only if adapt>",'
             '"name":"<short-kebab-name>","description":"<one line>",'
             '"trigger":"<when to use it>","action":{"kind":"<one of: %s>","sources":'
@@ -1017,10 +1072,20 @@ class CognitionCore:
         user = (f"Existing capabilities:\n{cat}\n\nYour personality (0..1): "
                 f"{self.traits_phrase()}.{selfctx}\n\nRecent experience (look for gaps, "
                 f"repeated stumbles, things people seemed to want):\n"
-                f"{self.recent_events_text(40)}\n\nPropose one capability to add or improve.")
+                f"{self.recent_events_text(40)}\n\n"
+                + ("Propose one physical/reflexive capability you could still perform with "
+                   "your mind offline." if offline else
+                   "Propose one capability to add or improve."))
         content = self.llm.complete(system, user, smart=True, json_object=True)
         obj = _extract_json(content or "")
-        return obj if isinstance(obj, dict) and obj.get("name") else None
+        if not (isinstance(obj, dict) and obj.get("name")):
+            return None
+        if offline:
+            action = obj.get("action")
+            kind = action.get("kind") if isinstance(action, dict) else action
+            if str(kind or "").strip().lower() != "topic":
+                return None                      # ignored the constraint -> discard, don't mint
+        return obj
 
     def _rehearse_skill(self, skill):
         """Dry-run the candidate ONCE to get a real sample of its output, without speaking it

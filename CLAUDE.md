@@ -543,6 +543,21 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   so they only run when deliberately invoked. (`grow-phrases` — `action.kind: phrases` — is the
   other meta skill: on-demand phrase-bank growth, see the phrase-bank note above.) See
   [[meditation-skill-workshop]].
+  - **The autonomous skill beat (`run_skill_beat`) degrades gracefully when the LLM is down.**
+    Picking normally asks the model (`llm.complete`) which offered capability best fits the
+    moment; if the LLM is unavailable/rate-limited that call returns `None`, so the beat instead
+    falls back to a **plain random pick among the currently offered `topic` (action) skills**
+    (the only tier that needs zero model calls to execute) — a `blink-led`/`cool-down`-style
+    reflex still fires instead of the beat going silent. Narrative (`say`/`observe`/`look`)
+    skills still require the LLM (no cached-line fallback for named skills yet — unlike the
+    generic idle "musing" beat, which already tries the phrase bank first via `bank_say`).
+  - **A fourth meta skill grows that offline-only fallback pool: `skills/expand-offline.md`**
+    (`action.kind: offline`, `CognitionCore.expand_offline_skills`/`_do_offline_skill`). It reuses
+    the exact same workshop pipeline (`run_skill_workshop(offline=True)` → `_suggest_skill
+    (offline=True)`), constrained so the smart model MUST propose a pure `topic` capability — a
+    reply that ignores the constraint is discarded, nothing is minted. No-op if
+    `skills_allow_actions` is off (there'd be nothing useful to grow). Needs the LLM to invent
+    the capability now, even though the point is to have something that runs later without it.
 - **Reflection mode** (renamed from "meditation"; topic `/reflect`, web `POST /brain/reflect`,
   `🧘 Reflection mode` toggle, `PurposeBrain.set_reflecting`/`.reflecting`, chart state
   `reflecting` + event `reflect`/`wake`). It pauses beats and consolidates (purpose/A/B/bank +
