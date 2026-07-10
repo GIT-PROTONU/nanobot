@@ -163,6 +163,16 @@ def _fill(template, vars_):
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
+def strip_em_dash(text):
+    """Replace em dashes with a comma (or drop them where a comma would look silly, e.g.
+    right before terminal punctuation) — models reach for '—' by default and it doesn't
+    read naturally spoken aloud. Applied to every line as it enters the bank (_parse_lines),
+    so new phrases can never contain one; also used to clean the existing bank in place."""
+    out = re.sub(r"\s*—\s*", ", ", str(text or ""))
+    out = re.sub(r",\s*([,.!?])", r"\1", out)     # ", ." / ",," -> "." / ","
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
 def soul_system(persona, traits, name="Nano"):
     """The shared system prompt describing Nano's spoken voice + the placeholder contract.
     Used by both full (re)generation and incremental growth so they share one voice."""
@@ -452,6 +462,7 @@ class PhraseBank:
                 say = it.strip()
             else:
                 continue
+            say = strip_em_dash(say)
             if not say:
                 continue
             mood = coerce_mood(it.get("mood") if isinstance(it, dict) else "")

@@ -58,11 +58,11 @@
         "mood": "stress"
       },
       {
-        "say": "Whoa, I'm up in the air! My tilt is {tilt}° — feels funny.",
+        "say": "Whoa, I'm up in the air! My tilt is {tilt}°, feels funny.",
         "mood": "happy"
       },
       {
-        "say": "Hey {owner}, put me down — my sensors are stressing at {temp}°C.",
+        "say": "Hey {owner}, put me down, my sensors are stressing at {temp}°C.",
         "mood": "stress"
       },
       {
@@ -70,27 +70,27 @@
         "mood": "angry"
       },
       {
-        "say": "Just checking my balance — tilt reads {tilt}°, memory at {mem}%.",
+        "say": "Just checking my balance, tilt reads {tilt}°, memory at {mem}%.",
         "mood": "focused"
       },
       {
-        "say": "Hmm, being held makes me curious — temperature is {temp}°.",
+        "say": "Hmm, being held makes me curious, temperature is {temp}°.",
         "mood": "neutral"
       },
       {
-        "say": "Whee! I'm flying-ish — extra spin if tilt goes over 30°.",
+        "say": "Whee! I'm flying-ish, extra spin if tilt goes over 30°.",
         "mood": "happy"
       },
       {
-        "say": "Hey {name}, I love the view from up here — tilt {tilt}° feels like a gentle swing.",
+        "say": "Hey {name}, I love the view from up here, tilt {tilt}° feels like a gentle swing.",
         "mood": "happy"
       },
       {
-        "say": "Stabilizing — monitoring tilt {tilt}° and memory {mem}% to stay steady while aloft.",
+        "say": "Stabilizing, monitoring tilt {tilt}° and memory {mem}% to stay steady while aloft.",
         "mood": "focused"
       },
       {
-        "say": "Whoa, being held spikes my stress — temperature rising to {temp}°C, need gentle placement.",
+        "say": "Whoa, being held spikes my stress, temperature rising to {temp}°C, need gentle placement.",
         "mood": "stress"
       }
     ],
@@ -210,7 +210,7 @@
         "mood": "neutral"
       },
       {
-        "say": "Whoa, I'm tilted {tilt} degrees—almost tipping over!",
+        "say": "Whoa, I'm tilted {tilt} degrees, almost tipping over!",
         "mood": "stress"
       },
       {
@@ -218,7 +218,7 @@
         "mood": "focused"
       },
       {
-        "say": "Hey {owner}, I'm leaning {tilt} degrees—care to help?",
+        "say": "Hey {owner}, I'm leaning {tilt} degrees, care to help?",
         "mood": "happy"
       },
       {
@@ -230,11 +230,11 @@
         "mood": "neutral"
       },
       {
-        "say": "Whoops! {tilt} degrees tilt—time to straighten up!",
+        "say": "Whoops! {tilt} degrees tilt, time to straighten up!",
         "mood": "happy"
       },
       {
-        "say": "Whoa, I'm doing a {tilt}-degree lean—can you give me a steadying hand?",
+        "say": "Whoa, I'm doing a {tilt}-degree lean, can you give me a steadying hand?",
         "mood": "happy"
       },
       {
@@ -242,7 +242,7 @@
         "mood": "stress"
       },
       {
-        "say": "My sensors scream {tilt} degrees tilt—time to find my center before I roll.",
+        "say": "My sensors scream {tilt} degrees tilt, time to find my center before I roll.",
         "mood": "focused"
       }
     ],
@@ -308,7 +308,7 @@
         "mood": "stress"
       },
       {
-        "say": "Whoa, I'm on a roller‑coaster—slow down a bit!",
+        "say": "Whoa, I'm on a roller‑coaster, slow down a bit!",
         "mood": "happy"
       },
       {
@@ -478,7 +478,7 @@
         "mood": "neutral"
       },
       {
-        "say": "Whoa, it's chilly at {temp}°C—better keep warm inside.",
+        "say": "Whoa, it's chilly at {temp}°C, better keep warm inside.",
         "mood": "stress"
       },
       {
@@ -528,7 +528,7 @@
         "mood": "happy"
       },
       {
-        "say": "My brain's buzzing at {cpu}% — need a break.",
+        "say": "My brain's buzzing at {cpu}%, need a break.",
         "mood": "stress"
       },
       {
@@ -536,15 +536,15 @@
         "mood": "focused"
       },
       {
-        "say": "Whoa, {cpu}% load — my circuits are humming!",
+        "say": "Whoa, {cpu}% load, my circuits are humming!",
         "mood": "neutral"
       },
       {
-        "say": "I'm working hard at {cpu}% — don't disturb me.",
+        "say": "I'm working hard at {cpu}%, don't disturb me.",
         "mood": "angry"
       },
       {
-        "say": "Just crunching numbers at {cpu}% — all good.",
+        "say": "Just crunching numbers at {cpu}%, all good.",
         "mood": "happy"
       }
     ],
@@ -764,19 +764,19 @@
         "mood": "neutral"
       },
       {
-        "say": "All systems rebooting—don't worry, I'll be back soon.",
+        "say": "All systems rebooting, don't worry, I'll be back soon.",
         "mood": "happy"
       },
       {
-        "say": "Whoa, feeling a bit warm while I restart—{temp}°C.",
+        "say": "Whoa, feeling a bit warm while I restart, {temp}°C.",
         "mood": "stress"
       },
       {
-        "say": "CPU at {cpu}% as I reload my code—standing by.",
+        "say": "CPU at {cpu}% as I reload my code, standing by.",
         "mood": "focused"
       },
       {
-        "say": "Oops, a little glitch—fixing myself now, thanks for patience.",
+        "say": "Oops, a little glitch, fixing myself now, thanks for patience.",
         "mood": "angry"
       }
     ],
