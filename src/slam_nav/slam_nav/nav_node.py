@@ -27,7 +27,7 @@ from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, String, Int8, Int64MultiArray
+from std_msgs.msg import Bool, String, Int8, Int64MultiArray, Float32
 
 from .occupancy import GridMap
 
@@ -106,6 +106,11 @@ class NavNode(Node):
             ("trail_max", 400),          # breadcrumb ring-buffer length; 0 = off
             ("stuck_timeout", 0.0),      # s commanded-but-not-moving before abort; 0 = off
             ("stuck_eps", 0.04),         # m: movement below this counts as "not moving"
+            # --- LDS idle spin-down (power/wear/noise: park the spin motor when it's not
+            #     earning its keep — stationary + no reason to expect fresh scans soon) ---
+            ("lds_idle_timeout", 60.0),   # s of no motion/goal/exploring before spin-down; 0=off
+            ("lds_idle_rpm", 0.0),        # target rpm while parked (0 = fully stop)
+            ("lds_active_rpm", 300.0),    # target rpm to resume (match firmware LDS_TARGET_RPM)
             # --- pick-up awareness + lost-robot relocalization (Tier-1 autonomy) ---
             ("pickup_pause", True),       # both wheels off-ground -> halt + freeze SLAM
             ("pickup_face", "focused"),   # OLED mood while lifted ("" = don't touch the OLED)
@@ -167,6 +172,9 @@ class NavNode(Node):
         self._trail_max = int(g("trail_max").value)
         self.stuck_timeout = float(g("stuck_timeout").value)
         self.stuck_eps = float(g("stuck_eps").value)
+        self.lds_idle_timeout = float(g("lds_idle_timeout").value)
+        self.lds_idle_rpm = float(g("lds_idle_rpm").value)
+        self.lds_active_rpm = float(g("lds_active_rpm").value)
 
         # pick-up awareness + lost-robot relocalization
         self.pickup_pause = bool(g("pickup_pause").value)
@@ -214,6 +222,10 @@ class NavNode(Node):
         # stuck detector
         self._stuck_ref = None       # (x, y) pose when the current move started
         self._stuck_since = 0.0
+        # LDS idle spin-down: tracks the last (x, y) considered "moving" + when
+        self._lds_idle_ref = None    # (x, y); None until the first tick seeds it
+        self._lds_idle_since = 0.0
+        self._lds_active = True      # current commanded state; only republish on change
         # pick-up + relocalization state
         self._susp_l = self._susp_r = False   # per-wheel off-ground switches (from the ESP)
         self._susp_override = -1              # /pickup_override: -1 auto, 0 grounded, 1 lifted
@@ -238,6 +250,7 @@ class NavNode(Node):
 
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
+        self.lds_rpm_pub = self.create_publisher(Float32, "lds_target_rpm", 10)
         self.path_pub = self.create_publisher(Path, "plan", 5)
         self.face_pub = self.create_publisher(String, "oled_face", 10)   # pick-up reaction
         self.text_pub = self.create_publisher(String, "oled_text", 10)   # self-test status -> OLED
@@ -299,6 +312,12 @@ class NavNode(Node):
                     self._recovering = False
             elif p.name == "pickup_pause":
                 self.pickup_pause = bool(p.value)
+            elif p.name == "lds_idle_timeout":
+                self.lds_idle_timeout = float(p.value)
+            elif p.name == "lds_idle_rpm":
+                self.lds_idle_rpm = float(p.value)
+            elif p.name == "lds_active_rpm":
+                self.lds_active_rpm = float(p.value)
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
@@ -539,6 +558,7 @@ class NavNode(Node):
 
         # Pick-up + self-test + relocalization take priority over navigation.
         self._update_pickup(now)
+        self._update_lds_idle(now)
         if self._picked_up:
             if self._test_active:
                 self._abort_selftest("picked up")
@@ -622,6 +642,33 @@ class NavNode(Node):
                 self._recover_until = now + self.recover_timeout
                 self._lost_count = 0
             self.get_logger().info("set down — relocalizing")
+
+    def _update_lds_idle(self, now):
+        """Park the LDS spin motor (/lds_target_rpm -> lds_idle_rpm, usually 0) after
+        lds_idle_timeout s with no reason to expect fresh scans: no active/pending goal,
+        not exploring, not picked up, not actively relocalizing, and the pose hasn't
+        actually moved by more than stuck_eps. Wakes it back up (lds_active_rpm) the
+        instant any of those become true again. Only publishes on a state CHANGE, so a
+        manual override via the web UI's LDS slider isn't fought every tick — only at
+        the next genuine idle<->active transition."""
+        if self.lds_idle_timeout <= 0:
+            return
+        moved = (self._lds_idle_ref is None or
+                 math.hypot(self.px - self._lds_idle_ref[0],
+                           self.py - self._lds_idle_ref[1]) > self.stuck_eps)
+        needs_scans = (self._goal is not None or self.auto_explore or
+                      self._picked_up or self._recovering)
+        if moved or needs_scans:
+            self._lds_idle_ref = (self.px, self.py)
+            self._lds_idle_since = now
+        want_active = needs_scans or (now - self._lds_idle_since) < self.lds_idle_timeout
+        if want_active == self._lds_active:
+            return
+        self._lds_active = want_active
+        rpm = self.lds_active_rpm if want_active else self.lds_idle_rpm
+        self.lds_rpm_pub.publish(Float32(data=rpm))
+        self.get_logger().info(
+            f"LDS {'spinning up' if want_active else 'idle spin-down'} ({rpm:.0f} rpm)")
 
     def _set_face(self, mood):
         """Drive the OLED face (an alert stare while carried). Skipped entirely when

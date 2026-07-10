@@ -53,6 +53,8 @@ $("navStuck").oninput=()=>$("navStuckV").textContent=Number($("navStuck").value)
 $("navStuck").onchange=()=>setParam("slam_nav","stuck_timeout",Number($("navStuck").value));
 $("navRelocalize").onchange=e=>setParam("slam_nav","relocalize",e.target.checked);
 $("navPickupPause").onchange=e=>setParam("slam_nav","pickup_pause",e.target.checked);
+$("navLdsIdle").oninput=()=>$("navLdsIdleV").textContent=Number($("navLdsIdle").value)===0?"off":$("navLdsIdle").value;
+$("navLdsIdle").onchange=()=>setParam("slam_nav","lds_idle_timeout",Number($("navLdsIdle").value));
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();

@@ -471,6 +471,11 @@
               lost-robot recovery (wide scan-match + spin); <b>Pause SLAM when picked up</b>
               freezes mapping while both wheels are off the ground. All apply live, no
               restart.</p>
+            <div class="field"><label>LDS idle spin-down <span id="navLdsIdleV">60</span>s</label>
+              <input id="navLdsIdle" type="range" min="0" max="300" step="10" value="60"></div>
+            <p class="hint">Parks the lidar spin motor after this long with no motion/goal/
+              exploring (0 = never spin down). Wakes instantly on a new goal, exploring,
+              teleop motion, pickup, or relocalizing.</p>
           </div>
         </section>
 

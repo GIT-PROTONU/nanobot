@@ -123,6 +123,14 @@ slam_nav:
     stuck_timeout: 0.0             # s of commanded-but-no-motion before aborting goal; 0 = off.
                                    # Live-tunable.
     stuck_eps: 0.04                # m: movement below this counts as "not moving"
+    # --- LDS idle spin-down: park the spin motor (power/wear/noise) once there's no
+    #     reason to expect fresh scans soon -- stationary, no goal, not exploring, not
+    #     picked up/relocalizing. Wakes instantly the moment any of those change. ---
+    lds_idle_timeout: 60.0         # s of no motion/goal/exploring before spin-down; 0 = off.
+                                   # Live-tunable.
+    lds_idle_rpm: 0.0              # target rpm while parked (0 = fully stop). Live-tunable.
+    lds_active_rpm: 300.0          # target rpm to resume; match firmware LDS_TARGET_RPM.
+                                   # Live-tunable.
     # --- pick-up awareness + lost-robot relocalization (autonomy) ---
     pickup_pause: true             # both off-ground switches -> halt + freeze SLAM while carried.
                                    # Live-tunable.
