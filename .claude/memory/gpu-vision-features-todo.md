@@ -7,7 +7,7 @@ metadata:
   originSessionId: 0511c092-56af-4656-9941-b2e947bb7aaf
 ---
 
-User approved 2026-07-10 (session `0511c092`): two vision features to build using the Mali-450 GPU (GLES2 fragment shaders, not OpenCV — see [[h5-gpu-only-webcam-use]]), once the GPU is un-blacklisted (`sudo rm /etc/modprobe.d/blacklist-mali-gpu.conf && reboot`, since that blacklist just got deployed).
+User approved 2026-07-10 (session `0511c092`): two vision features to build using the Mali-450 GPU (GLES2 fragment shaders, not OpenCV — see [[h5-gpu-only-webcam-use]]). A GPU blacklist was briefly added the same session then reverted once these features were approved, so the `lima` driver is untouched — no re-enable step needed, `deploy/sbc-setup.sh` never shipped the blacklist.
 
 **1. Color-threshold blob tracking → a bearing.** Shader thresholds camera frame by hue, downsample-reduces the mask to a centroid on-GPU, reads back only `(x, y, confidence)` — a few bytes, not an image. Convert x-position to a bearing via the camera FOV, publish on something like `/target`. A small CPU-side proportional controller turns/drives toward it. Unlocks: chase-a-colored-ball play skill, camera-based dock approach (put a colored marker at the charging dock — currently there's no vision-based return-to-dock, only lidar/SLAM pose), orient-before-commenting for the "looking" beat.
 

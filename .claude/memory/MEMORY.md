@@ -2,7 +2,7 @@
 - [Architecture: two planes, three hubs](architecture-two-planes-three-hubs.md) — 2026-07-06 overhaul: rosbridge→SSE /telemetry gateway (lazy subs), app_hub (web+oled+behavior one process), systemd nano-robot.target + watchdog/MemoryMax, vitals blob (OLED/web IMU subs gone), `pixi run smoke` contract test; deploy needs one sbc-setup.sh re-run
 - [Memory in git](memory-in-git.md) — user ALWAYS wants memory committed to git; ~/.claude memory dir is symlinked to repo .claude/memory; commit memory changes
 - [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
-- [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy via ssh/scp; PENDING 2026-07-10: sbc-setup.sh re-run (GPU blacklist) + deploy.sh (LDS idle toggle, scheduled routines); bring-up log historical
+- [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy via ssh/scp; PENDING 2026-07-10: deploy.sh (LDS idle toggle, scheduled routines); bring-up log historical
 - [Dev host is Ubuntu](dev-host-is-ubuntu.md) — native Ubuntu 24.04 now; repo Windows/WSL/COM-port docs are stale; passwordless `ssh nano`/`scp nano:` alias (RSA host-key forced; creds git-ignored in .nano-deploy.env)
 - [Pin / bus map](pin-bus-map.md) — current SBC bus/port + ESP32 GPIO assignments (re-verified 2026-07-09); LDS=ttyS2, ESP32 link=ttyS1, OLED=i2c-0; 9 free ESP32 GPIOs listed (13/15/23/32/12 + input-only 34/35/36/39); canonical doc = nanopi-neo-plus2-pinmap.md
 - [ESP32 coprocessor](esp32-coprocessor.md) — native zenoh-pico (not micro-ROS) coprocessor in firmware/nanobot_coprocessor; single-channel encoders signed by commanded dir
@@ -22,7 +22,7 @@
 - [TTS / speech](tts-speech.md) — robot speaks (en) via espeak-ng in web_control + OLED karaoke + server-side spoken stats; audio out = H5 internal codec (boots muted; deploy/enable-h5-audio.sh); first-word clipping fixed via 0.35 s LEAD_SILENCE pad
 - [Behaviour layer plan](behavior-layer-plan.md) — Sismic behaviour layer FULLY BUILT (chart+brain+evolution+time awareness, runs inside app_hub); memory kept for the why-Sismic rationale + architecture rules
 - [Stack autoheal](stack-autoheal.md) — RETIRED 2026-07-06 (systemd Restart=on-failure replaced the heal timer); keeps the old failure history + still-true "catches crashes not hangs"
-- [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 unused; ES2-only (no OpenCL/compute); 2026-07-10 sbc-setup.sh now blacklists `lima` module (RAM/power); re-enable when vision work starts
+- [H5 GPU only good for webcam](h5-gpu-only-webcam-use.md) — Mali-450 unused today; ES2-only (no OpenCL/compute); a 2026-07-10 blacklist attempt was reverted same-day — GPU stays ON, vision features approved
 - [Cooling fan control](cooling-fan-control.md) — SBC fan = ESP32 PWM (GPIO22/CH_FAN) on /fan_pwm, driven by sys_monitor CPU-temp curve; web slider overrides via fan_override param; firmware+SBC deployed, physical fan wiring unconfirmed
 - [ESP32 link wedge: first-ping watchdog hole](esp32-link-wedge-first-ping-hole.md) — RESOLVED 2026-07-04 (LINK_FIRST_PING_DEADLINE_MS, fixed+flashed+verified); keeps the ttyS1 /proc/interrupts diagnosis recipe
 - [Motors dead after GPIO reassign](motors-dead-after-gpio-reassign.md) — RESOLVED 2026-07-04: crossed fwd pins (real harness L=26/27 R=25/33) + ~60% stiction deadband (MOTOR_MIN_DUTY remap); tank turns confirmed
@@ -30,4 +30,4 @@
 - [Skill offline fallback](skill-offline-fallback.md) — 2026-07-09: skill *picking* can need the LLM even when the picked action doesn't; run_skill_beat now falls back to local topic-only picks; added `expand-offline` meta skill to grow that pool
 - [Scheduled routines](scheduled-routines.md) — 2026-07-10: behavior.brain.Schedule fires a named skill once/day at HH:MM; stored in schedule.json (not ROS params), live-editable from the web UI Schedule card via /schedule_edit+/schedule
 - [rclpy string-array param gotcha](rclpy-string-array-param-gotcha.md) — empty-list default for a STRING_ARRAY param + ParameterDescriptor still breaks type inference; default to `[""]` instead, or avoid ROS params for structured config entirely
-- [GPU vision features todo](gpu-vision-features-todo.md) — user approved 2026-07-10: build blob-tracking bearing (visual servoing) + motion-diff wake trigger on Mali-450/GLES2, folded into app_hub, not started yet
+- [GPU vision features todo](gpu-vision-features-todo.md) — user approved 2026-07-10: build blob-tracking bearing (visual servoing) + motion-diff wake trigger on Mali-450/GLES2, folded into app_hub, not started yet; GPU is NOT blacklisted, ready to use
