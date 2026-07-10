@@ -594,19 +594,22 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   before ramping up to `fan_temp_max`=70°C.
 
 ## Deploying to the live board (from a dev host)
-- One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — copies `src/`+`scripts/`,
-  colcon-builds (optionally `--packages-select`), then `stack.sh restart`. Creds via
-  env (`NANO_PW`, `NANO_HOST`, `NANO_HOSTKEY`) — **never commit secrets**.
+- One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — `rsync`s `src/`+`scripts/` over the
+  passwordless `ssh nano` key alias (`~/.ssh/config`, `Host nano`; override the target with
+  `NANO_HOST`), colcon-builds on the board (optionally `--packages-select`), then
+  `stack.sh restart`. No creds needed in the environment — key auth only.
   It also pushes the dev-made soul/bank (`memory/personality.json` + `phrases.json`, plus
   hand-edited `presence_chart.yaml`/`beats.json` if present)
-  into the board's `~/.local/state/nanobot/` — **ON by default for now**
-  (`DEPLOY_SOUL=1`), which **overwrites** the robot's own persisted personality (discarding
-  any evolved trait drift). Set **`DEPLOY_SOUL=0`** to skip and keep the robot's evolved soul.
-- The dev host is native Ubuntu with a passwordless `ssh nano`/`scp nano:` alias
-  (creds git-ignored in `.nano-deploy.env`). (Historical, if ever deploying from
-  Windows again: **`plink -m <localfile>` sends the file's text as the remote shell's
-  argv**, so any `pkill -f`/`pgrep -f` pattern appearing in the script kills the
-  controlling shell — `pscp` the script and run it by path instead.)
+  into the board's `~/.local/state/nanobot/` — **OFF by default**
+  (`DEPLOY_SOUL=0`), so the robot keeps whatever personality it has evolved on its own.
+  Set **`DEPLOY_SOUL=1`** to overwrite the board's persisted soul with `memory/` (discards
+  accumulated trait drift).
+- The dev host is native Ubuntu with the passwordless `ssh nano`/`scp nano:` alias above
+  (`.nano-deploy.env`, gitignored, only still used by `.nano-askpass.sh` to bootstrap the
+  key if it's ever missing). (Historical, from the old Windows/PuTTY deploy path: `plink -m
+  <localfile>` sends the file's text as the remote shell's argv, so any `pkill -f`/`pgrep -f`
+  pattern appearing in the script kills the controlling shell — `pscp` the script and run it
+  by path instead. No longer relevant now that deploy is `ssh`/`rsync`-based.)
 - `stack.sh restart` is now `systemctl restart nano-robot.target` — systemd owns
   stop/kill/verify, so the old "stale process serving old code" failure mode (and the
   heal-timer duplicate-node race) is gone by construction. If a change "doesn't take",

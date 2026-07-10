@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# One-shot deploy from the dev host (Windows/git-bash) to the Nano board:
-# push src -> rebuild -> restart the runtime stack. Collapses what used to be a
-# dozen plink round-trips into a single command.
+# One-shot deploy from the dev host (native Ubuntu) to the Nano board:
+# push src -> rebuild -> restart the runtime stack.
 #
-#   NANO_PW=<pw> scripts/deploy.sh                # rebuild everything (KEEPS the robot's evolved soul)
-#   NANO_PW=<pw> scripts/deploy.sh oled_display   # rebuild only these packages
-#   DEPLOY_SOUL=1 NANO_PW=<pw> scripts/deploy.sh  # ALSO overwrite the board's soul with memory/
+#   scripts/deploy.sh                # rebuild everything (KEEPS the robot's evolved soul)
+#   scripts/deploy.sh oled_display   # rebuild only these packages
+#   DEPLOY_SOUL=1 scripts/deploy.sh  # ALSO overwrite the board's soul with memory/
 #
-# Creds come from the environment so nothing secret lands in the repo:
-#   NANO_PW (required), NANO_HOST, NANO_HOSTKEY, PLINK, PSCP.
+# Auth is the passwordless `ssh nano` key alias (see ~/.ssh/config, Host nano) —
+# nothing secret needs to land in the repo or the environment. Override the target
+# with NANO_HOST (any ssh destination, alias or user@host).
 set -euo pipefail
 
-HOST=${NANO_HOST:-ibster@192.168.178.141}
-PW=${NANO_PW:?set NANO_PW to the board password}
-HK=${NANO_HOSTKEY:-'SHA256:F8Ub4q4LFeOegO1MYuY84XfnK05+lx1Rv3TlZHF67Iw'}
-PLINK=${PLINK:-'/c/Program Files/PuTTY/plink.exe'}
-PSCP=${PSCP:-'/c/Program Files/PuTTY/pscp.exe'}
-STATE_DIR=/home/ibster/.local/state/nanobot
+HOST=${NANO_HOST:-nano}
+REMOTE_DIR=Nano
+STATE_DIR=.local/state/nanobot
 
 SEL=""; [ $# -gt 0 ] && SEL="--packages-select $*"
 
-echo ">> pushing src/ + scripts/ to $HOST"
-"$PSCP" -batch -pw "$PW" -hostkey "$HK" -r src scripts "$HOST:/home/ibster/Nano/"
+echo ">> pushing src/ + scripts/ to $HOST:$REMOTE_DIR"
+rsync -az --exclude '__pycache__' src scripts "$HOST:$REMOTE_DIR/"
 
 # Push the dev-made "soul" (personality.json) + phrase bank (phrases.json) + hand-editable
 # data (presence_chart.yaml, beats.json) from the project-local memory/ folder onto the board.
@@ -33,12 +30,12 @@ echo ">> pushing src/ + scripts/ to $HOST"
 # changes, so phrases.json is only ever a warm-start.
 if [ "${DEPLOY_SOUL:-0}" = "1" ]; then
   echo ">> pushing memory/ soul + phrase bank to $HOST:$STATE_DIR (DEPLOY_SOUL=1)"
-  "$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" "mkdir -p $STATE_DIR"
+  ssh "$HOST" "mkdir -p $STATE_DIR"
   pushed=0
   for f in personality.json phrases.json workshop.json trait_history.json self_model.json \
            skill_likes.json presence_chart.yaml beats.json; do
     if [ -f "memory/$f" ]; then
-      "$PSCP" -batch -pw "$PW" -hostkey "$HK" "memory/$f" "$HOST:$STATE_DIR/$f"
+      rsync -az "memory/$f" "$HOST:$STATE_DIR/$f"
       echo "   copied memory/$f"
       pushed=1
     fi
@@ -46,8 +43,8 @@ if [ "${DEPLOY_SOUL:-0}" = "1" ]; then
   # Skills the dev harness minted in its workshop (memory/skills/*.md) -> the board's writable
   # learned dir, so deploy carries them alongside the soul/bank + the workshop.json ledger.
   if [ -d "memory/skills" ] && ls memory/skills/*.md >/dev/null 2>&1; then
-    "$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" "mkdir -p $STATE_DIR/skills"
-    "$PSCP" -batch -pw "$PW" -hostkey "$HK" memory/skills/*.md "$HOST:$STATE_DIR/skills/"
+    ssh "$HOST" "mkdir -p $STATE_DIR/skills"
+    rsync -az memory/skills/*.md "$HOST:$STATE_DIR/skills/"
     echo "   copied memory/skills/*.md"
     pushed=1
   fi
@@ -55,5 +52,5 @@ if [ "${DEPLOY_SOUL:-0}" = "1" ]; then
 fi
 
 echo ">> build + restart on board"
-"$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" \
-  "cd ~/Nano && ~/.pixi/bin/pixi run bash -c 'colcon build --symlink-install $SEL && bash scripts/stack.sh restart'"
+ssh "$HOST" \
+  "cd $REMOTE_DIR && ~/.pixi/bin/pixi run bash -c 'colcon build --symlink-install $SEL && bash scripts/stack.sh restart'"
