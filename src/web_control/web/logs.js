@@ -9,6 +9,21 @@
   const drawer=$("logsDrawer"), handle=$("logsHandle"), body=$("logsBody");
   if(!drawer||!handle||!body) return;
 
+  // Dock the drawer's bottom edge exactly at the tab bar's real footprint (not a
+  // guessed px constant, which drifted out of sync and let the drawer overlap/hide
+  // the tabs — icon+label font metrics and the safe-area inset both vary by
+  // device). #tabbar is only truly `position:fixed` on the mobile single-column
+  // layout (see style.css's 880px breakpoint); on desktop it's a normal top-of-
+  // sidebar nav, so the drawer docks flush to the viewport bottom there instead.
+  function syncTabbarOffset(){
+    const tb=$("tabbar"); if(!tb) return;
+    const fixed=getComputedStyle(tb).position==="fixed";
+    document.documentElement.style.setProperty("--tabbar-h", (fixed?tb.offsetHeight:0)+"px");
+  }
+  syncTabbarOffset();
+  window.addEventListener("resize",syncTabbarOffset);
+  window.addEventListener("orientationchange",syncTabbarOffset);
+
   let lastEntries=[], filter="all", timer=null;
 
   function fmtHealthRow(e){
@@ -27,6 +42,7 @@
     }).catch(()=>{ body.innerHTML="<i>log unavailable (dev harness / server too old)</i>"; });
   }
   function setOpen(on){
+    if(on) syncTabbarOffset();       // re-measure in case the viewport changed since load
     drawer.classList.toggle("open",on);
     clearInterval(timer); timer=null;
     if(on){ load(); timer=setInterval(load,4000); }
