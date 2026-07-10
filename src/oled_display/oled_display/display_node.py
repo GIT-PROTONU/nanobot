@@ -551,13 +551,20 @@ class DisplayNode(Node):
         except Exception:
             x0, y0, x1, y1 = 0, 0, self._text_w(word), 8
         tw, th = max(1, x1 - x0), max(1, y1 - y0)
-        # Largest integer scale that fits with a small margin (cap so short words
-        # don't pixelate into illegibility). Falls back to 1 for a very long word.
-        scale = max(1, min((W - 4) // tw, (H - 8) // th, 6))
         glyph = Image.new("1", (tw, th), 0)
         ImageDraw.Draw(glyph).text((-x0, -y0), word, font=self.font, fill=1)
-        if scale > 1:
-            glyph = glyph.resize((tw * scale, th * scale), Image.NEAREST)
+        # Fit to the panel both ways: upscale (integer, capped so short words don't
+        # pixelate into illegibility) when there's room, DOWNSCALE when the word is
+        # already wider/taller than the panel at 1x — a long word used to hit the
+        # `max(1, ...)` floor here and get centred with a negative offset, clipping
+        # its LEFT side off-panel instead of shrinking to fit.
+        fit = min((W - 4) / tw, (H - 8) / th)
+        if fit >= 1:
+            scale = min(int(fit), 6)
+            if scale > 1:
+                glyph = glyph.resize((tw * scale, th * scale), Image.NEAREST)
+        else:
+            glyph = glyph.resize((max(1, int(tw * fit)), max(1, int(th * fit))), Image.NEAREST)
         gw, gh = glyph.size
         with canvas(self.device) as draw:
             draw.bitmap(((W - gw) // 2, (H - gh) // 2), glyph, fill=255)
