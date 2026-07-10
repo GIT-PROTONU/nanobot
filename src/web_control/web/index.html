@@ -396,6 +396,31 @@
               can be tested off the ground; the L/R rows keep showing the real switches.
               Resets to auto on page reload.</p>
           </div>
+          <div class="card">
+            <h2>Navigation (slam_nav)</h2>
+            <div class="field"><label>Max speed <span id="navMaxLinV">0.15</span> m/s</label>
+              <input id="navMaxLin" type="range" min="0.05" max="0.4" step="0.01" value="0.15"></div>
+            <div class="field"><label>Max turn <span id="navMaxAngV">1.0</span> rad/s</label>
+              <input id="navMaxAng" type="range" min="0.2" max="3.0" step="0.1" value="1.0"></div>
+            <div class="field"><label>Stop distance <span id="navStopDistV">0.25</span> m</label>
+              <input id="navStopDist" type="range" min="0.10" max="0.60" step="0.01" value="0.25"></div>
+            <div class="field"><label>Robot radius <span id="navRadiusV">0.16</span> m</label>
+              <input id="navRadius" type="range" min="0.05" max="0.30" step="0.01" value="0.16"></div>
+            <div class="field"><label>Stuck timeout <span id="navStuckV">off</span></label>
+              <input id="navStuck" type="range" min="0" max="10" step="0.5" value="0"></div>
+            <label class="switch"><input type="checkbox" id="navRelocalize" checked><span class="track"></span>
+              Auto-relocalize when lost</label>
+            <label class="switch"><input type="checkbox" id="navPickupPause" checked><span class="track"></span>
+              Pause SLAM when picked up</label>
+            <p class="hint"><b>Max speed/turn</b> cap the pursuit controller (also used by
+              <b>Motion</b> in the Map view). <b>Stop distance</b> = obstacle range ahead that
+              triggers a reactive stop+replan; <b>Robot radius</b> = obstacle inflation used by
+              the planner. <b>Stuck timeout</b> aborts a goal if commanded but not actually
+              moving for that long ("off" = never). <b>Auto-relocalize</b> is the local
+              lost-robot recovery (wide scan-match + spin); <b>Pause SLAM when picked up</b>
+              freezes mapping while both wheels are off the ground. All apply live, no
+              restart.</p>
+          </div>
         </section>
 
         <!-- ===== SYSTEM ===== -->

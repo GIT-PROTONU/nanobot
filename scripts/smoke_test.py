@@ -153,7 +153,7 @@ def main():
         st, body = req("POST", "/publish", {"topic": "/goal_pose", "value": {"a": 1}})
         check("bad goal body refused", b"bad value" in body, body[:80])
         st, body = req("POST", "/param",
-                       {"node": "slam_nav", "name": "stop_distance", "value": 0})
+                       {"node": "slam_nav", "name": "match_lin", "value": 0})
         check("non-whitelisted param refused", b"not whitelisted" in body, body[:80])
         st, body = req("POST", "/drive", {"v": 0.1, "w": 0.0})
         check("drive accepted", st == 200 and b'"v": 0.1' in body, body[:80])

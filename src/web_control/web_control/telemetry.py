@@ -46,7 +46,8 @@ PARAM_WHITELIST = {
     "imu_driver": {"publish_rate"},
     "lds_driver": {"publish_rate"},
     "wheel_odometry": {"publish_rate"},
-    "slam_nav": {"enable_motion", "auto_explore"},
+    "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
+                 "robot_radius", "stuck_timeout", "relocalize", "pickup_pause"},
     "sys_monitor": {"fan_override", "fan_temp_min"},
 }
 

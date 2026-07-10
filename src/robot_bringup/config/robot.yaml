@@ -96,16 +96,17 @@ slam_nav:
     # --- navigation (click-to-go) ---
     enable_motion: false           # SAFETY: false = plan + show path but DON'T drive.
                                    # Flip live from the web UI "enable motion" toggle.
-    robot_radius: 0.16             # obstacle inflation for the planner (m)
+    robot_radius: 0.16             # obstacle inflation for the planner (m). Live-tunable:
+                                   # web UI Sensors -> Navigation (slam_nav).
     plan_downsample: 4             # plan on a 1/N grid (CPU/RAM); 4 = 0.20 m cells
     allow_unknown: true            # let the global plan cross unmapped cells
     control_rate: 10.0             # Hz pursuit/controller loop
     replan_period: 1.0             # s between global replans while a goal is active
-    max_lin: 0.15                  # m/s pursuit speed cap (start gentle)
-    max_ang: 1.0                   # rad/s turn-rate cap
+    max_lin: 0.15                  # m/s pursuit speed cap (start gentle). Live-tunable.
+    max_ang: 1.0                   # rad/s turn-rate cap. Live-tunable.
     lookahead: 0.30                # m pure-pursuit lookahead
     goal_tol: 0.12                 # m: within this of the goal = arrived
-    stop_distance: 0.25            # m: obstacle this close ahead = stop + replan
+    stop_distance: 0.25            # m: obstacle this close ahead = stop + replan. Live-tunable.
     front_angle: 0.6               # rad: half-width of the reactive front cone
     # --- extras (each independently toggleable; behaviour-changers default OFF for
     #     easy/safe testing — flip them on one at a time) ---
@@ -119,12 +120,15 @@ slam_nav:
                                    # off it just shows where it *would* explore.
     explore_period: 4.0            # s between frontier picks while exploring
     trail_max: 400                 # breadcrumb ring-buffer length (where it's been); 0 = off
-    stuck_timeout: 0.0             # s of commanded-but-no-motion before aborting goal; 0 = off
+    stuck_timeout: 0.0             # s of commanded-but-no-motion before aborting goal; 0 = off.
+                                   # Live-tunable.
     stuck_eps: 0.04                # m: movement below this counts as "not moving"
     # --- pick-up awareness + lost-robot relocalization (autonomy) ---
-    pickup_pause: true             # both off-ground switches -> halt + freeze SLAM while carried
+    pickup_pause: true             # both off-ground switches -> halt + freeze SLAM while carried.
+                                   # Live-tunable.
     pickup_face: "focused"         # OLED mood shown while lifted ("" = leave the OLED alone)
-    relocalize: true               # auto-recover the pose when scans stop matching the map
+    relocalize: true               # auto-recover the pose when scans stop matching the map.
+                                   # Live-tunable.
     recover_patience: 5            # consecutive unmatched scans before declaring "lost"
     recover_min_beams: 40          # need this many in-range beams to trust a "mismatch"
     recover_exit_score: 4.0        # scan-match score that ends recovery (relocalized)

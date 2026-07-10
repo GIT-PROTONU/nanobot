@@ -276,9 +276,16 @@ class NavNode(Node):
                 if not self.enable_motion:
                     self._send(0.0, 0.0)     # drop to a stop the moment it's disabled
             elif p.name == "max_lin":
-                self.max_lin = float(p.value)
+                # also re-baseline the caution=0 end so a manual UI tune sticks even
+                # with trait_motion on (else the next /cognition/traits tick would
+                # recompute max_lin from the stale _base_max_lin and stomp this).
+                self.max_lin = self._base_max_lin = float(p.value)
             elif p.name == "max_ang":
                 self.max_ang = float(p.value)
+            elif p.name == "stop_distance":
+                self.stop_distance = self._base_stop = float(p.value)
+            elif p.name == "robot_radius":
+                self.robot_radius = float(p.value)
             elif p.name == "auto_explore":
                 self.auto_explore = bool(p.value)
                 if not self.auto_explore and self._goal_is_frontier:

@@ -40,6 +40,19 @@ $("odoRate").onchange=()=>setNodeRate("wheel_odometry",Number($("odoRate").value
 function mapSetGoal(wx,wy){ pub("/goal_pose",{x:wx,y:wy}); mapGoal=[wx,wy]; }
 const setNavMotion=on=>setParam("slam_nav","enable_motion",on);
 const setNavExplore=on=>setParam("slam_nav","auto_explore",on);
+// slam_nav navigation tuning (Sensors tab) — all whitelisted + live, no restart needed.
+$("navMaxLin").oninput=()=>$("navMaxLinV").textContent=$("navMaxLin").value;
+$("navMaxLin").onchange=()=>setParam("slam_nav","max_lin",Number($("navMaxLin").value));
+$("navMaxAng").oninput=()=>$("navMaxAngV").textContent=$("navMaxAng").value;
+$("navMaxAng").onchange=()=>setParam("slam_nav","max_ang",Number($("navMaxAng").value));
+$("navStopDist").oninput=()=>$("navStopDistV").textContent=$("navStopDist").value;
+$("navStopDist").onchange=()=>setParam("slam_nav","stop_distance",Number($("navStopDist").value));
+$("navRadius").oninput=()=>$("navRadiusV").textContent=$("navRadius").value;
+$("navRadius").onchange=()=>setParam("slam_nav","robot_radius",Number($("navRadius").value));
+$("navStuck").oninput=()=>$("navStuckV").textContent=Number($("navStuck").value)===0?"off":$("navStuck").value+" s";
+$("navStuck").onchange=()=>setParam("slam_nav","stuck_timeout",Number($("navStuck").value));
+$("navRelocalize").onchange=e=>setParam("slam_nav","relocalize",e.target.checked);
+$("navPickupPause").onchange=e=>setParam("slam_nav","pickup_pause",e.target.checked);
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
