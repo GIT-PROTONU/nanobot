@@ -542,22 +542,28 @@ class DisplayNode(Node):
     def _draw_word(self, word):
         """Render a single word as large as it'll fit, centred on the panel. The
         default luma font is tiny, so we draw the word once at 1x then nearest-scale
-        it up (integer, mode '1') — no TTF file needed, so it costs no extra disk."""
+        it up (integer, mode '1') — no TTF file needed, so it costs no extra disk.
+
+        The crop box comes from the RENDERED image's own `.getbbox()` (actual ink),
+        not `font.getbbox(word)` (predicted metrics) — the two can disagree for a
+        small bitmap font (hinting/bearing quirks), which previously understated a
+        word's true width and clipped one side off the panel. Drawing onto a
+        generously oversized scratch canvas first means the true ink is never
+        clipped before we even get to measuring it."""
         if not self.device:
             return
         W, H = self.width, self.height
-        try:
-            x0, y0, x1, y1 = self.font.getbbox(word)
-        except Exception:
-            x0, y0, x1, y1 = 0, 0, self._text_w(word), 8
-        tw, th = max(1, x1 - x0), max(1, y1 - y0)
-        glyph = Image.new("1", (tw, th), 0)
-        ImageDraw.Draw(glyph).text((-x0, -y0), word, font=self.font, fill=1)
+        pad, scratch_w, scratch_h = 8, max(W * 4, 256), max(H * 2, 32)
+        scratch = Image.new("1", (scratch_w, scratch_h), 0)
+        ImageDraw.Draw(scratch).text((pad, pad), word, font=self.font, fill=1)
+        bbox = scratch.getbbox()
+        if bbox is None:                       # blank/whitespace word: nothing to show
+            return
+        glyph = scratch.crop(bbox)
+        tw, th = glyph.size
         # Fit to the panel both ways: upscale (integer, capped so short words don't
-        # pixelate into illegibility) when there's room, DOWNSCALE when the word is
-        # already wider/taller than the panel at 1x — a long word used to hit the
-        # `max(1, ...)` floor here and get centred with a negative offset, clipping
-        # its LEFT side off-panel instead of shrinking to fit.
+        # pixelate into illegibility) when there's room, downscale when the word is
+        # already wider/taller than the panel at 1x (rather than clip it).
         fit = min((W - 4) / tw, (H - 8) / th)
         if fit >= 1:
             scale = min(int(fit), 6)
@@ -567,7 +573,7 @@ class DisplayNode(Node):
             glyph = glyph.resize((max(1, int(tw * fit)), max(1, int(th * fit))), Image.NEAREST)
         gw, gh = glyph.size
         with canvas(self.device) as draw:
-            draw.bitmap(((W - gw) // 2, (H - gh) // 2), glyph, fill=255)
+            draw.bitmap((max(0, (W - gw) // 2), max(0, (H - gh) // 2)), glyph, fill=255)
 
     # ---- face / mood animation ----
     def _anim_update(self, now):
