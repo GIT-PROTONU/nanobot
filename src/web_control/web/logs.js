@@ -1,20 +1,21 @@
-// ---- Merged log drawer: decision log + health log, one chronological stream ---------
-// An expandable bottom drawer (click the handle bar to open/close), NOT a modal — the
-// rest of the page (any tab's settings) stays visible and usable while it's open.
-// Reachable from every tab since it's outside the tab-switching #panels entirely.
-// Polls GET /logs (web_server.get_merged_log) only while open.
+// ---- Merged log sheet: decision log + health log, one chronological stream ----------
+// Toggled by the "📜 Logs" button that lives IN the tab bar (#logsToggle) — not a
+// separate always-on bar, so there's nothing to ever collide with the tab bar's own
+// space when collapsed. Not a modal: no backdrop, the currently-open tab's settings
+// stay visible/editable behind it while it's open. Polls GET /logs only while open.
 (function(){
   "use strict";
   const $=id=>document.getElementById(id);
-  const drawer=$("logsDrawer"), handle=$("logsHandle"), body=$("logsBody");
-  if(!drawer||!handle||!body) return;
+  const toggle=$("logsToggle"), drawer=$("logsDrawer"), body=$("logsBody");
+  if(!toggle||!drawer||!body) return;
 
-  // Dock the drawer's bottom edge exactly at the tab bar's real footprint (not a
-  // guessed px constant, which drifted out of sync and let the drawer overlap/hide
-  // the tabs — icon+label font metrics and the safe-area inset both vary by
+  // The sheet docks directly above the tab bar's real rendered height (measured
+  // live, not guessed — icon/label font metrics + the safe-area inset vary by
   // device). #tabbar is only truly `position:fixed` on the mobile single-column
   // layout (see style.css's 880px breakpoint); on desktop it's a normal top-of-
-  // sidebar nav, so the drawer docks flush to the viewport bottom there instead.
+  // sidebar nav, so the sheet docks flush to the viewport bottom there instead.
+  // This only affects the sheet while it's OPEN — collapsed, #logsDrawer has no
+  // footprint on screen at all, so a stale measurement can no longer hide a tab.
   function syncTabbarOffset(){
     const tb=$("tabbar"); if(!tb) return;
     const fixed=getComputedStyle(tb).position==="fixed";
@@ -43,12 +44,13 @@
   }
   function setOpen(on){
     if(on) syncTabbarOffset();       // re-measure in case the viewport changed since load
+    toggle.classList.toggle("active",on);
     drawer.classList.toggle("open",on);
     clearInterval(timer); timer=null;
     if(on){ load(); timer=setInterval(load,4000); }
   }
 
-  handle.onclick=()=>setOpen(!drawer.classList.contains("open"));
+  toggle.onclick=()=>setOpen(!drawer.classList.contains("open"));
   document.addEventListener("keydown",e=>{
     if(e.key==="Escape"&&drawer.classList.contains("open")) setOpen(false);
   });

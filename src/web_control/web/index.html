@@ -97,6 +97,7 @@
         <button data-tab="sensors"><span class="ic">📊</span>Sensors</button>
         <button data-tab="system"><span class="ic">⚙️</span>System</button>
         <button data-tab="sim"><span class="ic">🧪</span>Sim</button>
+        <button id="logsToggle"><span class="ic">📜</span>Logs</button>
       </nav>
       <div id="panels">
 
@@ -597,27 +598,22 @@
   </div>
 </div>
 
-<!-- Merged log drawer: decision log (cognition.py) + health log (sys_monitor), one
-     chronological stream. Deliberately OUTSIDE #app / the tab system — reachable from
-     any tab via the always-visible topbar button. An expandable bottom DRAWER, not a
-     modal: no backdrop, doesn't block the rest of the page, so settings elsewhere on
-     the page stay visible/editable while it's open. Docked above the mobile tab bar. -->
+<!-- Merged log sheet: decision log (cognition.py) + health log (sys_monitor), one
+     chronological stream. Toggled by the "📜 Logs" button IN the tab bar (a 7th
+     button, not a separate always-on bar) so there's never a second fixed element
+     fighting the tab bar for the same screen real estate — collapsed, this sheet
+     doesn't exist on screen at all. Not a modal: no backdrop, settings in the
+     currently-open tab stay visible/editable behind it while it's open. -->
 <div id="logsDrawer">
-  <button id="logsHandle">
-    <span>📜 Log stream</span>
-    <span class="spacer"></span>
-    <span id="logsChevron">▾</span>
-  </button>
-  <div id="logsDrawerBody">
-    <div id="logsHead">
-      <div class="row" id="logsFilter">
-        <button class="btn small active" data-src="all">All</button>
-        <button class="btn small" data-src="cognition">🧠 Decisions</button>
-        <button class="btn small" data-src="health">🩺 Health</button>
-      </div>
+  <div id="logsHead">
+    <b>📜 Log stream</b>
+    <div class="row" id="logsFilter">
+      <button class="btn small active" data-src="all">All</button>
+      <button class="btn small" data-src="cognition">🧠 Decisions</button>
+      <button class="btn small" data-src="health">🩺 Health</button>
     </div>
-    <div id="logsBody" class="log">…</div>
   </div>
+  <div id="logsBody" class="log">…</div>
 </div>
 
 <script src="app.js"></script>

@@ -84,7 +84,7 @@
   #tabbar button .ic{font-size:19px;line-height:1}
   #tabbar button.active{color:var(--accent)}
   #panels{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;
-    padding:12px 12px calc(var(--tabbar-h,80px) + 44px);
+    padding:12px 12px var(--tabbar-h,80px);
     display:flex;flex-direction:column;gap:12px}
   .panel{display:none;flex-direction:column;gap:12px}
   .panel.active{display:flex}
@@ -205,29 +205,23 @@
   .skillrow .sklike.liked{border-color:var(--accent);color:var(--accent)}
   .skillrow.disabled{opacity:.55}
 
-  /* ---------- merged log drawer (independent of the tab system) ---------------- */
-  /* An expandable bottom DRAWER, not a modal: no backdrop, the rest of the page
-     (incl. settings in other panels) stays fully visible/interactive while it's
-     open. Sits directly above the tab bar's real footprint — `--tabbar-h` is
-     measured live by logs.js (offsetHeight when #tabbar is actually
-     position:fixed, else 0 on the desktop layout where it's a normal top-of-
-     sidebar nav) so this can't drift out of sync with the tab bar's actual
-     height (icon/label font metrics + the safe-area inset vary by device) the
-     way a hardcoded guess did. */
+  /* ---------- merged log sheet (toggled by #logsToggle, a 7th tab-bar button) --- */
+  /* Collapsed, #logsDrawer is `display:none` -- zero footprint, so it can NEVER
+     overlap/hide the tab bar (the recurring failure mode of the earlier "always-on
+     handle bar docked above the tabbar" design: any drift between the guessed/
+     measured offset and the tab bar's actual height showed up as the drawer eating
+     into the tabs). Opened, it's a sheet docked directly above the tab bar's real
+     footprint (--tabbar-h, measured live by logs.js — 0 on the desktop layout,
+     where #tabbar is a normal top-of-sidebar nav, not fixed). Not a modal: no
+     backdrop, so the currently-open tab's settings stay visible/editable behind it. */
   .hidden{display:none!important}
   .btn.small{padding:5px 10px;font-size:12px}
   .btn.small.active{border-color:var(--accent);color:var(--accent)}
-  #logsDrawer{position:fixed;left:0;right:0;z-index:25;
-    bottom:var(--tabbar-h,80px);
-    background:var(--surface);border-top:1px solid var(--border);
-    display:flex;flex-direction:column}
-  #logsHandle{flex:none;display:flex;align-items:center;gap:10px;width:100%;
-    background:transparent;border:none;color:var(--txt);font:inherit;font-weight:600;
-    padding:10px 14px;cursor:pointer;text-align:left}
-  #logsChevron{transition:transform .15s;color:var(--muted)}
-  #logsDrawer.open #logsChevron{transform:rotate(180deg)}
-  #logsDrawerBody{max-height:0;overflow:hidden;transition:max-height .2s ease}
-  #logsDrawer.open #logsDrawerBody{max-height:min(40vh,340px);overflow-y:auto}
-  #logsHead{flex:none;padding:0 14px 8px}
-  #logsBody{margin:0;padding:0 14px 12px;max-height:none;overflow:visible}
+  #logsDrawer{display:none}
+  #logsDrawer.open{display:flex;flex-direction:column;position:fixed;left:0;right:0;
+    bottom:var(--tabbar-h,80px);z-index:25;max-height:min(40vh,340px);
+    background:var(--surface);border-top:1px solid var(--border)}
+  #logsHead{flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px;
+    border-bottom:1px solid var(--border)}
+  #logsBody{flex:1;overflow-y:auto;margin:0;padding:10px 14px;max-height:none}
   #logsBody .logrow.src-health{color:var(--amber)}

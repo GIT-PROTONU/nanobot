@@ -3,12 +3,14 @@
   "use strict";
   const $=id=>document.getElementById(id);
 
-  // bottom tab bar -> show one panel
+  // bottom tab bar -> show one panel. #logsToggle lives in the same bar but isn't a
+  // real tab (no data-tab, no matching .panel) — it toggles the log sheet instead
+  // (see logs.js), so it's excluded here.
   function showTab(name){
-    document.querySelectorAll("#tabbar button").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
+    document.querySelectorAll("#tabbar button[data-tab]").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
     document.querySelectorAll(".panel").forEach(p=>p.classList.toggle("active",p.id==="panel-"+name));
   }
-  document.querySelectorAll("#tabbar button").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+  document.querySelectorAll("#tabbar button[data-tab]").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
   $("statusChip").onclick=()=>showTab("system");
 
   // hero view switcher: Lidar / Map / Camera. Reuses the existing (now hidden)
