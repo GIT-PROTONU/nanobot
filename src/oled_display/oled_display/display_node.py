@@ -65,6 +65,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, String
 
 try:
@@ -189,6 +190,8 @@ class DisplayNode(Node):
         # face_mood + idle_face + the dashboard pin in _recompute_mood (the single arbiter).
         self._mood = ""
         self._accent = ""               # effective emotion accent overlaid on the shape
+        self._reflecting = False        # /oled_reflecting: owns the panel above everything
+                                         # else except a spoken word or a shutdown/restart screen
         self.speak_word = ""            # current TTS word (karaoke); "" = not speaking
         self.esp_temp = float("nan")
         self.esp_at = -1e9
@@ -253,6 +256,8 @@ class DisplayNode(Node):
         self.create_subscription(Bool, "oled_show_words", self._on_show_words, 10)
         self.create_subscription(String, "oled_word", self._on_word, 10)
         self.create_subscription(String, "oled_system", self._on_system, 10)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Bool, "oled_reflecting", self._on_reflecting, latched)
 
         # Dashboard ticks slowly; the face has its own faster timer that runs while a face is
         # shown (the default) and is cancelled (no wakeups) only while the dashboard is pinned.
@@ -280,6 +285,13 @@ class DisplayNode(Node):
             self.face_accent = accent if accent in ACCENT_MOODS and accent != self.face_mood else ""
         self._recompute_mood()
 
+    def _on_reflecting(self, msg: Bool):
+        """Reflection mode on/off (behavior/mood_node._on_reflect). Not a mood — a
+        sustained consolidation state, not a quick reactive expression — so it gets
+        its own screen (_reflecting_glyph) rather than borrowing a face."""
+        self._reflecting = bool(msg.data)
+        self._recompute_mood()
+
     def _on_dashboard(self, msg: Bool):
         """Web UI Dashboard toggle: pin the status dashboard always (True) or show the face
         (False, the default)."""
@@ -295,12 +307,20 @@ class DisplayNode(Node):
             self._resume_after_word()
 
     def _recompute_mood(self):
-        """Derive the EFFECTIVE mood from the dashboard pin + the requested/idle face, and
-        start/stop the face animation timer on a face<->dashboard transition. "" = dashboard.
-        The single place face vs dashboard is decided, so every owner stays consistent."""
-        new = "" if self.pin_dashboard else (self.face_mood or self.idle_face)
-        # The emotion accent rides only an actively-requested mood — the resting idle face is plain.
-        new_acc = "" if (self.pin_dashboard or not self.face_mood) else self.face_accent
+        """Derive the EFFECTIVE mood from reflection mode + the dashboard pin + the
+        requested/idle face, and start/stop the face animation timer on a
+        face<->dashboard transition. "" = dashboard, "reflecting" = the dedicated
+        reflection-mode screen. The single place face vs dashboard vs reflecting is
+        decided, so every owner stays consistent. Reflecting outranks the dashboard
+        pin AND any requested face — it owns the panel until it ends (a spoken word
+        or a shutdown/restart screen can still interrupt it, gated separately in
+        _face_tick/_on_word/_on_system)."""
+        if self._reflecting:
+            new, new_acc = "reflecting", ""
+        else:
+            new = "" if self.pin_dashboard else (self.face_mood or self.idle_face)
+            # The emotion accent rides only an actively-requested mood — the resting idle face is plain.
+            new_acc = "" if (self.pin_dashboard or not self.face_mood) else self.face_accent
         if new == self._mood and new_acc == self._accent:
             return
         was_face = bool(self._mood)
@@ -739,6 +759,16 @@ class DisplayNode(Node):
         for i in range(zc):
             draw.text((zx + i * 8, zy - i * 6), "z", font=self.font, fill=255)
 
+    def _reflecting_glyph(self, draw, ang):
+        """Reflection-mode screen: a slowly rotating open ring (same arc-glyph
+        language as _shutdown_screen/_restart_screen, but animated to signal ongoing
+        background work rather than a one-shot terminal state) + a static label."""
+        W, H = self.width, self.height
+        cx, gy, r = W // 2, H // 2 - 12, 8
+        draw.arc((cx - r, gy - r, cx + r, gy + r), ang, ang + 260, fill=255)
+        msg = "Reflecting"
+        draw.text(((W - self._text_w(msg)) // 2, gy + r + 4), msg, font=self.font, fill=255)
+
     def _stress(self, draw):
         """Worst-case animation: a full-screen pattern that changes every single
         frame, so the dirty-check never skips and we flush at the bus ceiling.
@@ -778,6 +808,19 @@ class DisplayNode(Node):
             self._face_sig = sig
             with canvas(self.device) as draw:
                 self._sleepy(draw, zc)
+            return
+
+        if self._mood == "reflecting":
+            # A slow spinner (not an eye shape at all -- reflection is a sustained
+            # background-processing state, not a reactive expression) + a static
+            # label, same visual language as _shutdown_screen/_restart_screen.
+            ang = int(now * 90) % 360                # one full turn every 4s
+            sig = ("reflecting", ang // 6)            # coarse bucket: redraw ~60x/turn, not 60fps
+            if sig == self._face_sig:
+                return
+            self._face_sig = sig
+            with canvas(self.device) as draw:
+                self._reflecting_glyph(draw, ang)
             return
 
         # All moods: eye-whites stay fixed at the base position and the gaze drives

@@ -294,7 +294,8 @@ behavior:
     purpose_period: 240.0       # s between purpose reflections (faster while in reflection mode; local+free)
     pursue_min_interval: 180.0  # s, min gap between goal-pursuit ("pursuing") beats
     ab_epsilon: 0.2             # A/B bandit exploration rate (0..1; higher = explores more)
-    reflect_face: "focused"     # OLED face shown while in reflection mode
+    # Reflection mode's OLED screen is dedicated (oled_display._reflecting_glyph, driven by
+    # /oled_reflecting), not a configurable face — see the "reflecting" chart state.
     # Time awareness: inside the quiet window the idle cadence is stretched by night_tempo
     # (2.0 = beats fire half as often), so the robot is naturally sleepier after hours.
     # Speech muting for the same window is web_control's quiet_start/quiet_end below —

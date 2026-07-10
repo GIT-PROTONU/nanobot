@@ -91,7 +91,6 @@ class MoodNode(Node):
             ("purpose_period", 600.0),      # s between purpose reflections (reads the decision log)
             ("pursue_min_interval", 180.0), # s, min gap between goal-pursuit ("pursuing") beats
             ("ab_epsilon", 0.2),            # A/B bandit exploration rate (0..1)
-            ("reflect_face", "focused"),    # OLED face shown while in reflection mode
             ("greet_face", "happy"),        # OLED "startup mood" shown at boot (greeting)
             # --- LLM-steerable drives (energy/focus/introspection/mood): new expressive states ---
             ("attend_face", "looking"),     # OLED face for the focus-driven "attending" perk-up
@@ -128,7 +127,6 @@ class MoodNode(Node):
         # latched). Optimistic default (True) so the chart behaves as before until the first
         # message arrives / if web_control isn't running (e.g. some offline dev setups).
         self._llm_ready = True
-        self._reflect_face = str(g("reflect_face").value or "focused")
         self._greet_face = str(g("greet_face").value or "happy")
         self._reflect_auto_enable = bool(g("reflect_auto_enable").value)
         self._reflect_auto_idle = max(0.0, float(g("reflect_auto_idle").value))
@@ -171,6 +169,11 @@ class MoodNode(Node):
         self.purpose_pub = self.create_publisher(String, "purpose", latched)
         self.task_pub = self.create_publisher(String, "task_current", latched)
         self.experiments_pub = self.create_publisher(String, "experiments", latched)
+        # Dedicated OLED signal for reflection mode (NOT a mood — it's a sustained
+        # background-processing state, not a quick reactive expression, so it gets its
+        # own screen in oled_display rather than borrowing a face). Latched so a late
+        # subscriber (e.g. oled_display restarting mid-reflection) still gets it right.
+        self.oled_reflect_pub = self.create_publisher(Bool, "oled_reflecting", latched)
 
         # --- the brain (ROS-free orchestration; see brain.py) --------------------
         # Personality owns the chart-context traits/registry + their evolution/persist;
@@ -263,7 +266,7 @@ class MoodNode(Node):
                 traits=self._personality.traits, registry=self._personality.registry,
                 drives=self._personality.drives,
                 alpha=float(g("smoothing_alpha").value), clock=self._chart_clock,
-                reflect_face=self._reflect_face, greet_face=self._greet_face,
+                greet_face=self._greet_face,
                 attend_face=str(g("attend_face").value or "looking"),
                 attend_secs=float(g("attend_secs").value),
                 feel_secs=float(g("feel_secs").value),
@@ -406,6 +409,7 @@ class MoodNode(Node):
         on = bool(msg.data)
         if not self._brain.set_reflecting(on, traits=self._personality.live_traits()):
             return
+        self.oled_reflect_pub.publish(Bool(data=on))
         if self._interp is not None:
             self._interp.queue(Event("reflect" if on else "wake"))
         self.get_logger().info("reflecting — consolidating brain + forging skills (beats paused)"

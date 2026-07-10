@@ -103,10 +103,13 @@ def test_camera_beats_off_never_looks():
 def test_reflect_pauses_beats_until_wake():
     interp, clock, faces, beats = _build()
     _step(interp, clock, GREET + 0.1)            # -> resting
+    n_faces = len(faces)
     interp.queue(Event("reflect"))
     _step(interp, clock, GREET + 0.2)
     assert "reflecting" in interp.configuration
-    assert faces[-1] == "focused"                # the calm reflect face
+    # No chart-driven face on entry — reflection mode's OLED screen is a dedicated
+    # /oled_reflecting signal published directly by mood_node, outside the chart.
+    assert len(faces) == n_faces
     before = list(beats)
     _run_cycles(interp, clock, 3)                # no beats should fire while reflecting
     assert beats == before

@@ -291,7 +291,6 @@ statechart:
           - event: resume
             target: idle_life
       - name: reflecting
-        on entry: face(reflect_face)
         transitions:
           - event: wake
             target: idle_life
@@ -336,7 +335,7 @@ def _build_statechart(chart_path):
 def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
                       perform_secs=4.0, camera_beats=True,
                       traits=None, registry=None, drives=None, alpha=0.1, clock=None,
-                      reflect_face="focused", greet_face="happy", attend_face="looking",
+                      greet_face="happy", attend_face="looking",
                       attend_secs=2.0, feel_secs=2.5, rng=None, chart_path="", beats=None,
                       tempo=None):
     """Parse + validate the chart and return (interpreter, clock), already advanced into
@@ -467,7 +466,6 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
         "traits": live_traits,
         "registry": live_registry,
         "drives": live_drives,
-        "reflect_face": str(reflect_face),
         "greet_face": str(greet_face),
         "attend_face": str(attend_face),
     })
