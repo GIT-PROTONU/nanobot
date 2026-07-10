@@ -14,6 +14,7 @@
   <header id="topbar">
     <span class="brand"><span id="dot"></span>NANO</span>
     <button class="status" id="statusChip"><b id="conn">disconnected</b></button>
+    <button class="status" id="logsBtn">📜 Logs</button>
     <div class="spacer"></div>
     <div class="metrics">
       <span class="m"><label>x</label><b id="px">0</b></span>
@@ -25,6 +26,24 @@
   </header>
 
   <div id="body">
+    <!-- Merged log panel: decision log (cognition.py) + health log (sys_monitor), one
+         chronological stream. A genuine collapsible sidebar/section laid out in normal
+         flow (no position:fixed, no z-index) — it takes real layout space and pushes
+         the lidar/map view + settings tabs aside instead of overlaying them, so it can
+         never cover the tab bar or anything else. Toggled by the topbar "📜 Logs"
+         button (always visible, not tied to any tab). -->
+    <aside id="logsPanel">
+      <div id="logsHead">
+        <b>📜 Log stream</b>
+        <button class="btn small" id="logsPanelClose">✕</button>
+      </div>
+      <div class="row" id="logsFilter">
+        <button class="btn small active" data-src="all">All</button>
+        <button class="btn small" data-src="cognition">🧠 Decisions</button>
+        <button class="btn small" data-src="health">🩺 Health</button>
+      </div>
+      <div id="logsBody" class="log">…</div>
+    </aside>
     <section id="left">
       <div id="hero">
         <div id="view-lidar" class="view on">
@@ -97,7 +116,6 @@
         <button data-tab="sensors"><span class="ic">📊</span>Sensors</button>
         <button data-tab="system"><span class="ic">⚙️</span>System</button>
         <button data-tab="sim"><span class="ic">🧪</span>Sim</button>
-        <button id="logsToggle"><span class="ic">📜</span>Logs</button>
       </nav>
       <div id="panels">
 
@@ -596,24 +614,6 @@
       </div>
     </aside>
   </div>
-</div>
-
-<!-- Merged log sheet: decision log (cognition.py) + health log (sys_monitor), one
-     chronological stream. Toggled by the "📜 Logs" button IN the tab bar (a 7th
-     button, not a separate always-on bar) so there's never a second fixed element
-     fighting the tab bar for the same screen real estate — collapsed, this sheet
-     doesn't exist on screen at all. Not a modal: no backdrop, settings in the
-     currently-open tab stay visible/editable behind it while it's open. -->
-<div id="logsDrawer">
-  <div id="logsHead">
-    <b>📜 Log stream</b>
-    <div class="row" id="logsFilter">
-      <button class="btn small active" data-src="all">All</button>
-      <button class="btn small" data-src="cognition">🧠 Decisions</button>
-      <button class="btn small" data-src="health">🩺 Health</button>
-    </div>
-  </div>
-  <div id="logsBody" class="log">…</div>
 </div>
 
 <script src="app.js"></script>

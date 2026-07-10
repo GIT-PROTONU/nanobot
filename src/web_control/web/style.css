@@ -20,6 +20,7 @@
   #dot{width:9px;height:9px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red);transition:.2s}
   #dot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
   .status{background:transparent;border:none;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;padding:2px 4px}
+  .status.active{color:var(--accent)}
   .spacer{flex:1}
   .metrics{display:flex;gap:12px;overflow-x:auto;scrollbar-width:none;mask-image:linear-gradient(90deg,transparent,#000 12px)}
   .metrics::-webkit-scrollbar{display:none}
@@ -30,6 +31,20 @@
   /* ---------- body layout ---------- */
   #body{flex:1;display:flex;flex-direction:column;min-height:0}
   #left{display:flex;flex-direction:column;flex:none;min-width:0}
+
+  /* merged log panel: a genuine collapsible sidebar/section in NORMAL FLOW (no
+     position:fixed, no z-index) -- it takes real layout space and pushes #left/
+     #right aside instead of overlaying them, so it structurally cannot cover the
+     tab bar or anything else. Collapsed = display:none, zero footprint. Stacks
+     above the hero view on mobile (own scroll, capped height); becomes a real
+     sidebar column to the left of the hero view on the desktop row layout. */
+  #logsPanel{display:none;flex-direction:column;background:var(--surface);
+    border-bottom:1px solid var(--border)}
+  #logsPanel.open{display:flex;flex:none;max-height:40vh}
+  #logsHead{flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px 8px}
+  #logsFilter{flex:none;padding:0 14px 8px}
+  #logsBody{flex:1;overflow-y:auto;margin:0;padding:0 14px 12px;max-height:none}
+  #logsBody .logrow.src-health{color:var(--amber)}
 
   /* hero viewport */
   #hero{position:relative;flex:none;height:34vh;min-height:210px;background:#000;
@@ -84,7 +99,7 @@
   #tabbar button .ic{font-size:19px;line-height:1}
   #tabbar button.active{color:var(--accent)}
   #panels{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;
-    padding:12px 12px var(--tabbar-h,80px);
+    padding:12px 12px calc(80px + env(safe-area-inset-bottom));
     display:flex;flex-direction:column;gap:12px}
   .panel{display:none;flex-direction:column;gap:12px}
   .panel.active{display:flex}
@@ -178,6 +193,9 @@
     #tabbar button{flex-direction:row;gap:7px;padding:13px 0;font-size:13px}
     #tabbar button .ic{font-size:16px}
     #panels{padding:14px}
+    /* a real sidebar column, not a stacked block -- full height, own scroll */
+    #logsPanel.open{flex:none;width:320px;max-height:none;border-right:1px solid var(--border);
+      border-bottom:none}
   }
   /* sim map editor */
   .simEditWrap{width:100%;aspect-ratio:1;background:#0a0d13;border:1px solid var(--border);
@@ -205,23 +223,7 @@
   .skillrow .sklike.liked{border-color:var(--accent);color:var(--accent)}
   .skillrow.disabled{opacity:.55}
 
-  /* ---------- merged log sheet (toggled by #logsToggle, a 7th tab-bar button) --- */
-  /* Collapsed, #logsDrawer is `display:none` -- zero footprint, so it can NEVER
-     overlap/hide the tab bar (the recurring failure mode of the earlier "always-on
-     handle bar docked above the tabbar" design: any drift between the guessed/
-     measured offset and the tab bar's actual height showed up as the drawer eating
-     into the tabs). Opened, it's a sheet docked directly above the tab bar's real
-     footprint (--tabbar-h, measured live by logs.js — 0 on the desktop layout,
-     where #tabbar is a normal top-of-sidebar nav, not fixed). Not a modal: no
-     backdrop, so the currently-open tab's settings stay visible/editable behind it. */
+  /* small toolbar buttons (log panel filters, etc.) */
   .hidden{display:none!important}
   .btn.small{padding:5px 10px;font-size:12px}
   .btn.small.active{border-color:var(--accent);color:var(--accent)}
-  #logsDrawer{display:none}
-  #logsDrawer.open{display:flex;flex-direction:column;position:fixed;left:0;right:0;
-    bottom:var(--tabbar-h,80px);z-index:25;max-height:min(40vh,340px);
-    background:var(--surface);border-top:1px solid var(--border)}
-  #logsHead{flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px;
-    border-bottom:1px solid var(--border)}
-  #logsBody{flex:1;overflow-y:auto;margin:0;padding:10px 14px;max-height:none}
-  #logsBody .logrow.src-health{color:var(--amber)}
