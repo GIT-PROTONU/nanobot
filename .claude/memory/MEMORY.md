@@ -30,3 +30,4 @@
 - [Skill offline fallback](skill-offline-fallback.md) — 2026-07-09: skill *picking* can need the LLM even when the picked action doesn't; run_skill_beat now falls back to local topic-only picks; added `expand-offline` meta skill to grow that pool
 - [Scheduled routines](scheduled-routines.md) — 2026-07-10: behavior.brain.Schedule fires a named skill once/day at HH:MM; stored in schedule.json (not ROS params), live-editable from the web UI Schedule card via /schedule_edit+/schedule
 - [rclpy string-array param gotcha](rclpy-string-array-param-gotcha.md) — empty-list default for a STRING_ARRAY param + ParameterDescriptor still breaks type inference; default to `[""]` instead, or avoid ROS params for structured config entirely
+- [GPU vision features todo](gpu-vision-features-todo.md) — user approved 2026-07-10: build blob-tracking bearing (visual servoing) + motion-diff wake trigger on Mali-450/GLES2, folded into app_hub, not started yet
