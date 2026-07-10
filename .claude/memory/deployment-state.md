@@ -18,6 +18,10 @@ The robot board is **live at 192.168.178.141**, user `ibster` (sudo). See [[proj
 - The "Left to do" list at the bottom is ALL done (LDS spins via ESP32 PID, encoders live via ESP32, systemd installed).
 - ESP32 coprocessor is currently **disconnected** (unplugged/off) — firmware flash pending, deliberately deferred by the user.
 
+**PENDING as of 2026-07-10 (none of this is on the live board yet):**
+- `deploy/sbc-setup.sh` gained a new step 5/6 (Mali-450 GPU blacklist, see [[h5-gpu-only-webcam-use]]) — needs `sudo bash deploy/sbc-setup.sh` re-run + reboot on the board.
+- New code since the last deploy: LDS idle spin-down toggle (`slam_nav.lds_idle_enable`), [[scheduled-routines]] (new `behavior.schedule_path` param + `schedule.json`). Needs `scripts/deploy.sh` (colcon build + restart covers the code; `DEPLOY_SOUL=1` only if you want a dev-authored `memory/schedule.json` pushed too — off by default).
+
 ---- historical bring-up log (2026-06-17/18) below ----
 
 **Access (Windows host):** no OpenSSH password automation available; use PuTTY `plink`/`pscp` at `C:\Program Files\PuTTY\` with `-pw <redacted> -hostkey '<redacted>'`. For multi-line remote commands use `plink -m <localscript>` (avoids PowerShell→bash quoting hell). NOTE: the auto-classifier **blocked installing a persistent SSH key** (wasn't asked for), so it's password-per-command for now — a local key exists at `~/.ssh/nano_robot` but is NOT installed on the board.
