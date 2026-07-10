@@ -1,11 +1,13 @@
-// ---- Merged log overlay: decision log + health log, one chronological stream --------
-// Reachable from any tab via the topbar's always-visible 📜 Logs button — deliberately
-// NOT another tab/card, since the whole point is "the one place to check regardless of
-// what you're doing". Polls GET /logs (web_server.get_merged_log) only while open.
+// ---- Merged log drawer: decision log + health log, one chronological stream ---------
+// An expandable bottom drawer (click the handle bar to open/close), NOT a modal — the
+// rest of the page (any tab's settings) stays visible and usable while it's open.
+// Reachable from every tab since it's outside the tab-switching #panels entirely.
+// Polls GET /logs (web_server.get_merged_log) only while open.
 (function(){
   "use strict";
   const $=id=>document.getElementById(id);
-  const overlay=$("logsOverlay"), body=$("logsBody"); if(!overlay||!body) return;
+  const drawer=$("logsDrawer"), handle=$("logsHandle"), body=$("logsBody");
+  if(!drawer||!handle||!body) return;
 
   let lastEntries=[], filter="all", timer=null;
 
@@ -24,19 +26,16 @@
       lastEntries=(d&&d.entries)||[]; render();
     }).catch(()=>{ body.innerHTML="<i>log unavailable (dev harness / server too old)</i>"; });
   }
-  function open(){
-    overlay.classList.remove("hidden");
-    load(); clearInterval(timer); timer=setInterval(load,4000);
-  }
-  function close(){
-    overlay.classList.add("hidden");
+  function setOpen(on){
+    drawer.classList.toggle("open",on);
     clearInterval(timer); timer=null;
+    if(on){ load(); timer=setInterval(load,4000); }
   }
 
-  $("logsBtn").onclick=open;
-  $("logsClose").onclick=close;
-  overlay.addEventListener("click",e=>{ if(e.target===overlay) close(); });
-  document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&!overlay.classList.contains("hidden")) close(); });
+  handle.onclick=()=>setOpen(!drawer.classList.contains("open"));
+  document.addEventListener("keydown",e=>{
+    if(e.key==="Escape"&&drawer.classList.contains("open")) setOpen(false);
+  });
   document.querySelectorAll("#logsFilter button").forEach(b=>b.onclick=()=>{
     document.querySelectorAll("#logsFilter button").forEach(x=>x.classList.toggle("active",x===b));
     filter=b.dataset.src; render();

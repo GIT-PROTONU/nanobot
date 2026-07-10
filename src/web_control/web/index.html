@@ -14,7 +14,6 @@
   <header id="topbar">
     <span class="brand"><span id="dot"></span>NANO</span>
     <button class="status" id="statusChip"><b id="conn">disconnected</b></button>
-    <button class="status" id="logsBtn" title="Merged log: decision log + health events, in one chronological stream">📜 Logs</button>
     <div class="spacer"></div>
     <div class="metrics">
       <span class="m"><label>x</label><b id="px">0</b></span>
@@ -598,20 +597,24 @@
   </div>
 </div>
 
-<!-- Merged log overlay: decision log (cognition.py) + health log (sys_monitor), one
+<!-- Merged log drawer: decision log (cognition.py) + health log (sys_monitor), one
      chronological stream. Deliberately OUTSIDE #app / the tab system — reachable from
-     any tab via the always-visible topbar button, not tucked in a card. -->
-<div id="logsOverlay" class="hidden">
-  <div id="logsPanel">
+     any tab via the always-visible topbar button. An expandable bottom DRAWER, not a
+     modal: no backdrop, doesn't block the rest of the page, so settings elsewhere on
+     the page stay visible/editable while it's open. Docked above the mobile tab bar. -->
+<div id="logsDrawer">
+  <button id="logsHandle">
+    <span>📜 Log stream</span>
+    <span class="spacer"></span>
+    <span id="logsChevron">▾</span>
+  </button>
+  <div id="logsDrawerBody">
     <div id="logsHead">
-      <b>📜 Log stream</b>
       <div class="row" id="logsFilter">
         <button class="btn small active" data-src="all">All</button>
         <button class="btn small" data-src="cognition">🧠 Decisions</button>
         <button class="btn small" data-src="health">🩺 Health</button>
       </div>
-      <div class="spacer"></div>
-      <button class="btn small" id="logsClose">✕ Close</button>
     </div>
     <div id="logsBody" class="log">…</div>
   </div>

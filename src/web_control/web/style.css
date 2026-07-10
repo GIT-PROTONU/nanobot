@@ -84,7 +84,7 @@
   #tabbar button .ic{font-size:19px;line-height:1}
   #tabbar button.active{color:var(--accent)}
   #panels{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;
-    padding:12px 12px calc(80px + env(safe-area-inset-bottom));
+    padding:12px 12px calc(80px + 44px + env(safe-area-inset-bottom));
     display:flex;flex-direction:column;gap:12px}
   .panel{display:none;flex-direction:column;gap:12px}
   .panel.active{display:flex}
@@ -205,16 +205,30 @@
   .skillrow .sklike.liked{border-color:var(--accent);color:var(--accent)}
   .skillrow.disabled{opacity:.55}
 
-  /* ---------- merged log overlay (topbar button, independent of the tab system) --- */
+  /* ---------- merged log drawer (independent of the tab system) ---------------- */
+  /* An expandable bottom DRAWER, not a modal: no backdrop, the rest of the page
+     (incl. settings in other panels) stays fully visible/interactive while it's
+     open — only the drawer's own body grows, pushing nothing else off-screen since
+     it's `position:fixed` (overlaps content at the very bottom, same as any console
+     drawer). Docked just above the mobile fixed tab bar; flush to the bottom on the
+     desktop two-column layout where the tab bar isn't fixed. */
   .hidden{display:none!important}
   .btn.small{padding:5px 10px;font-size:12px}
   .btn.small.active{border-color:var(--accent);color:var(--accent)}
-  #logsOverlay{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.55);
-    display:flex;align-items:center;justify-content:center;padding:16px}
-  #logsPanel{width:min(720px,100%);max-height:min(80vh,720px);display:flex;
-    flex-direction:column;background:var(--surface);border:1px solid var(--border);
-    border-radius:12px;overflow:hidden}
-  #logsHead{flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px;
-    border-bottom:1px solid var(--border)}
-  #logsBody{flex:1;margin:0;padding:10px 14px;max-height:none}
+  #logsDrawer{position:fixed;left:0;right:0;z-index:35;
+    bottom:calc(80px + env(safe-area-inset-bottom));
+    background:var(--surface);border-top:1px solid var(--border);
+    display:flex;flex-direction:column}
+  #logsHandle{flex:none;display:flex;align-items:center;gap:10px;width:100%;
+    background:transparent;border:none;color:var(--txt);font:inherit;font-weight:600;
+    padding:10px 14px;cursor:pointer;text-align:left}
+  #logsChevron{transition:transform .15s;color:var(--muted)}
+  #logsDrawer.open #logsChevron{transform:rotate(180deg)}
+  #logsDrawerBody{max-height:0;overflow:hidden;transition:max-height .2s ease}
+  #logsDrawer.open #logsDrawerBody{max-height:min(45vh,380px);overflow-y:auto}
+  #logsHead{flex:none;padding:0 14px 8px}
+  #logsBody{margin:0;padding:0 14px 12px;max-height:none;overflow:visible}
   #logsBody .logrow.src-health{color:var(--amber)}
+  @media(min-width:880px){
+    #logsDrawer{bottom:0}
+  }
