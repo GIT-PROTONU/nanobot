@@ -222,7 +222,8 @@ statechart:
     initial: greeting
     transitions:
       - event: evolve
-        action: apply_evolve(event.traits, event.registry, getattr(event, 'drives', {}))
+        action: apply_evolve(event.traits, event.registry, getattr(event, 'drives', {}),
+                              getattr(event, 'hard', False))
       - event: brain_lost
         action: revert()
       # Reflection mode: from anywhere, drop into a calm "reflecting" state that pauses the
@@ -382,20 +383,29 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
     base_drives = copy.deepcopy(live_drives)
     last_beat = {"name": None}                  # novelty memory for the chooser
 
-    def apply_evolve(traits_patch, registry_patch, drives_patch=None):
+    def apply_evolve(traits_patch, registry_patch, drives_patch=None, hard=False):
         """Ease live traits + drive scalars toward the target values (exponential smoothing),
         merge the registry patch, and set the categorical `mood` face directly. All untrusted
-        inputs are clamped / whitelisted."""
+        inputs are clamped / whitelisted. `hard=True` (a deliberate web-UI edit, as opposed to
+        a slow LLM-reflection nudge) sets traits/drives EXACTLY instead of smoothing, and
+        re-baselines all three live dicts as the new `revert()` target — so a manual edit
+        can't be silently undone by a later `brain_lost` heartbeat the way drift can."""
         for k, target in (traits_patch or {}).items():
             if k in live_traits:
-                live_traits[k] = round((1 - a) * live_traits[k] + a * clamp01(target), 4)
+                live_traits[k] = (clamp01(target) if hard else
+                                   round((1 - a) * live_traits[k] + a * clamp01(target), 4))
         for name, patch in (registry_patch or {}).items():
             live_registry.setdefault(name, {}).update(patch or {})
         for k, target in (drives_patch or {}).items():
             if k in DRIVE_KEYS:
-                live_drives[k] = round((1 - a) * live_drives[k] + a * clamp01(target), 4)
+                live_drives[k] = (clamp01(target) if hard else
+                                   round((1 - a) * live_drives[k] + a * clamp01(target), 4))
             elif k == "mood" and target in MOOD_FACES:
                 live_drives["mood"] = target        # categorical: set directly (still revertible)
+        if hard:
+            base_traits.clear(); base_traits.update(copy.deepcopy(live_traits))
+            base_registry.clear(); base_registry.update(copy.deepcopy(live_registry))
+            base_drives.clear(); base_drives.update(copy.deepcopy(live_drives))
 
     def revert():
         live_traits.clear(); live_traits.update(copy.deepcopy(base_traits))

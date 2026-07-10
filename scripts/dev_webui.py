@@ -64,7 +64,8 @@ from web_control.skills import resolve_skills_dir            # noqa: E402
 from web_control.jsonio import read_json, write_json         # noqa: E402  (atomic dev-state I/O)
 from web_control.stress import StressTest                    # noqa: E402  (ROS-free CPU stress)
 # The SAME cognition core the robot runs — one base to maintain (see cognition.py).
-from web_control.cognition import CognitionCore              # noqa: E402
+from web_control.cognition import (                          # noqa: E402
+    CognitionCore, REFLECT_TRAITS, REFLECT_DRIVES, DRIVE_MOODS)
 # The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Pursuit
 # driver), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
 from behavior.brain import Personality, PurposeBrain         # noqa: E402
@@ -223,6 +224,41 @@ def _load_cfg(section):
     except Exception as exc:
         print(f"(couldn't read robot.yaml [{section}]: {exc} — using defaults)", file=sys.stderr)
         return {}
+
+
+def _clamp01f(v, default=0.5):
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _sanitize_personality_patch(d):
+    """Coerce/clamp a web-UI personality edit to {traits?, registry?, drives?} (untrusted
+    input) before it's applied as a HARD evolve. Mirrors web_server._sanitize_personality_patch
+    (duplicated, not imported, so this harness stays importable without rclpy)."""
+    out = {}
+    if isinstance(d.get("traits"), dict):
+        out["traits"] = {k: _clamp01f(d["traits"][k]) for k in REFLECT_TRAITS if k in d["traits"]}
+    if isinstance(d.get("drives"), dict):
+        dv = {k: _clamp01f(d["drives"][k]) for k in REFLECT_DRIVES if k in d["drives"]}
+        if d["drives"].get("mood") in DRIVE_MOODS:
+            dv["mood"] = d["drives"]["mood"]
+        out["drives"] = dv
+    if isinstance(d.get("registry"), dict):
+        reg = {}
+        for name, patch in d["registry"].items():
+            if not isinstance(name, str) or not isinstance(patch, dict):
+                continue
+            p = {}
+            if "priority" in patch:
+                p["priority"] = _clamp01f(patch["priority"])
+            if "enabled" in patch:
+                p["enabled"] = bool(patch["enabled"])
+            if p:
+                reg[name] = p
+        out["registry"] = reg
+    return out
 
 
 class DevState:
@@ -630,6 +666,16 @@ class DevState:
     def get_cog_log(self):
         return self.cog.get_cog_log()
 
+    def get_merged_log(self):
+        """Same contract as the robot's WebServerNode.get_merged_log, minus the health
+        log (no real hardware to have outages here) — just the decision log, tagged."""
+        entries = []
+        for e in self.cog.get_cog_log()["entries"]:
+            d = dict(e)
+            d["source"] = "cognition"
+            entries.append(d)
+        return {"entries": entries}
+
     def get_phrasebank(self):
         return self.cog.get_phrasebank()
 
@@ -737,6 +783,29 @@ class DevState:
         with self._lock_pe:
             ev, self._pending_evolve = self._pending_evolve, None
         return ev
+
+    # ---- personality (web-UI editable traits/registry/drives) ---------------
+    def get_personality(self):
+        return self.cog.get_personality()
+
+    def set_personality(self, data):
+        """Web-UI edit -> a HARD Personality.on_evolve, same semantics as the robot's
+        set_personality (see web_server.py): sets exactly + re-baselines so it isn't smoothed
+        away or reverted by a brain_lost heartbeat. No ROS topic here — straight to the same
+        Personality object the chart loop drives (this process IS the "node")."""
+        patch = _sanitize_personality_patch(data if isinstance(data, dict) else {})
+        if not patch:
+            return {"error": "empty or invalid personality patch"}
+        reg = None
+        if patch.get("registry"):
+            reg = dict(self.cog.registry)
+            for name, p in patch["registry"].items():
+                reg[name] = {**reg.get(name, {}), **p}
+        self.cog.update_personality(traits=patch.get("traits"), registry=reg,
+                                     drives=patch.get("drives"))
+        patch["hard"] = True
+        self._personality.on_evolve(patch)
+        return self.get_personality()
 
     # ---- purpose engine + planner (served from the shared PurposeBrain) ------
     def get_purpose(self):
@@ -905,10 +974,15 @@ def run_behavior(state, idle_secs, reflect_secs):
         # bits that make temperament compound across dev sessions.
         if state._personality.tick_events(now, picked=False) == "lost":
             print("[personality] brain lost — reverting toward the seed", file=sys.stderr)
+        # Mirror the live soul into CognitionCore every tick (not just on `ev`) so GET
+        # /personality and a web-UI edit's optimistic re-read are never stale — parity with
+        # the robot's WebServerNode._on_traits, which fires on every mood_node publish.
+        state.cog.update_personality(traits=dict(interp.context["traits"]),
+                                      registry=interp.context["registry"],
+                                      drives=dict(interp.context["drives"]))
         if ev:
             print(f"[behavior] traits now {dict(interp.context['traits'])}; "
                   f"drives {dict(interp.context['drives'])}", file=sys.stderr)
-            state.cog.update_traits(dict(interp.context["traits"]))  # track soul for bank-regen
             state.cog.bank_regen_check()                     # refresh bank if it drifted too far
         state._personality.publish_and_persist(now)          # save drift (throttled, on change)
         if reflect_secs > 0 and state.llm.available() and (now - last_reflect) > reflect_secs:
@@ -1027,8 +1101,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         p = self.path.split("?", 1)[0]
         if p == "/llm/config":
             return self._json(self.state.llm_config())
+        if p == "/personality":
+            return self._json(self.state.get_personality())
         if p == "/llm/log":
             return self._json(self.state.get_cog_log())
+        if p == "/logs":
+            return self._json(self.state.get_merged_log())
         if p == "/llm/phrases":
             return self._json(self.state.get_phrasebank())
         if p == "/skills":
@@ -1089,6 +1167,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(s.llm_look() or {"error": "no reply"})
         if p == "/llm/config":
             return self._json(s.update_llm_config(self._body()))
+        if p == "/personality":
+            return self._json(s.set_personality(self._body()))
         if p == "/llm/phrases/regenerate":
             return self._json(s.regenerate_phrasebank())
         if p == "/skills/invoke":

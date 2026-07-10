@@ -24,6 +24,7 @@ the page talks exclusively to this server:
 import array
 import functools
 import http.server
+import copy
 import json
 import math
 import os
@@ -31,6 +32,7 @@ import queue
 import subprocess
 import threading
 import time
+from datetime import datetime
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
@@ -46,7 +48,7 @@ from .telemetry import TelemetryHub
 from .tts import TtsEngine, VOICES, clamp
 from .llm import LlmClient
 from .skills import resolve_skills_dir
-from .cognition import CognitionCore
+from .cognition import CognitionCore, REFLECT_TRAITS, REFLECT_DRIVES, DRIVE_MOODS
 from .stress import StressTest
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
@@ -57,7 +59,6 @@ SETTINGS_DEFAULTS = {
     "speed": 100,
     "pitch": 100,
     "base_pitch": 50,         # espeak -p 0-99, default 50 (normal)
-    "cap_pitch": 0,           # espeak -k 0-100, 0=off
     "lead_silence": 350,      # ms of silence prepended so the H5 codec's power-up
                                # ramp can't clip the first word (tts.LEAD_SILENCE);
                                # live-tunable here since the right value is hardware/
@@ -517,6 +518,25 @@ class WebServerNode(Node):
             lines = lines[1:]                          # drop the line the seek cut in half
         return {"lines": lines[-int(limit):], "path": path}
 
+    # ---- merged log stream: decision log + health log, interleaved by time ----
+    def get_merged_log(self, limit=200):
+        """Read-only merge of the two append-only event logs into one chronological
+        stream: the decision log (cognition.py — LLM/beat/skill activity, kept in an
+        in-memory ring buffer) and the health log (sys_monitor — ESP32/lidar outages,
+        read fresh from disk). Doesn't touch either file — each stays single-writer,
+        this just interleaves reads for the web UI's always-on Logs panel."""
+        limit = int(limit)
+        entries = []
+        for e in self._cog.get_cog_log()["entries"]:
+            d = dict(e)
+            d["source"] = "cognition"
+            entries.append(d)
+        for line in self.get_health_log(limit=limit)["lines"]:
+            t, text = _parse_health_line(line)
+            entries.append({"t": t, "source": "health", "text": text})
+        entries.sort(key=lambda e: e.get("t") or 0, reverse=True)
+        return {"entries": entries[:limit]}
+
     # ---- stress test mode (see stress.py) ------------------------------------
     def stress_start(self, data):
         data = data or {}
@@ -558,7 +578,7 @@ class WebServerNode(Node):
         s = self._settings
         self._tts.configure(voice=s["voice"], volume=s["volume"],
                             speed=s["speed"], pitch=s["pitch"],
-                            base_pitch=s["base_pitch"], cap_pitch=s["cap_pitch"],
+                            base_pitch=s["base_pitch"],
                             lead_silence=s["lead_silence"] / 1000.0)
 
     def get_settings(self):
@@ -678,6 +698,29 @@ class WebServerNode(Node):
 
     def update_llm_settings(self, data):
         return self._cog.update_llm_settings(data)
+
+    def get_personality(self):
+        return self._cog.get_personality()
+
+    def set_personality(self, data):
+        """Web-UI edit of traits/registry/drives -> a HARD /cognition/evolve (set exactly +
+        re-baseline in the behaviour node, see presence.apply_evolve) so it sticks instead of
+        being smoothed/reverted like an LLM-reflection nudge. Applied server-side too (not just
+        published) so a fast GET right after a POST already reflects it, even before the
+        behaviour node's next tick round-trips back over /cognition/traits."""
+        patch = _sanitize_personality_patch(data if isinstance(data, dict) else {})
+        if not patch:
+            return {"error": "empty or invalid personality patch"}
+        reg = None
+        if patch.get("registry"):        # registry is a per-beat PATCH, not a full replacement
+            reg = copy.deepcopy(self._cog.registry)
+            for name, p in patch["registry"].items():
+                reg.setdefault(name, {}).update(p)
+        self._cog.update_personality(traits=patch.get("traits"), registry=reg,
+                                      drives=patch.get("drives"))
+        patch["hard"] = True
+        self._evolve_pub.publish(String(data=json.dumps(patch)))
+        return self.get_personality()
 
     def get_cog_log(self):
         return self._cog.get_cog_log()
@@ -936,7 +979,8 @@ class WebServerNode(Node):
         except Exception:
             return
         if isinstance(data.get("traits"), dict):
-            self._cog.update_traits(data["traits"])
+            self._cog.update_personality(traits=data.get("traits"), registry=data.get("registry"),
+                                          drives=data.get("drives"))
             self._cog.bank_regen_check()                # soul moved -> refresh bank if too far
 
     # --- personality reflection (deep/slow tier): scheduled here, done by the core ----
@@ -1216,7 +1260,6 @@ def _sanitize_settings(s):
     out["speed"] = clamp(out["speed"], 20, 500)
     out["pitch"] = clamp(out["pitch"], 50, 200)
     out["base_pitch"] = clamp(out["base_pitch"], 0, 99)
-    out["cap_pitch"] = clamp(out["cap_pitch"], 0, 100)
     out["lead_silence"] = clamp(out["lead_silence"], 0, 2000)
     out["announce"] = bool(out["announce"])
     out["announce_interval"] = clamp(out["announce_interval"], ANNOUNCE_MIN, ANNOUNCE_MAX)
@@ -1232,6 +1275,54 @@ def _sanitize_llm_settings(s):
               "free_model", "free_smart_model"):
         out[k] = str(out.get(k) or "")[:120]
     out["api_key"] = str(out.get("api_key") or "").strip()[:200]
+    return out
+
+
+def _parse_health_line(line):
+    """Parse a health-log line ("YYYY-MM-DDTHH:MM:SS message", written by
+    sys_monitor.health_log) into (epoch_seconds, message). Best-effort: an
+    unparseable line still gets served (t=0.0 sorts it oldest) rather than dropped."""
+    try:
+        ts, msg = line.split(" ", 1)
+        return datetime.fromisoformat(ts).timestamp(), msg
+    except (ValueError, IndexError):
+        return 0.0, line
+
+
+def _clamp01f(v, default=0.5):
+    """Like tts.clamp but float-preserving (tts.clamp rounds to int — wrong for 0..1 axes)."""
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _sanitize_personality_patch(d):
+    """Coerce/clamp a web-UI personality edit to {traits?, registry?, drives?} (untrusted
+    input) before it's published as a HARD /cognition/evolve. Traits/drive scalars clamp to
+    0..1; `mood` must be one of the known OLED faces; registry patches only touch
+    priority/enabled per beat (needs/trait stay code/file-config, not web-editable)."""
+    out = {}
+    if isinstance(d.get("traits"), dict):
+        out["traits"] = {k: _clamp01f(d["traits"][k]) for k in REFLECT_TRAITS if k in d["traits"]}
+    if isinstance(d.get("drives"), dict):
+        dv = {k: _clamp01f(d["drives"][k]) for k in REFLECT_DRIVES if k in d["drives"]}
+        if d["drives"].get("mood") in DRIVE_MOODS:
+            dv["mood"] = d["drives"]["mood"]
+        out["drives"] = dv
+    if isinstance(d.get("registry"), dict):
+        reg = {}
+        for name, patch in d["registry"].items():
+            if not isinstance(name, str) or not isinstance(patch, dict):
+                continue
+            p = {}
+            if "priority" in patch:
+                p["priority"] = _clamp01f(patch["priority"])
+            if "enabled" in patch:
+                p["enabled"] = bool(patch["enabled"])
+            if p:
+                reg[name] = p
+        out["registry"] = reg
     return out
 
 
@@ -1260,11 +1351,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     GET_JSON = {
         "/tts/config": lambda n: n.get_settings(),      # page restores controls on load
         "/llm/config": lambda n: n.get_llm_settings(),
+        "/personality": lambda n: n.get_personality(),
         "/llm/log": lambda n: n.get_cog_log(),
         "/llm/phrases": lambda n: n.get_phrasebank(),
         "/skills": lambda n: n.get_skills(),
         "/skills/workshop": lambda n: n.brain_workshop(),
         "/health/log": lambda n: n.get_health_log(),
+        "/logs": lambda n: n.get_merged_log(),
         "/stress/status": lambda n: n.stress_status(),
     }
     POST_JSON = {
@@ -1275,6 +1368,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/stress/stop": lambda n, d: n.stress_stop(),
         "/tts/config": lambda n, d: n.update_settings(d),
         "/llm/config": lambda n, d: n.update_llm_settings(d),
+        "/personality": lambda n, d: n.set_personality(d),
         "/llm/phrases/regenerate": lambda n, d: n.regenerate_phrasebank(),
         "/skills/reload": lambda n, d: n.reload_skills(),
         "/skills/like": lambda n, d: n.like_skill(d),   # {"name","delta":±1}

@@ -653,13 +653,15 @@ class Personality:
     # ---- evolution events ---------------------------------------------------
     def on_evolve(self, payload):
         """A trait/registry proposal from the cognitive layer -> a Sismic `evolve` event
-        (smoothed in the chart). Also feeds the heartbeat (the brain is alive). `payload` is the
-        decoded /cognition/evolve dict. Returns True iff the brain just came back."""
+        (smoothed in the chart, unless `payload["hard"]` — a deliberate web-UI edit — sets it
+        exactly and re-baselines). Also feeds the heartbeat (the brain is alive). `payload` is
+        the decoded /cognition/evolve dict. Returns True iff the brain just came back."""
         if self._interp is None or Event is None:
             return False
         self._interp.queue(Event("evolve", traits=payload.get("traits") or {},
                                  registry=payload.get("registry") or {},
-                                 drives=payload.get("drives") or {}))
+                                 drives=payload.get("drives") or {},
+                                 hard=bool(payload.get("hard", False))))
         self._last_brain = time.monotonic()
         came_back = self._brain_lost
         self._brain_lost = False

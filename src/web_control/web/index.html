@@ -14,6 +14,7 @@
   <header id="topbar">
     <span class="brand"><span id="dot"></span>NANO</span>
     <button class="status" id="statusChip"><b id="conn">disconnected</b></button>
+    <button class="status" id="logsBtn" title="Merged log: decision log + health events, in one chronological stream">📜 Logs</button>
     <div class="spacer"></div>
     <div class="metrics">
       <span class="m"><label>x</label><b id="px">0</b></span>
@@ -136,9 +137,6 @@
               <input id="ttsSpeed" type="range" min="50" max="200" step="5" value="100"></div>
             <div class="field"><label>Pitch <span id="ttsPitchV">100</span>%</label>
               <input id="ttsPitch" type="range" min="50" max="200" step="5" value="100"></div>
-            <div class="field"><label>Capitals <span id="ttsCapV">0</span></label>
-              <input id="ttsCap" type="range" min="0" max="100" step="1" value="0">
-              <span class="hint-inline">Pitch rise on capital letters (0=off)</span></div>
             <div class="field"><label>Lead silence <span id="ttsLeadV">350</span>ms</label>
               <input id="ttsLead" type="range" min="0" max="1500" step="50" value="350">
               <span class="hint-inline">Pause before a COLD first utterance, so the speaker's
@@ -246,6 +244,45 @@
               <summary>🧠 Decision log</summary>
               <div id="llmLog" class="log">…</div>
             </details>
+          </div>
+          <div class="card">
+            <h2>🎭 Personality</h2>
+            <p class="hint" id="persName">…</p>
+            <h2 style="margin-top:10px">Traits</h2>
+            <div class="field"><label>Curiosity <span id="pCuriosityV">0.50</span></label>
+              <input id="pCuriosity" type="range" min="0" max="1" step="0.01" value="0.5"></div>
+            <div class="field"><label>Extraversion <span id="pExtraversionV">0.50</span></label>
+              <input id="pExtraversion" type="range" min="0" max="1" step="0.01" value="0.5"></div>
+            <div class="field"><label>Caution <span id="pCautionV">0.60</span></label>
+              <input id="pCaution" type="range" min="0" max="1" step="0.01" value="0.6"></div>
+            <div class="field"><label>Playfulness <span id="pPlayfulnessV">0.50</span></label>
+              <input id="pPlayfulness" type="range" min="0" max="1" step="0.01" value="0.5"></div>
+            <h2 style="margin-top:14px">Drives</h2>
+            <div class="field"><label>Energy <span id="pEnergyV">0.50</span></label>
+              <input id="pEnergy" type="range" min="0" max="1" step="0.01" value="0.5"></div>
+            <div class="field"><label>Focus <span id="pFocusV">0.50</span></label>
+              <input id="pFocus" type="range" min="0" max="1" step="0.01" value="0.5"></div>
+            <div class="field"><label>Introspection <span id="pIntrospectionV">0.50</span></label>
+              <input id="pIntrospection" type="range" min="0" max="1" step="0.01" value="0.5"></div>
+            <div class="field"><label>Mood tint (worn between beats)</label>
+              <select id="pMood">
+                <option value="">none</option>
+                <option value="happy">happy</option>
+                <option value="angry">angry</option>
+                <option value="focused">focused</option>
+                <option value="stress">stress</option>
+                <option value="neutral">neutral</option>
+                <option value="looking">looking</option>
+                <option value="sleepy">sleepy</option>
+              </select></div>
+            <h2 style="margin-top:14px">Beats — when they fire</h2>
+            <div id="persBeats" class="kv">…</div>
+            <p class="hint">0.5 is neutral (drives only kick in above 0.5). Edits here are
+              <b>immediate and sticky</b> — they become the robot's new baseline right away and
+              won't be smoothed away or reverted the way a slow LLM-reflection nudge can be.
+              Per beat: <b>priority</b> is the idle lottery weight (higher fires more often);
+              unchecking <b>on</b> disables it entirely. The robot may still drift these on its
+              own during reflection — reload the tab to see the latest.</p>
           </div>
           <div class="card">
             <h2>🛠 Skills · capabilities</h2>
@@ -561,7 +598,28 @@
   </div>
 </div>
 
+<!-- Merged log overlay: decision log (cognition.py) + health log (sys_monitor), one
+     chronological stream. Deliberately OUTSIDE #app / the tab system — reachable from
+     any tab via the always-visible topbar button, not tucked in a card. -->
+<div id="logsOverlay" class="hidden">
+  <div id="logsPanel">
+    <div id="logsHead">
+      <b>📜 Log stream</b>
+      <div class="row" id="logsFilter">
+        <button class="btn small active" data-src="all">All</button>
+        <button class="btn small" data-src="cognition">🧠 Decisions</button>
+        <button class="btn small" data-src="health">🩺 Health</button>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn small" id="logsClose">✕ Close</button>
+    </div>
+    <div id="logsBody" class="log">…</div>
+  </div>
+</div>
+
 <script src="app.js"></script>
+<script src="personality.js"></script>
+<script src="logs.js"></script>
 <script src="map.js"></script>
 <script src="oled.js"></script>
 <script src="chrome.js"></script>

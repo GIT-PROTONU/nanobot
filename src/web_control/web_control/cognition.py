@@ -26,6 +26,7 @@ The TTS engine + the constructed `LlmClient` are passed in too (their constructi
 platform — env key vs param key). Degrades to silence on every error: the brain is a garnish,
 never load-bearing.
 """
+import copy
 import json
 import os
 import random
@@ -198,6 +199,13 @@ class CognitionCore:
         self.traits = {k: 0.5 for k in REFLECT_TRAITS}
         self.traits["caution"] = 0.6
         self.update_traits(traits or {})
+        # registry (per-beat priority/enabled/needs/trait) + drives (energy/focus/
+        # introspection/mood) mirror the behaviour node's live Personality — kept here too
+        # so the web UI has one GET (/personality) to read the FULL soul, not just traits.
+        # Populated by update_personality() (see web_server._on_traits / dev_webui).
+        self.registry = {}
+        self.drives = {k: 0.5 for k in REFLECT_DRIVES}
+        self.drives["mood"] = ""
         self.settings = dict(settings or {"enabled": llm.available(), "model": ""})
         # platform adapters
         self._face = face or (lambda _m: None)
@@ -327,6 +335,25 @@ class CognitionCore:
 
     def traits_phrase(self):
         return ", ".join(f"{k} {self.traits.get(k, 0.5):.2f}" for k in REFLECT_TRAITS)
+
+    # ---- full personality snapshot (traits + registry + drives) -------------
+    def update_personality(self, traits=None, registry=None, drives=None):
+        """Mirror the behaviour node's live Personality here so /personality GET has
+        something to serve. Called on every `/cognition/traits` publish (robot) or every
+        chart tick (dev harness) — registry/drives are trusted (sourced from the chart, not
+        the network), so no clamping beyond what presence.py already does."""
+        self.update_traits(traits)
+        if isinstance(registry, dict):
+            self.registry = copy.deepcopy(registry)
+        if isinstance(drives, dict):
+            self.drives.update({k: clamp01(drives[k]) for k in REFLECT_DRIVES if k in drives})
+            if drives.get("mood") in DRIVE_MOODS:
+                self.drives["mood"] = drives["mood"]
+
+    def get_personality(self):
+        return {"name": self.persona_name, "persona": self.persona,
+                "traits": dict(self.traits), "registry": self.registry,
+                "drives": dict(self.drives)}
 
     # ---- trait trajectory (self-knowledge: how it has changed over time) -----
     def _load_trait_history(self):

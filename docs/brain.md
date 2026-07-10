@@ -417,3 +417,8 @@ On Windows, `scripts/start-dev.ps1` finds a real Python, loads the key, and laun
 | Config (models, caps, beats, persona) | `src/robot_bringup/config/robot.yaml` |
 | Personality seed + creator | `personality.json` ← `scripts/personality_creator.py` |
 | Off-robot test harness | `scripts/dev_webui.py`, `scripts/dev_tts_test.py` |
+
+The table above is *code* files. For the *data* side — every persisted
+personality/traits/skills/log file, which ones are git-tracked seeds vs.
+runtime state, and who reads/writes each — see
+[`personality-files.md`](personality-files.md).

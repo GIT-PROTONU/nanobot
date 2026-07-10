@@ -204,3 +204,17 @@
   .skillrow .sklike{flex:0 0 auto;padding:5px 10px}
   .skillrow .sklike.liked{border-color:var(--accent);color:var(--accent)}
   .skillrow.disabled{opacity:.55}
+
+  /* ---------- merged log overlay (topbar button, independent of the tab system) --- */
+  .hidden{display:none!important}
+  .btn.small{padding:5px 10px;font-size:12px}
+  .btn.small.active{border-color:var(--accent);color:var(--accent)}
+  #logsOverlay{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.55);
+    display:flex;align-items:center;justify-content:center;padding:16px}
+  #logsPanel{width:min(720px,100%);max-height:min(80vh,720px);display:flex;
+    flex-direction:column;background:var(--surface);border:1px solid var(--border);
+    border-radius:12px;overflow:hidden}
+  #logsHead{flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px;
+    border-bottom:1px solid var(--border)}
+  #logsBody{flex:1;margin:0;padding:10px 14px;max-height:none}
+  #logsBody .logrow.src-health{color:var(--amber)}
