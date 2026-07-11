@@ -222,8 +222,6 @@ over the robot's — set `DEPLOY_SOUL=0` to keep the robot's evolved personality
 - **Run as a service:** `deploy/sbc-setup.sh` installs per-process systemd units under
   `nano-robot.target` (with `Restart=on-failure`), so the robot comes up headless on
   power-on; `scripts/stack.sh` wraps `systemctl {start|stop|restart}` of the target.
-- **`LDS_Visualizer.html`** (repo root) is the original Web-Serial bench tool — plug
-  the LDS straight into a laptop to sanity-check the sensor independently of ROS.
 
 ## Verified deployment (NanoPi NEO Plus2)
 

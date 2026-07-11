@@ -4,7 +4,6 @@ Deliberately dependency-light (no Adafruit Blinka) because Blinka's board
 auto-detection does not know the Allwinner H5 — we just talk to /dev/i2c-N
 directly, which works on any mainline kernel.
 """
-import math
 import time
 
 from smbus2 import SMBus

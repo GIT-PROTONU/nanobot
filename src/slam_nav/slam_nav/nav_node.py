@@ -108,6 +108,7 @@ class NavNode(Node):
             ("stuck_eps", 0.04),         # m: movement below this counts as "not moving"
             # --- LDS idle spin-down (power/wear/noise: park the spin motor when it's not
             #     earning its keep — stationary + no reason to expect fresh scans soon) ---
+            ("lds_idle_enable", True),    # master on/off for the spin-down behaviour
             ("lds_idle_timeout", 60.0),   # s of no motion/goal/exploring before spin-down; 0=off
             ("lds_idle_rpm", 0.0),        # target rpm while parked (0 = fully stop)
             ("lds_active_rpm", 300.0),    # target rpm to resume (match firmware LDS_TARGET_RPM)
@@ -172,6 +173,7 @@ class NavNode(Node):
         self._trail_max = int(g("trail_max").value)
         self.stuck_timeout = float(g("stuck_timeout").value)
         self.stuck_eps = float(g("stuck_eps").value)
+        self.lds_idle_enable = bool(g("lds_idle_enable").value)
         self.lds_idle_timeout = float(g("lds_idle_timeout").value)
         self.lds_idle_rpm = float(g("lds_idle_rpm").value)
         self.lds_active_rpm = float(g("lds_active_rpm").value)
@@ -312,6 +314,18 @@ class NavNode(Node):
                     self._recovering = False
             elif p.name == "pickup_pause":
                 self.pickup_pause = bool(p.value)
+            elif p.name == "lds_idle_enable":
+                self.lds_idle_enable = bool(p.value)
+                if self.lds_idle_enable:
+                    # fresh countdown on re-enable, so it doesn't immediately spin
+                    # down using a stale (possibly long-elapsed) idle clock
+                    self._lds_idle_ref = (self.px, self.py)
+                    self._lds_idle_since = time.monotonic()
+                elif not self._lds_active:
+                    # was parked -> wake it back up immediately, disabling means "always on"
+                    self._lds_active = True
+                    self.lds_rpm_pub.publish(Float32(data=self.lds_active_rpm))
+                    self.get_logger().info("LDS idle spin-down disabled — spinning up")
             elif p.name == "lds_idle_timeout":
                 self.lds_idle_timeout = float(p.value)
             elif p.name == "lds_idle_rpm":
@@ -651,7 +665,7 @@ class NavNode(Node):
         instant any of those become true again. Only publishes on a state CHANGE, so a
         manual override via the web UI's LDS slider isn't fought every tick — only at
         the next genuine idle<->active transition."""
-        if self.lds_idle_timeout <= 0:
+        if not self.lds_idle_enable or self.lds_idle_timeout <= 0:
             return
         moved = (self._lds_idle_ref is None or
                  math.hypot(self.px - self._lds_idle_ref[0],

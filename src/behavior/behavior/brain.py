@@ -707,3 +707,58 @@ class Personality:
             self.data["registry"] = copy.deepcopy(ctx["registry"])
             self.data["drives"] = dict(ctx["drives"])
         save_json(self.path, self.data, logger=self._log)
+
+
+class Schedule:
+    """A tiny local-time cron: fires a named skill once a day at a configured HH:MM. Built from
+    a list of `{"time": "HH:MM", "skill": "name"}` dicts (the same shape persisted to
+    schedule.json and sent by the web UI's editor) — a malformed/incomplete entry is dropped
+    with a logged warning rather than failing the whole schedule.
+
+    `due()` is level-, not edge-triggered: if `now` is already past an entry's time today and it
+    hasn't fired yet today, it's due — so a tick that lands a little late, or a node that starts
+    up after the target time, still fires it once. Firing is NOT persisted across a restart, so a
+    restart shortly after a fire can repeat it once; acceptable for a "greet at the door" style
+    routine, not meant for anything that must fire exactly once ever."""
+
+    def __init__(self, entries, logger=None):
+        self._entries = []
+        for i, raw in enumerate(entries or []):
+            t = str((raw or {}).get("time") or "").strip()
+            skill = str((raw or {}).get("skill") or "").strip()
+            if not t and not skill:       # a blank editor row — not worth a warning
+                continue
+            try:
+                h, m = t.split(":")
+                h, m = int(h), int(m)
+                if not (0 <= h < 24 and 0 <= m < 60):
+                    raise ValueError
+            except Exception:
+                if logger:
+                    logger(f"schedule: bad time '{t}' at index {i} — skipping")
+                continue
+            if not skill:
+                if logger:
+                    logger(f"schedule: no skill paired with time '{t}' at index {i} — skipping")
+                continue
+            self._entries.append({"hour": h, "minute": m, "skill": skill, "fired_on": None})
+
+    def due(self, now=None):
+        """Return one skill name that's newly due, marking it fired for today, else None. Only
+        ever returns one entry per call, so entries firing on the same tick spread over
+        subsequent ticks instead of all invoking at once."""
+        lt = now or time.localtime()
+        today = (lt.tm_year, lt.tm_yday)
+        cur = lt.tm_hour * 60 + lt.tm_min
+        for e in self._entries:
+            if e["fired_on"] == today:
+                continue
+            if cur >= e["hour"] * 60 + e["minute"]:
+                e["fired_on"] = today
+                return e["skill"]
+        return None
+
+    def to_list(self):
+        """The normalized (validated, HH:MM-formatted) entries, for persisting/echoing back."""
+        return [{"time": f"{e['hour']:02d}:{e['minute']:02d}", "skill": e["skill"]}
+                for e in self._entries]

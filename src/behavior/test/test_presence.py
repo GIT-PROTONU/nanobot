@@ -24,7 +24,7 @@ pytest.importorskip("sismic")  # skip cleanly if sismic isn't installed
 from sismic.clock import SimulatedClock  # noqa: E402
 from sismic.model import Event  # noqa: E402
 from behavior.presence import (build_interpreter, choose_beat, BEATS,  # noqa: E402
-                               DEFAULT_TRAITS, DEFAULT_REGISTRY, DEFAULT_DRIVES,
+                               DEFAULT_TRAITS, DEFAULT_REGISTRY,
                                drive_prob)
 
 GREET, IDLE, PERFORM = 1.0, 2.0, 1.0

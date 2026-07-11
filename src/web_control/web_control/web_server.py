@@ -43,6 +43,7 @@ from geometry_msgs.msg import Twist
 
 from .jsonio import read_json, write_json
 from .mjpeg_camera import CameraStream
+from .gpu_vision import GpuVision
 from .mic_audio import AudioStream
 from .telemetry import TelemetryHub
 from .tts import TtsEngine, VOICES, clamp
@@ -129,6 +130,33 @@ class WebServerNode(Node):
         self.declare_parameter("cam_width", 640)
         self.declare_parameter("cam_height", 480)
         self.declare_parameter("cam_fps", 15)
+        # GPU vision (Mali-450/GLES2 via lima, gpu_vision.py): OFF by default. When on,
+        # GpuVision becomes the sole continuous camera owner (YUYV, zero-copy) and the
+        # browser's /stream.mjpg + /snapshot.jpg are served from its JPEG tee instead of
+        # a second MjpegCamera session -- see memory gpu-vision-camera-architecture for
+        # why (the C270 only exposes one true capture-capable V4L2 node). Requires
+        # `sudo modprobe lima` + the Mesa/EGL/GBM apt packages (deploy/sbc-setup.sh);
+        # missing GPU userspace degrades to a log line + no-op, same as `sismic` absent.
+        self.declare_parameter("gpu_vision_enable", False)
+        # Flashlight/dark reflex (GPU vision Tier-B extension, opt-in, independent of
+        # skills_allow_actions): auto-toggles /led when the GPU's average frame
+        # luminance drops below/rises above these thresholds (hysteresis avoids
+        # flicker at the boundary). OFF by default -- gpu_vision_enable alone never
+        # makes the robot's LED move on its own.
+        self.declare_parameter("vision_dark_reflex_enable", False)
+        self.declare_parameter("vision_dark_threshold", 0.15)   # luma below this -> LED on
+        self.declare_parameter("vision_dark_recover", 0.25)     # luma above this -> LED off
+        # Optical virtual bumper (GPU vision Tier-B extension, telemetry.py's
+        # _optical_bumper): commanded to move but the GPU's motion score stays under
+        # motion_floor for confirm_secs -> likely a wheel stall/slip. Purely
+        # informational (nothing acts on it), but its thresholds are real ROS params
+        # (not fixed constants) so the web UI's sliders actually take effect, and
+        # telemetry now also surfaces `commanded`/`cmd_vel` -- "always clear" almost
+        # always just means "not currently being driven," not that it's broken; this
+        # makes that visible instead of a single opaque bool.
+        self.declare_parameter("vision_bumper_cmd_eps", 0.03)      # m/s or rad/s floor to count as "commanded"
+        self.declare_parameter("vision_bumper_motion_floor", 0.01)  # gpu motion score below this = "nothing moved"
+        self.declare_parameter("vision_bumper_confirm_secs", 0.6)   # s the stall condition must hold before alerting
         self.declare_parameter("mic_device", "")       # "" = auto-detect USB mic
         self.declare_parameter("mic_rate", 16000)      # Hz; 16k mono = 32 KB/s
         self.declare_parameter("tts_enabled", True)
@@ -221,10 +249,31 @@ class WebServerNode(Node):
         g = self.get_parameter
         port = g("web_port").value
 
-        self._cam = CameraStream(
+        # The direct hardware-MJPEG passthrough is ALWAYS constructed (cheap -- lazily
+        # opens the camera only once a viewer actually connects, same as before
+        # GPU vision existed) so it's available as manual mode's fallback backend even
+        # when GPU vision is the default. Idle cost is zero either way.
+        self._cam_direct = CameraStream(
             dev=g("cam_device").value or None,
             width=g("cam_width").value, height=g("cam_height").value,
             fps=g("cam_fps").value, logger=self.get_logger().info)
+        self._gpu_vision = None
+        self._manual_mode = False          # see vision_manual() / the `_cam` property below
+        self._dark_led_pub = None
+        self._dark_led_on = False
+        if g("gpu_vision_enable").value:
+            self._gpu_vision = GpuVision(
+                dev=g("cam_device").value or None,
+                width=g("cam_width").value, height=g("cam_height").value,
+                fps=g("cam_fps").value, logger=self.get_logger().info)
+            self._gpu_vision.start()
+            # Publisher + timer always created (cheap, idle-safe) whenever GPU vision is
+            # on, regardless of vision_dark_reflex_enable's startup value -- the tick
+            # itself reads that param live, so toggling it via the web UI's /param POST
+            # (see PARAM_WHITELIST) actually takes effect instead of silently no-op'ing
+            # because the timer was never scheduled.
+            self._dark_led_pub = self.create_publisher(Bool, "led", 5)
+            self.create_timer(1.0, self._dark_reflex_tick)
 
         self._mic = AudioStream(
             device=g("mic_device").value or None,
@@ -858,9 +907,13 @@ class WebServerNode(Node):
         if not self._cog.available():
             self._cog.log_decision(trigger, state, camera, status="llm-unavailable")
             return
-        if beat == "skill":                            # let the brain pick a skill to perform
-            threading.Thread(target=self._cog.run_skill_beat,
-                             args=(state or "acting",), daemon=True).start()
+        if beat == "skill":
+            name = str(req.get("skill") or "")
+            if name:                                    # a named request (e.g. a scheduled routine)
+                threading.Thread(target=self._cog.invoke_skill, args=(name,), daemon=True).start()
+            else:                                        # let the brain pick a skill to perform
+                threading.Thread(target=self._cog.run_skill_beat,
+                                 args=(state or "acting",), daemon=True).start()
             return
         threading.Thread(target=self._cog.run_beat,
                          args=(trigger, state, prompt, camera, audio, face), daemon=True).start()
@@ -1124,6 +1177,122 @@ class WebServerNode(Node):
         return {"cpu": cpu, "mem": mem, "temp": temp, "moving": moving,
                 "tilt": tilt, "pickup": pickup}
 
+    @property
+    def _cam(self):
+        """The active browser-facing camera backend: the direct hardware-MJPEG
+        passthrough (CameraStream, zero CPU/GPU cost) when GPU vision is off entirely
+        OR manual mode is on, else GpuVision's JPEG tee. Both `_cam_direct` and
+        `_gpu_vision` share the same add_viewer/get_frame/remove_viewer/running shape,
+        so every existing caller (_capture_frame, _stream_mjpeg) needed zero other
+        changes to become manual-mode-aware."""
+        if self._gpu_vision is None or self._manual_mode:
+            return self._cam_direct
+        return self._gpu_vision
+
+    def vision_manual(self, d):
+        """POST /vision/manual {enabled: bool}: flip between GpuVision's camera
+        ownership and the direct hardware-MJPEG passthrough, live, no restart needed.
+        Manual mode = zero GPU/CPU vision cost (no PIR, no blob tracking, no dark
+        reflex -- GpuVision's capture thread is fully stopped, releasing the V4L2
+        device so the direct backend can open it; the C270 only exposes one true
+        capture-capable node, see memory gpu-vision-camera-architecture, so exactly one
+        backend may hold the camera at a time). A no-op if GPU vision was never enabled
+        (there's nothing to switch away from -- already always direct)."""
+        if self._gpu_vision is None:
+            return {"error": "gpu vision not enabled -- camera is already direct"}
+        want = bool(d.get("enabled"))
+        if want == self._manual_mode:
+            return {"ok": True, "manual_mode": self._manual_mode}
+        if want:
+            self._gpu_vision.stop()        # release the V4L2 device before direct opens it
+            self._manual_mode = True
+        else:
+            self._manual_mode = False
+            self._gpu_vision.start()       # reacquire + resume PIR/blob/luma/dark-reflex
+        return {"ok": True, "manual_mode": self._manual_mode}
+
+    def _dark_reflex_tick(self):
+        """Flashlight/dark reflex: auto-toggle /led from the GPU's average frame
+        luminance, with hysteresis (dark_threshold to turn on, dark_recover > threshold
+        to turn back off) so it doesn't flicker right at the boundary. Reads
+        vision_dark_reflex_enable LIVE (not just at startup) so the web UI's toggle
+        actually takes effect -- the timer always runs while GPU vision is on, cheap
+        either way (one param read + one property read per second)."""
+        if self._gpu_vision is None or self._dark_led_pub is None:
+            return
+        # Manual mode stops GpuVision entirely (see vision_manual) -- .luma would be
+        # frozen at whatever it last was, not a live reading. Treat it the same as
+        # "disabled": release the LED rather than act on stale data.
+        if not self.get_parameter("vision_dark_reflex_enable").value or self._manual_mode:
+            if self._dark_led_on:            # was on when disabled -- don't leave it stuck
+                self._dark_led_on = False
+                self._dark_led_pub.publish(Bool(data=False))
+            return
+        luma = self._gpu_vision.luma
+        low = self.get_parameter("vision_dark_threshold").value
+        high = self.get_parameter("vision_dark_recover").value
+        if high <= low:
+            # The web UI's slider JS keeps recover > threshold, but /param can be hit
+            # directly (bypassing that) -- an inverted or equal band has no stable
+            # luma range and oscillates every tick. Widen it server-side rather than
+            # trust the caller (confirmed by testing: this really does oscillate).
+            high = low + 0.05
+        if not self._dark_led_on and luma < low:
+            self._dark_led_on = True
+            self._dark_led_pub.publish(Bool(data=True))
+        elif self._dark_led_on and luma > high:
+            self._dark_led_on = False
+            self._dark_led_pub.publish(Bool(data=False))
+
+    def vision_calibrate(self, d):
+        """POST /vision/calibrate: set or clear the GPU blob-tracker's target colour.
+        Body: {r,g,b (0..1), threshold?} to set, or {clear:true} to disable tracking.
+        The browser samples the pixel colour itself (canvas getImageData on the live
+        <img>) and posts the RGB value directly -- no server-side coordinate mapping
+        needed."""
+        if self._gpu_vision is None:
+            return {"error": "gpu vision not enabled"}
+        if d.get("clear"):
+            self._gpu_vision.set_target_color(None)
+            return {"ok": True, "target_color": None}
+        try:
+            rgb = tuple(max(0.0, min(1.0, float(d[k]))) for k in ("r", "g", "b"))
+        except (KeyError, TypeError, ValueError):
+            return {"error": "bad color"}
+        try:
+            threshold = max(0.02, min(1.0, float(d.get("threshold", 0.22))))
+        except (TypeError, ValueError):
+            threshold = 0.22
+        self._gpu_vision.set_target_color(rgb, threshold)
+        return {"ok": True, "target_color": list(rgb), "threshold": threshold}
+
+    def vision_blob_tune(self, d):
+        """POST /vision/blob_tune: adjust colour-match sensitivity and blob-size gating
+        WITHOUT re-picking the target colour (unlike /vision/calibrate, which sets the
+        colour itself). Body: any of {threshold, min_confidence, max_confidence} (each
+        0..1) -- omitted fields keep their current value. min/max_confidence gate the
+        matched-fraction-of-frame range that counts as a valid lock: min rejects noise
+        (a couple of stray matching pixels), max rejects "matched almost the whole
+        frame" false locks (e.g. a colour that also matches a wall/background)."""
+        if self._gpu_vision is None:
+            return {"error": "gpu vision not enabled"}
+
+        def opt_float(key):
+            if key not in d:
+                return None
+            try:
+                return float(d[key])
+            except (TypeError, ValueError):
+                return None
+
+        self._gpu_vision.set_blob_tuning(
+            threshold=opt_float("threshold"),
+            min_confidence=opt_float("min_confidence"),
+            max_confidence=opt_float("max_confidence"))
+        threshold, min_conf, max_conf = self._gpu_vision.blob_tuning
+        return {"ok": True, "threshold": threshold, "min_confidence": min_conf,
+                "max_confidence": max_conf}
+
     def _capture_frame(self, timeout=4.0):
         """Grab one JPEG from the webcam via the shared CameraStream (starts the camera
         if nobody's watching, stops it after). Returns bytes, or None if unavailable."""
@@ -1244,6 +1413,11 @@ class WebServerNode(Node):
             self._stress.stop()
         except Exception:
             pass
+        if self._gpu_vision is not None:
+            try:
+                self._gpu_vision.stop()
+            except Exception:
+                pass
         try:
             self._httpd.shutdown()
         except Exception:
@@ -1376,6 +1550,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/skills/workshop/kill": lambda n, d: n.workshop_kill(d),
         "/brain/reward": lambda n, d: n.brain_reward(d),
         "/brain/reflect": lambda n, d: n.brain_reflect(d),
+        "/vision/calibrate": lambda n, d: n.vision_calibrate(d),
+        "/vision/blob_tune": lambda n, d: n.vision_blob_tune(d),
+        "/vision/manual": lambda n, d: n.vision_manual(d),
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.
@@ -1412,6 +1589,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._serve_snapshot()
         if path == "/stream.mjpg":
             return self._stream_mjpeg()
+        if path == "/stream_mask.mjpg":
+            return self._stream_mask_mjpeg()
         if path == "/audio.pcm":
             return self._stream_audio()
         if path == "/map":
@@ -1537,10 +1716,17 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _stream_mjpeg(self):
-        if self._stream is None:
+        # Resolve the active camera backend ONCE, at the start of this streaming
+        # session, not on every call -- `node._cam` is a property that can swap
+        # between GpuVision and the direct hardware-MJPEG CameraStream (manual mode,
+        # see WebServerNode.vision_manual). Pinning it here means a mid-stream toggle
+        # takes effect on the NEXT connection, not this already-open one -- avoids
+        # split-brain viewer-count accounting between two different backend objects.
+        cam = self._node._cam if self._node is not None else self._stream
+        if cam is None:
             self.send_error(503, "no camera")
             return
-        self._stream.add_viewer()
+        cam.add_viewer()
         self.close_connection = True   # never-ending multipart body: no keep-alive
         try:
             self.send_response(200)
@@ -1551,9 +1737,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             seq = 0
             while True:
-                seq, jpeg = self._stream.get_frame(seq, timeout=5.0)
+                seq, jpeg = cam.get_frame(seq, timeout=5.0)
                 if jpeg is None:
-                    if not self._stream.running():
+                    if not cam.running():
                         break          # camera failed / no device
                     continue
                 self.wfile.write(b"--FRAME\r\n")
@@ -1564,7 +1750,47 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         except OSError:
             pass                       # client closed the stream / write timed out
         finally:
-            self._stream.remove_viewer()
+            cam.remove_viewer()
+
+    def _stream_mask_mjpeg(self):
+        """GET /stream_mask.mjpg: the live colour-threshold mask (white = matches the
+        calibrated target colour, black = doesn't) instead of the normal camera feed --
+        "where is the tracked colour actually showing up." Only meaningful while GPU
+        vision owns the camera (not manual mode) AND a target colour is calibrated;
+        both are checked up front so this fails fast with a clear reason instead of
+        hanging on a mask frame that will never be computed."""
+        gv = getattr(self._node, "_gpu_vision", None) if self._node is not None else None
+        if gv is None or getattr(self._node, "_manual_mode", False):
+            self.send_error(503, "gpu vision not active (off, or in manual/direct mode)")
+            return
+        if not gv.has_target_color:
+            self.send_error(503, "no target colour set -- pick one first")
+            return
+        gv.add_mask_viewer()
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Content-Type",
+                             "multipart/x-mixed-replace; boundary=FRAME")
+            self.end_headers()
+            seq = 0
+            while True:
+                seq, jpeg = gv.get_mask_frame(seq, timeout=5.0)
+                if jpeg is None:
+                    if not gv.running() or not gv.has_target_color:
+                        break     # camera failed, or the target was cleared mid-stream
+                    continue
+                self.wfile.write(b"--FRAME\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(b"Content-Length: %d\r\n\r\n" % len(jpeg))
+                self.wfile.write(jpeg)
+                self.wfile.write(b"\r\n")
+        except OSError:
+            pass
+        finally:
+            gv.remove_mask_viewer()
 
     def _stream_telemetry(self):
         """GET /telemetry: Server-Sent Events. One JSON frame per telemetry tick, shared

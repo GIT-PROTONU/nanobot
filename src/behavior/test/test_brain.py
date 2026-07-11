@@ -4,8 +4,9 @@ IO is redirected to a tmp dir, so these never touch ~/.local/state.
 
 Run: pixi run python -m pytest src/behavior/test"""
 import random
+import time
 
-from behavior.brain import PurposeBrain, Personality, load_personality, load_json
+from behavior.brain import PurposeBrain, Personality, Schedule, load_personality, load_json
 from behavior.presence import build_interpreter, DEFAULT_TRAITS
 
 
@@ -149,3 +150,45 @@ def test_personality_heartbeat_reverts(tmp_path):
     pers._last_brain = 0.0                                   # pin the "last alive" reference
     assert pers.tick_events(1.0, picked=False) == "lost"    # no evolve within timeout
     assert pers.tick_events(2.0, picked=False) is None      # only fires once
+
+
+# ---- Schedule: scheduled routines (fire a named skill once a day at HH:MM) ----
+def _lt(hour, minute, yday=191):
+    return time.struct_time((2026, 7, 10, hour, minute, 0, 4, yday, 0))
+
+
+def test_schedule_drops_malformed_and_unpaired_entries():
+    logs = []
+    s = Schedule([{"time": "09:00", "skill": "patrol"}, {"time": "bad", "skill": "x"},
+                 {"time": "25:00", "skill": "y"}, {"time": "18:30", "skill": ""}],
+                logger=logs.append)
+    assert [e["skill"] for e in s._entries] == ["patrol"]    # 18:30 has no skill
+    assert len(logs) == 3                                    # "bad", "25:00", unpaired "18:30"
+
+
+def test_schedule_blank_entries_are_silently_ignored():
+    logs = []
+    s = Schedule([{"time": "", "skill": ""}], logger=logs.append)
+    assert s._entries == []
+    assert logs == []
+
+
+def test_schedule_due_fires_once_then_waits_for_tomorrow():
+    s = Schedule([{"time": "09:00", "skill": "patrol"}])
+    assert s.due(_lt(8, 59)) is None                # not yet
+    assert s.due(_lt(9, 0)) == "patrol"             # due
+    assert s.due(_lt(9, 5)) is None                 # already fired today
+    assert s.due(_lt(9, 0, yday=192)) == "patrol"   # fires again tomorrow
+
+
+def test_schedule_due_returns_one_entry_per_call():
+    s = Schedule([{"time": "09:00", "skill": "a"}, {"time": "09:01", "skill": "b"}])
+    now = _lt(9, 5)
+    first = s.due(now)
+    second = s.due(now)
+    assert {first, second} == {"a", "b"}      # both eventually due, one per call
+
+
+def test_schedule_to_list_round_trips_normalized():
+    s = Schedule([{"time": "9:5", "skill": "patrol"}])
+    assert s.to_list() == [{"time": "09:05", "skill": "patrol"}]

@@ -68,7 +68,7 @@ from web_control.cognition import (                          # noqa: E402
     CognitionCore, REFLECT_TRAITS, REFLECT_DRIVES, DRIVE_MOODS)
 # The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Pursuit
 # driver), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
-from behavior.brain import Personality, PurposeBrain         # noqa: E402
+from behavior.brain import Personality, PurposeBrain, Schedule  # noqa: E402
 from behavior.presence import merge_beats                    # noqa: E402  (beat table)
 
 WEB_DIR = os.path.join(_ROOT, "src", "web_control", "web")
@@ -915,6 +915,12 @@ def run_behavior(state, idle_secs, reflect_secs):
     auto_on = bool(b.get("reflect_auto_enable", True))   # autonomously drift into reflection mode
     auto_idle = max(0.0, float(b.get("reflect_auto_idle", 1200.0)))
     auto_secs = max(1.0, float(b.get("reflect_auto_secs", 120.0)))
+    # Scheduled routines (parity with mood_node._check_schedule): fire a NAMED skill once a
+    # day at a local HH:MM, independent of the idle-beat cadence. Same schedule.json shape
+    # as the robot (hand-editable here; the web UI's Schedule card is robot-only, like the
+    # rest of /telemetry — see CLAUDE.md's web_control note).
+    schedule = Schedule(read_json(_dev_state("schedule.json"), {}).get("entries", []),
+                        logger=lambda m: print(f"[behavior] {m}", file=sys.stderr))
     clock = SimulatedClock()
     clock.time = 0.0
     interp, _ = build_interpreter(
@@ -955,6 +961,12 @@ def run_behavior(state, idle_secs, reflect_secs):
                 state.brain_reflect({"on": True})
                 auto_until = now + auto_secs
                 interp.queue(Event("reflect"))
+        if not state._brain.reflecting:        # don't interrupt a consolidation
+            due = schedule.due()
+            if due:
+                print(f"[behavior] scheduled routine due — invoking skill '{due}'",
+                      file=sys.stderr)
+                threading.Thread(target=state.invoke_skill, args=(due,), daemon=True).start()
         if (now - last_purpose) > 30.0:        # local Purpose Engine: drift reward weights
             last_purpose = now
             state._brain.run_reflection()

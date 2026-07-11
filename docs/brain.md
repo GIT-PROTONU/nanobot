@@ -325,6 +325,33 @@ Nano knows what time it is, in three small ways (all off by default; enabled by 
    `tempo()` callable (`night_tempo`, default 2.0 = beats half as often inside the window),
    deliberately separate from the LLM-owned traits/drives so evolution is untouched.
 
+## Scheduled routines
+
+Beyond reacting to idleness, Nano can be told to do something specific at a specific time —
+`behavior.brain.Schedule`, a small local-time cron. Entries are `{"time":"09:00",
+"skill":"patrol"}` dicts in `schedule.json` (`schedule_path` in `robot.yaml`, hand-editable
+like `beats.json`/`presence_chart.yaml`) — **or live from the web UI's Schedule card**, which
+edits the same list. Each tick, `mood_node._check_schedule()` asks `Schedule.due()` whether a
+configured HH:MM has passed today and not yet fired; if so it publishes the same
+`/cognition/request` a `skill` beat uses, just naming the skill instead of asking the brain to
+pick one — `web_control._on_cog` sees the `skill` field and calls `invoke_skill(name)` directly
+(the exact path `POST /skills/invoke` uses). A scheduled fire is therefore a **named,
+manual-style invocation**: it always talks, even in quiet hours, and doesn't touch the idle-beat
+cadence or the skill-beat's autonomous picker. Firing is level-triggered (a tick that lands a
+little late, or a node that starts up after the time, still fires it once that day) and is
+**not** persisted across a restart — fine for "greet at the door", not a guarantee for anything
+that must fire exactly once ever.
+
+**Editing it:** the web UI's Schedule card lists the current entries (add/remove HH:MM + skill
+rows) and a Save button POSTs the whole list to the whitelisted `/schedule_edit` topic
+(`POST /publish {topic:"/schedule_edit", value:[...]}` — `telemetry.py` does a light shape
+check). `mood_node._on_schedule_edit` does the real parsing (drops malformed rows, logs why),
+swaps in the new `Schedule` immediately (no restart), persists it to `schedule.json`, and
+re-publishes the normalized result on the latched `/schedule` topic — which rides the existing
+`/telemetry` SSE frame, so every open browser (and a fresh page load) sees exactly what's
+configured, not just what was last typed. The dev harness (`scripts/dev_webui.py`,
+`run_behavior`) runs the identical `Schedule` for parity, minting into `memory/schedule.json`.
+
 ## Model tiers (and the cost caps)
 
 Three tiers in `llm.py`, each **free-first**: every text tier tries one or more **free**

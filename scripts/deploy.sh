@@ -33,7 +33,7 @@ if [ "${DEPLOY_SOUL:-0}" = "1" ]; then
   ssh "$HOST" "mkdir -p $STATE_DIR"
   pushed=0
   for f in personality.json phrases.json workshop.json trait_history.json self_model.json \
-           skill_likes.json presence_chart.yaml beats.json; do
+           skill_likes.json presence_chart.yaml beats.json schedule.json; do
     if [ -f "memory/$f" ]; then
       rsync -az "memory/$f" "$HOST:$STATE_DIR/$f"
       echo "   copied memory/$f"

@@ -60,6 +60,8 @@
         </div>
         <div id="view-cam" class="view">
           <img id="cam" alt="">
+          <div id="visionPickHint" class="overlay-hint" style="display:none">Click the video to pick a target colour…</div>
+          <div id="visionCrosshair" class="vision-crosshair" style="display:none"></div>
         </div>
         <div id="view-oled" class="view">
           <canvas id="oledcv"></canvas>
@@ -100,10 +102,23 @@
             Listen <span id="micState" class="muted"></span></label>
           <div class="meter"><span class="lbl">in</span><span class="bar"><i id="micBar"></i></span><b id="micPct">–</b></div>
           <button id="camShot" class="btn">📸 Snapshot</button>
+          <button id="visionPick" class="btn">🎯 Pick target colour</button>
+          <button id="visionClear" class="btn">✕ Clear target</button>
+          <button id="visionMaskToggle" class="btn">🎭 Show tracking mask</button>
+          <label class="switch" id="visManualRow" style="display:none">
+            <input type="checkbox" id="visManual"><span class="track"></span>
+            🎥 Manual mode (direct feed, no GPU)</label>
           <p class="hint" id="camHint" style="display:none">USB webcam MJPEG (<b>/stream.mjpg</b>)
             and the webcam mic as raw PCM (<b>/audio.pcm</b>). Both stream only while open.
             <b>📸 Snapshot</b> grabs one still (<b>/snapshot.jpg</b>) in a new tab — right-click
-            to save it.</p>
+            to save it. <b>🎯 Pick target colour</b> (GPU vision only) arms click-to-calibrate —
+            click anywhere on the video to track that colour; a crosshair shows the live lock.
+            <b>🎭 Show tracking mask</b> swaps the feed to a black/white view of exactly which
+            pixels match the calibrated colour right now — needs a target colour set first, or
+            it'll show an error. <b>🎥 Manual mode</b> (only shown when GPU vision is on) swaps
+            the feed to the raw hardware MJPEG passthrough — zero CPU/GPU cost, but
+            PIR/blob-tracking/dark-reflex/mask view all pause while it's on (nothing to analyse
+            without the GPU capture running).</p>
         </div>
       </div>
     </section>
@@ -321,6 +336,19 @@
               here. <b>Kill</b> deletes the trial file; <b>Keep</b> adopts it for good.</p>
           </div>
           <div class="card">
+            <h2>📅 Schedule · routines</h2>
+            <p class="hint" id="scheduleStatus">loading…</p>
+            <div id="scheduleList" class="skills"></div>
+            <div class="row">
+              <button id="scheduleAdd" class="btn grow">+ Add routine</button>
+              <button id="scheduleSave" class="btn grow primary">💾 Save</button>
+            </div>
+            <p class="hint">Fires a named <b>skill</b> once a day at a local time — a manual-style
+              invocation (always talks, even in quiet hours), independent of the autonomous
+              skill-beat picker above. <b>Save</b> replaces the whole list, applies immediately
+              (no restart), and persists.</p>
+          </div>
+          <div class="card">
             <h2>🧠 Brain · purpose &amp; learning</h2>
             <p class="hint" id="purposeObjective">objective: …</p>
             <div class="kv" id="rewardBars"></div>
@@ -404,6 +432,73 @@
               UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.</p>
           </div>
           <div class="card">
+            <h2>Camera (GPU vision)</h2>
+            <label class="switch" id="visManualRow2" style="display:none">
+              <input type="checkbox" id="visManual2"><span class="track"></span>
+              🎥 Manual mode (direct feed, no GPU)</label>
+            <div class="kv">
+              <span>motion</span><b id="visMotion2">–</b>
+              <span>motion center</span><b id="visMotionCenter2">–</b>
+              <span>target lock</span><b id="visTarget2">–</b>
+              <span>intercept rate</span><b id="visIntercept2">–</b>
+              <span>brightness</span><b id="visLuma2">–</b>
+              <span>optical bumper</span><b id="visBumper2">–</b>
+              <span>commanded /cmd_vel</span><b id="visBumperCmd2">–</b>
+              <span>stall held for</span><b id="visBumperHeld2">–</b>
+            </div>
+            <label class="switch"><input type="checkbox" id="visDarkAuto"><span class="track"></span>
+              Dark reflex (auto-LED)</label>
+            <div class="field"><label>LED on below <span id="visDarkOnV">15</span>% brightness</label>
+              <input id="visDarkOn" type="range" min="2" max="40" step="1" value="15"></div>
+            <div class="field"><label>LED off above <span id="visDarkOffV">25</span>% brightness</label>
+              <input id="visDarkOff" type="range" min="5" max="60" step="1" value="25"></div>
+            <p class="exp" id="bumperTuneToggle">▸ Optical bumper tuning</p>
+            <div id="bumperTune" style="display:none">
+              <div class="field"><label>Commanded-speed floor <span id="visBumpEpsV">0.03</span> m/s or rad/s</label>
+                <input id="visBumpEps" type="range" min="0.01" max="0.2" step="0.01" value="0.03"></div>
+              <div class="field"><label>Motion floor <span id="visBumpFloorV">1</span>% ("nothing visibly moved")</label>
+                <input id="visBumpFloor" type="range" min="0" max="10" step="0.5" value="1"></div>
+              <div class="field"><label>Confirm time <span id="visBumpSecsV">0.6</span>s</label>
+                <input id="visBumpSecs" type="range" min="0.1" max="3" step="0.1" value="0.6"></div>
+            </div>
+            <p class="exp" id="blobTuneToggle">▸ Blob tracking tuning</p>
+            <div id="blobTune" style="display:none">
+              <div class="field"><label>Colour match tolerance <span id="visBlobThreshV">22</span>%</label>
+                <input id="visBlobThresh" type="range" min="5" max="60" step="1" value="22"></div>
+              <div class="field"><label>Min blob size <span id="visBlobMinV">0</span>% (reject noise)</label>
+                <input id="visBlobMin" type="range" min="0" max="50" step="1" value="0"></div>
+              <div class="field"><label>Max blob size <span id="visBlobMaxV">100</span>% (reject "matched everything")</label>
+                <input id="visBlobMax" type="range" min="1" max="100" step="1" value="100"></div>
+            </div>
+            <p class="hint">Continuous on-GPU frame-diff ("PIR") + optional colour-blob
+              tracking + luminance, computed whether or not the video view is open (all
+              off when <b>gpu_vision_enable</b> is false). <b>Manual mode</b> bypasses the
+              whole GPU pipeline for a raw hardware MJPEG passthrough — zero CPU/GPU cost,
+              but PIR/blob-tracking/dark-reflex/mask view all pause while it's on (same
+              toggle as the one above the Camera view). <b>Motion center</b>/
+              <b>intercept rate</b> are the motion-saliency and kinetic-intercept Tier-B
+              extensions. <b>Optical bumper</b> flags commanded-but-not-moving (possible
+              wheel stall/slip) — it reads "clear" almost all the time simply because
+              the robot isn't currently being driven; <b>commanded /cmd_vel</b> shows
+              exactly what it's seeing so that's visible instead of a single opaque
+              flag. To actually see it trigger: drive the robot from the <b>Drive</b>
+              tab while something blocks a wheel (or just pick it up) — commanded speed
+              stays nonzero, GPU motion stays near zero, and after <b>confirm time</b>
+              the bumper should flag. <b>Blob tracking tuning</b>: <b>colour match
+              tolerance</b> is how close a pixel must be to the calibrated colour to
+              count (higher = more forgiving, catches more shades but more false
+              positives); <b>min/max blob size</b> gate how much of the frame must match
+              to count as a real lock — raise <b>min</b> if a couple of stray pixels are
+              triggering a false lock, lower <b>max</b> if the calibrated colour also
+              matches a big wall/background area (use the <b>🎭 Show tracking mask</b>
+              button to see exactly what's matching before tuning these). Picking a new
+              target colour resets all three to their defaults. Otherwise, all vision
+              readouts are informational only, nothing yet acts on them autonomously.
+              <b>Dark reflex</b> is the one exception: opt-in, auto-toggles the ESP32's
+              <b>/led</b> from brightness with hysteresis (on/off thresholds must stay
+              apart to avoid flicker).</p>
+          </div>
+          <div class="card">
             <h2>Cooling fan</h2>
             <div class="kv">
               <span>output</span><b id="fanDuty">–</b>
@@ -471,11 +566,14 @@
               lost-robot recovery (wide scan-match + spin); <b>Pause SLAM when picked up</b>
               freezes mapping while both wheels are off the ground. All apply live, no
               restart.</p>
+            <label class="switch"><input type="checkbox" id="navLdsIdleEnable" checked><span class="track"></span>
+              LDS idle spin-down</label>
             <div class="field"><label>LDS idle spin-down <span id="navLdsIdleV">60</span>s</label>
               <input id="navLdsIdle" type="range" min="0" max="300" step="10" value="60"></div>
             <p class="hint">Parks the lidar spin motor after this long with no motion/goal/
               exploring (0 = never spin down). Wakes instantly on a new goal, exploring,
-              teleop motion, pickup, or relocalizing.</p>
+              teleop motion, pickup, or relocalizing. Untick to disable the whole behaviour
+              and keep the lidar always spinning, regardless of the timeout below.</p>
           </div>
         </section>
 

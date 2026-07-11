@@ -7,7 +7,7 @@ Mirrors src/behavior/test: pure logic, no rclpy, no network.
 import os
 import textwrap
 
-from web_control.skills import (Skill, SkillLibrary, parse_skill_text,
+from web_control.skills import (SkillLibrary, parse_skill_text,
                                  resolve_skills_dir, _slug)
 
 

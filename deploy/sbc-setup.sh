@@ -18,7 +18,7 @@ set -euo pipefail
 USER_NAME="${SUDO_USER:-ibster}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-echo "== 1/4  Device-tree overlays (I2C0/1/2, UART1=ESP32 link, UART2=LDS scan, ALL USB hosts, analog audio) =="
+echo "== 1/6  Device-tree overlays (I2C0/1/2, UART1=ESP32 link, UART2=LDS scan, ALL USB hosts, analog audio) =="
 ENV=/boot/armbianEnv.txt
 # usbhost0..3 = all four H5 host controllers (USB-A + header ports). The OTG/micro-
 # USB port (usb@1c19000) is already dr_mode=host in the base DT. Enabling every host
@@ -86,22 +86,43 @@ else
 fi
 grep '^user_overlays=' "$ENV"
 
-echo "== 2/4  udev: non-root I2C access + port-independent USB device names =="
+echo "== 2/6  udev: non-root I2C access + port-independent USB device names =="
 install -m 0644 "$HERE/udev/90-i2c.rules" /etc/udev/rules.d/90-i2c.rules
 install -m 0644 "$HERE/udev/95-nano-usb.rules" /etc/udev/rules.d/95-nano-usb.rules
 udevadm control --reload-rules || true
 udevadm trigger --subsystem-match=i2c-dev || true
 udevadm trigger --subsystem-match=tty --subsystem-match=video4linux --subsystem-match=usb || true
 
-echo "== 3/4  groups: $USER_NAME in dialout (serial+i2c), video (webcam), audio (mic) =="
-usermod -aG dialout,video,audio "$USER_NAME"
+echo "== 3/6  groups: $USER_NAME in dialout (serial+i2c), video (webcam), audio (mic), render (GPU) =="
+usermod -aG dialout,video,audio,render "$USER_NAME"
 
-echo "== 4/5  sudoers: passwordless poweroff/reboot + nano-robot.target start/stop/restart =="
+echo "== 4/6  sudoers: passwordless poweroff/reboot + nano-robot.target start/stop/restart =="
 install -m 0440 "$HERE/sudoers/nano-power" /etc/sudoers.d/nano-power
 [ "$USER_NAME" = ibster ] || sed -i "s/^ibster /$USER_NAME /" /etc/sudoers.d/nano-power
 visudo -cf /etc/sudoers.d/nano-power
 
-echo "== 5/5  systemd: per-process units under nano-robot.target (Restart=on-failure) =="
+echo "== 5/6  GPU: lima (Mali-450) kernel module + Mesa/EGL/GBM userspace =="
+# Backs the GPU-vision feature (color-blob tracking + PIR motion trigger + Tier-B
+# extensions — see memory `gpu-vision-implemented`), gated OFF by default
+# (gpu_vision_enable: false in robot.yaml), so this step just makes /dev/dri/renderD128
+# + EGL/GLES2 available; it changes nothing about the running stack by itself.
+# CONFIG_DRM_LIMA is a module, not built-in, and doesn't auto-load on this Armbian
+# image — verified 2026-07-11 (fresh board had it absent).
+grep -q '^lima$' /etc/modules-load.d/lima.conf 2>/dev/null || echo lima > /etc/modules-load.d/lima.conf
+modprobe lima || true    # also load it now, so a reboot isn't required to use this setup
+# ^ NOTE: the modules-load.d line above has proven UNRELIABLE across a real reboot —
+# systemd-modules-load.service runs too early, before whatever the Mali GPU platform
+# device depends on is ready, so `lima` can silently fail to bind even with this file
+# correctly in place (confirmed on hardware 2026-07-11, see memory
+# `lima-boot-load-bug`). The real fix is a belt-and-suspenders retry right before
+# app_hub starts (`ExecStartPre=-/usr/sbin/modprobe lima` in
+# `deploy/systemd/nano-app.service`, installed by step 6/6 below) — kept here too since
+# it's cheap and harmless, but don't rely on this line alone.
+# mesa-libgallium (the actual lima driver blob) comes in as a transitive dep of these —
+# apt-get install is itself idempotent, no need to guard it.
+apt-get install -y --no-install-recommends libegl1 libgles2 libgbm1 libgl1-mesa-dri
+
+echo "== 6/6  systemd: per-process units under nano-robot.target (Restart=on-failure) =="
 # One unit per stack process (router/app/sensors/nav/map), grouped by nano-robot.target.
 # systemd's own Restart=on-failure replaced the old nano-heal.timer polling (and its
 # heal-vs-restart duplicate-node race); scripts/stack.sh is now a systemctl wrapper.

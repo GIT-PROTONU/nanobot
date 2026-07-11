@@ -11,6 +11,21 @@ PartOf=nano-robot.target
 Type=notify
 WatchdogSec=90
 User=ibster
+# GPU vision (gpu_vision.py) needs the `lima` kernel module. /etc/modules-load.d/lima.conf
+# (see deploy/sbc-setup.sh) is supposed to load it at boot but has proven unreliable —
+# systemd-modules-load.service runs very early, before whatever the Mali GPU platform
+# device depends on is ready, so `lima` can silently fail to bind even though the conf
+# file is correct (confirmed on hardware 2026-07-11 — see memory lima-boot-load-bug).
+# Retry it here, right before app_hub actually needs it: by the time nano-app starts
+# (After=nano-router.service, itself gated on the router actually listening) far more
+# of the system has settled than at early-boot modules-load time. `-` = non-fatal if it
+# fails; gpu_vision.py already degrades gracefully (falls back, now loudly logs a
+# warning) rather than crashing if the GPU truly isn't available. `+` = run this ONE
+# command as root regardless of the unit's User=ibster below -- loading a kernel module
+# needs CAP_SYS_MODULE, which ibster doesn't have; confirmed on hardware 2026-07-11
+# that omitting `+` fails with "modprobe: ERROR: could not insert 'lima': Operation not
+# permitted" (silently, since `-` swallows the failure) -- don't drop this prefix.
+ExecStartPre=-+/usr/sbin/modprobe lima
 ExecStart=/home/ibster/Nano/scripts/unit_exec.sh app
 # SIGTERM lets the OLED draw its restart/shutdown end-screen before exiting.
 TimeoutStopSec=15

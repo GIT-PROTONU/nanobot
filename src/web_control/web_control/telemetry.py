@@ -32,13 +32,21 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int64MultiArray, String
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path
 from diagnostic_msgs.msg import DiagnosticArray
 
 SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the last client
+# Optical virtual bumper (GPU vision Tier-B extension): commanded-to-move but the GPU's
+# frame-diff score stays under a floor for a confirm window -> likely a wheel stall/slip
+# (expected optical flow from ego-motion isn't happening). Informational only for now --
+# nothing yet acts on this, it's surfaced in /telemetry + the web UI. Its three
+# thresholds are live web_control PARAMS now (vision_bumper_cmd_eps/motion_floor/
+# confirm_secs, declared in web_server.py, live-tunable via the Sensors panel), not
+# fixed constants -- see _optical_bumper below.
 PLAN_MAX_PTS = 64        # planned-path polyline is downsampled to at most this many points
 LDS_RPM_MAX = 400.0      # clamp on the /lds_target_rpm setpoint a browser may publish
+SCHEDULE_MAX_ENTRIES = 20  # cap on the scheduled-routines list a browser may set
 STALE = -1e9
 
 # ---- POST /param whitelist: node -> settable parameter names -------------------
@@ -48,8 +56,10 @@ PARAM_WHITELIST = {
     "wheel_odometry": {"publish_rate"},
     "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
                  "robot_radius", "stuck_timeout", "relocalize", "pickup_pause",
-                 "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm"},
+                 "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm"},
     "sys_monitor": {"fan_override", "fan_temp_min"},
+    "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
+                    "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs"},
 }
 
 
@@ -81,8 +91,10 @@ class TelemetryHub:
         self._lds = {}                # rpm / hz / duty
         self._fan = None
         self._selftest = ""
-        self._purpose = self._task = self._experiments = ""   # latched JSON strings
+        self._purpose = self._task = self._experiments = self._schedule = ""  # latched JSON
         self._oled = {"face": "", "word": "", "brand": "", "system": ""}
+        self._cmd_vel = (0.0, 0.0)     # (linear.x, angular.z), for the optical bumper
+        self._low_motion_since = None  # monotonic ts the stall condition started, or None
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._latched_qos = latched
@@ -101,6 +113,10 @@ class TelemetryHub:
             "/oled_text": (pub(String, "oled_text", 5), self._mk_text),
             "/oled_dashboard": (pub(Bool, "oled_dashboard", 5), self._mk_bool),
             "/oled_show_words": (pub(Bool, "oled_show_words", 5), self._mk_bool),
+            # Scheduled routines: replace the whole schedule (mood_node validates/parses the
+            # HH:MM + skill entries, persists them, and echoes the normalized result back on
+            # the latched /schedule topic below — see behavior.brain.Schedule).
+            "/schedule_edit": (pub(String, "schedule_edit", 5), self._mk_schedule),
         }
         # --- POST /param: one SetParameters client per whitelisted node --------
         self._param_clients = {
@@ -146,6 +162,34 @@ class TelemetryHub:
             self._frame = frame
             self._cond.notify_all()
 
+    def _optical_bumper(self, now, motion_score):
+        """Optical virtual bumper (GPU vision Tier-B): commanded to move, but the GPU's
+        frame-diff score has stayed under the noise floor for `vision_bumper_confirm_secs`
+        -> likely a wheel stall/slip, since ego-motion should otherwise produce visible
+        optical flow. Purely informational -- nothing acts on this yet, it's surfaced in
+        /telemetry + the web UI only. Reads its three thresholds LIVE from web_control's
+        params (not fixed constants) so the web UI's sliders actually take effect --
+        same pattern as _dark_reflex_tick's vision_dark_* params. Returns a dict (not
+        just the alert bool) so the UI can show WHY it's clear -- "always clear" usually
+        just means "not currently commanded to move," not that the reflex is broken;
+        without visibility into the commanded /cmd_vel there was no way to tell the two
+        apart, which is the whole reason this got richer."""
+        g = self._node.get_parameter
+        cmd_eps = g("vision_bumper_cmd_eps").value
+        motion_floor = g("vision_bumper_motion_floor").value
+        confirm_secs = g("vision_bumper_confirm_secs").value
+        lin, ang = self._cmd_vel
+        commanded = abs(lin) > cmd_eps or abs(ang) > cmd_eps
+        if not commanded or motion_score >= motion_floor:
+            self._low_motion_since = None
+            return {"alert": False, "commanded": commanded,
+                    "cmd_vel": [round(lin, 3), round(ang, 3)], "low_motion_secs": 0.0}
+        if self._low_motion_since is None:
+            self._low_motion_since = now
+        held = now - self._low_motion_since
+        return {"alert": held >= confirm_secs, "commanded": commanded,
+                "cmd_vel": [round(lin, 3), round(ang, 3)], "low_motion_secs": round(held, 2)}
+
     def _build(self):
         n = self._node
         now = time.monotonic()
@@ -185,9 +229,37 @@ class TelemetryHub:
             f["fan"] = self._fan
         if self._selftest:
             f["selftest"] = self._selftest
+        gv = getattr(n, "_gpu_vision", None)
+        manual = bool(getattr(n, "_manual_mode", False))
+        if gv is not None:
+            # Plain thread-safe Python properties, not a ROS topic -- no subscription
+            # needed, just read on each tick (gpu_vision.py runs continuously regardless
+            # of telemetry clients, so this is never stale) -- UNLESS manual mode has
+            # stopped GpuVision's capture thread entirely (see WebServerNode.
+            # vision_manual), in which case these properties are frozen at their last
+            # value before the stop, not live. Still report them (harmless, and lets the
+            # UI show "last known" state) but the `manual` flag lets the page grey them
+            # out / label them stale instead of implying they're updating.
+            target = gv.target
+            motion_center = gv.motion_center
+            motion_score = gv.motion_score
+            bumper = ({"alert": False, "commanded": False, "cmd_vel": [0.0, 0.0], "low_motion_secs": 0.0}
+                      if manual else self._optical_bumper(now, motion_score))
+            blob_threshold, blob_min, blob_max = gv.blob_tuning
+            f["vision"] = {
+                "manual": manual,
+                "motion": round(motion_score, 3),
+                "motion_center": [round(v, 3) for v in motion_center] if motion_center else None,
+                "target": [round(v, 3) for v in target] if target else None,
+                "has_target_color": gv.has_target_color,
+                "blob_tuning": [round(blob_threshold, 3), round(blob_min, 3), round(blob_max, 3)],
+                "intercept_rate": round(gv.intercept_rate, 3),
+                "luma": round(gv.luma, 3),
+                "bumper": bumper,
+            }
         # latched brain readouts, passed through as the raw JSON strings the page parses
         for k, v in (("purpose", self._purpose), ("task", self._task),
-                     ("experiments", self._experiments)):
+                     ("experiments", self._experiments), ("schedule", self._schedule)):
             if v:
                 f[k] = v
         return f
@@ -208,6 +280,7 @@ class TelemetryHub:
         s(sub(Float32, "lds_duty", self._mk_lds("duty"), 2))
         s(sub(Float32, "fan_pwm", self._on_fan, 2))
         s(sub(String, "selftest_result", self._on_selftest, 2))
+        s(sub(Twist, "cmd_vel", self._on_cmd_vel, 5))   # optical virtual bumper correlation
         # OLED mirror inputs (the page renders a client-side copy of the panel)
         s(sub(String, "oled_face", self._mk_oled("face"), 5))
         s(sub(String, "oled_word", self._mk_oled("word"), 5))
@@ -217,6 +290,7 @@ class TelemetryHub:
         s(sub(String, "purpose", self._mk_str("_purpose"), self._latched_qos))
         s(sub(String, "task_current", self._mk_str("_task"), self._latched_qos))
         s(sub(String, "experiments", self._mk_str("_experiments"), self._latched_qos))
+        s(sub(String, "schedule", self._mk_str("_schedule"), self._latched_qos))
         self._node.get_logger().info("telemetry: browser connected — subscriptions up")
 
     def _drop_subs(self):
@@ -272,6 +346,9 @@ class TelemetryHub:
 
     def _on_selftest(self, msg):
         self._selftest = msg.data
+
+    def _on_cmd_vel(self, msg):
+        self._cmd_vel = (msg.linear.x, msg.angular.z)
 
     def _mk_oled(self, key):
         def cb(msg):
@@ -331,6 +408,21 @@ class TelemetryHub:
     @staticmethod
     def _mk_text(v):
         return String(data=str(v or "")[:32])
+
+    @staticmethod
+    def _mk_schedule(v):
+        """Light shape-check only — the real HH:MM/skill-name parsing (and dropping
+        malformed entries) is mood_node's Schedule, which echoes the normalized result
+        back on the latched /schedule topic."""
+        if not isinstance(v, list) or len(v) > SCHEDULE_MAX_ENTRIES:
+            raise ValueError(f"expected a list of at most {SCHEDULE_MAX_ENTRIES} entries")
+        entries = []
+        for e in v:
+            if not isinstance(e, dict):
+                raise ValueError("each entry must be an object")
+            entries.append({"time": str(e.get("time") or "")[:8],
+                            "skill": str(e.get("skill") or "")[:64]})
+        return String(data=json.dumps(entries))
 
     # ---- POST /param --------------------------------------------------------------
     def set_param_json(self, data):

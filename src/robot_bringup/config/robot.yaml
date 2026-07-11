@@ -126,6 +126,7 @@ slam_nav:
     # --- LDS idle spin-down: park the spin motor (power/wear/noise) once there's no
     #     reason to expect fresh scans soon -- stationary, no goal, not exploring, not
     #     picked up/relocalizing. Wakes instantly the moment any of those change. ---
+    lds_idle_enable: true          # master on/off for the spin-down behaviour. Live-tunable.
     lds_idle_timeout: 60.0         # s of no motion/goal/exploring before spin-down; 0 = off.
                                    # Live-tunable.
     lds_idle_rpm: 0.0              # target rpm while parked (0 = fully stop). Live-tunable.
@@ -318,6 +319,13 @@ behavior:
     purpose_path: ""            # "" = ~/.local/state/nanobot/purpose.json
     experiments_path: ""        # "" = ~/.local/state/nanobot/experiments.json
     cognition_log_path: ""      # shared decision log (read-only); "" = ~/.local/state/nanobot/cognition.log
+    # --- scheduled routines: fire a named skill once a day at a local HH:MM ---
+    # Hand-editable, like beats_path/chart_path: [{"time":"09:00","skill":"patrol"}, ...] in
+    # schedule.json, live-editable from the web UI's Schedule card (no restart needed — an
+    # edit replaces the in-memory schedule + persists immediately). A scheduled fire is a
+    # NAMED invocation (like POST /skills/invoke), not the autonomous picker, and always
+    # talks even in quiet hours (same as any manually invoked skill).
+    schedule_path: ""           # "" = ~/.local/state/nanobot/schedule.json
 
 # ---- Web control (static page + SSE telemetry gateway; no rosbridge) --------
 web_control:
@@ -338,6 +346,31 @@ web_control:
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"
+    # GPU vision (Mali-450/GLES2 via lima, gpu_vision.py): continuous on-device motion
+    # detection ("PIR") + colour-blob tracking, off the camera feed. OFF by default —
+    # when off, /stream.mjpg + /snapshot.jpg use the original hardware-MJPEG passthrough
+    # (mjpeg_camera.py) exactly as before, zero behavior change. When on, GpuVision
+    # becomes the sole continuous camera owner (raw YUYV, zero-copy DMA-buf import) and
+    # the browser view is served from its JPEG tee instead — see memory
+    # gpu-vision-camera-architecture for the full design + why (the C270 only exposes
+    # one true capture-capable V4L2 node, so the two can't both open it independently).
+    # Requires `sudo modprobe lima` + the Mesa/EGL/GBM apt packages, both handled by
+    # deploy/sbc-setup.sh; if the GPU userspace is missing this logs one line and the
+    # camera falls back to being unavailable rather than crashing the node.
+    gpu_vision_enable: false
+    # Flashlight/dark reflex (GPU vision Tier-B extension): auto-toggles /led from the
+    # GPU's average frame luminance, with hysteresis. OFF by default and independent of
+    # skills_allow_actions -- gpu_vision_enable alone never moves the LED on its own.
+    # Live-tunable from the web UI's Sensors > Camera card (see PARAM_WHITELIST).
+    vision_dark_reflex_enable: false
+    vision_dark_threshold: 0.15   # luma below this -> LED on
+    vision_dark_recover: 0.25     # luma above this -> LED off (must stay > threshold)
+    # Optical virtual bumper (GPU vision Tier-B extension): commanded to move but the
+    # GPU's motion score stays under motion_floor for confirm_secs -> likely a wheel
+    # stall/slip. Informational only. Live-tunable from the same Sensors > Camera card.
+    vision_bumper_cmd_eps: 0.03        # m/s or rad/s floor to count as "commanded to move"
+    vision_bumper_motion_floor: 0.01   # gpu motion score below this = "nothing visibly moved"
+    vision_bumper_confirm_secs: 0.6    # s the stall condition must hold before alerting
     # Stress test mode (web "Stress test" card, POST /stress/start|stop): niced (lowest
     # priority) CPU busy-loop worker subprocesses that peg every core without starving
     # this web server (see web_control/stress.py). Auto-stops regardless of the caller.

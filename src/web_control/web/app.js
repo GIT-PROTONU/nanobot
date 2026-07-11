@@ -53,6 +53,7 @@ $("navStuck").oninput=()=>$("navStuckV").textContent=Number($("navStuck").value)
 $("navStuck").onchange=()=>setParam("slam_nav","stuck_timeout",Number($("navStuck").value));
 $("navRelocalize").onchange=e=>setParam("slam_nav","relocalize",e.target.checked);
 $("navPickupPause").onchange=e=>setParam("slam_nav","pickup_pause",e.target.checked);
+$("navLdsIdleEnable").onchange=e=>setParam("slam_nav","lds_idle_enable",e.target.checked);
 $("navLdsIdle").oninput=()=>$("navLdsIdleV").textContent=Number($("navLdsIdle").value)===0?"off":$("navLdsIdle").value;
 $("navLdsIdle").onchange=()=>setParam("slam_nav","lds_idle_timeout",Number($("navLdsIdle").value));
 // LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
@@ -87,13 +88,23 @@ function syncLdsTgt(){ publishLdsTgt(); }
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
 // server). Toggling off drops the connection so the camera stops (ref-counted).
+// visionMaskOn swaps which endpoint is used -- the normal feed, or the GPU vision
+// tracking-mask debug view (/stream_mask.mjpg, see gpu_vision.py's mask viewer).
+let visionMaskOn=false;
+function camStreamUrl(){ return (visionMaskOn?"/stream_mask.mjpg":"/stream.mjpg")+"?t="+Date.now(); }
 $("camOn").addEventListener("change",e=>{
   const img=$("cam"), hint=$("camHint");
-  if(e.target.checked){ img.src="/stream.mjpg?t="+Date.now();
+  if(e.target.checked){ img.src=camStreamUrl();
     img.style.display="block"; hint.style.display="block"; }
   else { img.removeAttribute("src"); img.style.display="none"; hint.style.display="none"; }
 });
 $("cam").onerror=()=>{ if($("camOn").checked) $("cam").style.background="#3d1418"; };
+$("visionMaskToggle").onclick=()=>{
+  visionMaskOn=!visionMaskOn;
+  $("visionMaskToggle").textContent=visionMaskOn?"🎥 Show normal feed":"🎭 Show tracking mask";
+  $("visionMaskToggle").classList.toggle("primary",visionMaskOn);
+  if($("camOn").checked){ $("cam").style.background=""; $("cam").src=camStreamUrl(); }
+};
 
 // Webcam mic: stream raw S16LE PCM from /audio.pcm and play it via the Web Audio
 // API. We schedule small AudioBuffers on a short jitter buffer (~180 ms) for low
@@ -219,6 +230,33 @@ stressPoll();
 // so this works with the live stream off). Cache-busted so each click is a new grab.
 $("camShot").onclick=()=>window.open("/snapshot.jpg?t="+Date.now(),"_blank");
 
+// GPU vision click-to-calibrate: arm, then the next click on the video samples that
+// pixel's colour client-side (canvas) and POSTs it -- see onCamPickClick above.
+$("visionPick").onclick=()=>visionPickArmed?disarmVisionPick():armVisionPick();
+$("visionClear").onclick=()=>{
+  disarmVisionPick();
+  fetch("/vision/calibrate",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({clear:true})}).catch(()=>{});
+  resetBlobTuneUI();   // clearing also resets tuning server-side, same as a fresh pick
+};
+$("cam").addEventListener("click",onCamPickClick);
+
+// Manual mode: direct hardware-MJPEG passthrough, bypassing GPU vision entirely
+// (zero CPU/GPU cost, but pauses PIR/blob-tracking/dark-reflex -- see WebServerNode.
+// vision_manual). Two checkboxes drive the same server state -- one over the Camera
+// view, one on the Sensors "Camera (GPU vision)" card, so the pipeline can be killed
+// without switching views. Both are synced FROM telemetry (see onVision), so these
+// handlers only fire on a genuine user click, not the programmatic sync; each also
+// mirrors its own state onto the other checkbox immediately, instead of waiting for
+// the next telemetry tick to catch up.
+function setVisManual(enabled){
+  $("visManual").checked=enabled; $("visManual2").checked=enabled;
+  fetch("/vision/manual",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({enabled})}).catch(()=>{});
+}
+$("visManual").onchange=()=>setVisManual($("visManual").checked);
+$("visManual2").onchange=()=>setVisManual($("visManual2").checked);
+
 // Health events: poll sys_monitor's durable outage log only while the box is open
 // (each poll is an HTTP round-trip to the board — no point when nobody's looking).
 (function(){
@@ -282,7 +320,7 @@ function setConn(ok){
 }
 
 // ---- telemetry frame fan-out: one frame updates every readout ----------------
-let rawPurpose="", rawTask="", rawExp="", rawSelftest="";
+let rawPurpose="", rawTask="", rawExp="", rawSelftest="", rawSchedule="";
 function onFrame(f){
   if(f.odom) onOdom(f.odom);
   if(f.imu) onImu(f.imu);
@@ -292,6 +330,7 @@ function onFrame(f){
   onLds(f.lds||{});
   if(f.fan!==undefined) $("fanDuty").textContent=(f.fan*100).toFixed(0)+"%";
   if(f.plan) mapPlan=f.plan;
+  onVision(f.vision);
   if(f.selftest && f.selftest!==rawSelftest){ rawSelftest=f.selftest;
     const el=$("mapTestOut"); el.style.display="block"; el.textContent=f.selftest; }
   // Brain readouts arrive as the same latched JSON strings the behaviour node
@@ -299,11 +338,179 @@ function onFrame(f){
   if(f.purpose && f.purpose!==rawPurpose){ rawPurpose=f.purpose; renderPurpose(f.purpose); }
   if(f.task && f.task!==rawTask){ rawTask=f.task; renderTask(f.task); }
   if(f.experiments && f.experiments!==rawExp){ rawExp=f.experiments; renderExperiments(f.experiments); }
+  if(f.schedule && f.schedule!==rawSchedule){ rawSchedule=f.schedule; onScheduleFrame(f.schedule); }
   // OLED mirror: feed the client-side panel copy the same inputs the physical
   // panel renders from. (Dashboard/words toggles are page-owned — sendDash/sendWords.)
   const o=f.oled||{};
   OLED.setFace(o.face||""); OLED.setWord(o.word||""); OLED.setBrand(o.brand||"");
   if(o.system) OLED.setSystem(o.system);
+}
+
+// GPU vision (gpu_vision.py): absent from the frame entirely when gpu_vision_enable
+// is off, so the Sensors card just shows "off" -- no behavior change otherwise. Runs
+// continuously server-side regardless of whether the Camera tab is open, so this
+// readout works even with the video view never opened. The status numbers live in the
+// Sensors panel only (no on-video badge, per user preference) -- the crosshair is kept
+// on the video itself since it's a spatial indicator, not a text label.
+let visManualSynced=false, blobTuneSynced=false;
+function onVision(v){
+  const manualRow=$("visManualRow"), manualRow2=$("visManualRow2"), cross=$("visionCrosshair");
+  const ids=["visMotion2","visMotionCenter2","visTarget2","visIntercept2","visLuma2","visBumper2"];
+  if(!v){
+    if(manualRow) manualRow.style.display="none";   // no GpuVision instance at all -- nothing to toggle
+    if(manualRow2) manualRow2.style.display="none";
+    if(cross) cross.style.display="none";
+    ids.forEach(id=>{ const el=$(id); if(el) el.textContent="off"; });
+    return;
+  }
+  // The manual-mode rows only make sense when a GpuVision instance exists to switch
+  // away from/back to (gpu_vision_enable was true at startup) -- shown regardless of
+  // whether manual mode is currently on, so the operator can toggle it either way.
+  if(manualRow) manualRow.style.display="flex";
+  if(manualRow2) manualRow2.style.display="flex";
+  if(!visManualSynced){    // reflect server state once, without fighting the user's own clicks
+    $("visManual").checked=!!v.manual; $("visManual2").checked=!!v.manual; visManualSynced=true;
+  }
+  // Sync the blob-tuning sliders to whatever's ACTUALLY active once (e.g. a target was
+  // already calibrated from a previous session, or another browser tab) -- after that,
+  // resetBlobTuneUI() on a fresh pick/clear keeps them in sync without fighting drags.
+  if(!blobTuneSynced && v.has_target_color && v.blob_tuning){
+    const [th,mn,mx]=v.blob_tuning;
+    $("visBlobThresh").value=Math.round(th*100); $("visBlobThreshV").textContent=Math.round(th*100);
+    $("visBlobMin").value=Math.round(mn*100); $("visBlobMinV").textContent=Math.round(mn*100);
+    $("visBlobMax").value=Math.round(mx*100); $("visBlobMaxV").textContent=Math.round(mx*100);
+    blobTuneSynced=true;
+  }
+  const paused=!!v.manual;
+  [$("visionPick"),$("visionClear")].forEach(b=>{ if(b) b.disabled=paused; });
+  // A reported target has already passed the server's min/max blob-size gate (see
+  // GpuVision._loop / the "Blob tracking tuning" sliders) -- that IS the lock condition
+  // now, so there's no separate confidence floor here to fight the tuning sliders.
+  const locked=!paused && !!v.target;
+  const set=(id,txt)=>{ const el=$(id); if(el){ el.textContent=txt; el.style.opacity=paused?0.5:1; } };
+  set("visMotion2", paused?"paused (manual mode)":(v.motion*100).toFixed(1)+"%");
+  set("visMotionCenter2", paused?"–":(v.motion_center
+    ? `${(v.motion_center[0]*100).toFixed(0)}%,${(v.motion_center[1]*100).toFixed(0)}%` : "none"));
+  set("visTarget2", paused?"–":(v.target ? "locked "+(v.target[2]*100).toFixed(0)+"%"
+                              : (v.has_target_color ? "searching" : "no target set")));
+  set("visIntercept2", paused?"–":(v.target ? (v.intercept_rate*100).toFixed(0)+"%/s" : "–"));
+  set("visLuma2", paused?"–":(v.luma*100).toFixed(0)+"%");
+  const bump=v.bumper||{alert:false,commanded:false,cmd_vel:[0,0],low_motion_secs:0};
+  const bEl=$("visBumper2");
+  if(bEl){ bEl.textContent=paused?"–":(bump.alert?"⚠ possible stall":"clear");
+    bEl.style.color=(!paused && bump.alert)?"var(--red)":""; bEl.style.opacity=paused?0.5:1; }
+  set("visBumperCmd2", paused?"–":(bump.commanded
+    ? `lin ${bump.cmd_vel[0].toFixed(2)} ang ${bump.cmd_vel[1].toFixed(2)}` : "not driving"));
+  set("visBumperHeld2", paused?"–":(bump.commanded ? bump.low_motion_secs.toFixed(1)+"s" : "–"));
+  if(cross){
+    const r=locked && camDisplayRect();
+    if(r){
+      cross.style.left=(r.left+v.target[0]*r.width)+"px";
+      cross.style.top=(r.top+v.target[1]*r.height)+"px";
+      cross.style.display="block";
+    } else cross.style.display="none";
+  }
+}
+
+// Dark reflex config -> web_control params (see PARAM_WHITELIST in telemetry.py).
+// UI sliders are 0-100%, the backend stores 0..1 luma fractions.
+function syncDarkReflex(){
+  let on=Number($("visDarkOn").value), off=Number($("visDarkOff").value);
+  if(off<=on){ off=Math.min(100,on+5); $("visDarkOff").value=off; }
+  $("visDarkOnV").textContent=on; $("visDarkOffV").textContent=off;
+  setParam("web_control","vision_dark_threshold",on/100);
+  setParam("web_control","vision_dark_recover",off/100);
+}
+$("visDarkAuto").onchange=()=>setParam("web_control","vision_dark_reflex_enable",$("visDarkAuto").checked);
+
+$("bumperTuneToggle").onclick=()=>{
+  const box=$("bumperTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("bumperTuneToggle").textContent=(open?"▾":"▸")+" Optical bumper tuning";
+};
+// Optical bumper thresholds -> web_control params. cmd_eps/confirm_secs are already in
+// the backend's native units (m/s-or-rad/s, seconds); motion_floor is a 0-100% slider
+// over the backend's 0..1 gpu motion-score fraction, same conversion idiom as dark reflex.
+$("visBumpEps").oninput=()=>$("visBumpEpsV").textContent=$("visBumpEps").value;
+$("visBumpEps").onchange=()=>setParam("web_control","vision_bumper_cmd_eps",Number($("visBumpEps").value));
+$("visBumpFloor").oninput=()=>$("visBumpFloorV").textContent=$("visBumpFloor").value;
+$("visBumpFloor").onchange=()=>setParam("web_control","vision_bumper_motion_floor",Number($("visBumpFloor").value)/100);
+$("visBumpSecs").oninput=()=>$("visBumpSecsV").textContent=$("visBumpSecs").value;
+$("visBumpSecs").onchange=()=>setParam("web_control","vision_bumper_confirm_secs",Number($("visBumpSecs").value));
+
+$("blobTuneToggle").onclick=()=>{
+  const box=$("blobTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("blobTuneToggle").textContent=(open?"▾":"▸")+" Blob tracking tuning";
+};
+// Blob tuning -> POST /vision/blob_tune (NOT a ROS param -- this lives inside
+// gpu_vision.py's own state, adjusted via a dedicated action endpoint, same reasoning
+// as /vision/calibrate). All three sliders are 0-100% over the backend's 0..1 fractions.
+function blobTune(body){
+  fetch("/vision/blob_tune",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)}).catch(()=>{});
+}
+$("visBlobThresh").oninput=()=>$("visBlobThreshV").textContent=$("visBlobThresh").value;
+$("visBlobThresh").onchange=()=>blobTune({threshold:Number($("visBlobThresh").value)/100});
+$("visBlobMin").oninput=()=>$("visBlobMinV").textContent=$("visBlobMin").value;
+$("visBlobMin").onchange=()=>blobTune({min_confidence:Number($("visBlobMin").value)/100});
+$("visBlobMax").oninput=()=>$("visBlobMaxV").textContent=$("visBlobMax").value;
+$("visBlobMax").onchange=()=>blobTune({max_confidence:Number($("visBlobMax").value)/100});
+$("visDarkOn").oninput=()=>$("visDarkOnV").textContent=$("visDarkOn").value;
+$("visDarkOff").oninput=()=>$("visDarkOffV").textContent=$("visDarkOff").value;
+$("visDarkOn").onchange=syncDarkReflex;
+$("visDarkOff").onchange=syncDarkReflex;
+
+// Maps the displayed <img>'s rendered rect (accounting for object-fit:contain
+// letterboxing) in coordinates relative to #cam itself -- shared by the crosshair
+// overlay and the click-to-calibrate colour picker below.
+function camDisplayRect(){
+  const img=$("cam");
+  const iw=img.naturalWidth||640, ih=img.naturalHeight||480;
+  const cw=img.clientWidth, ch=img.clientHeight;
+  if(!iw||!ih||!cw||!ch) return null;
+  const scale=Math.min(cw/iw, ch/ih);
+  const dw=iw*scale, dh=ih*scale;
+  return {left:(cw-dw)/2, top:(ch-dh)/2, width:dw, height:dh, iw, ih};
+}
+
+let visionPickArmed=false;
+function armVisionPick(){
+  visionPickArmed=true;
+  $("cam").classList.add("pick-armed");
+  $("visionPickHint").style.display="block";
+}
+function disarmVisionPick(){
+  visionPickArmed=false;
+  $("cam").classList.remove("pick-armed");
+  $("visionPickHint").style.display="none";
+}
+function onCamPickClick(e){
+  if(!visionPickArmed) return;
+  const r=camDisplayRect();
+  if(!r){ disarmVisionPick(); return; }
+  const px=e.offsetX-r.left, py=e.offsetY-r.top;
+  if(px<0||py<0||px>=r.width||py>=r.height) return;    // clicked the letterbox margin
+  const nx=Math.min(r.iw-1, Math.max(0, Math.floor(px/r.width*r.iw)));
+  const ny=Math.min(r.ih-1, Math.max(0, Math.floor(py/r.height*r.ih)));
+  const cv=document.createElement("canvas");
+  cv.width=r.iw; cv.height=r.ih;
+  let data;
+  try{
+    const ctx=cv.getContext("2d");
+    ctx.drawImage($("cam"), 0, 0, r.iw, r.ih);
+    data=ctx.getImageData(nx, ny, 1, 1).data;
+  }catch(err){ disarmVisionPick(); return; }
+  fetch("/vision/calibrate",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({r:data[0]/255, g:data[1]/255, b:data[2]/255, threshold:0.22})})
+    .catch(()=>{});
+  resetBlobTuneUI();   // server resets threshold/min/max on every fresh colour pick -- match it
+  disarmVisionPick();
+}
+function resetBlobTuneUI(){
+  $("visBlobThresh").value=22; $("visBlobThreshV").textContent=22;
+  $("visBlobMin").value=0; $("visBlobMinV").textContent=0;
+  $("visBlobMax").value=100; $("visBlobMaxV").textContent=100;
 }
 
 // ---- ESP32 coprocessor handlers ----
@@ -586,6 +793,7 @@ function fmtSkill(s){
     +` shift-click to take one back.">👍 ${likes}</button>`
     +`<button class="btn skinvoke" data-name="${s.name}">Run</button></div>`;
 }
+let skillNames=[];   // populated by loadSkills(); used to build the Schedule card's skill picker
 function loadSkills(){
   const box=$("skillsList"), st=$("skillsStatus"); if(!box||!st) return;
   fetch("/skills").then(r=>r.ok?r.json():null).then(d=>{
@@ -597,6 +805,8 @@ function loadSkills(){
     box.innerHTML=sk.length?sk.map(fmtSkill).join(""):"<i>no skills found — add a .md to skills/</i>";
     box.querySelectorAll(".skinvoke").forEach(b=>b.onclick=()=>invokeSkill(b.dataset.name));
     box.querySelectorAll(".sklike").forEach(b=>b.onclick=e=>likeSkill(b.dataset.name,e.shiftKey?-1:1));
+    skillNames=sk.map(s=>s.name);
+    renderSchedule();   // refresh the skill <select> options now that names are known
   }).catch(()=>{ st.textContent="offline"; });
 }
 // Like (👍) a skill so the brain performs it more often — repeatable (each click +1), shift-click
@@ -663,6 +873,43 @@ function workshopAct(act,name){
     .catch(()=>{ if(st) st.textContent="network error"; });
 }
 loadWorkshop();
+
+// ---- Schedule · routines ---- fires a NAMED skill once a day at a local HH:MM (a manual-
+// style invocation, unlike the autonomous skill-beat picker above). The behaviour node
+// echoes the normalized list on the latched /schedule topic (see onFrame); editing here
+// replaces the whole list via the whitelisted /schedule_edit topic (see telemetry.py).
+let scheduleEntries=[];   // the editable working copy: [{time,skill}]
+function renderSchedule(){
+  const box=$("scheduleList"); if(!box) return;
+  if(!scheduleEntries.length){ box.innerHTML="<i>no routines — Add one</i>"; return; }
+  const opts=n=>(skillNames.length?skillNames:[n]).map(s=>
+    `<option value="${s}"${s===n?" selected":""}>${s||"(no skills loaded)"}</option>`).join("");
+  box.innerHTML=scheduleEntries.map((e,i)=>
+    `<div class="row" data-i="${i}">`
+    +`<input type="time" class="schTime" value="${e.time||""}">`
+    +`<select class="schSkill grow">${opts(e.skill)}</select>`
+    +`<button class="btn danger schDel" data-i="${i}">✕</button></div>`).join("");
+  box.querySelectorAll(".schTime").forEach(el=>el.onchange=e=>{
+    scheduleEntries[+e.target.closest("[data-i]").dataset.i].time=e.target.value; });
+  box.querySelectorAll(".schSkill").forEach(el=>el.onchange=e=>{
+    scheduleEntries[+e.target.closest("[data-i]").dataset.i].skill=e.target.value; });
+  box.querySelectorAll(".schDel").forEach(b=>b.onclick=()=>{
+    scheduleEntries.splice(+b.dataset.i,1); renderSchedule(); });
+}
+function onScheduleFrame(raw){
+  try{ scheduleEntries=(JSON.parse(raw)||[]).map(e=>({time:e.time||"",skill:e.skill||""})); }
+  catch(e){ scheduleEntries=[]; }
+  const st=$("scheduleStatus");
+  if(st) st.textContent=scheduleEntries.length
+    ?`${scheduleEntries.length} routine${scheduleEntries.length===1?"":"s"}`:"no routines configured";
+  renderSchedule();
+}
+if($("scheduleAdd")) $("scheduleAdd").onclick=()=>{
+  scheduleEntries.push({time:"09:00",skill:skillNames[0]||""}); renderSchedule(); };
+if($("scheduleSave")) $("scheduleSave").onclick=()=>{
+  pub("/schedule_edit", scheduleEntries.filter(e=>e.time&&e.skill));
+  const st=$("scheduleStatus"); if(st) st.textContent="saved";
+};
 
 // ---- Brain · purpose & learning ---- the Purpose Engine (goals + intrinsic reward) and
 // the Horizon Planner's A/B bandit live in the behaviour node and publish latched JSON on

@@ -42,7 +42,8 @@ from std_msgs.msg import Bool, String, Int8
 from geometry_msgs.msg import Twist, PoseStamped
 
 from .presence import build_interpreter, clamp01, merge_beats
-from .brain import PurposeBrain, Personality, _state_path, load_json
+from .brain import (PurposeBrain, Personality, Schedule, _state_path, load_json,
+                    save_json)
 
 # Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
 # Import defensively so a board that hasn't run `pixi install` yet still boots the
@@ -113,6 +114,11 @@ class MoodNode(Node):
             # The shared decision log written by web_control — the Purpose Engine's
             # experience input (read-only here). Same default path as web_server.
             ("cognition_log_path", ""),     # "" -> ~/.local/state/nanobot/cognition.log
+            # --- scheduled routines: fire a named skill once a day at a local HH:MM ---
+            # Hand-editable, like beats_path/chart_path: a list of {"time","skill"} entries
+            # in schedule.json, editable via the web UI's Schedule card (POST /publish
+            # topic=/schedule_edit) or by hand. See skills/*.md for the names available.
+            ("schedule_path", ""),          # "" -> ~/.local/state/nanobot/schedule.json
         ])
         g = self.get_parameter
         self.enable = bool(g("enable").value)
@@ -134,6 +140,9 @@ class MoodNode(Node):
         self._quiet_start = float(g("quiet_start").value)
         self._quiet_end = float(g("quiet_end").value)
         self._night_tempo = max(1.0, float(g("night_tempo").value))
+        self._schedule_path = _state_path(g("schedule_path").value, "schedule.json")
+        _sched_data = load_json(self._schedule_path, logger=self.get_logger().warning) or {}
+        self._schedule = Schedule(_sched_data.get("entries", []), logger=self.get_logger().warning)
 
         # --- signals updated by callbacks, read by the tick ---
         self._susp_l = False
@@ -169,6 +178,11 @@ class MoodNode(Node):
         self.purpose_pub = self.create_publisher(String, "purpose", latched)
         self.task_pub = self.create_publisher(String, "task_current", latched)
         self.experiments_pub = self.create_publisher(String, "experiments", latched)
+        # Scheduled routines: the normalized (validated) list, so the web UI's editor and
+        # /telemetry always reflect what will actually fire, not raw unvalidated input.
+        self.schedule_pub = self.create_publisher(String, "schedule", latched)
+        self._publish_schedule()
+        self.create_subscription(String, "schedule_edit", self._on_schedule_edit, 10)
         # Dedicated OLED signal for reflection mode (NOT a mood — it's a sustained
         # background-processing state, not a quick reactive expression, so it gets its
         # own screen in oled_display rather than borrowing a face). Latched so a late
@@ -483,6 +497,44 @@ class MoodNode(Node):
             self._auto_reflect_deadline = now + self._reflect_auto_secs
             self.get_logger().info("idle a while — entering reflection mode on my own")
 
+    # --- scheduled routines ---------------------------------------------------
+    def _publish_schedule(self):
+        """Latch the current (normalized) schedule on /schedule — the web UI's Schedule card
+        reads it from /telemetry, so this is how a page load or a fresh browser sees what's
+        actually configured, not just what was last POSTed."""
+        self.schedule_pub.publish(String(data=json.dumps(self._schedule.to_list())))
+
+    def _on_schedule_edit(self, msg: String):
+        """Replace the whole schedule from the web UI's editor (telemetry.py validates the
+        shape; we validate/parse the HH:MM + skill names for real). Persisted to schedule.json
+        so it survives a restart, and re-latched so every viewer sees the normalized result —
+        malformed rows the editor sent get silently dropped, same as a hand-edited file."""
+        try:
+            entries = json.loads(msg.data)
+        except Exception:
+            return
+        if not isinstance(entries, list):
+            return
+        self._schedule = Schedule(entries, logger=self.get_logger().warning)
+        save_json(self._schedule_path, {"entries": self._schedule.to_list()},
+                  logger=self.get_logger().warning)
+        self._publish_schedule()
+        self.get_logger().info(f"schedule updated — {len(self._schedule.to_list())} entr"
+                               f"{'y' if len(self._schedule.to_list()) == 1 else 'ies'}")
+
+    def _check_schedule(self):
+        """Fire a due scheduled skill by name, the same fire-and-forget /cognition/request path
+        as the autonomous skill beat — but naming the skill instead of asking the brain to pick
+        one, and independent of the idle-beat chooser/cadence (a schedule fires on the clock,
+        not on idleness)."""
+        skill = self._schedule.due()
+        if skill is None:
+            return
+        req = {"beat": "skill", "state": "scheduled", "skill": skill, "prompt": "",
+               "camera": False, "audio": False, "traits": self._personality.live_traits()}
+        self.cog_pub.publish(String(data=json.dumps(req)))
+        self.get_logger().info(f"scheduled routine due — invoking skill '{skill}'")
+
     # --- the periodic statechart step ----------------------------------------
     def _tick(self):
         now = time.monotonic()
@@ -498,6 +550,8 @@ class MoodNode(Node):
 
         try:
             self._auto_reflect(now, stand)                 # maybe enter/exit a self-started reflection
+            if not self._brain.reflecting:                 # don't interrupt a consolidation
+                self._check_schedule()
             # Reflection is a deliberate, sticky mode (only `wake` leaves it), so we skip the
             # normal stand-down/resume arbitration while consolidating.
             dormant = "dormant" in self._interp.configuration

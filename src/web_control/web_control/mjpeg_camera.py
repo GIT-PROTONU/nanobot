@@ -101,6 +101,8 @@ _BUF_TYPE = 1          # V4L2_BUF_TYPE_VIDEO_CAPTURE
 _MEMORY_MMAP = 1
 _FIELD_NONE = 1
 _MJPG = _fourcc(b'MJPG')
+FOURCC_MJPG = _MJPG
+FOURCC_YUYV = _fourcc(b'YUYV')          # public: gpu_vision.py requests this format
 
 
 def find_camera():
@@ -123,20 +125,24 @@ def find_camera():
 
 
 class MjpegCamera:
-    """Low-level V4L2 MMAP MJPEG capture. Call read() for the next JPEG frame."""
+    """Low-level V4L2 MMAP capture. Call read() for the next frame's raw bytes.
+    Despite the name, `fourcc` lets a caller request any format the camera supports
+    (e.g. raw YUYV for the GPU vision path in gpu_vision.py) — defaults to MJPG so
+    every existing caller (the browser stream) is unaffected."""
 
-    def __init__(self, dev, width=640, height=480, fps=15, nbufs=4):
+    def __init__(self, dev, width=640, height=480, fps=15, nbufs=4, fourcc=_MJPG):
         self.fd = os.open(dev, os.O_RDWR)
         self._streaming = False
         self.maps = []
         try:
             f = _Format(type=_BUF_TYPE)
             f.pix.width, f.pix.height = width, height
-            f.pix.pixelformat, f.pix.field = _MJPG, _FIELD_NONE
+            f.pix.pixelformat, f.pix.field = fourcc, _FIELD_NONE
             fcntl.ioctl(self.fd, _S_FMT, f)
-            if f.pix.pixelformat != _MJPG:
-                raise OSError("camera did not accept MJPG")
+            if f.pix.pixelformat != fourcc:
+                raise OSError(f"camera did not accept requested format {fourcc!r}")
             self.width, self.height = f.pix.width, f.pix.height
+            self.bytesperline = f.pix.bytesperline
             # best-effort frame-rate cap (lower CPU/bandwidth); ignore if unsupported
             try:
                 sp = _StreamParm(type=_BUF_TYPE)
