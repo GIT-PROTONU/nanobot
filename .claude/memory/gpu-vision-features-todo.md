@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-features-todo
-description: Two planned GPU (Mali-450/GLES2) vision features — blob-tracking bearing and "PIR" motion trigger — preferred capture is raw YUYV + DMA-buf zero-copy, not JPEG decode
+description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); this file now also holds an unbuilt "cheap-tier" brainstorm (white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation) plus rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project
@@ -99,3 +99,68 @@ under mains-frequency lighting is well documented) but should be narrowed if eve
 detected → lock exposure/frame-rate to de-band the live view," not the original brainstorm's
 "detect industrial space" framing, which overreaches what a bare flicker-frequency signal
 supports.
+
+## Cheap-tier brainstorm, 2026-07-12 (post-commit a881ddc/7060bde, nothing built yet)
+
+Prompted by "what new functions would be cheap" — these all reuse the reduction-pass plumbing
+(shader → `build_downsample_chain`/`run_downsample_chain` → tiny `glReadPixels`) that already
+exists and costs ~1.9ms/pass measured on hardware, or cost literally **zero** extra GPU time by
+combining signals `_loop()` already computes. Not yet approved/scoped — brainstorm only, same
+status as the rest of this file until a user picks one to build.
+
+**Reuses an existing pass (near-zero marginal GPU cost):**
+- **Auto white-balance / colour-cast drift signal.** `_LUMA_FS` already reads
+  `texture2D(tex,uv).rgb` before collapsing to one grayscale scalar via the luminance dot
+  product — summing R/G/B separately instead (same packing trick `_DIFF_FS`/`_THRESHOLD_FS`
+  already use: 3 values in one RGBA readout) gives an average-scene-colour signal for free off
+  the pass that already runs unconditionally every frame. Use: detect when ambient light has
+  shifted (evening incandescent vs. daytime) and auto-nudge blob-tracking's calibrated colour
+  threshold, instead of a stale calibration silently degrading through the day.
+- **Camera-obstruction / lens-covered flag.** Also off the always-on luma pass: near-zero
+  variance (needs one more cheap stat, see "dynamic range" below) combined with very-dark or
+  very-uniform average luma = "something is covering or has fogged the lens" (a hand, dust, the
+  robot wedged face-first into something). Pure CPU threshold logic on numbers already being
+  computed — zero new shader.
+- **Second / named colour target.** Directly the open design question already on record above
+  ("single target vs. a named list"). Running the threshold+reduce pass twice (or packing two
+  hues into separate RGBA channels of one pass) is ~another 1.9ms — still trivial against the
+  ~66ms frame budget. GPU cost is basically free; the real cost is the same as always, the UI/
+  skill work to let something *name and pick* a target ("track the ball" vs. "track the dock
+  marker").
+
+**New shader, still cheap (one more reduction-chain instance):**
+- **Visual "interest"/edge-density scalar.** A Sobel-ish (or even a cheap 4-tap gradient)
+  fragment shader reduced the same way as PIR, giving "how much texture/contrast is in frame"
+  as a static complement to PIR's "how much just *changed*." Use: let the `looking` beat also
+  fire on "camera is pointed at something visually busy" (a cluttered shelf, a person standing
+  still) not just on motion — PIR alone misses a stationary subject entirely.
+- **Dynamic range / backlit detector.** The downsample chain's `_COPY_FS` passthrough relies on
+  `GL_LINEAR` box-filter averaging for free box-blur; swapping in a MAX-blend variant for one
+  chain (GLES2 doesn't do this via blend state the way desktop GL might, but a tiny fragment
+  shader that samples the 4 texels a `GL_NEAREST` upstream stage would've blurred and takes
+  their `max()` gets the same effect) gives frame max-luma; combined with the existing average
+  from `_LUMA_FS`, `max - avg` is a crude "how backlit/blown-out is this scene" signal — the
+  plain dark reflex (average brightness only) can't distinguish "dim room" from "bright window
+  behind a dark subject," which matters because dark-reflex's LED response is the wrong fix for
+  the second case (more light won't help a silhouette).
+
+**Zero GPU cost — pure CPU correlation of signals already computed:**
+- **Motion-matches-target correlation.** `motion_center` (PIR's weighted centroid) and `target`
+  (the colour-blob centroid) are both already read every tick in `_loop()` — comparing their
+  (x,y) distance costs nothing. Answers "is the thing that's moving actually my tracked ball,
+  or is something else moving elsewhere in frame" — meaningfully sharper than either signal
+  alone, and the intercept-rate/bumper logic could both benefit from knowing this.
+- **Camera-freeze / stuck-capture diagnostic.** The PIR diff score already goes near-zero when
+  nothing changes; correlating that against *commanded* `/cmd_vel` (already read for the
+  optical bumper) the same way the bumper does, but framed as "the whole picture should be
+  sliding past while driving, and it isn't" — a `mjpeg_camera`/V4L2-level hang (camera USB
+  wedge, not a wheel stall) would look identical to the optical bumper's existing check but
+  means something different downstream (recover the camera, not flag a stall). Might just be a
+  second interpretation of the same number rather than a genuinely separate feature — worth
+  deciding if it needs its own signal or just a second consumer of the existing one.
+
+**Not cheap, listed for contrast (don't build under a "cheap" ask):** the AC-hum flicker
+analyzer above needs multi-frame temporal analysis (not a single reduction pass), and per-target
+shape/circularity discrimination (see the earlier answer in this session) needs a real
+downscaled-mask readback (KBs, not bytes) — both are real, previously-considered ideas but a
+different cost tier than everything in this section.
