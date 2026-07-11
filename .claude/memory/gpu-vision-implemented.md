@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions) BUILT and fully hardware-verified 2026-07-11, incl. CPU/RAM numbers; lima boot-load bug found AND fixed same day (see lima-boot-load-bug)"
+description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions + manual/direct mode) BUILT and fully hardware-verified 2026-07-11, incl. CPU/RAM numbers; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
 metadata: 
   node_type: memory
   type: project
@@ -233,3 +233,86 @@ colour calibrated (cleared). Committed git default remains `gpu_vision_enable: f
 
 Nothing in this session has been committed to git — only memory writes, per the user's standing
 preference. All code (original core + this session's Tier-B extensions) sits in the working tree.
+
+## Manual mode (2026-07-11, same day, third follow-up session)
+
+**Built**: a live, no-restart toggle to bypass GPU vision entirely and get the original
+zero-CPU/GPU hardware-MJPEG passthrough back on demand. `POST /vision/manual {enabled: bool}`
+(`WebServerNode.vision_manual`) + a "🎥 Manual mode" switch in the web UI's Camera tab.
+
+**Architecture**: `WebServerNode` now ALWAYS constructs `self._cam_direct` (a `CameraStream`,
+cheap/idle until viewed, same as before GPU vision existed) regardless of `gpu_vision_enable`.
+`self._cam` became a `@property`: returns `self._cam_direct` when `self._gpu_vision is None` OR
+`self._manual_mode` is true, else `self._gpu_vision`. Every existing consumer
+(`_capture_frame`/`snapshot()`, and `_Handler._stream_mjpeg` after being changed to resolve
+`self._node._cam` instead of a construction-time-bound `self._stream`) needed zero further
+changes — both backends already share the same `add_viewer`/`get_frame`/`remove_viewer`/
+`running` shape. `_stream_mjpeg` pins the backend ONCE per streaming session (at connection
+start) rather than re-resolving per call, so a mid-stream toggle affects only the NEXT
+connection, not an already-open one — avoids split-brain viewer-count accounting between two
+different backend objects. `vision_manual(True)` calls `self._gpu_vision.stop()` (releases the
+V4L2 device) before flipping the flag; `vision_manual(False)` flips the flag then calls `.start()`
+(reacquires + resumes PIR/blob/luma/dark-reflex). `telemetry.py`'s `vision.manual` field lets the
+UI show frozen/stale readouts correctly instead of implying they're still live while paused.
+
+**Testing this surfaced THREE real bugs, all found and fixed the same session** (this is turning
+into a pattern for this codebase's GPU work — build it, then find what breaks under an actual
+stop/start cycle, not just "does it work once"):
+
+1. **`GpuVision.stop()` never freed the EGL context's ~70MB.** Toggling manual mode dropped CPU
+   back to true baseline (confirmed: 70%→50%, exactly matching the "GPU off" baseline) but RSS
+   barely moved (~3MB of a possible ~74MB). Root cause: `eglDestroyContext`/`eglTerminate` were
+   never called — letting the Python wrapper object get garbage-collected does nothing, ctypes
+   has no idea those are cleanup functions. Fixed: `GLContext.close()` now does the full EGL
+   teardown sequence, called from all three `_loop()` exit paths (normal stop, capture-read-error,
+   and the two early camera-open-failure returns).
+2. **Repeated toggling leaked ~3-4MB per cycle even after fix #1**, confirmed via 5 back-to-back
+   toggle cycles (155.8→159.8→163.7→166.6→169.3→171.4MB, not plateauing). `eglDestroyContext`
+   alone is *supposed* to implicitly free every GL object per spec, but isn't fully honored by
+   `lima` (a reverse-engineered driver — consistent with the earlier `GL_LUMINANCE_ALPHA` bug
+   found the same day). Two further fixes stacked:
+   - Explicit `glDeleteTextures`/`glDeleteFramebuffers`/`glDeleteProgram`/`glDeleteShader` for
+     every GL object, tracked automatically via `GLContext`-level lists appended to inside
+     `make_texture`/`make_fbo`/`compile_shader`/`program` — this alone cut the per-cycle growth
+     from ~3-4MB to ~1MB (a ~75% reduction) but didn't fully eliminate it.
+   - **The bigger single fix**: `JpegEncoder` called `tjInitCompress()` fresh every `_loop()` run
+     but never `tjDestroy()` — a genuine leak in project code, not the driver. A fresh
+     `JpegEncoder` is created every GpuVision restart (manual-mode toggle), so each cycle leaked
+     one compressor's internal buffers/tables forever. Fixed: `JpegEncoder.close()` added,
+     called from `_loop()`'s cleanup alongside `cam.close()`/`gl.close()`.
+   - Net result: per-cycle growth reduced from ~3-4MB to ~1MB residual (likely the remaining
+     driver-level imperfection in `lima`, not something fixable from the Python side without
+     patching Mesa). At that rate, ~300+ toggles would be needed to threaten the 450MB budget —
+     acceptable for the interactive/occasional use manual mode is designed for, NOT
+     safe for high-frequency automated toggling in a tight loop.
+3. **A real race condition, causing intermittent `503`s on `/snapshot.jpg` after switching manual
+   mode off**: `vision_manual(False)` calls `self._gpu_vision.start()` immediately, but
+   `self._cam_direct` (`CameraStream`) releases the V4L2 device ASYNCHRONOUSLY in its own
+   background thread (`remove_viewer()` just sets a flag; the actual `close()` happens once that
+   thread notices) — confirmed on hardware via the exact log line
+   `gpu_vision: camera open (YUYV) failed: [Errno 16] Device or resource busy`. Worse, the
+   failure path didn't reset `self._run`, so `GpuVision.running()` kept lying "True" forever after
+   the thread had actually died — `_capture_frame()`'s frame-wait loop had no way to detect the
+   dead thread and just timed out every single call, producing the 503. Fixed: (a) the camera-open
+   step now retries up to 6 times with a 0.3s backoff (the busy condition is transient, clearing
+   once the other backend's thread catches up), aborting early if `stop()` is called mid-retry;
+   (b) EVERY early-return failure path in `_loop()` now explicitly sets `self._run = False` so
+   `running()` is accurate. Verified fixed via the exact failing sequence repeated 3x (all `200`)
+   plus a more aggressive rapid-toggle-with-concurrent-snapshot test (4x, all `200`, no busy/retry
+   even needed that time — but the retry logic is now a permanent safety net for when the race
+   does occur, which is real and reproducible, just timing-dependent).
+
+**Verified working end-to-end**: manual-on gives a valid, correctly-oriented direct-passthrough
+JPEG (visually confirmed) at a different size/quality than the GPU-tee path (15-42KB vs ~38-42KB,
+different encoder settings — cosmetic, not a bug); `/stream.mjpg` streams correctly in both modes;
+CPU cost of GPU vision processing is fully eliminated while manual (confirmed back to the true
+"off" baseline); telemetry's `manual` flag correctly reflects state and the readouts freeze
+rather than silently going stale-but-labeled-live; resuming reliably restores fresh, live
+(non-frozen) motion/luma readings.
+
+One elevated-CPU false alarm during testing, resolved by verification rather than more code
+changes: a sustained 120% CPU reading that didn't settle during a "quiet" test window turned out
+to be three genuinely active browser connections on port 8080 (confirmed via `ss -tn`) — i.e. a
+real person/browser watching the live feed the whole time, matching the ALREADY-documented
+"idle 70% + streaming 50% = 120%" cost from the original CPU/RAM test matrix. Not a bug; a good
+reminder to check for real concurrent viewers before chasing a phantom regression.
