@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions + manual/direct mode + tunable optical bumper) BUILT and fully hardware-verified 2026-07-11; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
+description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + tracking-mask debug view) BUILT and fully hardware-verified 2026-07-11; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
 metadata: 
   node_type: memory
   type: project
@@ -355,3 +355,43 @@ robot.yaml change requires re-flipping it back to `true` afterward (`sed -i` + r
 demo state is meant to persist. Consider: either don't touch the committed default's value casually
 between sessions, or remember this step is now a standing part of "deploy robot.yaml + verify
 gpu vision still shows `renderer=Mali450` in the log" for this robot specifically.
+
+## Tracking-mask debug view (2026-07-11, same day, fifth follow-up)
+
+**Built**: a "🎭 Show tracking mask" button in the Camera tab that swaps the video feed to a
+live black/white view of exactly which pixels currently match the calibrated blob-tracking
+colour — the same kind of visualization used earlier this session to debug the threshold shader
+itself (`gpu_vision_mask.png`), now a permanent, on-demand feature instead of a one-off test
+script. Click again ("🎥 Show normal feed") to swap back.
+
+**Architecture**: mirrors the existing JPEG-tee design exactly, as a fully parallel second
+pipeline rather than complicating the first: `GpuVision` gained `_mask_viewers`/`_mask_jpeg`/
+`_mask_jpeg_seq`/`_mask_jpeg_cond` (same shape as the normal `_viewers`/`_jpeg`/...) +
+`add_mask_viewer`/`remove_mask_viewer`/`get_mask_frame` (same shape as `add_viewer`/
+`remove_viewer`/`get_frame`). A new `_MASK_VIEW_FS` shader (reads just the R channel of
+`thresh_tex` — the existing threshold pass's 0/1 hit value, ignoring G/B which encode centroid
+math for the tracker itself, not for display — and replicates it to grayscale) combined with the
+already-existing `_FLIP_VS` (same mirror-correction as the normal live view) renders into a new
+`mask_flip_fbo`, read back into a new pre-allocated `mask_flip_buf`, and JPEG-encoded via the
+SAME `jpeg_enc` instance as the main tee (two sequential encode calls per tick when both are
+active — safe, since everything in `_loop()` is single-threaded, no concurrency between them).
+Only computed when `_mask_viewers > 0` AND a target colour is set (mirrors `want_jpeg`'s
+viewer-gating) — zero cost when the mask view isn't open, same idle-cost philosophy as
+everything else in this module.
+
+New route `GET /stream_mask.mjpg` (`WebServerNode._Handler._stream_mask_mjpeg`, mirrors
+`_stream_mjpeg`) fails fast with a clear `503` reason — "gpu vision not active" or "no target
+colour set" — instead of hanging forever waiting for a mask frame that will never be computed;
+needed a new `GpuVision.has_target_color` property to distinguish "no colour calibrated at all"
+from "`target` is None because nothing currently matches," which look identical from `target`
+alone. The web UI's `#cam` `<img>` just points at a different URL depending on a `visionMaskOn`
+JS flag (`camStreamUrl()` picks `/stream.mjpg` or `/stream_mask.mjpg`); the existing `camOn`
+show/hide toggle, viewer ref-counting, and error styling all work unchanged since it's the same
+`<img>` element just pointed elsewhere.
+
+**Verified working end-to-end on hardware**, including a spatial correctness check: calibrated a
+light blue-grey colour, pulled a mask frame and a contemporaneous normal snapshot, and confirmed
+the mask's white region lines up exactly with the light wall visible in the real scene (matching
+the earlier session's manual debug-script validation, now proven through the real HTTP
+endpoints/UI path instead of a one-off script). Also confirmed the fail-fast 503 fires correctly
+with no target colour set, avoiding an indefinitely-hanging stream.
