@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + tracking-mask debug view) BUILT and fully hardware-verified 2026-07-11; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
+description: "GPU vision (PIR + blob-tracking + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + tracking-mask debug view) BUILT and fully hardware-verified 2026-07-11; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
 metadata: 
   node_type: memory
   type: project
@@ -395,3 +395,40 @@ the mask's white region lines up exactly with the light wall visible in the real
 the earlier session's manual debug-script validation, now proven through the real HTTP
 endpoints/UI path instead of a one-off script). Also confirmed the fail-fast 503 fires correctly
 with no target colour set, avoiding an indefinitely-hanging stream.
+
+## Blob-tracking tuning (2026-07-11, same day, sixth follow-up)
+
+**Built**: three live-tunable knobs for the colour-blob tracker, adjustable WITHOUT re-picking
+the target colour — colour-match tolerance (the existing `_target_thresh`, now exposed instead of
+fixed at calibration time) plus new min/max blob-size gating (`_blob_min_confidence`/
+`_blob_max_confidence`, fractions of the frame that must match for `target` to be reported at
+all — min rejects noise/speckle, max rejects "the whole frame matched" false locks).
+
+**Architecture**: `GpuVision.set_blob_tuning(threshold=, min_confidence=, max_confidence=)` +
+`blob_tuning` property (reads `(threshold, min, max)` under the existing lock) — same idiom as
+`set_target_color`/`target`. Gating is applied in `_loop()` right where `target` is computed:
+`confidence` (matched-fraction) is checked against `[blob_min, blob_max]` before `target` is set,
+else `target = None` — same semantics as "nothing currently matches," reusing the existing
+`has_target_color` vs `target` distinction (mask view / UI still know tracking is *armed* even
+while gated out). Deliberately, `confidence` itself is computed ungated and still feeds the
+kinetic-intercept ring buffer regardless of min/max — so intercept-rate trend tracking doesn't
+blink on/off at the gate boundary. New `POST /vision/blob_tune {threshold?, min_confidence?,
+max_confidence?}` (`WebServerNode.vision_blob_tune`) — all three fields optional/independent,
+server clamps each to sane ranges and forces `max >= min`. `set_target_color()` resets tuning to
+`(existing threshold, 0.0, 1.0)` (no filtering) on every fresh colour pick, specifically so a new
+calibration is never silently invisible because of a leftover min/max from tuning a *previous*
+target.
+
+**UI**: collapsible "▸ Blob tracking tuning" section in the Sensors card (3 sliders: tolerance
+5-60%, min size 0-50%, max size 1-100%), synced once from telemetry's new `blob_tuning` array the
+first time a target colour is present (`blobTuneSynced` flag, mirrors the manual-mode sync
+pattern) so the sliders reflect server state rather than always resetting to their HTML defaults.
+Reset to defaults explicitly on every fresh colour pick/clear (`resetBlobTuneUI()`), matching the
+server-side reset. `telemetry.py`'s `vision` key gained `blob_tuning: [threshold, min, max]`.
+
+**Verified live end-to-end**: calibrated a target (confidence settled at ~4.9% of frame), then
+`min_confidence=0.5` correctly filtered `target` to `null` (4.9% < 50%) while `blob_tuning`
+telemetry still reflected the updated value — confirmed the gate suppresses reporting without
+disabling tracking. Symmetrically, `max_confidence=0.01` also correctly filtered to `null`
+(4.9% > 1%), confirming both directions of the range gate work. Reset to clean defaults
+(`threshold=0.22, min=0.0, max=1.0`, target cleared) after testing.
