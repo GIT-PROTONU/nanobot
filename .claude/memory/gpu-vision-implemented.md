@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + tracking-mask debug view) BUILT and fully hardware-verified 2026-07-11; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed"
 metadata: 
   node_type: memory
   type: project
@@ -13,8 +13,25 @@ GPU vision pipeline was **built and verified working end-to-end on the live robo
 [[gpu-vision-camera-architecture]]. Not a prototype/spike — this is the real feature module,
 wired into `web_server.py`, gated by `gpu_vision_enable` (default `false`).
 
-**What was built** (all in the working tree, NOT committed to git — code commits need explicit
-ask per the user's standing git preference; only this memory write is committed):
+**Committed 2026-07-12 (commit a881ddc, pushed to main)** — the user explicitly asked for
+commit+push after confirming the crosshair fix, largest-blob tracking, and a duplicated
+manual-mode toggle all worked live. Fixed same session: `TARGET_LOCK_MIN` (a hardcoded 8%
+frontend confidence floor, disconnected from the blob-size tuning sliders) was removed —
+"locked"/crosshair now just follow whether the backend reported a target at all, since that
+already passed the tuned min/max gate; a real ball settles around ~4.9% confidence, well under
+the old 8% floor, so the crosshair/lock had never actually been reachable for a normal target.
+Also added connected-component "largest blob" selection (`largest_blob_sums` in
+`gpu_vision.py`) so multiple matching regions no longer blend into one wrong averaged centroid.
+**Gotcha hit during this session**: a full `scripts/deploy.sh` (no package filter) rsyncs
+`robot_bringup/config/robot.yaml` verbatim, silently reverting any hand-edit made directly on
+the board (like the live `gpu_vision_enable: true` test flip) back to the repo's committed
+`false` default — this happened mid-session and looked like "the manual-mode button vanished"
+until traced to `gv is None` on the board. No code fix applied (deploy.sh's behavior is
+unchanged); just re-flip `gpu_vision_enable` on the board after any full deploy, or use
+`scripts/deploy.sh web_control` (package-scoped) to avoid rsyncing robot.yaml at all.
+
+**What was built** (originally in the working tree pre-commit — code commits need explicit
+ask per the user's standing git preference; now committed, see above):
 - `src/web_control/web_control/gpu_vision.py` (new) — the full module: headless EGL/GLES2
   context (raw ctypes, no `moderngl` needed — same zero-dependency philosophy as
   `mjpeg_camera.py`), continuous YUYV capture via `mjpeg_camera.MjpegCamera(fourcc=YUYV)`,
