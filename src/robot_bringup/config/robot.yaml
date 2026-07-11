@@ -357,7 +357,7 @@ web_control:
     # Requires `sudo modprobe lima` + the Mesa/EGL/GBM apt packages, both handled by
     # deploy/sbc-setup.sh; if the GPU userspace is missing this logs one line and the
     # camera falls back to being unavailable rather than crashing the node.
-    gpu_vision_enable: false
+    gpu_vision_enable: true
     # Flashlight/dark reflex (GPU vision Tier-B extension): auto-toggles /led from the
     # GPU's average frame luminance, with hysteresis. OFF by default and independent of
     # skills_allow_actions -- gpu_vision_enable alone never moves the LED on its own.
