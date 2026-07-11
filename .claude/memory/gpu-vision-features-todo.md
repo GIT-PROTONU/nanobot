@@ -29,7 +29,7 @@ User approved 2026-07-10 (session `0511c092`): two vision features to build usin
 **PREFERRED capture design (decided 2026-07-10, supersedes plain-JPEG-decode as the default plan):** capture the camera as **raw YUYV at 640×480/30fps** (not MJPEG) for the vision path — bandwidth math checks out (640×480 YUYV @30fps ≈ 18.4 MB/s / ~147 Mbps, comfortably inside USB 2.0's ~280-320 Mbps real throughput; 720p YUYV would NOT fit, hence MJPEG is used at that resolution today). No JPEG anywhere in this path, so **no CPU decode step at all** — the shader does the trivial YUV→RGB conversion itself. Go further with **zero-copy DMA-buf import**: export the V4L2 YUYV capture buffer (`VIDIOC_EXPBUF`) and import it directly into a GLES texture via `EGL_EXT_image_dma_buf_import` + `GL_OES_EGL_image_external` (`samplerExternalOES` in GLSL) — camera driver to GPU texture with **zero CPU copy**, not just zero decode.
 
 **Both former open items are now RESOLVED (2026-07-11, on real hardware — see `gpu-vision-phase0-verified`):**
-1. **Concurrent MJPG+YUYV: confirmed NOT possible** — the C270 exposes exactly one true capture-capable V4L2 node (`/dev/video2`; `/dev/video3` is metadata-only, verified via a live ioctl probe). Design decision made: extend `CameraStream` (in `mjpeg_camera.py`) to arbitrate — a new vision-viewer gets exclusive YUYV access only when the browser's MJPG viewer count is 0; vision pauses while a human has the live view open (rare/short window) and resumes when they close it. Not still open — this is the answer.
+1. **Concurrent MJPG+YUYV: confirmed NOT possible as two independent V4L2 sessions** — the C270 exposes exactly one true capture-capable V4L2 node (`/dev/video2`; `/dev/video3` is metadata-only, verified via a live ioctl probe). The camera-ownership architecture that resolves this (superseding an earlier "arbitration/pause" idea) is its own memory — see [[gpu-vision-camera-architecture]]: GPU vision becomes the sole continuous camera owner, the browser's live view is a downstream tee off the same frames (CPU JPEG-encode only while a viewer is connected), so neither consumer ever pauses.
 2. **`lima` extension support: confirmed YES** — both `EGL_EXT_image_dma_buf_import` and `GL_OES_EGL_image_external` are present (spike script output on the live board). The zero-copy DMA-buf import path is viable; no `glTexImage2D`-upload fallback needed.
 
 **Implementation stack (worked out 2026-07-10, nothing built yet):** ordinary embedded-Linux headless-GPU-rendering tech, not anything GPU-compute-specific (no Vulkan/OpenCL/CUDA-equivalent) — `lima` (kernel DRM driver, already present) + Mesa's `libEGL`/`libGLESv2` (userspace) → an **EGL context via the GBM platform** (`EGL_KHR_platform_gbm`, the standard way to render off-screen against `/dev/dri/renderD128` with no display attached) → **OpenGL ES 2.0**, where the actual logic is a **GLSL ES 1.00 fragment shader** (the threshold-compare for feature 1, the texel-subtract for PIR) run over a full-screen quad into an **FBO** (off-screen render target), chained through a few downsample passes, finished with one `glReadPixels` call. From Python: **moderngl** preferred over raw **PyOpenGL** (lower per-call overhead, better fit for this per-frame repeated pattern) to drive it from inside `app_hub`.
@@ -41,7 +41,58 @@ User approved 2026-07-10 (session `0511c092`): two vision features to build usin
 
 **Phase 0 (hardware bring-up + verification) is DONE as of 2026-07-11** — see
 `gpu-vision-phase0-verified` for the full record. Feature code itself (the `gpu_vision.py`
-module, the `CameraStream` arbitration change, the `chase-target.md` skill, the PIR wiring into
-`mood_node._camera_beats_ok()`) is still not started — that's the next chunk of work, and it's
-a real feature build (new GL shader code, camera architecture change, motion-adjacent skill file)
-worth confirming with the user before diving in, not something to just start unprompted.
+module, the camera-ownership change — see [[gpu-vision-camera-architecture]] — the
+`chase-target.md` skill, the PIR wiring into `mood_node._camera_beats_ok()`) is still not
+started — that's the next chunk of work, and it's a real feature build (new GL shader code,
+camera architecture change, motion-adjacent skill file) worth confirming with the user before
+diving in, not something to just start unprompted.
+
+**3-6. Approved backlog extensions (2026-07-11), building on features 1/2's shader infra — not
+designed in file-level detail yet, but explicitly endorsed as worth building once 1/2 ship:**
+- **Motion-saliency bounding center**: the exact same frame-diff shader as PIR (feature 2), but
+  keep the bounding-box extent instead of collapsing to one scalar → `(target_x, target_y)`.
+  Near-zero extra cost once PIR exists; reasonable to bundle into the same PR as PIR rather than
+  build separately. Use: orient toward movement (a person/pet entering frame) before the
+  `looking` beat snaps a photo, or before the LLM comments.
+- **Optical virtual bumper**: global frame-to-frame delta (same diff shader again) correlated
+  CPU-side against the currently *commanded* `/cmd_vel` — large delta while commanded-stopped =
+  something moved through frame (expected, ignore); near-zero delta while commanded-moving =
+  wheel slip/stall (the interesting case). The correlation logic is cheap CPU, not a new shader.
+  Consumer: a caution-trait nudge via the same fast-rule mechanism as the pickup reflex
+  (`Personality.tick_events` in `brain.py`), or a `slam_nav` reactive-stop input.
+- **Kinetic intercept alert**: reuses feature 1's color-mask/blob machinery — track the mask's
+  bounding-box area over a short (3-frame) history and flag rapid growth as "something's
+  approaching the lens fast." Needs a small ring-buffer texture (trivial RAM). Complementary to
+  lidar's distance-based stop, not redundant with it — lidar says "something is close," this
+  says "something is closing fast," which lidar's snapshot-style range reads don't distinguish
+  well frame-to-frame.
+- **Flashlight/dark reflex**: global average luminance (one more reduction pass) → trigger the
+  ESP32's existing `/led` topic via the `blink-led.md` skill pattern. Trivially cheap once any
+  reduction-pass plumbing exists from features 1/2 — good candidate for "first extra thing to
+  ship" after the core two.
+
+**Explicitly considered and NOT added to the backlog (2026-07-11 analysis)**, with reasons, so a
+future session doesn't have to re-litigate: LED beacon tracking / flicker-locked IR tag detection
+(no beacon/IR marker hardware exists — would become a legitimate Tier-B item on top of feature 1
+IF a beacon is ever added at the dock); dynamic cliff detector (needs the camera remounted
+downward-facing, conflicts with its forward-facing role for `looking`/`/llm/look` — needs a
+second camera, not just software); chromatic-aberration proximity ("visual focal-proximity
+cushion" — not physically sound on a fixed consumer lens, don't prototype); visual hydrophone
+floor classifier (the IMU accelerometer is a strictly better, more direct vibration sensor);
+horizon drift index / 4-quadrant visual-odometry cross-check (IMU + wheel encoders already do
+tilt/roll/odometry more reliably; no stated consumer for a noisy camera-derived cross-check);
+dynamic vignette exposure bias (blocked on missing V4L2 exposure-control plumbing in
+`mjpeg_camera.py`, not hardware — revisit if that plumbing ever gets built for other reasons).
+
+**Hardware wishlist (not software-buildable today, but worth knowing about if a small BOM
+addition is ever considered)**: a **structured-light depth plane** (a cheap $2-5 laser line
+projector + isolating its Y-position across 3 forward windows) would give the robot actual
+*depth* sensing, which nothing today provides (lidar is 2D-planar only) — this is the single
+highest-value hardware addition on the original 21-item brainstorm list if ever pursued; the
+matching **laser stripe gap/hole finder** (row-wise continuity check on the same laser line, for
+trench/gap negative-obstacle detection) would come essentially free alongside it, same shader
+infra. Also: the **AC-hum flicker analyzer** idea is physically real (rolling-shutter banding
+under mains-frequency lighting is well documented) but should be narrowed if ever built — "flicker
+detected → lock exposure/frame-rate to de-band the live view," not the original brainstorm's
+"detect industrial space" framing, which overreaches what a bare flicker-frequency signal
+supports.
