@@ -47,8 +47,11 @@ started — that's the next chunk of work, and it's a real feature build (new GL
 camera architecture change, motion-adjacent skill file) worth confirming with the user before
 diving in, not something to just start unprompted.
 
-**3-6. Approved backlog extensions (2026-07-11), building on features 1/2's shader infra — not
-designed in file-level detail yet, but explicitly endorsed as worth building once 1/2 ship:**
+**3-6. BUILT 2026-07-11 (same day, follow-up session) — see [[gpu-vision-implemented]] for the
+full writeup, code locations, and verification status (code-reviewed only, NOT yet live-tested —
+robot went offline mid-session).** Original backlog description kept below for the design
+rationale/consumer ideas, several of which (the caution-trait nudge, the `looking`-beat orient
+consumer) are still NOT wired up — only the raw GPU signals + telemetry/UI surfacing are built:
 - **Motion-saliency bounding center**: the exact same frame-diff shader as PIR (feature 2), but
   keep the bounding-box extent instead of collapsing to one scalar → `(target_x, target_y)`.
   Near-zero extra cost once PIR exists; reasonable to bundle into the same PR as PIR rather than
