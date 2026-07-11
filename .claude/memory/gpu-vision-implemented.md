@@ -11,7 +11,8 @@ Status update, supersedes the "not started" framing in [[gpu-vision-features-tod
 GPU vision pipeline was **built and verified working end-to-end on the live robot** on
 2026-07-11, in the same session as [[gpu-vision-phase0-verified]] and
 [[gpu-vision-camera-architecture]]. Not a prototype/spike — this is the real feature module,
-wired into `web_server.py`, gated by `gpu_vision_enable` (default `false`).
+wired into `web_server.py`, gated by `gpu_vision_enable` (default `true` as of commit 7060bde,
+2026-07-12 — see below).
 
 **Committed 2026-07-12 (commit a881ddc, pushed to main)** — the user explicitly asked for
 commit+push after confirming the crosshair fix, largest-blob tracking, and a duplicated
@@ -22,13 +23,16 @@ already passed the tuned min/max gate; a real ball settles around ~4.9% confiden
 the old 8% floor, so the crosshair/lock had never actually been reachable for a normal target.
 Also added connected-component "largest blob" selection (`largest_blob_sums` in
 `gpu_vision.py`) so multiple matching regions no longer blend into one wrong averaged centroid.
-**Gotcha hit during this session**: a full `scripts/deploy.sh` (no package filter) rsyncs
-`robot_bringup/config/robot.yaml` verbatim, silently reverting any hand-edit made directly on
-the board (like the live `gpu_vision_enable: true` test flip) back to the repo's committed
-`false` default — this happened mid-session and looked like "the manual-mode button vanished"
-until traced to `gv is None` on the board. No code fix applied (deploy.sh's behavior is
-unchanged); just re-flip `gpu_vision_enable` on the board after any full deploy, or use
-`scripts/deploy.sh web_control` (package-scoped) to avoid rsyncing robot.yaml at all.
+**Gotcha hit during this session, now RESOLVED**: a full `scripts/deploy.sh` (no package
+filter) rsyncs `robot_bringup/config/robot.yaml` verbatim, silently reverting any hand-edit
+made directly on the board (like the live `gpu_vision_enable: true` test flip, back when the
+repo default was `false`) — this happened mid-session and looked like "the manual-mode button
+vanished" until traced to `gv is None` on the board. **Fixed by flipping the repo's own
+default to `gpu_vision_enable: true`** (commit 7060bde, 2026-07-12 — the feature is now
+hardware-verified enough to ship on by default), so a full deploy no longer disables it. The
+general class of gotcha (a full deploy always overwrites board-local hand-edits to
+robot.yaml) still applies to any OTHER param someone hand-tweaks directly on the board without
+committing it — not fixed generically, just for this one setting.
 
 **What was built** (originally in the working tree pre-commit — code commits need explicit
 ask per the user's standing git preference; now committed, see above):
