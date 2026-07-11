@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions + manual/direct mode) BUILT and fully hardware-verified 2026-07-11, incl. CPU/RAM numbers; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
+description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions + manual/direct mode + tunable optical bumper) BUILT and fully hardware-verified 2026-07-11; lima boot-load bug + 3 manual-mode bugs found AND fixed same day"
 metadata: 
   node_type: memory
   type: project
@@ -316,3 +316,42 @@ to be three genuinely active browser connections on port 8080 (confirmed via `ss
 real person/browser watching the live feed the whole time, matching the ALREADY-documented
 "idle 70% + streaming 50% = 120%" cost from the original CPU/RAM test matrix. Not a bug; a good
 reminder to check for real concurrent viewers before chasing a phantom regression.
+
+## UI polish + optical bumper diagnostics (2026-07-11, same day, fourth follow-up)
+
+**On-video overlay trimmed per user preference**: the "GPU vision X%" badge (`#visionBadge`) was
+removed from the camera video view entirely — all six readouts (motion, motion center, target
+lock, intercept rate, brightness, optical bumper) live ONLY in the Sensors tab's "Camera (GPU
+vision)" card now, which already worked with the video view closed. The target-lock **crosshair**
+(`#visionCrosshair`) was removed in the same pass, then explicitly restored per follow-up
+request — it's a spatial indicator overlaid on the video (where the tracked colour actually is),
+not a text status label, so it stays on the video itself while the numeric badge doesn't.
+
+**Optical bumper made properly usable** (was previously "always clear" with zero way to tell why
+or tune it): its three thresholds (`vision_bumper_cmd_eps` 0.03 m/s-or-rad/s,
+`vision_bumper_motion_floor` 0.01 gpu-motion-score fraction, `vision_bumper_confirm_secs` 0.6s)
+were fixed Python module constants in `telemetry.py`, now real `web_control` ROS params
+(declared in `web_server.py`, added to `PARAM_WHITELIST`, in `robot.yaml`) with live sliders in
+a collapsible "▸ Optical bumper tuning" section of the Sensors card. `telemetry.py`'s
+`_optical_bumper` now returns a diagnostic dict (`{alert, commanded, cmd_vel, low_motion_secs}`)
+instead of a bare bool — the `vision.bumper_alert` telemetry key became `vision.bumper` (a
+breaking shape change, both `telemetry.py`'s `_build()` and `app.js`'s `onVision` updated
+together). **This directly explains the "always clear" symptom**: it was correct behavior, not a
+bug — the bumper only evaluates anything while `commanded` is true (robot actually being driven
+above `cmd_eps`), and the robot mostly just sits idle. The new `commanded`/`cmd_vel` readout
+(labelled "commanded /cmd_vel" in the UI) makes this visible instead of a single opaque flag — a
+new hint in the card tells the user how to actually trigger it: drive from the Drive tab while a
+wheel is blocked (or pick the robot up), watch `commanded /cmd_vel` go non-zero while `motion`
+stays near zero, and after `confirm_secs` held (shown live as "stall held for") it should alert.
+Not personally triggered/verified live this session (driving the physical robot wasn't done
+without the user explicitly present/expecting it) — the telemetry shape, param-tuning round trip,
+and the underlying threshold logic were all verified working; the actual stall-detection trigger
+itself is logic already covered by `_optical_bumper`'s existing design, unchanged by this pass.
+
+**Recurring gotcha hit 3 times this session, worth flagging for next time**: pushing the local
+repo's `src/robot_bringup/config/robot.yaml` to the robot resets `gpu_vision_enable` back to its
+committed default (`false`), silently undoing the live demo override — deploying ANY other
+robot.yaml change requires re-flipping it back to `true` afterward (`sed -i` + restart) if the
+demo state is meant to persist. Consider: either don't touch the committed default's value casually
+between sessions, or remember this step is now a standing part of "deploy robot.yaml + verify
+gpu vision still shows `renderer=Mali450` in the log" for this robot specifically.
