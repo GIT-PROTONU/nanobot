@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (color-blob tracking + PIR motion diff) BUILT and verified working end-to-end on hardware 2026-07-11 — camera capture, shaders, JPEG tee, web UI all wired; a real GPU-memory leak was found and fixed"
+description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions) BUILT and fully hardware-verified 2026-07-11, incl. CPU/RAM numbers; open follow-up bug: lima doesn't reliably auto-load at boot, silently falls back to llvmpipe software rendering"
 metadata: 
   node_type: memory
   type: project
@@ -165,17 +165,72 @@ remain informational-only in the web UI; nothing in the robot's autonomous behav
 yet. The dark reflex is the ONE signal with a real actuator response (the LED), and even that is
 off by default and fully opt-in.
 
-**Verification status of this session's additions: CODE-REVIEWED ONLY, NOT LIVE-TESTED.** The
-user disconnected the robot partway through ("ill disconnect the robot for now just make the
-code ready") before the Tier-B extensions could be pushed/verified on hardware, unlike the
-original PIR/blob-tracking/JPEG-tee core (which WAS fully hardware-verified earlier the same
-day — see above). All Python files pass `py_compile`; HTML/CSS/JS were checked for brace/paren
-balance and cross-referenced ID matching, but none of it has run on the actual Mali-450/lima
-driver yet. **A live re-test (including the CPU/RAM impact test the user explicitly asked for) is
-still outstanding and must happen next time the robot is reachable** — treat the four Tier-B
-extensions and the calibration UI as "should work, same patterns as the hardware-verified core,
-but unproven" until then, distinct from the core PIR/blob/JPEG-tee pipeline's "proven on
-hardware" status.
+**2026-07-11, robot reconnected same day — Tier-B extensions now LIVE-VERIFIED, including the
+CPU/RAM test.** Deploying surfaced two real, previously-unknown issues, both since fixed:
+
+1. **`systemd-modules-load.service` does NOT reliably load `lima` at boot**, despite
+   `/etc/modules-load.d/lima.conf` being correctly in place (confirmed present + correct
+   content) — after this reboot `/dev/dri` was entirely absent and `lsmod` showed no `lima`. A
+   manual `sudo modprobe lima` worked instantly (exit 0, `/dev/dri/renderD128` appeared), so the
+   module itself is fine; the failure is an **ordering problem** — `systemd-modules-load.service`
+   runs very early in boot, likely before whatever the Mali GPU platform device depends on
+   (display-engine/DRM core) is ready to bind. **Consequence if unnoticed: `gpu_vision.py`
+   silently falls back to Mesa's `llvmpipe` SOFTWARE rasterizer** (confirmed via the startup log
+   line `renderer=llvmpipe (LLVM 19.1.7, 128 bits)` instead of `renderer=Mali450`) rather than
+   erroring — `EGL_PLATFORM=surfaceless` happily hands you a software context if no DRM render
+   node exists, defeating the entire point of offloading to the GPU without any obvious failure
+   signal. **This is an open follow-up bug**: `deploy/sbc-setup.sh`'s current `modules-load.d`
+   approach needs strengthening (a `systemd.unit` with explicit `After=`/`Requires=` ordering, or
+   a udev-triggered load, or at minimum `gpu_vision.py` should log a loud warning — not just the
+   renderer string at INFO level — when it detects `llvmpipe` instead of a hardware renderer, so
+   this can't silently degrade to CPU-bound "GPU" vision unnoticed). Not fixed this session
+   (out of scope for "run the tests") — logged here so a future session picks it up. Manual
+   `sudo modprobe lima` after every reboot is the workaround until then.
+2. **A genuine test-only bug surfaced during dark-reflex verification, NOT a production bug**:
+   directly POSTing `/param` with `vision_dark_threshold > vision_dark_recover` (an inverted
+   hysteresis band, bypassing the web UI's client-side guard) causes real 1Hz on/off oscillation
+   — confirmed via `ros2 topic echo /led` showing rapid `true`/`false` alternation. Added a
+   server-side defensive clamp in `_dark_reflex_tick` (`if high <= low: high = low + 0.05`) so
+   this can't happen even via direct API misuse, not just relying on the UI's JS guard. The
+   underlying live-param-toggle fix (the bug found in the earlier code-review pass) is confirmed
+   working — real toggling was observed in direct response to `/param` POSTs.
+
+**Camera device path shifted after reboot**: `/dev/video1` this time (was `/dev/video2` before) —
+expected/harmless, USB enumeration order isn't guaranteed stable across reboots and
+`mjpeg_camera.find_camera()` already auto-detects via `VIDIOC_QUERYCAP` rather than hardcoding a
+path, so this needed no fix, just confirms the auto-detect path works correctly in practice.
+
+**CPU/RAM test results (the one the user explicitly asked for), measured via `/proc/<pid>/stat`
+utime+stime deltas over 5s windows, `renderer=Mali450` confirmed active for all of it:**
+
+| Scenario | RSS | CPU (% of one core) |
+|---|---|---|
+| GPU vision OFF (baseline: web+OLED+behavior only) | 81.3 MB | 50% |
+| GPU vision ON, idle (continuous YUYV+PIR+luma, no target, no viewer) | 155.7 MB (+74.4MB) | 70% (+20pp) |
+| + blob-tracking target set (threshold pass + intercept calc) | 155.7 MB (+0) | 70% (+0, immeasurable) |
+| + browser viewer streaming (`/stream.mjpg` actively pulled) | 157.9 MB (+2.2MB) | 120% (+50pp) |
+
+Key takeaways: the **+74.4MB idle RSS delta matches the Phase-0 spike's standalone ~70MB estimate
+almost exactly** — strong cross-session consistency. Blob tracking is genuinely free (buffers are
+pre-allocated regardless of whether a target is set, per the leak-fix design). **The browser-tee
+JPEG path is the one real, deliberate cost** (+50 percentage-points of one core, i.e. roughly
+12.5% of a quad-core board's total capacity) — but only while a viewer is actively watching, and
+it drops straight back to 70% the instant they disconnect (confirmed). All of this sits
+comfortably under `nano-app`'s 450MB `MemoryMax`.
+
+**Extended stability re-confirmed for the NEW Tier-B code specifically** (the original leak-fix
+was only proven for the PIR/threshold reduction chains; the new luma chain + intercept ring
+buffer + JPEG double-copy fix hadn't been soak-tested until now): flat RSS across a ~4-minute
+mixed-activity soak (idle + periodic snapshot pulls + a streaming burst) — 155.7MB → 158.0MB, a
+~2.3MB drift over ~4 minutes that reads as ordinary allocator noise, not a leak (compare to the
+original bug's ~85MB/minute unbounded growth). `/snapshot.jpg` and `/stream.mjpg` both confirmed
+working through the real production HTTP path throughout. Zero GPU-vision-related errors in the
+logs across the whole test session (the one log hit was an unrelated OpenRouter free-tier
+rate-limit message, expected/known behavior per the LLM fallback design).
+
+**Final deployed state after this test session**: `gpu_vision_enable: true` (left on so the user
+can see it live), `vision_dark_reflex_enable: false` + defaults restored (0.15/0.25), no target
+colour calibrated (cleared). Committed git default remains `gpu_vision_enable: false`.
 
 Nothing in this session has been committed to git — only memory writes, per the user's standing
 preference. All code (original core + this session's Tier-B extensions) sits in the working tree.
