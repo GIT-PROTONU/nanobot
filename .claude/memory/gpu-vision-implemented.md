@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions) BUILT and fully hardware-verified 2026-07-11, incl. CPU/RAM numbers; open follow-up bug: lima doesn't reliably auto-load at boot, silently falls back to llvmpipe software rendering"
+description: "GPU vision (PIR + blob-tracking + 4 Tier-B extensions) BUILT and fully hardware-verified 2026-07-11, incl. CPU/RAM numbers; lima boot-load bug found AND fixed same day (see lima-boot-load-bug)"
 metadata: 
   node_type: memory
   type: project
@@ -179,13 +179,12 @@ CPU/RAM test.** Deploying surfaced two real, previously-unknown issues, both sin
    line `renderer=llvmpipe (LLVM 19.1.7, 128 bits)` instead of `renderer=Mali450`) rather than
    erroring — `EGL_PLATFORM=surfaceless` happily hands you a software context if no DRM render
    node exists, defeating the entire point of offloading to the GPU without any obvious failure
-   signal. **This is an open follow-up bug**: `deploy/sbc-setup.sh`'s current `modules-load.d`
-   approach needs strengthening (a `systemd.unit` with explicit `After=`/`Requires=` ordering, or
-   a udev-triggered load, or at minimum `gpu_vision.py` should log a loud warning — not just the
-   renderer string at INFO level — when it detects `llvmpipe` instead of a hardware renderer, so
-   this can't silently degrade to CPU-bound "GPU" vision unnoticed). Not fixed this session
-   (out of scope for "run the tests") — logged here so a future session picks it up. Manual
-   `sudo modprobe lima` after every reboot is the workaround until then.
+   signal. **RESOLVED same day, immediate follow-up session — see [[lima-boot-load-bug]] for the
+   full fix + verification.** Short version: `gpu_vision.py` now warns loudly on a non-Mali
+   renderer, and `deploy/systemd/nano-app.service` retries the module load right before app_hub
+   starts (`ExecStartPre=-+/usr/sbin/modprobe lima` — the `+` was the actual missing piece,
+   ExecStartPre otherwise runs as the unprivileged `ibster` user and can't load kernel modules).
+   Verified fixed across a genuine reboot, not just a warm restart.
 2. **A genuine test-only bug surfaced during dark-reflex verification, NOT a production bug**:
    directly POSTing `/param` with `vision_dark_threshold > vision_dark_recover` (an inverted
    hysteresis band, bypassing the web UI's client-side guard) causes real 1Hz on/off oscillation
