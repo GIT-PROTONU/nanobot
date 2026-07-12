@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus a 2026-07-12 motion-mask debug view (/stream_motion_mask.mjpg) -- code written, build+smoke pass, NOT yet hardware-verified, not committed"
 metadata: 
   node_type: memory
   type: project
@@ -453,3 +453,56 @@ telemetry still reflected the updated value — confirmed the gate suppresses re
 disabling tracking. Symmetrically, `max_confidence=0.01` also correctly filtered to `null`
 (4.9% > 1%), confirming both directions of the range gate work. Reset to clean defaults
 (`threshold=0.22, min=0.0, max=1.0`, target cleared) after testing.
+
+## Motion-mask debug view (2026-07-12, dev-host session — CODE WRITTEN, NOT hardware-verified)
+
+**Built**: a second "🎭"-style debug view, `/stream_motion_mask.mjpg` + a "👣 Show motion mask"
+button in the Camera tab, showing a live grayscale heatmap of the PIR/motion-diff signal
+(brighter = more change since the last frame) — "where is something actually moving," as opposed
+to the existing colour-mask view's "where is the tracked colour." Prompted by the user asking for
+exactly this after a design discussion about mirroring GPU masks to the OLED (see
+[[gpu-vision-features-todo]]'s OLED mask-mirroring section — a related but separate idea; this
+build is the browser-stream version, not the OLED one).
+
+**Architecture: an almost-exact copy of the existing colour tracking-mask view**, reusing far more
+than expected once the code was actually read: `_MASK_VIEW_FS` (reads the R channel of a texture,
+outputs grayscale) already works unmodified on `diff_tex` because `_DIFF_FS` packs its magnitude
+into R the same way `_THRESHOLD_FS` packs its hit value (both are "weighted-centroid" shaders by
+design, per the comment at `_DIFF_FS`'s definition) — **zero new shader code**. Added: a parallel
+ref-counted viewer/JPEG state on `GpuVision` (`_motion_mask_viewers`/`_motion_mask_jpeg`/
+`_motion_mask_jpeg_seq`/`_motion_mask_jpeg_cond` + `add_motion_mask_viewer`/
+`remove_motion_mask_viewer`/`get_motion_mask_frame`, same shape as the colour-mask trio), one more
+persistent flip FBO + readback buffer (`motion_mask_flip_fbo`/`motion_mask_flip_buf`, allocated
+once at setup like everything else in this module), and one more viewer-gated render block inside
+`_loop()`'s existing `if have_prev:` section (right after the motion score/center are computed) —
+draws `mask_view_prog` against `diff_tex` into the new FBO, reads back full W×H, JPEG-encodes,
+bumps the sequence counter. **Unlike the colour mask, no "target must be configured" gate is
+needed** — motion diff runs unconditionally once a second frame exists, so
+`get_motion_mask_frame` only needs to check `running()` on timeout, not an equivalent of
+`has_target_color`.
+
+New route `GET /stream_motion_mask.mjpg` (`WebServerNode._Handler._stream_motion_mask_mjpeg`,
+mirrors `_stream_mask_mjpeg` minus the target-colour check). Web UI: `app.js`'s `visionMaskOn`
+boolean was generalized to a three-way `camMode` (`"normal"`/`"color"`/`"motion"`) with a new
+`setCamMode(mode)` toggling whichever button was clicked back to normal if already active —
+`camStreamUrl()` now picks between `/stream.mjpg`, `/stream_mask.mjpg`, and
+`/stream_motion_mask.mjpg`. New button `#visionMotionMaskToggle` ("👣 Show motion mask") added
+next to the existing `#visionMaskToggle` in `index.html`.
+
+**Cost, per the existing measured numbers**: same order as the already-proven colour-mask view —
+zero when no viewer is connected, one more full-res pass+flip+readback+JPEG-encode while watched
+(the colour mask's equivalent add was already measured as part of the existing viewer-streaming
+cost in the CPU/RAM table above; this is a second instance of the same shape, not a new cost
+category).
+
+**Verification status — honest gap**: `pixi run build` and `pixi run smoke` both pass (this dev
+host has no Mali GPU/camera, so `gpu_vision_enable` never actually engages here — smoke doesn't
+exercise this code path). `py_compile` + a `symtable` scope check both pass on the edited files.
+**Not yet run on the real robot** — needs a deploy + a live check (open the Camera tab, click "👣
+Show motion mask", wave a hand in frame, confirm the stream brightens where the motion is and
+stays dark on a static scene) before this can be called verified, following this module's
+established "build then hardware-verify" pattern (see the several real bugs found only on
+hardware earlier in this file).
+
+**Files touched**: `gpu_vision.py`, `web_server.py`, `web/index.html`, `web/app.js`. Not committed
+yet — per the user's standing git preference, code commits need an explicit ask.
