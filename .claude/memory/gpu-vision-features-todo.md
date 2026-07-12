@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-features-todo
-description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); holds unbuilt brainstorms (cheap-tier: white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation; reworked safety trio: overhead-clearance, looming corroboration, clutter throttle; general: personality hooks, self-diagnostics, docking aids; distance-estimation pair: tau/motion-parallax merged into looming, focus-blur near-proximity; OLED mask-mirroring nice-to-have) plus rejected/hardware-blocked ideas
+description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); 2026-07-12 white-balance/colour-cast, obstruction flag, and motion-intercept (looming) were BUILT (code written, not hardware-verified); remaining unbuilt brainstorms (2nd colour target, edge-density, backlit detector, motion/target correlation; overhead-clearance, clutter throttle; general: personality hooks, self-diagnostics, docking aids; focus-blur near-proximity; OLED mask-mirroring nice-to-have) plus rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project
@@ -109,18 +109,17 @@ combining signals `_loop()` already computes. Not yet approved/scoped — brains
 status as the rest of this file until a user picks one to build.
 
 **Reuses an existing pass (near-zero marginal GPU cost):**
-- **Auto white-balance / colour-cast drift signal.** `_LUMA_FS` already reads
-  `texture2D(tex,uv).rgb` before collapsing to one grayscale scalar via the luminance dot
-  product — summing R/G/B separately instead (same packing trick `_DIFF_FS`/`_THRESHOLD_FS`
-  already use: 3 values in one RGBA readout) gives an average-scene-colour signal for free off
-  the pass that already runs unconditionally every frame. Use: detect when ambient light has
-  shifted (evening incandescent vs. daytime) and auto-nudge blob-tracking's calibrated colour
-  threshold, instead of a stale calibration silently degrading through the day.
-- **Camera-obstruction / lens-covered flag.** Also off the always-on luma pass: near-zero
-  variance (needs one more cheap stat, see "dynamic range" below) combined with very-dark or
-  very-uniform average luma = "something is covering or has fogged the lens" (a hand, dust, the
-  robot wedged face-first into something). Pure CPU threshold logic on numbers already being
-  computed — zero new shader.
+- **Auto white-balance / colour-cast drift signal — BUILT 2026-07-12** (see
+  [[gpu-vision-implemented]], code written/not yet hardware-verified). Built as a NEW reduction
+  chain on `cur_tex` directly (reusing `copy_prog`/`_COPY_FS` verbatim) rather than modifying
+  `_LUMA_FS` in place — kept the existing dark-reflex luma calc byte-for-byte unchanged instead of
+  risking it. `GpuVision.color_cast` property, surfaced in telemetry + the Sensors card. The
+  auto-nudge-blob-threshold consumer described below is NOT built — only the raw signal exists.
+- **Camera-obstruction / lens-covered flag — BUILT 2026-07-12** (see [[gpu-vision-implemented]],
+  code written/not yet hardware-verified). `GpuVision.luma_variance`/`.obstructed`, exactly the
+  zero-new-shader design described here (variance over the already-read-back luma buffer). Flags
+  `variance < 15.0 AND luma < 0.15` — both thresholds are initial guesses, explicitly flagged as
+  not yet hardware-tuned.
 - **Second / named colour target.** Directly the open design question already on record above
   ("single target vs. a named list"). Running the threshold+reduce pass twice (or packing two
   hues into separate RGBA channels of one pass) is ~another 1.9ms — still trivial against the
@@ -183,18 +182,20 @@ scalar isn't a costmap) while keeping the genuinely useful core of each. None bu
   against a known object settles it) before writing any shader. Feeds a caution-trait nudge /
   coarse slowdown, not a hard stop — edge-density-in-a-band is a heuristic, not a distance
   measurement.
-- **Looming corroboration signal** (was "global looming brake"). Reuses the edge-density shader
-  above (whole-frame variant) tracked over a short 3-frame ring buffer, generalizing the
-  already-backlogged colour-based "kinetic intercept alert" to any looming object, not just the
-  calibrated tracked colour — catches a pet/kid running at the robot, a door swinging open, etc.
-  Cost: free if the edge-density shader already exists (CPU-side ring-buffer math on a number
-  already read each tick); ~1.9ms standalone. **Correction from the original pitch:** drop the
-  "bypasses the 10Hz slam_nav loop" framing — the vision pipeline is designed to poll at 5-10Hz,
-  the same order as slam_nav, not faster, and monocular RGB edge-growth is a noisier looming cue
-  than lidar range for the glass/thin-wire cases cited (both sensors are weak there, not just
-  lidar). Route into the existing caution-trait fast-rule path (`Personality.tick_events`, same
-  mechanism as the pickup reflex), NOT a new direct-to-motor path — keep `slam_nav` as the sole
-  owner of reactive stops.
+- **Looming corroboration signal** (was "global looming brake") — **the raw signal is BUILT
+  2026-07-12** as `GpuVision.motion_intercept_rate` (see [[gpu-vision-implemented]], code
+  written/not yet hardware-verified): same ring-buffer growth-rate trick as the already-built
+  colour-based kinetic intercept alert, applied to the raw PIR motion score instead of edge-
+  density (edge-density itself is still unbuilt — this used the simpler, already-existing motion
+  score instead, which covers the same "is anything looming" question without needing a new
+  shader at all). Catches a pet/kid running at the robot, a door swinging open, etc. — anything
+  looming, not just the calibrated tracked colour. **Correction from the original pitch:** drop
+  the "bypasses the 10Hz slam_nav loop" framing — the vision pipeline is designed to poll at
+  5-10Hz, the same order as slam_nav, not faster, and monocular RGB motion-growth is a noisier
+  looming cue than lidar range for the glass/thin-wire cases cited (both sensors are weak there,
+  not just lidar). **Still NOT built**: routing this into the caution-trait fast-rule path
+  (`Personality.tick_events`) — the signal exists and is surfaced in telemetry/UI, but nothing
+  consumes it autonomously yet, same as every other Tier-B signal.
 - **Clutter-aware velocity throttle** (was "dynamic clutter costmap penalty"). Whole-frame
   edge-density/variance (same shader as above, free if built) as a global "this looks visually
   busy" scalar. Real gap: lidar only sees obstacles at its own mounted height, so cables, a shoe,

@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus a 2026-07-12 motion-mask debug view (/stream_motion_mask.mjpg) -- code written, build+smoke pass, NOT yet hardware-verified, not committed"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view (/stream_motion_mask.mjpg) + motion-intercept rate + obstruction flag + colour-cast signal -- ALL code written, build+smoke pass, NOT yet hardware-verified, not committed"
 metadata: 
   node_type: memory
   type: project
@@ -506,3 +506,47 @@ hardware earlier in this file).
 
 **Files touched**: `gpu_vision.py`, `web_server.py`, `web/index.html`, `web/app.js`. Not committed
 yet — per the user's standing git preference, code commits need an explicit ask.
+
+## Three more cheap signals (2026-07-12, same dev-host session — CODE WRITTEN, NOT hardware-verified)
+
+User asked for 3 more features from [[gpu-vision-features-todo]] that are cheap AND don't need
+the robot to drive to test (a real constraint: several backlog items, like the clutter throttle
+or looming brake, need actual driving to observe their effect). Picked the three that are both
+cheapest to build and verifiable just by pointing the stationary camera at things:
+
+1. **Motion-intercept rate** (`GpuVision.motion_intercept_rate`) — the exact same ring-buffer
+   growth-rate trick as the existing `intercept_rate` (kinetic intercept alert), but keyed on the
+   raw PIR `motion` score instead of a calibrated colour target's confidence. **Zero new GPU
+   cost** — pure Python over `score`, already computed every tick. Resolves the open item from the
+   user's earlier motion-parallax pitch (properly formalized as tau/looming-rate this time, not
+   the rejected `Δy_pixel` formula) and the "looming corroboration signal" backlog entry — this
+   IS that signal, now built. Test without driving: wave a hand toward the lens, watch the rate
+   spike; hold still, watch it settle near zero.
+2. **Camera-obstruction / lens-covered flag** (`GpuVision.luma_variance`/`.obstructed`) — variance
+   computed over the SAME small downsampled luma buffer already read back every tick for the
+   flashlight/dark reflex — **zero new GPU cost**, pure CPU stats on numbers already transferred.
+   Flags `variance < OBSTRUCTION_VAR_MAX (15.0) AND luma < OBSTRUCTION_DARK_MAX (0.15)` —
+   deliberately requires BOTH (flat AND dark) so a genuinely blank bright wall (also low-variance)
+   isn't misreported as an obstruction. **Both thresholds are initial guesses, explicitly not yet
+   hardware-tuned** — a real board test (cover the lens with a hand, check it flips; point at a
+   blank bright wall, check it doesn't) is needed before trusting the exact numbers, though the
+   logic shape itself needs no new infrastructure to test. Test without driving: cover the lens.
+3. **Colour-cast (white-balance drift) signal** (`GpuVision.color_cast`) — one new persistent
+   downsample-chain instance (`wb_chain`/`wb_buf`), reusing the **already-compiled** `copy_prog`/
+   `_COPY_FS` verbatim, run straight on `cur_tex` (the RGB frame) instead of a luminance/threshold
+   derivative, so R/G/B stay separable into an `(r,g,b)` average instead of collapsing to one grey
+   value like the existing luma pass. **No new shader source** — same cost as any other reduction
+   chain instance (~1.9ms per the existing measured numbers), runs unconditionally every frame
+   like luma. Test without driving: point the camera at different coloured/lit surfaces, watch the
+   R/G/B split shift.
+
+**Wiring**: all three surfaced in `telemetry.py`'s `vision` dict (`motion_intercept_rate`,
+`obstructed`, `color_cast`) and the Sensors "Camera (GPU vision)" card (`app.js`'s `onVision` +
+new `index.html` rows: "motion intercept", "lens obstructed", "colour cast") — same pattern as
+every other Tier-B signal, all informational-only, nothing yet acts on them autonomously.
+
+**Verification status**: `pixi run build` + `pixi run smoke` both pass; `py_compile` clean.
+**Not yet hardware-verified** — same honest gap as the motion-mask viewer above, this dev host has
+no Mali GPU/camera. Needs a board deploy + manually covering the lens / waving a hand / pointing
+at different-coloured surfaces while watching the Sensors card, before the obstruction thresholds
+in particular can be trusted. Not committed to git yet.
