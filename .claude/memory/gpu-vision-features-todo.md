@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-features-todo
-description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); holds unbuilt brainstorms (cheap-tier: white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation; reworked safety trio: overhead-clearance, looming corroboration, clutter throttle; general: personality hooks, self-diagnostics, docking aids) plus rejected/hardware-blocked ideas
+description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); holds unbuilt brainstorms (cheap-tier: white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation; reworked safety trio: overhead-clearance, looming corroboration, clutter throttle; general: personality hooks, self-diagnostics, docking aids; distance-estimation pair: tau/motion-parallax merged into looming, focus-blur near-proximity) plus rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project
@@ -272,3 +272,38 @@ aids. Same status as the rest of this file: brainstorm only, nothing built/appro
 file (colour-cast, edge-density, threshold, motion bounding box) or costs literally nothing extra
 (CPU correlation of numbers already computed each tick). The only two with real new GPU work are
 the shiny-floor threshold pass and the novelty background-blend, both still sub-2ms.
+
+## Distance-estimation pair, 2026-07-12 (user-pitched, reworked)
+
+User pitched motion parallax and focus-blur as distance proxies. Both reworked below — the
+literal formulas as pitched don't hold, but a corrected version of each survives and is cheap.
+
+- **Motion parallax / "vertical descent" distance.** As pitched (`d ≈ 1/Δy_pixel` on an arbitrary
+  tracked edge) conflates two different real techniques and the formula itself isn't right for
+  either: (1) **inverse perspective mapping** — if a point is known to sit on the floor, its image
+  row maps to a real-world distance from ONE frame + a one-time camera height/tilt calibration, no
+  motion needed at all (cheaper than parallax, but only valid for floor-touching objects — useless
+  for the overhang/glass cases this backlog cares about); (2) **time-to-contact ("tau") via optical
+  expansion** — `τ ≈ size / (rate of size growth)`, scale- and distance-invariant, which is what
+  the pitch is actually reaching for. **Tau is already on this backlog** as the "kinetic intercept
+  alert" and the reworked "looming corroboration signal" above (bounding-box area growth over a
+  short frame history) — this pitch should be merged into those, not built as a third variant, and
+  formalized with the correct tau math rather than ad hoc `Δy`.
+  **Feasibility boundary:** tracking an *arbitrary* edge needs real per-pixel optical flow /
+  frame-to-frame correspondence — a genuine vision workload that doesn't fit the cheap
+  global-reduction-pass toolkit this whole backlog runs on. Restricted to a feature ALREADY
+  tracked with a returned centroid/box (the colour blob, the motion-saliency bounding box — both
+  built/planned) it's free: the `(x,y)`/box history is already read back every tick, the only
+  missing piece is a few lines of host-side tau math.
+- **Focus-blur near-proximity proxy.** Reuses the edge-density shader (free marginal cost once
+  built) as a sharpness scalar. **Correction:** the C270 is fixed-focus and consumer webcam
+  fixed-focus lenses are deliberately set near the hyperfocal distance to maximize depth of field
+  — so the "far away = blurry too" half of the pitch is likely too weak to detect on this class of
+  lens; drop it. The **near/macro end survives** — genuine defocus blur does spike within a few
+  cm-tens of cm (the lens's minimum focus distance), which is conveniently exactly the "about to
+  touch a glass pane" case wanted. **Confound to guard against:** near-zero edge-density is
+  indistinguishable from "looking at a blank wall/foggy window" — texture-free scenes read
+  identically to genuine defocus. Don't trust the scalar alone; fuse with lidar-no-return + high
+  average luma (not a dark void) + the already-backlogged wheel-stall-vs-commanded-motion check
+  (robot commanded to move but not actually moving) for a real "touching something transparent"
+  signal.
