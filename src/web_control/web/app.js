@@ -99,13 +99,33 @@ function camStreamUrl(){
              : "/stream.mjpg";
   return path+"?t="+Date.now();
 }
+// camWait: a proper "camera disabled"/"camera unavailable" message instead of a
+// blank red <img> broken-image square. lastCameraEnabled tracks the master switch
+// (see set_camera_enable in web_server.py) as last reported by telemetry (onVision
+// below), so the message is specific ("disabled" vs a generic connection failure) and
+// -- the main point -- re-enabling the camera auto-retries the stream on its own
+// instead of requiring a manual page refresh.
+let lastCameraEnabled=true;
+function showCamWait(){
+  const img=$("cam"), wait=$("camWait");
+  img.style.display="none";
+  wait.textContent = lastCameraEnabled
+    ? "⚠ Camera unavailable — check the connection"
+    : "📷 Camera disabled — enable it in Sensors → Camera (GPU vision)";
+  wait.style.display="flex";
+}
+function hideCamWait(){ $("camWait").style.display="none"; }
 $("camOn").addEventListener("change",e=>{
   const img=$("cam"), hint=$("camHint");
-  if(e.target.checked){ img.src=camStreamUrl();
-    img.style.display="block"; hint.style.display="block"; }
-  else { img.removeAttribute("src"); img.style.display="none"; hint.style.display="none"; }
+  if(e.target.checked){
+    hint.style.display="block";
+    if(lastCameraEnabled){ img.src=camStreamUrl(); img.style.display="block"; hideCamWait(); }
+    else showCamWait();
+  }
+  else { img.removeAttribute("src"); img.style.display="none"; hideCamWait(); hint.style.display="none"; }
 });
-$("cam").onerror=()=>{ if($("camOn").checked) $("cam").style.background="#3d1418"; };
+$("cam").onerror=()=>{ if($("camOn").checked) showCamWait(); };
+$("cam").onload=()=>{ hideCamWait(); $("cam").style.display="block"; };
 function setCamMode(mode){
   camMode = (camMode===mode) ? "normal" : mode;
   $("visionMaskToggle").textContent=camMode==="color"?"🎥 Show normal feed":"🎭 Show tracking mask";
@@ -484,6 +504,19 @@ function onVision(v){
     blobTuneSynced=true;
   }
   const camOff=(v.camera_enabled===false);
+  // Track the master camera switch's state across ticks so the live-view <img> reacts
+  // immediately (not just on its own onerror) -- disabling shows the message even if
+  // this specific connection hasn't errored yet (a mid-stream toggle only takes effect
+  // on the NEXT connection, see web_server.py's _cam property comment); re-enabling
+  // auto-retries the stream instead of leaving the user needing a manual page refresh.
+  const wasCameraEnabled=lastCameraEnabled;
+  lastCameraEnabled=!camOff;
+  if($("camOn").checked){
+    if(camOff) showCamWait();
+    else if(!wasCameraEnabled){
+      $("cam").src=camStreamUrl(); $("cam").style.display="block"; hideCamWait();
+    }
+  }
   const paused=!!v.manual||camOff;
   const pausedReason=camOff?"camera off":"paused (manual mode)";
   [$("visionPick"),$("visionClear")].forEach(b=>{ if(b) b.disabled=paused; });

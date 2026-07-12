@@ -61,6 +61,8 @@
   #mapWait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     text-align:center;color:var(--muted);font-size:13px;padding:18px}
   #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none}
+  #camWait{position:absolute;inset:0;background:#000;display:none;align-items:center;
+    justify-content:center;text-align:center;color:var(--muted);font-size:13px;padding:18px}
   /* OLED mirror: a pixel-exact, client-side copy of the physical SSD1306 panel */
   #view-oled{background:#05080d}
   #view-oled.on{display:flex;align-items:center;justify-content:center}

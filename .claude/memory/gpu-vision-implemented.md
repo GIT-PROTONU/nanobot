@@ -780,6 +780,28 @@ User acted on both findings immediately:
    re-verified live: `diag` frame confirmed `gpu_percent` key is gone, `gpu_temp_c` still present
    in the backend (67.8°C this check) but simply not surfaced in the UI anymore.
 
+## Camera-disabled UX fix (2026-07-12, same session, deployed+verified)
+
+User reported the master camera-disable toggle left the live-view `<img>` showing a bare red
+broken-image square (the old `onerror` handler just set `background:#3d1418`) and that
+re-enabling required a manual page refresh to get the feed back. Fixed both:
+- New `#camWait` overlay div (same centered-message pattern as the map view's `#mapWait`) shows
+  a real message instead of a broken image: "📷 Camera disabled — enable it in Sensors → Camera
+  (GPU vision)" when the master switch is off, vs. "⚠ Camera unavailable — check the connection"
+  for any other stream failure — `lastCameraEnabled` (tracked from telemetry's `camera_enabled`
+  key) picks which text to show.
+- **Auto-retry on re-enable**: `onVision` now diffs `camera_enabled` tick-to-tick; the instant it
+  flips false→true while the camera checkbox is on, it resets `<img src>` itself (no user action
+  needed) — this directly fixes the "I have to refresh the page" complaint. It also reacts
+  proactively on the disable side too (shows the message the moment telemetry reports
+  `camera_enabled:false`), not only when the stream connection itself eventually errors — matters
+  because `_cam` is resolved once per TCP connection (see `web_server.py`'s comment on `_cam`), so
+  an already-open stream wouldn't otherwise notice a mid-stream disable until reconnecting.
+- Verified live: served page confirmed to include `id="camWait"`; disable/re-enable round-tripped
+  cleanly via `/vision/camera_enable` + `/telemetry` with no errors in the logs.
+
+Committed (see git log) and pushed alongside the rest of this session's GPU vision work.
+
 **Unrelated finding surfaced in the post-fix log check, NOT caused by anything in this session's
 diff** (worth a note for a future session, not chased further here): a single
 `AttributeError: 'WebServerNode' object has no attribute '_cog'` from a request arriving at
