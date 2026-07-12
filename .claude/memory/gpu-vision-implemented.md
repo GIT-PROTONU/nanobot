@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view + 9 live-tunable alerts (obstruction var_max FIXED to 400 from real data), GPU utilization tried then REMOVED per user request (devfreq useless on this board, gpu_temp redundant; pipeline-load KEPT) -- ALL DEPLOYED + LIVE-VERIFIED on real hardware twice, code NOT yet committed to git"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view + 9 live-tunable alerts (obstruction var_max FIXED to 400 from real data), GPU utilization tried then REMOVED (devfreq useless on this board; pipeline-load KEPT), master camera on/off switch + camWait UX fix, hover hints -- ALL DEPLOYED + LIVE-VERIFIED on real hardware multiple times, COMMITTED+PUSHED (96f4913, 45a09e0), README.md/CLAUDE.md now document the whole subsystem"
 metadata: 
   node_type: memory
   type: project

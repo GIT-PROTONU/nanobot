@@ -379,11 +379,15 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   demonstrably-useful number. A **master camera switch** (`POST /vision/camera_enable`,
   the Camera tab's "📷 Camera enabled") fully stops BOTH `GpuVision` and the direct
   passthrough (distinct from manual mode, which still runs the direct feed) — for
-  when the fuller pass set's cost isn't wanted. The Sensors tab's readouts AND every
-  tunable slider have hover explanations (native `title` attributes keyed by element
-  ID in `app.js`, not markup changes), toggleable/persisted via **💡 Show hints**.
-  Still not built: any autonomous consumer of the alert signals (all informational
-  only), the OLED-mirrored mask idea, and a 2nd/named colour target.
+  when the fuller pass set's cost isn't wanted. While off, the live-view `<img>` shows
+  a real `#camWait` overlay message ("Camera disabled…") instead of a broken-image
+  icon, and `app.js`'s `onVision` diffs `camera_enabled` tick-to-tick so re-enabling
+  auto-resets the stream `src` itself — no manual page refresh needed to get the feed
+  back. The Sensors tab's readouts AND every tunable slider have hover explanations
+  (native `title` attributes keyed by element ID in `app.js`, not markup changes),
+  toggleable/persisted via **💡 Show hints**. Still not built: any autonomous consumer
+  of the alert signals (all informational only), the OLED-mirrored mask idea, and a
+  2nd/named colour target.
 - **Stress test mode** (`stress.py`, ROS-free; web "Stress test" card in System):
   `POST /stress/start {duration,workers?}` / `POST /stress/stop` / `GET /stress/status`.
   Deliberately loads every CPU core to validate the hardening tier (systemd watchdogs,
