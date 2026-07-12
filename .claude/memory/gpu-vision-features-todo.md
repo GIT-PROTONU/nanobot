@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-features-todo
-description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); holds unbuilt brainstorms (cheap-tier: white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation; reworked safety trio: overhead-clearance, looming corroboration, clutter throttle; general: personality hooks, self-diagnostics, docking aids; distance-estimation pair: tau/motion-parallax merged into looming, focus-blur near-proximity) plus rejected/hardware-blocked ideas
+description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); holds unbuilt brainstorms (cheap-tier: white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation; reworked safety trio: overhead-clearance, looming corroboration, clutter throttle; general: personality hooks, self-diagnostics, docking aids; distance-estimation pair: tau/motion-parallax merged into looming, focus-blur near-proximity; OLED mask-mirroring nice-to-have) plus rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project
@@ -307,3 +307,34 @@ literal formulas as pitched don't hold, but a corrected version of each survives
   average luma (not a dark void) + the already-backlogged wheel-stall-vs-commanded-motion check
   (robot commanded to move but not actually moving) for a real "touching something transparent"
   signal.
+
+## Nice-to-have: mirror the tracking mask to the OLED, 2026-07-12
+
+Prompted by "would it take a lot of CPU to draw the mask to the OLED" — answer: the OLED draw
+itself is free (the `np.packbits` fast-display path already flushes full 128×64 frames at up to
+20Hz for face animation, ~0.6ms CPU, ~79% of flush wall-time is I2C bus wait not CPU — see
+`oled-display-perf`); the real new work is upstream, getting an actual mask image off the GPU
+instead of the current design's few-byte scalar-only readback.
+
+**How, cheaply:** the existing colour-threshold/PIR downsample chain already box-filter-halves
+the frame in passes (~1.9ms full chain to 1×1, hardware-measured) — branch/stop that chain early
+and read back an intermediate stage instead of continuing to 1×1. **Can't land on the OLED's
+exact 128×64 in one resize pass from the 640×480 source** — GLES `GL_LINEAR` minification only
+blends a 2×2 texel neighbourhood regardless of scale ratio, so a single ~5×/7.5× jump would alias;
+that's precisely why the existing chain halves repeatedly instead of resizing once. Correct
+shape: ride the existing chain down to something close (640×480 → 320×240 → 160×120), then one
+more modest-ratio pass (160×120 → 128×64, ~1.25×/1.875×) to land exactly on the panel's
+resolution — one extra pass, still sub-2ms, same shader machinery already built. Box-filtering a
+binary mask through those passes turns it greyscale ("coverage fraction" per enlarged texel), so
+re-threshold back to true black/white right before `np.packbits` — one more cheap GPU pass or a
+trivial CPU-side numpy threshold.
+
+**Cost summary:** readback grows from a few bytes to ~8-32KB (128×64, a handful of bytes/pixel),
+still sub-ms on this hardware; one extra reduction-chain pass beyond what's already planned for
+blob tracking. Genuinely cheap, just not the literal zero-new-code of the scalar-only design.
+
+**Not just a CPU question — an ownership one:** the OLED is a single shared panel (face/
+dashboard/karaoke words) and `mood_node` already has an arbitration pattern for exactly this
+("stand down when another owner uses the panel" — TTS/manual override/pickup). Showing the mask
+should fit that same model — e.g. only during an active chase-target skill, standing the face
+down for that window — rather than fighting the face for the panel simultaneously.
