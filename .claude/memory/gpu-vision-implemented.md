@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view, motion-intercept, obstruction flag, colour-cast, edge-density/clutter, overhead-structure, luma_max/backlit, highlight/shiny, motion-target-match -- 9 live-tunable alerts total, ALL code written+smoke-tested+unit-tested, NOT yet hardware-verified, not committed"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view, 9 live-tunable alerts (motion-intercept/obstruction/colour-cast/clutter/overhead/backlit/shiny/focus-blur/motion-target-match), GPU utilization (devfreq freq-ratio estimate + software pipeline-duty proxy) -- ALL code written+smoke-tested+unit-tested, NOT yet hardware-verified, not committed"
 metadata: 
   node_type: memory
   type: project
@@ -661,3 +661,42 @@ script that POSTs `/param` for all 10 new `vision_*` names against a live app_hu
 string would have silently 403'd just that one). Cross-checked all 10 slider element IDs between
 `index.html` and `app.js`'s `VISION_ALERT_SLIDERS` array textually too (no typos). Re-ran
 `pixi run build` + `pixi run smoke` after the fix — still green.
+
+## GPU utilization, "if possible" (2026-07-12, same session)
+
+User asked for GPU utilization next to CPU/RAM in the web UI. Investigated what's actually
+available rather than assuming: a TRUE hardware busy-time reading (the modern generic mechanism
+is DRM fdinfo, `/proc/<pid>/fdinfo/<fd>` `drm-engine-*` lines, deltas over time — what tools like
+`nvtop` use) needs the raw DRI device file descriptor, which Mesa's `EGL_PLATFORM=surfaceless`
+opens INTERNALLY inside `eglGetPlatformDisplay` — this code doesn't control that fd today, and
+whether `lima` even supports fdinfo on this board's specific kernel version is unverified from
+here. Rather than guess, built two DIFFERENT, clearly-distinguished-in-the-UI numbers that don't
+need that fd, each honestly labeled for what it actually is:
+
+1. **`gpu_percent`** (System health card, next to CPU/RAM as asked) — a devfreq frequency-ratio
+   ESTIMATE (`cur_freq/max_freq * 100`), sysfs-only, zero root/debugfs needed, same discovery-once
+   pattern as the existing `_thermal_zones()` (`monitor_node._find_gpu_devfreq()` scans
+   `/sys/class/devfreq/*` for a name containing "gpu"). Correlates with load under an
+   "ondemand"-style governor but is NOT true busy-time (a GPU pinned at max freq by a different
+   governor would misreport as 100%) — labeled as an estimate in the UI hint, not oversold.
+   Also added `gpu_temp_c` to the same UI row group since it already existed as an unused
+   diagnostics field (`_temp("gpu-thermal")`, defined since before this session) — free to surface
+   alongside utilization while touching this exact card.
+2. **`gpu_duty`** (Camera/GPU-vision card, "pipeline load") — a SOFTWARE proxy: wall-clock time
+   spent in `gpu_vision.py`'s shader-submit+readback block (measured from after the camera frame
+   is captured to after `glFinish()`) divided by the frame period. Always available with zero
+   sysfs/hardware dependency once GPU vision is running, but measures "how loaded is the vision
+   pipeline," not GPU-core occupancy — explicitly documented as a DIFFERENT number from
+   `gpu_percent` that "won't necessarily match," in both the property docstring and the UI hint,
+   so the two are never confused for the same thing.
+
+**On this dev host** (no Mali, no `gpu-thermal` zone, no GPU devfreq node), both `gpu_percent`
+and `gpu_temp_c` correctly resolve to NaN → the string `"nan"` in the diagnostics KeyValue → the
+UI shows "n/a" (added `Number.isNaN` guards in `app.js`, since the existing `cpu_temp_c` pattern
+would have shown a literal confusing "nan°C" otherwise). `gpu_duty` DOES compute on this host
+once `GpuVision` is running (it's pure Python timing, no hardware dependency), so it's real, not
+a stub. Verified via `pixi run build` + `pixi run smoke` (added one more permanent assertion:
+`/diagnostics` has `gpu_percent`/`gpu_temp_c` keys, and `gpu_duty` is in the vision frame's key
+list) — all green. **Not yet known whether `gpu_percent` will read a real number or "n/a" on the
+actual board** — depends on whether this specific Armbian kernel build has a devfreq node for the
+Mali GPU, genuinely unverified until deployed.
