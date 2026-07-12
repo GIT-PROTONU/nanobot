@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-features-todo
-description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); 2026-07-12 white-balance/colour-cast, obstruction flag, and motion-intercept (looming) were BUILT (code written, not hardware-verified); remaining unbuilt brainstorms (2nd colour target, edge-density, backlit detector, motion/target correlation; overhead-clearance, clutter throttle; general: personality hooks, self-diagnostics, docking aids; focus-blur near-proximity; OLED mask-mirroring nice-to-have) plus rejected/hardware-blocked ideas
+description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); 2026-07-12 batch BUILT (code written+smoke/unit-tested, not hardware-verified): colour-cast, obstruction, motion-intercept/looming, edge-density/clutter, overhead-structure, backlit, shiny-surface, focus-blur, motion-target-match -- 9 alerts total, all live-tunable via web UI; remaining unbuilt (2nd colour target, clutter velocity-throttle ACTION, personality hooks, self-diagnostics needing driving, docking aids, OLED mask-mirroring) plus rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project
@@ -128,27 +128,25 @@ status as the rest of this file until a user picks one to build.
   marker").
 
 **New shader, still cheap (one more reduction-chain instance):**
-- **Visual "interest"/edge-density scalar.** A Sobel-ish (or even a cheap 4-tap gradient)
-  fragment shader reduced the same way as PIR, giving "how much texture/contrast is in frame"
-  as a static complement to PIR's "how much just *changed*." Use: let the `looking` beat also
-  fire on "camera is pointed at something visually busy" (a cluttered shelf, a person standing
-  still) not just on motion — PIR alone misses a stationary subject entirely.
-- **Dynamic range / backlit detector.** The downsample chain's `_COPY_FS` passthrough relies on
-  `GL_LINEAR` box-filter averaging for free box-blur; swapping in a MAX-blend variant for one
-  chain (GLES2 doesn't do this via blend state the way desktop GL might, but a tiny fragment
-  shader that samples the 4 texels a `GL_NEAREST` upstream stage would've blurred and takes
-  their `max()` gets the same effect) gives frame max-luma; combined with the existing average
-  from `_LUMA_FS`, `max - avg` is a crude "how backlit/blown-out is this scene" signal — the
-  plain dark reflex (average brightness only) can't distinguish "dim room" from "bright window
-  behind a dark subject," which matters because dark-reflex's LED response is the wrong fix for
-  the second case (more light won't help a silhouette).
+- **Visual "interest"/edge-density scalar — BUILT 2026-07-12** (see [[gpu-vision-implemented]],
+  code written/not yet hardware-verified). Built as `GpuVision.edge_density` via a NEW `_EDGE_FS`
+  shader — a cheap 3-tap gradient (centre+right+down neighbour), not a full 8-tap Sobel, still
+  matches the "even a cheap 4-tap gradient" framing here. The `looking`-beat consumer described
+  below is NOT built — only the raw signal + a live-tunable `clutter` alert exist so far.
+- **Dynamic range / backlit detector — BUILT 2026-07-12** (see [[gpu-vision-implemented]], code
+  written/not yet hardware-verified), and CHEAPER than this entry assumed: no MAX-blend shader
+  needed. The existing luma downsample chain already reads back a small MULTI-CELL buffer (the
+  chain stops at `min_size=24`, not 1×1) for the dark reflex — tracking a max alongside the
+  existing sum in that already-read-back buffer was genuinely free. `GpuVision.luma_max`, alert
+  = `(luma_max - luma) > threshold AND luma < 0.5` (both live-tunable), same "distinguish dim room
+  from backlit silhouette" reasoning as originally proposed here.
 
 **Zero GPU cost — pure CPU correlation of signals already computed:**
-- **Motion-matches-target correlation.** `motion_center` (PIR's weighted centroid) and `target`
-  (the colour-blob centroid) are both already read every tick in `_loop()` — comparing their
-  (x,y) distance costs nothing. Answers "is the thing that's moving actually my tracked ball,
-  or is something else moving elsewhere in frame" — meaningfully sharper than either signal
-  alone, and the intercept-rate/bumper logic could both benefit from knowing this.
+- **Motion-matches-target correlation — BUILT 2026-07-12** (see [[gpu-vision-implemented]], code
+  written/not yet hardware-verified). `GpuVision.motion_target_match` — exactly as described here,
+  a plain distance between the already-computed centroids. Surfaced with a live-tunable
+  "motion_matches_target" alert (distance below threshold = match). The intercept-rate/bumper
+  cross-consumer idea is NOT wired up — only the raw signal + alert exist.
 - **Camera-freeze / stuck-capture diagnostic.** The PIR diff score already goes near-zero when
   nothing changes; correlating that against *commanded* `/cmd_vel` (already read for the
   optical bumper) the same way the bumper does, but framed as "the whole picture should be
@@ -170,18 +168,19 @@ User pitched three ideas framed as safety features; reworked below to correct ov
 (monocular RGB isn't depth, the vision loop isn't faster than slam_nav's 10Hz loop, a global
 scalar isn't a costmap) while keeping the genuinely useful core of each. None built.
 
-- **Overhead-clearance signal** (was "under-furniture wedge sentinel"). Real gap: lidar is
-  strictly 2D-planar, so an overhang entirely above the scan plane (couch arm, bed skirt,
-  chair armrest) is invisible to it, and the lidar tower sticks up past the scan plane — the
-  robot can fit its body under something while shearing the tower off on the overhang. Reworked
-  signal: crop the downsample chain's input to the top frame band (free — a UV-rect change, not
-  a new shader) and run edge-density (not plain luma — luma alone can't tell "dark overhang" from
-  "dark rug") on it, trending while driving forward. Cost: one more reduction-chain instance
-  (~1.9ms measured for the existing chain), zero new RAM. **Prerequisite, not assumption:** check
-  the camera's actual mount height/tilt vs. the lidar tower height first (a `/snapshot.jpg`
-  against a known object settles it) before writing any shader. Feeds a caution-trait nudge /
-  coarse slowdown, not a hard stop — edge-density-in-a-band is a heuristic, not a distance
-  measurement.
+- **Overhead-clearance signal** (was "under-furniture wedge sentinel") — **the raw signal is
+  BUILT 2026-07-12** as `GpuVision.overhead_edge_density` (see [[gpu-vision-implemented]], code
+  written/not yet hardware-verified): a second new tiny shader (`_CROP_TOP_FS`) crops the
+  edge-density shader's output to the top 30% of frame before reducing, plus a live-tunable
+  `overhead_alert` threshold. Real gap this addresses: lidar is strictly 2D-planar, so an
+  overhang entirely above the scan plane (couch arm, bed skirt, chair armrest) is invisible to
+  it, and the lidar tower sticks up past the scan plane — the robot can fit its body under
+  something while shearing the tower off on the overhang. **Still NOT done: the prerequisite
+  camera-mount-geometry check** (is the top 30% of frame actually where the tower's collision
+  zone projects to, given this camera's real height/tilt vs. the lidar tower's height) — this
+  was built as a heuristic signal on spec, not verified against the real mount geometry, and
+  the "trend while driving forward" / caution-trait consumer described below is also not wired
+  up, only the raw scalar + a generic alert threshold exist.
 - **Looming corroboration signal** (was "global looming brake") — **the raw signal is BUILT
   2026-07-12** as `GpuVision.motion_intercept_rate` (see [[gpu-vision-implemented]], code
   written/not yet hardware-verified): same ring-buffer growth-rate trick as the already-built
@@ -196,16 +195,18 @@ scalar isn't a costmap) while keeping the genuinely useful core of each. None bu
   not just lidar). **Still NOT built**: routing this into the caution-trait fast-rule path
   (`Personality.tick_events`) — the signal exists and is surfaced in telemetry/UI, but nothing
   consumes it autonomously yet, same as every other Tier-B signal.
-- **Clutter-aware velocity throttle** (was "dynamic clutter costmap penalty"). Whole-frame
-  edge-density/variance (same shader as above, free if built) as a global "this looks visually
-  busy" scalar. Real gap: lidar only sees obstacles at its own mounted height, so cables, a shoe,
-  or a dropped toy read as clear floor even though they can snag a caster or tangle a wheel — a
-  global clutter score catches that. Cost: zero marginal if the shared shader exists; ~1.9ms
-  standalone. Consumption reuses the exact whitelisted clamp mechanism `caution`→`max_lin`
-  already uses (e.g. 0.15 → 0.05 m/s in cluttered scenes). **Correction from the original pitch:**
-  this is one global scalar per frame, not a spatial map — real per-cell costmap inflation needs
-  floor-plane camera calibration, a separate, non-cheap project; framed as a coarse global
-  throttle it's cheap and buildable now, framed as "costmap penalty" it overpromises.
+- **Clutter-aware velocity throttle** (was "dynamic clutter costmap penalty") — **the raw signal
+  + alert are BUILT 2026-07-12** as `GpuVision.edge_density` + the live-tunable `clutter` alert
+  (see the edge-density entry above, and [[gpu-vision-implemented]]). Real gap: lidar only sees
+  obstacles at its own mounted height, so cables, a shoe, or a dropped toy read as clear floor
+  even though they can snag a caster or tangle a wheel — a global clutter score catches that.
+  **Still NOT built: the actual velocity-throttle ACTION** (writing `max_lin` via the
+  `caution`→`max_lin` clamp mechanism) — deliberately left informational-only like everything
+  else in this batch, since wiring an actual speed change needs driving to verify safely, which
+  was explicitly out of scope for this pass. **Correction from the original pitch:** this is one
+  global scalar per frame, not a spatial map — real per-cell costmap inflation needs floor-plane
+  camera calibration, a separate, non-cheap project; framed as a coarse global throttle it's cheap
+  and buildable now, framed as "costmap penalty" it overpromises.
 
 **Combined cost, all three:** at most 2 new reduction-chain instances (top-band edge-density +
 whole-frame edge-density, shareable between the looming signal and the clutter throttle) — an
@@ -241,11 +242,12 @@ aids. Same status as the rest of this file: brainstorm only, nothing built/appro
   diff), still sub-2ms each.
 
 **Self-diagnostic / maintenance:**
-- **Shiny-floor / wet-spot detector.** Reuse the exact threshold shader already built for
-  colour-blob tracking, thresholding on brightness (specular highlight) instead of hue, reduced
-  to "fraction of frame above highlight threshold" — a spike means a shiny/reflective/wet surface
-  ahead, throttle speed like the clutter throttle. Cost: same shader already built, different
-  threshold constant.
+- **Shiny-floor / wet-spot detector — BUILT 2026-07-12** (see [[gpu-vision-implemented]], code
+  written/not yet hardware-verified). `GpuVision.highlight_fraction`, exactly as described here —
+  reuses the already-compiled threshold shader/program with a FIXED near-white target in a
+  SEPARATE FBO/chain from the user's calibrated blob target, so the two can never collide. A
+  live-tunable `shiny` alert exists; the "throttle speed" consumer is NOT wired up, informational
+  only so far like everything else in this batch.
 - **Vibration/looseness diagnostic.** Correlate the edge-density scalar against commanded speed —
   an image blurrier than the current drive speed should produce indicates excess chassis
   vibration (loose screw, wheel imbalance, worn caster), a maintenance flag not a stop. Cost:
@@ -265,9 +267,11 @@ aids. Same status as the rest of this file: brainstorm only, nothing built/appro
 
 **Safety-adjacent, framed honestly:**
 - **Reflection/glare rejection for blob tracking.** A hard specular highlight can spoof the
-  hue-threshold tracker (a shiny reflection matching the tracked hue). The shiny-floor detector
-  above doubles as a guard: a spike in the highlight-fraction signal suppresses/derates
-  blob-tracking confidence for that frame. Cost: zero marginal, same shader, different consumer.
+  hue-threshold tracker (a shiny reflection matching the tracked hue). The signal this would
+  consume (`highlight_fraction`) is now BUILT (see the shiny-floor entry above), but the
+  actual suppression/derating of blob-tracking confidence is NOT wired up — deliberately not
+  done yet since it would change existing blob-tracking behaviour, a bigger step than adding an
+  informational signal.
 
 **Overall cost picture:** almost everything above reuses a pass already planned elsewhere in this
 file (colour-cast, edge-density, threshold, motion bounding box) or costs literally nothing extra

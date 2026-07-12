@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view (/stream_motion_mask.mjpg) + motion-intercept rate + obstruction flag + colour-cast signal -- ALL code written, build+smoke pass, NOT yet hardware-verified, not committed"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view, motion-intercept, obstruction flag, colour-cast, edge-density/clutter, overhead-structure, luma_max/backlit, highlight/shiny, motion-target-match -- 9 live-tunable alerts total, ALL code written+smoke-tested+unit-tested, NOT yet hardware-verified, not committed"
 metadata: 
   node_type: memory
   type: project
@@ -550,3 +550,89 @@ every other Tier-B signal, all informational-only, nothing yet acts on them auto
 no Mali GPU/camera. Needs a board deploy + manually covering the lens / waving a hand / pointing
 at different-coloured surfaces while watching the Sensors card, before the obstruction thresholds
 in particular can be trusted. Not committed to git yet.
+
+## Batch: 5 more raw signals + full live-tunable UI for all 9 alerts (2026-07-12, same session)
+
+User asked to add MOST of the remaining [[gpu-vision-features-todo]] items that don't need
+driving the robot to test, kept simple, with EVERY result viewable and every threshold tunable
+via the web UI, plus real tests run. Delivered:
+
+**New raw GpuVision signals** (all unconditional every tick, none need driving to verify — point
+the stationary camera at things):
+- `edge_density` — NEW shader `_EDGE_FS` (cheap 3-tap gradient: centre + right + down neighbour,
+  not a full 8-tap Sobel), reduced through the existing chain machinery. "Visual interest"/
+  clutter, a static complement to PIR's "how much just changed."
+- `overhead_edge_density` — the SAME edge shader's output, cropped to the top 30% of frame via a
+  second new tiny shader (`_CROP_TOP_FS`, remaps v_uv.y) before reducing. Overhead-clearance
+  heuristic (lidar's 2D plane blind spot) — still just a heuristic, camera-mount-vs-lidar-tower
+  geometry is unverified, as flagged in the backlog.
+- `luma_max` — genuinely free: the existing dark-reflex luma downsample already reads back a
+  small multi-cell buffer (chain stops at `min_size=24`, not 1×1), so tracking a max alongside
+  the existing sum needed zero new GPU work. `luma_max - luma` is the backlit/dynamic-range
+  signal from the backlog.
+- `highlight_fraction` — reuses the ALREADY-COMPILED `thresh_prog` with a FIXED near-white
+  target/threshold in a separate FBO/chain from the user's calibrated blob target (same program
+  object, different uniforms set immediately before each draw — verified safe, matches the
+  existing double-use-per-tick pattern the mask-view code already established). Shiny/wet-surface
+  signal.
+- `motion_target_match` — zero new GPU cost, pure CPU distance between the already-computed
+  motion centroid and target centroid. Resolves the "motion-matches-target correlation" backlog
+  item.
+
+**Architecture decision: moved ALL threshold/alert logic OUT of gpu_vision.py and into
+telemetry.py** (`TelemetryHub._vision_alerts`), mirroring the already-established `_optical_bumper`
+pattern exactly — GpuVision only ever exposes raw scalars, alerts are computed live from
+`self._node.get_parameter(...)` each tick. This is a deliberate REWORK of last round's
+obstruction flag: it was built with hardcoded `OBSTRUCTION_VAR_MAX`/`DARK_MAX` module constants
+and no way to tune them from the UI; retrofitted into the same live-param pattern as everything
+else in this batch, for consistency and actual tunability. 9 alerts total: `obstructed`,
+`clutter`, `overhead_alert`, `focus_blur`, `backlit`, `shiny`, `looming`, `colorcast`,
+`motion_matches_target` — each pairs one raw scalar with ONE tunable param (secondary constants
+like the obstruction-darkness floor's luma-lower-bound companion were kept as fixed values to
+avoid excessive slider clutter, per "keep them simple").
+
+**10 new `web_control` ROS params** (declared in `web_server.py`, whitelisted in `telemetry.py`'s
+`PARAM_WHITELIST`, defaulted in `robot.yaml`): `vision_obstruction_var_max/dark_max`,
+`vision_clutter_alert`, `vision_overhead_alert`, `vision_focus_blur_max`,
+`vision_backlit_delta_min`, `vision_highlight_alert`, `vision_looming_alert`,
+`vision_colorcast_alert`, `vision_motiontarget_match_max`. ALL are initial guesses, explicitly
+not hardware-tuned — that's exactly what the new live sliders are for.
+
+**Web UI**: every raw signal + alert surfaced as a new row in the Sensors "Camera (GPU vision)"
+card (motion↔target, visual interest, overhead structure, shiny surface, backlit, focus/blur —
+each shows the raw % AND an inline "⚠" when its alert fires), plus a new collapsible "▸ Vision
+alerts tuning" section with all 10 sliders, following the exact same collapsible-toggle +
+`setParam` idiom as the existing bumper/blob-tuning sections. Updated the hint paragraph to
+explain what to physically do to trigger each one (cover the lens partially, point at a mirror,
+hold something up high, etc.) — literally instructions for testing without driving.
+
+**Tests actually run this session** (dev host has no Mali GPU/camera, so these verify the
+*code paths that don't need hardware*, not the shaders themselves):
+1. `pixi run build` + `pixi run smoke` — both pass, including two NEW smoke assertions added to
+   `scripts/smoke_test.py` (a permanent addition, not throwaway): the `/telemetry` frame's
+   `vision` dict has all 14 expected keys including the new `alerts` sub-dict with all 9 alert
+   keys (verified on a REAL running app_hub process, not just a static check — `gpu_vision_enable`
+   defaults true, so `GpuVision` really does construct and its idle-default properties really do
+   flow through telemetry.py end-to-end even with no camera attached), and a real `POST /param`
+   for one new whitelisted param (`vision_clutter_alert`) is accepted.
+2. A throwaway pure-Python unit check (`/tmp/.../test_vision_alerts.py`, not committed) mocking
+   `get_parameter`/`GpuVision` to exercise `_vision_alerts`'s 9 formulas against 15 hand-picked
+   scenarios, specifically probing the AND-conditions' edge cases: dark+flat (obstructed=True) vs.
+   bright+flat (a blank wall, obstructed must stay False) vs. lit+flat (focus_blur=True instead);
+   dim+bright-spot (backlit=True) vs. bright+bright-spot (backlit=False); `motion_target_match=
+   None` doesn't crash the None-safety check. **All 15/15 passed** on the first logic pass (one
+   test-fixture bug caught and fixed along the way — an unrelated default value in the mock, not
+   the alert logic itself).
+
+**Deliberately excluded from this batch** (per "keep simple" + "don't need driving," but these
+don't fit either constraint): second/named colour target (needs real skill/UI design work, not
+just a GPU signal); camera-freeze/vibration diagnostics (need commanded motion to test
+meaningfully); charge-LED confirmation/doorway-bias (speculative, unconfirmed hardware/behavior);
+personality hooks (anticipatory greeting, mood→face accent, novelty score) — these touch
+`behavior`/`mood_node`/cognition, a different subsystem with higher integration risk, not a
+"simple first pass"; OLED mask-mirroring — needs cross-node transport design (`gpu_vision.py`
+lives in `web_control`, the mask would need to reach `oled_display`), a separate architecture
+question from "add a signal + a slider."
+
+**Not committed to git yet** — per the user's standing preference, all of this session's code
+(motion-mask viewer + this batch) sits in the working tree pending an explicit commit ask.
