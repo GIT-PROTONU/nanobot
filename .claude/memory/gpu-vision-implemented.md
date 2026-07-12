@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view, 9 live-tunable alerts, GPU utilization (devfreq estimate + software pipeline-duty) -- ALL DEPLOYED + LIVE-VERIFIED on real hardware (renderer=Mali450, no errors); found real obstruction-threshold miscalibration (var_max needs ~2 orders of magnitude bump) and gpu_duty running 60-190% (self-throttles gracefully); code NOT yet committed to git"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view + 9 live-tunable alerts (obstruction var_max FIXED to 400 from real data), GPU utilization tried then REMOVED per user request (devfreq useless on this board, gpu_temp redundant; pipeline-load KEPT) -- ALL DEPLOYED + LIVE-VERIFIED on real hardware twice, code NOT yet committed to git"
 metadata: 
   node_type: memory
   type: project
@@ -748,3 +748,43 @@ Nothing crashed, nothing hung, no viewer-gated path (mask views) fired spuriousl
 viewers connected (confirmed 0 mask-JPEG log lines during a no-viewer window). Code remains
 uncommitted to git per the user's standing preference — this was a live functional verification,
 not a commit.
+
+## Follow-up fixes from the live-verification findings (2026-07-12, same session, deployed)
+
+User acted on both findings immediately:
+
+1. **`vision_obstruction_var_max` fixed**: 15.0 → **400.0** (`robot.yaml` + `web_server.py`
+   default, plus the UI slider range widened from `1-60` to `10-2000` step 10 — the old range
+   couldn't even REACH a value near the real ~2700 baseline). 400 leaves comfortable margin
+   under a normal scene's ~2700-2770 reading while still (in principle) catching a genuinely
+   flat/covered frame — the exact right cutoff for an ACTUALLY covered lens is still unverified
+   (never physically tested covering the camera), but the default is no longer structurally
+   broken. **Re-deployed and confirmed live**: a fresh reading showed `luma_variance: 2208.22`
+   (a slightly dimmer moment than the first check, still normal-scene range) and `alerts.
+   obstructed: false` — correctly NOT flagging a normal scene now that the threshold sits below
+   it instead of absurdly above it.
+2. **GPU utilization + GPU temp REMOVED from the UI** per explicit user request ("remove gpu
+   utilization and temp, it['s] useless") — the devfreq-based `gpu_percent` was confirmed
+   real-hardware-useless (this board's kernel has no GPU devfreq node, permanently reads "n/a"),
+   and GPU temp just tracked CPU temp closely with no distinct information. Removed: `sys_
+   monitor.py`'s `_find_gpu_devfreq()`/`_gpu_percent()`/the `gpu_devfreq` attribute/the
+   `gpu_percent` field entirely (new code, fully deleted); the System health card's "GPU"/"GPU
+   temp" rows and their `app.js` wiring (also fully deleted); the smoke-test assertion that
+   checked for `gpu_percent`. **`gpu_temp_c` itself was NOT deleted from the backend** — it
+   pre-dated this session (an existing unused diagnostics field), only its NEW UI exposure was
+   removed, so this is a value-neutral revert of this session's addition, not new deletion of
+   old code. **`gpu_duty`" (the Camera card's "pipeline load," a different, software-measured,
+   demonstrably-varying metric) was KEPT** — not what the user called useless, and it already
+   proved informative (the 60-190%/tick finding above). Updated the Camera card's hint text to
+   drop the now-invalid "compare to the System card's GPU reading" cross-reference. Re-deployed,
+   re-verified live: `diag` frame confirmed `gpu_percent` key is gone, `gpu_temp_c` still present
+   in the backend (67.8°C this check) but simply not surfaced in the UI anymore.
+
+**Unrelated finding surfaced in the post-fix log check, NOT caused by anything in this session's
+diff** (worth a note for a future session, not chased further here): a single
+`AttributeError: 'WebServerNode' object has no attribute '_cog'` from a request arriving at
+11:02:46, ~2-3 minutes after the restart. `self._cog = CognitionCore(...)` is assigned early and
+unconditionally in `__init__` (line ~415) — nothing in this session touched that path — so this
+reads like a narrow HTTP-server-accepting-connections-before-`__init__`-finishes startup race,
+most likely triggered by opening/refreshing the browser tab right as the restart was still
+settling. Not reproduced/investigated further; flagging in case it recurs.
