@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view, 9 live-tunable alerts (motion-intercept/obstruction/colour-cast/clutter/overhead/backlit/shiny/focus-blur/motion-target-match), GPU utilization (devfreq freq-ratio estimate + software pipeline-duty proxy) -- ALL code written+smoke-tested+unit-tested, NOT yet hardware-verified, not committed"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view, 9 live-tunable alerts, GPU utilization (devfreq estimate + software pipeline-duty) -- ALL DEPLOYED + LIVE-VERIFIED on real hardware (renderer=Mali450, no errors); found real obstruction-threshold miscalibration (var_max needs ~2 orders of magnitude bump) and gpu_duty running 60-190% (self-throttles gracefully); code NOT yet committed to git"
 metadata: 
   node_type: memory
   type: project
@@ -700,3 +700,51 @@ a stub. Verified via `pixi run build` + `pixi run smoke` (added one more permane
 list) — all green. **Not yet known whether `gpu_percent` will read a real number or "n/a" on the
 actual board** — depends on whether this specific Armbian kernel build has a devfreq node for the
 Mali GPU, genuinely unverified until deployed.
+
+## LIVE HARDWARE VERIFICATION (2026-07-12, deployed via scripts/deploy.sh, real robot)
+
+Deployed the whole session's working tree (motion-mask viewer, all 9 alerts, GPU utilization) via
+a full `scripts/deploy.sh` (no package filter — multiple packages touched: `web_control`,
+`sys_monitor`, `robot_bringup`). Build succeeded on-board (2min 1s), stack restarted clean, all
+5 systemd units UP. **This is the real verification pass the earlier entries were pending.**
+
+**Confirmed working, no errors:**
+- `renderer=Mali450` in the app_hub log (real GPU, not the llvmpipe software fallback) — all the
+  new shader passes (`_EDGE_FS`, `_CROP_TOP_FS`, the reused `thresh_prog`/`mask_view_prog`
+  instances) compiled and ran with zero GL errors/tracebacks across a 5-minute log window.
+- `/telemetry` served real, sane numbers for every new field: `motion_center`, `luma`,
+  `color_cast` (~neutral grey, correctly no `colorcast` alert), `edge_density`/
+  `overhead_edge_density` (low, correctly no `clutter`/`overhead_alert`), `highlight_fraction`
+  (0.0, correctly no `shiny`), all 9 `alerts` keys present and behaving sensibly for the scene.
+- `POST /param vision_clutter_alert` → real `"sent"` ack on the live node (not just the smoke
+  test's mock). `GET /stream_motion_mask.mjpg` → real `200 OK` with multipart headers (not 503).
+- `sys_monitor` log confirms `gpu-thermal` IS a real thermal zone on this board — `gpu_temp_c`
+  reads a real number (~54°C, tracking `cpu_temp_c` closely, as expected for an SoC with no
+  separate GPU die). `gpu_percent` correctly reads `"nan"` → UI shows "n/a" — **confirmed this
+  kernel has NO GPU devfreq node** (`sys_monitor` logged "gpu devfreq: not found" explicitly) —
+  the honest-degradation design worked exactly as intended, this wasn't a guess that happened to
+  be wrong, it's a confirmed real fact about this board's kernel config now.
+
+**Two real, actionable findings from live numbers — not caught by any of the pre-deploy
+testing, exactly why "not yet hardware-verified" was the right caveat to keep repeating:**
+1. **`vision_obstruction_var_max`'s default guess (15.0) is off by ~2 orders of magnitude.**
+   Real `luma_variance` on an ordinary indoor scene reads ~2700-2770 — the obstruction alert
+   (`variance < 15`) can never fire at that default; it needs to be re-tuned via the live slider
+   (or the default bumped substantially, e.g. into the hundreds-to-low-thousands range) before
+   it's useful. Concrete proof the "not yet hardware-tuned" caveat on every alert threshold in
+   this batch was not just boilerplate hedging.
+2. **`gpu_duty` (the software pipeline-load proxy) reads 60%-190%+ per tick in practice**, not
+   the "well within budget" headroom the earlier ~1.9ms-per-chain estimates implied — the 4 new
+   unconditional reduction-chain passes added this session (edge, overhead-crop, colour-cast,
+   highlight) apparently push real per-tick cost close to or over the 66ms (15fps) frame period.
+   The existing `next_t`/`dt` scheduling logic degrades gracefully (no crash, just a lower
+   effective analysis rate — confirmed `app_hub` CPU at ~76.7% of one core / 160MB RSS, both only
+   modestly above the previously-documented ~70% / ~155-158MB Tier-B baseline, so the board isn't
+   struggling, just not hitting nominal fps). Worth knowing before adding more unconditional
+   passes on top of this batch, and a candidate for a future optimization pass (not all 6 chains
+   strictly need to run every single tick) if more headroom is ever needed.
+
+Nothing crashed, nothing hung, no viewer-gated path (mask views) fired spuriously with zero
+viewers connected (confirmed 0 mask-JPEG log lines during a no-viewer window). Code remains
+uncommitted to git per the user's standing preference — this was a live functional verification,
+not a commit.
