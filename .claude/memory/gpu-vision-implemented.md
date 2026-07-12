@@ -636,3 +636,28 @@ question from "add a signal + a slider."
 
 **Not committed to git yet** — per the user's standing preference, all of this session's code
 (motion-mask viewer + this batch) sits in the working tree pending an explicit commit ask.
+
+## Viewability/tunability audit (2026-07-12, same session)
+
+User asked to confirm every result is viewable and every threshold tunable in the web UI —
+prompted a systematic cross-check rather than trusting the earlier build. Method: enumerated all
+15 `GpuVision` raw `@property` names via a script, confirmed all 15 appear in `telemetry.py`'s
+`vision` dict (they did), then read `app.js`'s actual `onVision()` body line-by-line against that
+list (not just skimmed) to find any key that's sent but never rendered to a DOM element.
+
+**Found 2 real gaps**: `luma_variance` and `luma_max` were both in the telemetry frame but ONLY
+ever consumed to compute their alert booleans (`obstructed`/`backlit`) — the raw numbers
+themselves had no visible row, so a user watching the "lens obstructed"/"backlit" rows could see
+the flag flip but never see the actual variance/delta value driving it, or how close it was to
+tripping. **Fixed**: `visObstructed2` now reads `"var {luma_variance} clear/⚠ covered/dark"`,
+`visBacklit2` now reads `"Δ{(luma_max-luma)*100}% clear/⚠ backlit"` — both raw + alert in one row,
+matching the pattern every other row (edge_density, overhead_edge_density, highlight_fraction,
+motion_target_match) already used correctly the first time.
+
+**Confirmed correct** (all 10 params, not just the one smoke already checked): wrote a throwaway
+script that POSTs `/param` for all 10 new `vision_*` names against a live app_hub instance — all
+10 return `{"status":"sent",...}` with the right name echoed back, confirming the whole
+`PARAM_WHITELIST` list is correct (a typo in either the whitelist set or a slider's JS `param`
+string would have silently 403'd just that one). Cross-checked all 10 slider element IDs between
+`index.html` and `app.js`'s `VISION_ALERT_SLIDERS` array textually too (no typos). Re-ran
+`pixi run build` + `pixi run smoke` after the fix — still green.
