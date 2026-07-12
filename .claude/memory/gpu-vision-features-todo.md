@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-features-todo
-description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); this file now also holds an unbuilt "cheap-tier" brainstorm (white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation) plus rejected/hardware-blocked ideas
+description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); holds unbuilt brainstorms (cheap-tier: white-balance drift, obstruction flag, 2nd colour target, edge-density, backlit detector, motion/target correlation; reworked safety trio: overhead-clearance, looming corroboration, clutter throttle; general: personality hooks, self-diagnostics, docking aids) plus rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project
@@ -164,3 +164,111 @@ analyzer above needs multi-frame temporal analysis (not a single reduction pass)
 shape/circularity discrimination (see the earlier answer in this session) needs a real
 downscaled-mask readback (KBs, not bytes) — both are real, previously-considered ideas but a
 different cost tier than everything in this section.
+
+## Reworked safety-adjacent trio, 2026-07-12 (user-pitched, reworked after cost/architecture critique)
+
+User pitched three ideas framed as safety features; reworked below to correct overstated claims
+(monocular RGB isn't depth, the vision loop isn't faster than slam_nav's 10Hz loop, a global
+scalar isn't a costmap) while keeping the genuinely useful core of each. None built.
+
+- **Overhead-clearance signal** (was "under-furniture wedge sentinel"). Real gap: lidar is
+  strictly 2D-planar, so an overhang entirely above the scan plane (couch arm, bed skirt,
+  chair armrest) is invisible to it, and the lidar tower sticks up past the scan plane — the
+  robot can fit its body under something while shearing the tower off on the overhang. Reworked
+  signal: crop the downsample chain's input to the top frame band (free — a UV-rect change, not
+  a new shader) and run edge-density (not plain luma — luma alone can't tell "dark overhang" from
+  "dark rug") on it, trending while driving forward. Cost: one more reduction-chain instance
+  (~1.9ms measured for the existing chain), zero new RAM. **Prerequisite, not assumption:** check
+  the camera's actual mount height/tilt vs. the lidar tower height first (a `/snapshot.jpg`
+  against a known object settles it) before writing any shader. Feeds a caution-trait nudge /
+  coarse slowdown, not a hard stop — edge-density-in-a-band is a heuristic, not a distance
+  measurement.
+- **Looming corroboration signal** (was "global looming brake"). Reuses the edge-density shader
+  above (whole-frame variant) tracked over a short 3-frame ring buffer, generalizing the
+  already-backlogged colour-based "kinetic intercept alert" to any looming object, not just the
+  calibrated tracked colour — catches a pet/kid running at the robot, a door swinging open, etc.
+  Cost: free if the edge-density shader already exists (CPU-side ring-buffer math on a number
+  already read each tick); ~1.9ms standalone. **Correction from the original pitch:** drop the
+  "bypasses the 10Hz slam_nav loop" framing — the vision pipeline is designed to poll at 5-10Hz,
+  the same order as slam_nav, not faster, and monocular RGB edge-growth is a noisier looming cue
+  than lidar range for the glass/thin-wire cases cited (both sensors are weak there, not just
+  lidar). Route into the existing caution-trait fast-rule path (`Personality.tick_events`, same
+  mechanism as the pickup reflex), NOT a new direct-to-motor path — keep `slam_nav` as the sole
+  owner of reactive stops.
+- **Clutter-aware velocity throttle** (was "dynamic clutter costmap penalty"). Whole-frame
+  edge-density/variance (same shader as above, free if built) as a global "this looks visually
+  busy" scalar. Real gap: lidar only sees obstacles at its own mounted height, so cables, a shoe,
+  or a dropped toy read as clear floor even though they can snag a caster or tangle a wheel — a
+  global clutter score catches that. Cost: zero marginal if the shared shader exists; ~1.9ms
+  standalone. Consumption reuses the exact whitelisted clamp mechanism `caution`→`max_lin`
+  already uses (e.g. 0.15 → 0.05 m/s in cluttered scenes). **Correction from the original pitch:**
+  this is one global scalar per frame, not a spatial map — real per-cell costmap inflation needs
+  floor-plane camera calibration, a separate, non-cheap project; framed as a coarse global
+  throttle it's cheap and buildable now, framed as "costmap penalty" it overpromises.
+
+**Combined cost, all three:** at most 2 new reduction-chain instances (top-band edge-density +
+whole-frame edge-density, shareable between the looming signal and the clutter throttle) — an
+estimated +2-4ms of GPU time on top of the existing ~1.9ms PIR/diff chain, trivial against the
+66ms frame period, with the analysis loop still only running at 5-10Hz. Zero new RAM (same EGL
+context/FBOs). Only real prerequisite work: the camera-geometry check for the overhead-clearance
+signal, and wiring the other two through the existing caution-trait clamp rather than a new
+motor-authority path.
+
+## General brainstorm — personality/diagnostic/docking, 2026-07-12
+
+Prompted by "what other GPU features would be great and innovative" — broader than the cheap-tier
+safety brainstorm above, covering personality/expression hooks, self-diagnostics, and docking
+aids. Same status as the rest of this file: brainstorm only, nothing built/approved.
+
+**Personality/expression hooks (turns raw signals into character, not just safety):**
+- **Anticipatory-approach greeting.** The motion-saliency bounding box (already built in the 3-6
+  batch) growing rapidly + centered = someone walking up — trigger the `greeting` reflex before
+  pickup, not just on contact. Cost: ~zero, pure CPU correlation of an existing signal.
+- **Ambient colour mood → face accent.** The colour-cast scalar already brainstormed (sum R/G/B
+  off the luma pass) could bias which face/mood the `feeling` state leans toward (warm evening
+  light vs. cold daytime fluorescents) — a cheap "the room's vibe rubs off on me" touch. Cost:
+  zero marginal, same pass, new consumer.
+- **Visual diary / continuity for reflection.** Log the already-computed per-frame scalars (luma,
+  variance, motion) over time, same mechanism as `trait_trend_text` — gives the reflection prompt
+  real sensory continuity ("the room got darker and quieter through the evening"). Cost: zero
+  GPU, host-side logging only.
+- **Novelty/boredom score for curiosity.** Maintain one small persistent low-res texture (e.g.
+  16×16) as a slow exponential-moving-average "background" of the room, diff the current frame
+  against *that* instead of just the previous frame (PIR already does previous-frame diff) — a
+  sustained delta vs. the long-run background is a much better novelty signal for the curiosity
+  trait / `looking` beat priority than raw motion. Cost: ~2 extra passes (blend-into-background +
+  diff), still sub-2ms each.
+
+**Self-diagnostic / maintenance:**
+- **Shiny-floor / wet-spot detector.** Reuse the exact threshold shader already built for
+  colour-blob tracking, thresholding on brightness (specular highlight) instead of hue, reduced
+  to "fraction of frame above highlight threshold" — a spike means a shiny/reflective/wet surface
+  ahead, throttle speed like the clutter throttle. Cost: same shader already built, different
+  threshold constant.
+- **Vibration/looseness diagnostic.** Correlate the edge-density scalar against commanded speed —
+  an image blurrier than the current drive speed should produce indicates excess chassis
+  vibration (loose screw, wheel imbalance, worn caster), a maintenance flag not a stop. Cost:
+  zero marginal if edge-density exists, pure CPU correlation.
+- **Camera-freeze diagnostic** (already on the backlog above) fits the same cluster.
+
+**Docking / navigation aids:**
+- **Charge-LED confirmation.** If the dock has a status LED, crop to a small fixed ROI once
+  roughly docked and sample average luma over time to detect a blink pattern — cheap vision-side
+  corroboration of "am I actually charging." Cost: trivial, a handful of pixel reads, no
+  reduction chain needed. **Caveat: speculative** — depends on the dock having a visible LED the
+  camera can see while docked, unverified.
+- **Doorway/open-space bias for exploration.** A vertical-uniformity heuristic (open space tends
+  to look flat/uniform vs. cluttered) could bias autonomous wandering toward doorways/open rooms.
+  **Caveat:** only useful if the robot does open-ended roaming rather than fixed pursuits —
+  unverified whether that behavior exists today.
+
+**Safety-adjacent, framed honestly:**
+- **Reflection/glare rejection for blob tracking.** A hard specular highlight can spoof the
+  hue-threshold tracker (a shiny reflection matching the tracked hue). The shiny-floor detector
+  above doubles as a guard: a spike in the highlight-fraction signal suppresses/derates
+  blob-tracking confidence for that frame. Cost: zero marginal, same shader, different consumer.
+
+**Overall cost picture:** almost everything above reuses a pass already planned elsewhere in this
+file (colour-cast, edge-density, threshold, motion bounding box) or costs literally nothing extra
+(CPU correlation of numbers already computed each tick). The only two with real new GPU work are
+the shiny-floor threshold pass and the novelty background-blend, both still sub-2ms.
