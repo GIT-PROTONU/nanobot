@@ -44,6 +44,11 @@ SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the la
 # thresholds are live web_control PARAMS now (vision_bumper_cmd_eps/motion_floor/
 # confirm_secs, declared in web_server.py, live-tunable via the Sensors panel), not
 # fixed constants -- see _optical_bumper below.
+# Cheap GPU-vision alert signals (2026-07-12 batch): each pairs one raw GpuVision
+# scalar with a live web_control PARAM threshold, computed in _vision_alerts (same
+# "read params live, not fixed constants" pattern as the optical bumper) -- so every
+# alert's threshold is a web UI slider from day one, not a hardcoded guess. All are
+# informational only so far; nothing autonomous acts on them yet.
 PLAN_MAX_PTS = 64        # planned-path polyline is downsampled to at most this many points
 LDS_RPM_MAX = 400.0      # clamp on the /lds_target_rpm setpoint a browser may publish
 SCHEDULE_MAX_ENTRIES = 20  # cap on the scheduled-routines list a browser may set
@@ -59,7 +64,11 @@ PARAM_WHITELIST = {
                  "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm"},
     "sys_monitor": {"fan_override", "fan_temp_min"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
-                    "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs"},
+                    "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",
+                    "vision_obstruction_var_max", "vision_obstruction_dark_max",
+                    "vision_clutter_alert", "vision_overhead_alert", "vision_focus_blur_max",
+                    "vision_backlit_delta_min", "vision_highlight_alert", "vision_looming_alert",
+                    "vision_colorcast_alert", "vision_motiontarget_match_max"},
 }
 
 
@@ -190,6 +199,35 @@ class TelemetryHub:
         return {"alert": held >= confirm_secs, "commanded": commanded,
                 "cmd_vel": [round(lin, 3), round(ang, 3)], "low_motion_secs": round(held, 2)}
 
+    def _vision_alerts(self, gv):
+        """Turn GpuVision's raw scalar properties into ALERT booleans against LIVE
+        web_control params (not fixed constants), same pattern as _optical_bumper --
+        the web UI's sliders actually take effect immediately, no restart needed. Kept
+        in telemetry.py rather than gpu_vision.py so tuning never touches the GL thread."""
+        g = self._node.get_parameter
+        luma = gv.luma
+        obstructed = (gv.luma_variance < g("vision_obstruction_var_max").value
+                      and luma < g("vision_obstruction_dark_max").value)
+        clutter = gv.edge_density > g("vision_clutter_alert").value
+        overhead = gv.overhead_edge_density > g("vision_overhead_alert").value
+        # focus_blur additionally requires decent light -- otherwise it's redundant
+        # with `obstructed` (a dark, low-edge-density frame is already covered there).
+        focus_blur = (gv.edge_density < g("vision_focus_blur_max").value and luma > 0.1)
+        # backlit additionally requires a dim-ish overall scene -- a bright highlight in
+        # an already-bright frame isn't "backlit," it's just a normally lit room.
+        backlit = ((gv.luma_max - luma) > g("vision_backlit_delta_min").value and luma < 0.5)
+        shiny = gv.highlight_fraction > g("vision_highlight_alert").value
+        looming = gv.motion_intercept_rate > g("vision_looming_alert").value
+        cast = gv.color_cast
+        colorcast = bool(cast) and (max(cast) - min(cast)) > g("vision_colorcast_alert").value
+        match = gv.motion_target_match
+        motion_matches_target = match is not None and match < g("vision_motiontarget_match_max").value
+        return {
+            "obstructed": obstructed, "clutter": clutter, "overhead_alert": overhead,
+            "focus_blur": focus_blur, "backlit": backlit, "shiny": shiny, "looming": looming,
+            "colorcast": colorcast, "motion_matches_target": motion_matches_target,
+        }
+
     def _build(self):
         n = self._node
         now = time.monotonic()
@@ -231,30 +269,45 @@ class TelemetryHub:
             f["selftest"] = self._selftest
         gv = getattr(n, "_gpu_vision", None)
         manual = bool(getattr(n, "_manual_mode", False))
+        camera_enabled = not bool(getattr(n, "_camera_disabled", False))
         if gv is not None:
             # Plain thread-safe Python properties, not a ROS topic -- no subscription
             # needed, just read on each tick (gpu_vision.py runs continuously regardless
-            # of telemetry clients, so this is never stale) -- UNLESS manual mode has
-            # stopped GpuVision's capture thread entirely (see WebServerNode.
-            # vision_manual), in which case these properties are frozen at their last
-            # value before the stop, not live. Still report them (harmless, and lets the
-            # UI show "last known" state) but the `manual` flag lets the page grey them
-            # out / label them stale instead of implying they're updating.
+            # of telemetry clients, so this is never stale) -- UNLESS manual mode OR the
+            # master camera-disable switch has stopped GpuVision's capture thread
+            # entirely (see WebServerNode.vision_manual / set_camera_enable), in which
+            # case these properties are frozen at their last value before the stop, not
+            # live. Still report them (harmless, and lets the UI show "last known"
+            # state) but `manual`/`camera_enabled` let the page grey them out / label
+            # them stale instead of implying they're updating.
+            frozen = manual or not camera_enabled
             target = gv.target
             motion_center = gv.motion_center
             motion_score = gv.motion_score
             bumper = ({"alert": False, "commanded": False, "cmd_vel": [0.0, 0.0], "low_motion_secs": 0.0}
-                      if manual else self._optical_bumper(now, motion_score))
+                      if frozen else self._optical_bumper(now, motion_score))
             blob_threshold, blob_min, blob_max = gv.blob_tuning
+            match = gv.motion_target_match
             f["vision"] = {
                 "manual": manual,
+                "camera_enabled": camera_enabled,
                 "motion": round(motion_score, 3),
                 "motion_center": [round(v, 3) for v in motion_center] if motion_center else None,
                 "target": [round(v, 3) for v in target] if target else None,
                 "has_target_color": gv.has_target_color,
                 "blob_tuning": [round(blob_threshold, 3), round(blob_min, 3), round(blob_max, 3)],
                 "intercept_rate": round(gv.intercept_rate, 3),
+                "motion_intercept_rate": round(gv.motion_intercept_rate, 3),
+                "motion_target_match": round(match, 3) if match is not None else None,
                 "luma": round(gv.luma, 3),
+                "luma_variance": round(gv.luma_variance, 2),
+                "luma_max": round(gv.luma_max, 3),
+                "color_cast": [round(v, 3) for v in gv.color_cast] if gv.color_cast else None,
+                "edge_density": round(gv.edge_density, 3),
+                "overhead_edge_density": round(gv.overhead_edge_density, 3),
+                "highlight_fraction": round(gv.highlight_fraction, 3),
+                "gpu_duty": round(gv.gpu_duty, 3),
+                "alerts": self._vision_alerts(gv),
                 "bumper": bumper,
             }
         # latched brain readouts, passed through as the raw JSON strings the page parses

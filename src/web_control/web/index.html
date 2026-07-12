@@ -105,6 +105,7 @@
           <button id="visionPick" class="btn">🎯 Pick target colour</button>
           <button id="visionClear" class="btn">✕ Clear target</button>
           <button id="visionMaskToggle" class="btn">🎭 Show tracking mask</button>
+          <button id="visionMotionMaskToggle" class="btn">👣 Show motion mask</button>
           <label class="switch" id="visManualRow" style="display:none">
             <input type="checkbox" id="visManual"><span class="track"></span>
             🎥 Manual mode (direct feed, no GPU)</label>
@@ -374,6 +375,8 @@
 
         <!-- ===== SENSORS ===== -->
         <section id="panel-sensors" class="panel">
+          <label class="switch"><input type="checkbox" id="hintsToggle" checked><span class="track"></span>
+            💡 Show hints (hover explanations)</label>
           <div class="card">
             <h2>System health</h2>
             <div class="kv">
@@ -433,6 +436,8 @@
           </div>
           <div class="card">
             <h2>Camera (GPU vision)</h2>
+            <label class="switch"><input type="checkbox" id="visCameraEnable" checked><span class="track"></span>
+              📷 Camera enabled</label>
             <label class="switch" id="visManualRow2" style="display:none">
               <input type="checkbox" id="visManual2"><span class="track"></span>
               🎥 Manual mode (direct feed, no GPU)</label>
@@ -441,7 +446,17 @@
               <span>motion center</span><b id="visMotionCenter2">–</b>
               <span>target lock</span><b id="visTarget2">–</b>
               <span>intercept rate</span><b id="visIntercept2">–</b>
+              <span>motion intercept</span><b id="visMotionIntercept2">–</b>
+              <span>motion ↔ target</span><b id="visMotionTargetMatch2">–</b>
               <span>brightness</span><b id="visLuma2">–</b>
+              <span>lens obstructed</span><b id="visObstructed2">–</b>
+              <span>colour cast</span><b id="visColorCast2">–</b>
+              <span>visual interest</span><b id="visEdgeDensity2">–</b>
+              <span>overhead structure</span><b id="visOverhead2">–</b>
+              <span>shiny surface</span><b id="visShiny2">–</b>
+              <span>backlit</span><b id="visBacklit2">–</b>
+              <span>focus / blur</span><b id="visFocusBlur2">–</b>
+              <span>pipeline load</span><b id="visGpuDuty2">–</b>
               <span>optical bumper</span><b id="visBumper2">–</b>
               <span>commanded /cmd_vel</span><b id="visBumperCmd2">–</b>
               <span>stall held for</span><b id="visBumperHeld2">–</b>
@@ -470,6 +485,29 @@
               <div class="field"><label>Max blob size <span id="visBlobMaxV">100</span>% (reject "matched everything")</label>
                 <input id="visBlobMax" type="range" min="1" max="100" step="1" value="100"></div>
             </div>
+            <p class="exp" id="visionAlertsToggle">▸ Vision alerts tuning</p>
+            <div id="visionAlertsTune" style="display:none">
+              <div class="field"><label>Obstruction: flatness <span id="visObstrVarV">400</span> (variance units, lower = stricter)</label>
+                <input id="visObstrVar" type="range" min="10" max="2000" step="10" value="400"></div>
+              <div class="field"><label>Obstruction: darkness <span id="visObstrDarkV">15</span>%</label>
+                <input id="visObstrDark" type="range" min="2" max="50" step="1" value="15"></div>
+              <div class="field"><label>Clutter alert <span id="visClutterV">12</span>%</label>
+                <input id="visClutter" type="range" min="1" max="60" step="1" value="12"></div>
+              <div class="field"><label>Overhead-structure alert <span id="visOverheadV">12</span>%</label>
+                <input id="visOverhead" type="range" min="1" max="60" step="1" value="12"></div>
+              <div class="field"><label>Focus-blur max <span id="visFocusBlurV">3</span>%</label>
+                <input id="visFocusBlur" type="range" min="1" max="30" step="1" value="3"></div>
+              <div class="field"><label>Backlit delta <span id="visBacklitV">35</span>%</label>
+                <input id="visBacklit" type="range" min="5" max="80" step="1" value="35"></div>
+              <div class="field"><label>Shiny-surface alert <span id="visHighlightV">5</span>%</label>
+                <input id="visHighlight" type="range" min="1" max="40" step="1" value="5"></div>
+              <div class="field"><label>Looming alert <span id="visLoomingV">30</span>%/s</label>
+                <input id="visLooming" type="range" min="5" max="200" step="5" value="30"></div>
+              <div class="field"><label>Colour-cast alert <span id="visColorcastV">12</span>%</label>
+                <input id="visColorcast" type="range" min="2" max="50" step="1" value="12"></div>
+              <div class="field"><label>Motion-matches-target distance <span id="visMotionTargetV">15</span>%</label>
+                <input id="visMotionTarget" type="range" min="2" max="100" step="1" value="15"></div>
+            </div>
             <p class="hint">Continuous on-GPU frame-diff ("PIR") + optional colour-blob
               tracking + luminance, computed whether or not the video view is open (all
               off when <b>gpu_vision_enable</b> is false). <b>Manual mode</b> bypasses the
@@ -477,7 +515,26 @@
               but PIR/blob-tracking/dark-reflex/mask view all pause while it's on (same
               toggle as the one above the Camera view). <b>Motion center</b>/
               <b>intercept rate</b> are the motion-saliency and kinetic-intercept Tier-B
-              extensions. <b>Optical bumper</b> flags commanded-but-not-moving (possible
+              extensions. <b>Motion intercept</b> is the same looming-alert math applied to
+              raw motion instead of a calibrated target — no colour needs to be set. <b>Lens
+              obstructed</b> flags a flat, dark frame (hand/dust over the lens); try covering
+              the camera to see it trigger. <b>Colour cast</b> is the scene's average R/G/B —
+              watch it shift under different lighting. <b>Visual interest</b> is how much
+              texture/contrast is in frame (try pointing at a blank wall vs. a cluttered
+              shelf); <b>overhead structure</b> is the same signal cropped to the top of the
+              frame (try holding something up high); <b>shiny surface</b> flags specular
+              highlights (try a phone screen or mirror); <b>backlit</b> flags a bright spot in
+              an otherwise dim scene; <b>focus/blur</b> flags a sudden sharpness drop (try
+              covering the lens partially, close up); <b>motion ↔ target</b> shows how close
+              the moving thing is to the tracked colour (needs a target calibrated first).
+              <b>Pipeline load</b> is a SOFTWARE-measured proxy — the fraction of each frame's
+              time budget spent in the shader+readback block; over 100% means the vision loop
+              can't keep up with the configured fps and is quietly falling behind (confirmed on
+              real hardware — see the gpu-vision-implemented memory). All have live sliders
+              under <b>▸ Vision alerts tuning</b> — thresholds are tuned from real hardware
+              readings where available (obstruction's flatness default), otherwise still
+              initial guesses. All informational only so far.
+              <b>Optical bumper</b> flags commanded-but-not-moving (possible
               wheel stall/slip) — it reads "clear" almost all the time simply because
               the robot isn't currently being driven; <b>commanded /cmd_vel</b> shows
               exactly what it's seeing so that's visible instead of a single opaque

@@ -371,6 +371,24 @@ web_control:
     vision_bumper_cmd_eps: 0.03        # m/s or rad/s floor to count as "commanded to move"
     vision_bumper_motion_floor: 0.01   # gpu motion score below this = "nothing visibly moved"
     vision_bumper_confirm_secs: 0.6    # s the stall condition must hold before alerting
+    # Cheap GPU-vision alert thresholds (2026-07-12 batch): all informational only, all
+    # live-tunable from the same Sensors > Camera card -- see telemetry.py's
+    # _vision_alerts. Still initial guesses pending real hardware tuning EXCEPT
+    # var_max below, which is informed by a real live reading.
+    # var_max informed by a real reading (2026-07-12 live check): an ordinary indoor
+    # scene reads luma_variance ~2700-2770, so the original 15.0 guess could never have
+    # fired -- 400 leaves comfortable margin under a normal scene while still catching a
+    # genuinely flat/covered frame; the exact covered-lens number is still unverified.
+    vision_obstruction_var_max: 400.0    # luma variance below this = "flat/textureless"
+    vision_obstruction_dark_max: 0.15    # AND luma below this = lens obstructed
+    vision_clutter_alert: 0.12           # edge_density above this = visually busy/cluttered
+    vision_overhead_alert: 0.12          # overhead_edge_density above this = possible overhang
+    vision_focus_blur_max: 0.03          # edge_density below this (while lit) = defocused/close
+    vision_backlit_delta_min: 0.35       # luma_max - luma above this = backlit/silhouette
+    vision_highlight_alert: 0.05         # highlight_fraction above this = shiny/wet surface
+    vision_looming_alert: 0.3            # motion_intercept_rate above this = something looming
+    vision_colorcast_alert: 0.12         # colour_cast R/G/B spread above this = strong cast
+    vision_motiontarget_match_max: 0.15  # motion-vs-target centroid distance below this = match
     # Stress test mode (web "Stress test" card, POST /stress/start|stop): niced (lowest
     # priority) CPU busy-loop worker subprocesses that peg every core without starving
     # this web server (see web_control/stress.py). Auto-stops regardless of the caller.

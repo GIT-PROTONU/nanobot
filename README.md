@@ -155,6 +155,23 @@ works). It's entirely best-effort: no key / no network = silent, and it can neve
 robot unsafe. See **[docs/brain.md](docs/brain.md)** for the full picture, and test it
 off-robot with `scripts/dev_webui.py --behavior`.
 
+## 3d. (Optional) GPU vision
+
+The webcam feed can be run through the H5's **Mali-450 GPU** (`gpu_vision_enable`,
+default `true`) instead of a plain passthrough — motion detection ("PIR"), colour-blob
+tracking, and a batch of cheap secondary signals (visual clutter, shiny-surface,
+backlit, colour-cast, overhead-structure, focus/blur, motion-vs-target correlation),
+all computed as GLES2 fragment shaders and reduced on-GPU so almost nothing crosses
+back to the CPU. Needs the `lima` kernel driver loaded (`lsmod | grep lima`;
+`deploy/sbc-setup.sh` handles this) — if missing, vision silently falls back to a
+*software* GL rasterizer (a clear warning in the logs, not a crash) or the page's
+📷 **Camera** tab has a **Manual mode** switch for a zero-cost raw passthrough, plus a
+master **Camera enabled** switch to turn the whole thing off. Everything is
+live-viewable and live-tunable from the web UI's **Sensors → Camera (GPU vision)**
+card — hover any reading or slider there for an explanation (toggle off with
+**💡 Show hints** if you don't want them). All of it is informational only today;
+nothing in the robot's autonomous behavior acts on these signals yet.
+
 ## 4. Run
 
 **On the robot** the stack runs as systemd units (installed by `deploy/sbc-setup.sh`,

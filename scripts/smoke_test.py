@@ -158,6 +158,41 @@ def main():
         st, body = req("POST", "/drive", {"v": 0.1, "w": 0.0})
         check("drive accepted", st == 200 and b'"v": 0.1' in body, body[:80])
 
+        # --- GPU vision frame contract (gpu_vision_enable defaults true; no camera on
+        # this dev host, so GpuVision degrades to idle defaults -- the KEYS must still
+        # be present, that's the contract telemetry.py <-> app.js share) ------------
+        vision = None
+        for f in sse_frames(time.monotonic() + 6.0):
+            if "vision" in f:
+                vision = f["vision"]
+                break
+        if vision is not None:
+            missing = [k for k in (
+                "motion", "motion_center", "target", "intercept_rate",
+                "motion_intercept_rate", "motion_target_match", "luma", "luma_variance",
+                "luma_max", "color_cast", "edge_density", "overhead_edge_density",
+                "highlight_fraction", "gpu_duty", "camera_enabled", "alerts", "bumper")
+                if k not in vision]
+            check("vision frame has all keys", not missing, f"missing={missing}")
+            alerts = vision.get("alerts") or {}
+            missing_alerts = [k for k in (
+                "obstructed", "clutter", "overhead_alert", "focus_blur", "backlit",
+                "shiny", "looming", "colorcast", "motion_matches_target")
+                if k not in alerts]
+            check("vision alerts has all keys", not missing_alerts, f"missing={missing_alerts}")
+        else:
+            check("vision frame has all keys", False, "no 'vision' key in any frame")
+            check("vision alerts has all keys", False, "no 'vision' key in any frame")
+
+        st, body = req("POST", "/param",
+                       {"node": "web_control", "name": "vision_clutter_alert", "value": 0.2})
+        check("whitelisted vision-alert param accepted", st == 200 and b'"sent"' in body, body[:80])
+
+        st, body = req("POST", "/vision/camera_enable", {"enabled": False})
+        check("camera disable accepted", st == 200 and b'"camera_enabled": false' in body, body[:80])
+        st, body = req("POST", "/vision/camera_enable", {"enabled": True})
+        check("camera re-enable accepted", st == 200 and b'"camera_enabled": true' in body, body[:80])
+
         # --- vitals blob (written by sys_monitor regardless of the router) -----
         v = {}
         end = time.monotonic() + 8.0

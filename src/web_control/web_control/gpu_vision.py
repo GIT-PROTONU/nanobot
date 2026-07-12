@@ -356,6 +356,41 @@ void main() {
 }
 """
 
+# Cheap 3-tap gradient (centre + right + down neighbour, not a full 8-tap Sobel) --
+# "how much texture/contrast is in frame," a static complement to _DIFF_FS's "how much
+# just changed." `texel` is 1/width, 1/height of the SOURCE (cur_tex, i.e. W,H) so the
+# neighbour offset is exactly one source pixel regardless of downsample stage. Values
+# can exceed 1.0 (sum of two abs differences up to ~2.0) and get implicitly clamped on
+# write to the RGBA8 target -- fine for a coarse "how much edge" scalar, not for exact
+# gradient magnitude.
+_EDGE_FS = b"""
+precision mediump float;
+varying vec2 v_uv;
+uniform sampler2D tex;
+uniform vec2 texel;
+void main() {
+    vec3 w = vec3(0.299, 0.587, 0.114);
+    float l = dot(texture2D(tex, v_uv).rgb, w);
+    float lx = dot(texture2D(tex, v_uv + vec2(texel.x, 0.0)).rgb, w);
+    float ly = dot(texture2D(tex, v_uv + vec2(0.0, texel.y)).rgb, w);
+    float e = abs(lx - l) + abs(ly - l);
+    gl_FragColor = vec4(e, e, e, 1.0);
+}
+"""
+
+# Remaps v so only the TOP top_frac fraction of the source is sampled (v_uv.y=0 is the
+# top row) -- used to crop _EDGE_FS's output to an "overhead clearance" band before
+# reducing, without a second copy of the edge shader itself.
+_CROP_TOP_FS = b"""
+precision mediump float;
+varying vec2 v_uv;
+uniform sampler2D tex;
+uniform float top_frac;
+void main() {
+    gl_FragColor = texture2D(tex, vec2(v_uv.x, v_uv.y * top_frac));
+}
+"""
+
 
 def plan_downsample_stages(w, h, min_size=24):
     """Just the (w,h) sequence a downsample chain would halve through -- no GL calls,
@@ -570,8 +605,18 @@ class GpuVision:
         self._blob_min_confidence = 0.0
         self._blob_max_confidence = 1.0
         self._intercept_rate = 0.0         # kinetic intercept: target confidence growth/sec
+        self._motion_intercept_rate = 0.0  # same trick, but for raw motion (no target needed)
         self._luma = 0.0                   # flashlight/dark reflex: 0..1 average frame luminance
         self._luma_at = 0.0
+        self._luma_variance = 0.0          # camera-obstruction signal: flat-frame detector
+        self._luma_max = 0.0               # backlit/dynamic-range signal: brightest cell in frame
+        self._color_cast = None            # (r,g,b) 0..1 whole-scene average colour
+        self._edge_density = 0.0           # visual "interest"/clutter: how much texture in frame
+        self._overhead_edge_density = 0.0  # same, cropped to the top band (overhead clearance)
+        self._highlight_fraction = 0.0     # shiny/reflective-surface signal
+        self._motion_target_match = None   # distance between motion centroid and tracked target
+        self._gpu_duty = 0.0                # software proxy: fraction of the frame period spent
+                                             # in the shader+readback block (see gpu_duty's doc)
         self._viewers = 0                  # browser viewers of the JPEG tee (ref-counted)
         self._jpeg = None
         self._jpeg_seq = 0
@@ -583,6 +628,14 @@ class GpuVision:
         self._mask_jpeg = None
         self._mask_jpeg_seq = 0
         self._mask_jpeg_cond = threading.Condition()
+        # Same shape again, for the "show me where motion is" debug view (brighter =
+        # more change since last frame) -- reuses _MASK_VIEW_FS pointed at diff_tex
+        # instead of thresh_tex (see _DIFF_FS: same R-channel magnitude packing), so no
+        # new shader. Needs no target colour -- only a previous frame (have_prev).
+        self._motion_mask_viewers = 0
+        self._motion_mask_jpeg = None
+        self._motion_mask_jpeg_seq = 0
+        self._motion_mask_jpeg_cond = threading.Condition()
 
     # ---- thread-safe readouts ----
     @property
@@ -615,10 +668,104 @@ class GpuVision:
             return self._intercept_rate
 
     @property
+    def motion_intercept_rate(self):
+        """Tau-style looming alert for RAW motion, no calibrated colour target needed --
+        rate of growth (per second) of the PIR motion score over the last few frames.
+        High + sustained means something is filling more of the frame over time, i.e.
+        approaching the lens, not just present. Complements `intercept_rate` (which only
+        works once a target colour is set and visible)."""
+        with self._lock:
+            return self._motion_intercept_rate
+
+    @property
     def luma(self):
         """0..1 average frame luminance (flashlight/dark reflex)."""
         with self._lock:
             return self._luma
+
+    @property
+    def luma_variance(self):
+        """Variance (0..255^2 scale) of the small downsampled luma buffer -- near-zero
+        means a flat, textureless frame. Raw signal only -- the camera-obstruction ALERT
+        (variance + luma vs. tunable thresholds) is computed in telemetry.py, same
+        pattern as the optical bumper, so its thresholds are live web UI sliders instead
+        of baked-in constants."""
+        with self._lock:
+            return self._luma_variance
+
+    @property
+    def luma_max(self):
+        """Brightest cell (0..1) in the same small downsampled luma buffer used for the
+        dark reflex -- literally free, just tracking a max alongside the existing sum in
+        the same already-read-back buffer. `luma_max - luma` is a crude backlit/dynamic-
+        range signal (a bright window behind a dark subject); the ALERT threshold lives
+        in telemetry.py, same pattern as luma_variance above."""
+        with self._lock:
+            return self._luma_max
+
+    @property
+    def color_cast(self):
+        """(r,g,b) each 0..1, the whole-scene average colour (not just luminance) --
+        drifts with ambient lighting (warm evening vs. cool daylight). None until the
+        first frame is captured."""
+        with self._lock:
+            return self._color_cast
+
+    @property
+    def edge_density(self):
+        """0..1-ish (can clamp above 1 in extreme cases): how much texture/contrast is
+        in the whole frame, from _EDGE_FS -- a static complement to motion_score's "how
+        much just changed." High = visually busy (clutter, a person standing still);
+        near-zero = a blank wall/floor. Also the raw input for the focus-blur proxy
+        (telemetry.py) -- a sharp scene reads high here, a defocused/obstructed one low."""
+        with self._lock:
+            return self._edge_density
+
+    @property
+    def overhead_edge_density(self):
+        """Same edge-density signal as above, but cropped to the TOP band of the frame
+        only (see _CROP_TOP_FS) -- a coarse "is there structure above the lidar's 2D scan
+        plane" signal (a couch arm, a bed skirt, anything that would shear the lidar
+        tower off while the body clears underneath). Heuristic, not a distance
+        measurement -- see the overhead-clearance design note in
+        gpu-vision-features-todo for the caveats (needs the camera mount geometry
+        checked against the lidar tower height, not yet done)."""
+        with self._lock:
+            return self._overhead_edge_density
+
+    @property
+    def highlight_fraction(self):
+        """Fraction of the frame matching a FIXED near-white target colour (reuses the
+        blob-tracker's compiled threshold shader/program with fixed uniforms in a
+        separate FBO/chain from the user's calibrated target, so the two never collide)
+        -- a shiny/wet/reflective-surface signal (specular highlights), independent of
+        whatever colour the user has calibrated for blob tracking."""
+        with self._lock:
+            return self._highlight_fraction
+
+    @property
+    def motion_target_match(self):
+        """Distance (0..~1.4, image-normalized) between the motion centroid and the
+        tracked colour target's centroid, or None if either is currently absent. Small =
+        "the thing that's moving is my tracked target"; large = "something else is
+        moving elsewhere in frame." Zero new GPU cost -- both centroids are already
+        computed elsewhere in the same tick."""
+        with self._lock:
+            return self._motion_target_match
+
+    @property
+    def gpu_duty(self):
+        """SOFTWARE proxy for "how loaded is the vision pipeline," NOT a true hardware
+        occupancy percentage: fraction of the frame period spent in the shader-submit +
+        readback block (measured from after the camera frame is captured to after
+        `glFinish()`), 0..1+ (can exceed 1.0 if a tick overruns its period, e.g. a slow
+        JPEG encode while a viewer watches). Always available with zero sysfs/hardware
+        dependency, unlike true GPU-core busy-time (see gpu-vision-implemented memory for
+        why a real hardware occupancy reading -- DRM fdinfo -- wasn't attempted: it would
+        need the raw DRI device fd, which Mesa's surfaceless EGL platform opens
+        internally, not something this code currently controls)."""
+        with self._lock:
+            return self._gpu_duty
 
     @property
     def has_target_color(self):
@@ -705,6 +852,25 @@ class GpuVision:
                 return last_seq, None
             return self._mask_jpeg_seq, self._mask_jpeg
 
+    # ---- motion-mask debug view (same ref-counted shape; no target colour needed) ----
+    def add_motion_mask_viewer(self):
+        with self._motion_mask_jpeg_cond:
+            self._motion_mask_viewers += 1
+
+    def remove_motion_mask_viewer(self):
+        with self._motion_mask_jpeg_cond:
+            self._motion_mask_viewers = max(0, self._motion_mask_viewers - 1)
+
+    def get_motion_mask_frame(self, last_seq, timeout=5.0):
+        """Same shape as get_frame()/get_mask_frame(). Unlike the colour mask there's no
+        "not configured" case -- motion diff runs unconditionally once a second frame
+        has arrived, so callers only need to check running() on a timeout."""
+        with self._motion_mask_jpeg_cond:
+            if not self._motion_mask_jpeg_cond.wait_for(
+                    lambda: self._motion_mask_jpeg_seq != last_seq or not self._run, timeout):
+                return last_seq, None
+            return self._motion_mask_jpeg_seq, self._motion_mask_jpeg
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
@@ -786,6 +952,12 @@ class GpuVision:
         flip_prog = gl.program(_FLIP_VS, _COPY_FS)
         mask_view_prog = gl.program(_FLIP_VS, _MASK_VIEW_FS)   # mirror-corrected, like flip_prog
         u_mask_tex = gl.gl.glGetUniformLocation(mask_view_prog, b"tex")
+        edge_prog = gl.program(_QUAD_VS, _EDGE_FS)
+        u_edge_tex = gl.gl.glGetUniformLocation(edge_prog, b"tex")
+        u_edge_texel = gl.gl.glGetUniformLocation(edge_prog, b"texel")
+        crop_prog = gl.program(_QUAD_VS, _CROP_TOP_FS)
+        u_crop_tex = gl.gl.glGetUniformLocation(crop_prog, b"tex")
+        u_top_frac = gl.gl.glGetUniformLocation(crop_prog, b"top_frac")
         quad = make_quad_vbo(gl)
 
         yuyv_tex = gl.make_texture(W // 2, H, GL_RGBA)
@@ -797,11 +969,22 @@ class GpuVision:
         luma_tex, luma_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA, filt=GL_LINEAR)
         flip_tex, flip_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA)
         mask_flip_tex, mask_flip_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA)
+        motion_mask_flip_tex, motion_mask_flip_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA)
+        edge_tex, edge_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA, filt=GL_LINEAR)
+        crop_tex, crop_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA, filt=GL_LINEAR)
+        highlight_tex, highlight_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA, filt=GL_LINEAR)
         # Pre-allocated ONCE, reused every frame -- see build_downsample_chain's
         # docstring for why (a real leak, found + fixed on hardware).
         diff_chain = build_downsample_chain(gl, W, H)
         thresh_chain = build_downsample_chain(gl, W, H)
         luma_chain = build_downsample_chain(gl, W, H)
+        # Colour-cast (white-balance drift) chain: reuses copy_prog/_COPY_FS verbatim
+        # (no new shader) straight on cur_tex (the RGB frame, not a luminance/threshold
+        # derivative), so R/G/B stay separable instead of collapsing to one grey value.
+        wb_chain = build_downsample_chain(gl, W, H)
+        edge_chain = build_downsample_chain(gl, W, H)          # visual-interest/clutter
+        crop_chain = build_downsample_chain(gl, W, H)          # overhead-clearance (cropped edge)
+        highlight_chain = build_downsample_chain(gl, W, H)     # shiny/reflective-surface
         # Readback buffers, also pre-allocated once (same reasoning as the FBO chains --
         # per-frame ctypes allocation churn is real, avoidable cost; a chain's final
         # stage size is fixed for the whole session since W/H never change).
@@ -809,11 +992,18 @@ class GpuVision:
         diff_buf = make_readback_buffer(small_w, small_h)
         thresh_buf = make_readback_buffer(small_w, small_h)
         luma_buf = make_readback_buffer(small_w, small_h)
+        wb_buf = make_readback_buffer(small_w, small_h)
+        edge_buf = make_readback_buffer(small_w, small_h)
+        crop_buf = make_readback_buffer(small_w, small_h)
+        highlight_buf = make_readback_buffer(small_w, small_h)
         flip_buf = make_readback_buffer(W, H)
         mask_flip_buf = make_readback_buffer(W, H)
+        motion_mask_flip_buf = make_readback_buffer(W, H)
+        OVERHEAD_TOP_FRAC = 0.3   # fraction of frame height treated as "overhead" band
         cur_idx = 0
         have_prev = False
         target_hist = []           # kinetic intercept: [(t, confidence), ...] last few samples
+        motion_hist = []           # same trick for raw motion: [(t, motion_score), ...]
         try:
             jpeg_enc = JpegEncoder()
         except Exception as exc:
@@ -838,6 +1028,7 @@ class GpuVision:
                 self._run = False    # so running() doesn't lie -- the loop is exiting
                 break
 
+            gl_start = time.monotonic()   # gpu_duty: excludes the camera-read wait above
             g.glActiveTexture(GL_TEXTURE0)
             g.glBindTexture(GL_TEXTURE_2D, yuyv_tex)
             # `buf` (from cam.read()) is already a plain Python bytes object; ctypes
@@ -882,6 +1073,44 @@ class GpuVision:
                     self._motion_at = time.monotonic()
                     self._motion_center = center
 
+                # Motion-intercept rate: same ring-buffer trick as the kinetic intercept
+                # alert below, but tracking the raw motion score instead of a calibrated
+                # target's confidence -- works with nothing configured, complementing the
+                # colour-target version. Pure Python, zero extra GPU/shader cost.
+                now_tm = time.monotonic()
+                motion_hist.append((now_tm, score))
+                del motion_hist[:-5]
+                motion_expansion = 0.0
+                if len(motion_hist) >= 3:
+                    t0m, s0m = motion_hist[0]
+                    dtm = now_tm - t0m
+                    if dtm > 0.05:
+                        motion_expansion = max(0.0, (score - s0m) / dtm)
+                with self._lock:
+                    self._motion_intercept_rate = motion_expansion
+
+                # Motion-mask debug view: same viewer-gated shape as the colour mask
+                # below, reusing mask_view_prog (_MASK_VIEW_FS) verbatim on diff_tex --
+                # its R channel is already the per-pixel change magnitude (see _DIFF_FS),
+                # so no new shader is needed, just a different source texture.
+                with self._motion_mask_jpeg_cond:
+                    want_motion_mask = self._motion_mask_viewers > 0
+                if want_motion_mask and jpeg_enc is not None:
+                    g.glUseProgram(mask_view_prog)
+                    g.glActiveTexture(GL_TEXTURE0)
+                    g.glBindTexture(GL_TEXTURE_2D, diff_tex)
+                    g.glUniform1i(u_mask_tex, 0)
+                    draw_fullscreen(gl, mask_view_prog, quad, motion_mask_flip_fbo, W, H)
+                    motion_mask_pixels = readback_into(gl, W, H, motion_mask_flip_buf)
+                    try:
+                        motion_mask_jpeg = jpeg_enc.encode(motion_mask_pixels, W, H)
+                        with self._motion_mask_jpeg_cond:
+                            self._motion_mask_jpeg = motion_mask_jpeg
+                            self._motion_mask_jpeg_seq += 1
+                            self._motion_mask_jpeg_cond.notify_all()
+                    except Exception as exc:
+                        self._log(f"gpu_vision: motion mask JPEG encode failed: {exc}")
+
             with self._lock:
                 target_color = self._target_color
                 target_thresh = self._target_thresh
@@ -924,6 +1153,20 @@ class GpuVision:
                 with self._lock:
                     self._target = target
                     self._target_at = time.monotonic()
+                    cur_motion_center = self._motion_center
+
+                # Motion-matches-target correlation: zero new GPU cost -- both
+                # centroids are already computed elsewhere this tick; comparing them
+                # answers "is the thing that's moving actually my tracked target, or is
+                # something else moving elsewhere in frame."
+                if target is not None and cur_motion_center is not None:
+                    dx = target[0] - cur_motion_center[0]
+                    dy = target[1] - cur_motion_center[1]
+                    match_dist = (dx * dx + dy * dy) ** 0.5
+                else:
+                    match_dist = None
+                with self._lock:
+                    self._motion_target_match = match_dist
 
                 # Kinetic intercept alert: track the blob's confidence (~mask area) over
                 # the last few frames; a fast, sustained rise means it's growing in frame
@@ -944,6 +1187,7 @@ class GpuVision:
                 target_hist.clear()
                 with self._lock:
                     self._intercept_rate = 0.0
+                    self._motion_target_match = None
 
             # Flashlight/dark reflex: global average luminance, same reduction machinery.
             g.glUseProgram(luma_prog)
@@ -955,12 +1199,104 @@ class GpuVision:
             lpixels = readback_into(gl, lsw, lsh, luma_buf)
             ln = lsw * lsh
             lsum = 0
+            lmax = 0
             for i in range(ln):
-                lsum += lpixels[i * 4]
+                v = lpixels[i * 4]
+                lsum += v
+                if v > lmax:
+                    lmax = v
             luma = (lsum / ln) / 255.0
+            luma_max = lmax / 255.0
+
+            # Camera-obstruction signal: variance over the SAME small luma buffer just
+            # read back above -- zero new GPU cost, pure CPU stats on numbers already
+            # transferred for the dark reflex. The obstruction ALERT (variance+luma vs.
+            # tunable thresholds) lives in telemetry.py, not here -- see luma_variance's
+            # docstring for why.
+            lmean_byte = lsum / ln
+            lvariance = sum((lpixels[i * 4] - lmean_byte) ** 2 for i in range(ln)) / ln
             with self._lock:
                 self._luma = luma
                 self._luma_at = time.monotonic()
+                self._luma_variance = lvariance
+                self._luma_max = luma_max
+
+            # Colour-cast (white-balance drift) signal: the same copy_prog/_COPY_FS
+            # reduction chain, run straight on cur_tex instead of a luminance/threshold
+            # derivative, so R/G/B stay separable -- one more reduction-chain instance,
+            # no new shader code. Runs unconditionally every frame, like luma.
+            wtex, wsw, wsh = run_downsample_chain(gl, copy_prog, quad, cur_tex, wb_chain)
+            wpixels = readback_into(gl, wsw, wsh, wb_buf)
+            wn = wsw * wsh
+            wr = wg = wb_sum = 0
+            for i in range(wn):
+                wr += wpixels[i * 4]
+                wg += wpixels[i * 4 + 1]
+                wb_sum += wpixels[i * 4 + 2]
+            color_cast = (wr / wn / 255.0, wg / wn / 255.0, wb_sum / wn / 255.0)
+            with self._lock:
+                self._color_cast = color_cast
+
+            # Visual "interest"/clutter signal: a static complement to PIR's "how much
+            # just changed" -- how much texture/contrast is in the whole frame right
+            # now. Runs unconditionally every frame, same as luma/colour-cast.
+            g.glUseProgram(edge_prog)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
+            g.glUniform1i(u_edge_tex, 0)
+            g.glUniform2f(u_edge_texel, 1.0 / W, 1.0 / H)
+            draw_fullscreen(gl, edge_prog, quad, edge_fbo, W, H)
+            esmall_tex, esw, esh = run_downsample_chain(gl, copy_prog, quad, edge_tex, edge_chain)
+            epixels = readback_into(gl, esw, esh, edge_buf)
+            en = esw * esh
+            esum = 0
+            for i in range(en):
+                esum += epixels[i * 4]
+            edge_density = (esum / en) / 255.0
+
+            # Overhead-clearance signal: the SAME edge-density shader's output, cropped
+            # to the top OVERHEAD_TOP_FRAC of the frame before reducing (see
+            # _CROP_TOP_FS) -- a coarse "is there structure above the lidar's 2D scan
+            # plane" heuristic, not a distance measurement (see overhead_edge_density's
+            # docstring for the caveats).
+            g.glUseProgram(crop_prog)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, edge_tex)
+            g.glUniform1i(u_crop_tex, 0)
+            g.glUniform1f(u_top_frac, OVERHEAD_TOP_FRAC)
+            draw_fullscreen(gl, crop_prog, quad, crop_fbo, W, H)
+            csmall_tex, csw, csh = run_downsample_chain(gl, copy_prog, quad, crop_tex, crop_chain)
+            cpixels = readback_into(gl, csw, csh, crop_buf)
+            cn = csw * csh
+            csum = 0
+            for i in range(cn):
+                csum += cpixels[i * 4]
+            overhead_edge_density = (csum / cn) / 255.0
+            with self._lock:
+                self._edge_density = edge_density
+                self._overhead_edge_density = overhead_edge_density
+
+            # Shiny/reflective-surface signal: reuses the ALREADY-COMPILED thresh_prog
+            # with a FIXED near-white target in a SEPARATE FBO/chain from the user's
+            # calibrated blob-tracking pass above -- same program object, different
+            # uniform values set immediately before this draw call, so it can never
+            # collide with (or be affected by) whatever colour the user has calibrated.
+            g.glUseProgram(thresh_prog)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
+            g.glUniform1i(u_tex, 0)
+            g.glUniform3f(u_target, 1.0, 1.0, 1.0)      # fixed: pure white = specular highlight
+            g.glUniform1f(u_thresh, 0.12)                # fixed: fairly strict "near-white" match
+            draw_fullscreen(gl, thresh_prog, quad, highlight_fbo, W, H)
+            hsmall_tex, hsw, hsh = run_downsample_chain(gl, copy_prog, quad, highlight_tex, highlight_chain)
+            hpixels = readback_into(gl, hsw, hsh, highlight_buf)
+            hn = hsw * hsh
+            hsum = 0
+            for i in range(hn):
+                hsum += hpixels[i * 4]
+            highlight_fraction = (hsum / hn) / 255.0
+            with self._lock:
+                self._highlight_fraction = highlight_fraction
 
             with self._jpeg_cond:
                 want_jpeg = self._viewers > 0
@@ -1000,6 +1336,8 @@ class GpuVision:
                     self._log(f"gpu_vision: mask JPEG encode failed: {exc}")
 
             g.glFinish()
+            with self._lock:
+                self._gpu_duty = (time.monotonic() - gl_start) / period
             cur_idx = 1 - cur_idx
             have_prev = True
 
@@ -1018,6 +1356,8 @@ class GpuVision:
             self._jpeg_cond.notify_all()       # wake any blocked get_jpeg() callers
         with self._mask_jpeg_cond:
             self._mask_jpeg_cond.notify_all()  # wake any blocked get_mask_frame() callers
+        with self._motion_mask_jpeg_cond:
+            self._motion_mask_jpeg_cond.notify_all()  # wake any blocked get_motion_mask_frame()
         self._log("gpu_vision: stopped")
 
 

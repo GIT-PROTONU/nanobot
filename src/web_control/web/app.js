@@ -88,10 +88,17 @@ function syncLdsTgt(){ publishLdsTgt(); }
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
 // server). Toggling off drops the connection so the camera stops (ref-counted).
-// visionMaskOn swaps which endpoint is used -- the normal feed, or the GPU vision
-// tracking-mask debug view (/stream_mask.mjpg, see gpu_vision.py's mask viewer).
-let visionMaskOn=false;
-function camStreamUrl(){ return (visionMaskOn?"/stream_mask.mjpg":"/stream.mjpg")+"?t="+Date.now(); }
+// camMode swaps which endpoint is used -- the normal feed, the GPU vision colour-
+// threshold tracking mask (/stream_mask.mjpg), or the motion-diff mask
+// (/stream_motion_mask.mjpg) -- see gpu_vision.py's mask viewers. Only one mode is
+// active at a time; clicking the active mode's button returns to the normal feed.
+let camMode="normal";
+function camStreamUrl(){
+  const path = camMode==="color" ? "/stream_mask.mjpg"
+             : camMode==="motion" ? "/stream_motion_mask.mjpg"
+             : "/stream.mjpg";
+  return path+"?t="+Date.now();
+}
 $("camOn").addEventListener("change",e=>{
   const img=$("cam"), hint=$("camHint");
   if(e.target.checked){ img.src=camStreamUrl();
@@ -99,12 +106,16 @@ $("camOn").addEventListener("change",e=>{
   else { img.removeAttribute("src"); img.style.display="none"; hint.style.display="none"; }
 });
 $("cam").onerror=()=>{ if($("camOn").checked) $("cam").style.background="#3d1418"; };
-$("visionMaskToggle").onclick=()=>{
-  visionMaskOn=!visionMaskOn;
-  $("visionMaskToggle").textContent=visionMaskOn?"🎥 Show normal feed":"🎭 Show tracking mask";
-  $("visionMaskToggle").classList.toggle("primary",visionMaskOn);
+function setCamMode(mode){
+  camMode = (camMode===mode) ? "normal" : mode;
+  $("visionMaskToggle").textContent=camMode==="color"?"🎥 Show normal feed":"🎭 Show tracking mask";
+  $("visionMaskToggle").classList.toggle("primary",camMode==="color");
+  $("visionMotionMaskToggle").textContent=camMode==="motion"?"🎥 Show normal feed":"👣 Show motion mask";
+  $("visionMotionMaskToggle").classList.toggle("primary",camMode==="motion");
   if($("camOn").checked){ $("cam").style.background=""; $("cam").src=camStreamUrl(); }
-};
+}
+$("visionMaskToggle").onclick=()=>setCamMode("color");
+$("visionMotionMaskToggle").onclick=()=>setCamMode("motion");
 
 // Webcam mic: stream raw S16LE PCM from /audio.pcm and play it via the Web Audio
 // API. We schedule small AudioBuffers on a short jitter buffer (~180 ms) for low
@@ -257,6 +268,15 @@ function setVisManual(enabled){
 $("visManual").onchange=()=>setVisManual($("visManual").checked);
 $("visManual2").onchange=()=>setVisManual($("visManual2").checked);
 
+// Master camera on/off (see set_camera_enable in web_server.py) -- stops GpuVision AND
+// the direct passthrough entirely, distinct from manual mode (which still runs the
+// direct passthrough). Same synced-from-telemetry shape as setVisManual above.
+$("visCameraEnable").onchange=()=>{
+  const enabled=$("visCameraEnable").checked;
+  fetch("/vision/camera_enable",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({enabled})}).catch(()=>{});
+};
+
 // Health events: poll sys_monitor's durable outage log only while the box is open
 // (each poll is an HTTP round-trip to the board — no point when nobody's looking).
 (function(){
@@ -352,10 +372,89 @@ function onFrame(f){
 // readout works even with the video view never opened. The status numbers live in the
 // Sensors panel only (no on-video badge, per user preference) -- the crosshair is kept
 // on the video itself since it's a spatial indicator, not a text label.
-let visManualSynced=false, blobTuneSynced=false;
+// Hover explanations for the Sensors tab (both "System health" and "Camera (GPU
+// vision)" cards) -- readouts AND every tunable slider/toggle. Applied as plain
+// native `title` attributes (zero new UI component, browser handles the hover) via
+// element ID, so this needed no changes to the HTML markup itself. Toggleable
+// (#hintsToggle) and persisted across reloads via localStorage, since it's a pure
+// display preference, not robot state.
+const HINTS = {
+  // System health
+  sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
+  sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
+  sysMem: "RAM used/total (from /proc/meminfo: MemTotal - MemAvailable).",
+  sysTemp: "SBC CPU die temperature, from the cpu-thermal sysfs zone.",
+  sysDisk: "Root filesystem usage percent.",
+  sysWifi: "WiFi signal strength (dBm) and link quality (green ≥ -60dBm, amber ≥ -75, red below).",
+  sysUp: "Time since this stack process last started (not the board's boot time).",
+  // Camera (GPU vision) card -- toggles
+  visCameraEnable: "Master camera switch -- turns off BOTH GPU vision AND the direct passthrough entirely. Distinct from Manual mode, which still runs the direct feed.",
+  visManual2: "Bypasses the whole GPU pipeline for a raw hardware MJPEG passthrough -- zero CPU/GPU cost, but PIR/blob-tracking/dark-reflex/mask views all pause while on.",
+  visDarkAuto: "Auto-toggles the ESP32's /led from frame brightness, with hysteresis (on/off thresholds must stay apart to avoid flicker).",
+  // Camera card -- readouts
+  visMotion2: "PIR-style motion score: average per-pixel frame-to-frame change (0-100%). Near zero = static scene.",
+  visMotionCenter2: "Where in frame motion is concentrated (x%,y% from top-left), weighted by change magnitude.",
+  visTarget2: "Colour-blob tracker lock status -- \"locked N%\" means N% of the frame matches the calibrated colour.",
+  visIntercept2: "Kinetic intercept: growth rate of the tracked colour target's size (per second) -- high + sustained = approaching the lens.",
+  visMotionIntercept2: "Same growth-rate idea, but for raw motion -- no calibrated colour needed, flags anything looming.",
+  visMotionTargetMatch2: "Distance between the motion centroid and the tracked colour's centroid -- small = the thing that's moving IS the tracked target.",
+  visLuma2: "Average frame brightness (0-100%), same shader pass the flashlight/dark reflex uses.",
+  visObstructed2: "Flags a flat, dark frame (hand/dust over the lens) -- shows the raw flatness (variance) number plus the alert.",
+  visColorCast2: "Average scene colour split by channel (R/G/B%) -- flags a strong colour cast (e.g. warm incandescent light).",
+  visEdgeDensity2: "How much texture/contrast is in the whole frame -- a static complement to \"motion,\" flags visual clutter.",
+  visOverhead2: "Same texture signal, cropped to just the top 30% of frame -- a heuristic for structure above the lidar's 2D scan plane (an overhang the lidar can't see).",
+  visShiny2: "Fraction of frame matching a fixed near-white colour -- flags shiny/wet/reflective surfaces.",
+  visBacklit2: "Flags a bright spot in an otherwise dim scene (e.g. a window behind a dark subject) -- shows the brightness delta.",
+  visFocusBlur2: "Flags a sudden texture drop while the scene is still lit -- something close/blocking the lens, distinct from full darkness.",
+  visGpuDuty2: "Software-measured fraction of each frame's time budget spent in the shader+readback pipeline. Over 100% means the vision loop is falling behind the configured fps.",
+  visBumper2: "Optical virtual bumper: commanded to move but no visual motion detected for a while -- a possible wheel stall/slip.",
+  visBumperCmd2: "The /cmd_vel currently being commanded, as seen by the bumper check.",
+  visBumperHeld2: "How long the stall condition has held, while commanded to move.",
+  // Dark reflex sliders
+  visDarkOn: "Brightness below which the LED turns on.",
+  visDarkOff: "Brightness above which the LED turns back off (kept above the on-threshold to avoid flicker).",
+  // Optical bumper tuning
+  visBumpEps: "Minimum commanded speed (linear or angular) to count as \"actually driving.\"",
+  visBumpFloor: "GPU motion score below this counts as \"nothing visibly moved.\"",
+  visBumpSecs: "How long the stall condition must hold before the bumper alerts.",
+  // Blob tracking tuning
+  visBlobThresh: "Colour-match tolerance -- how close a pixel must be to the calibrated colour to count (higher = more forgiving).",
+  visBlobMin: "Minimum matched fraction of frame to count as a real lock (raise to reject a few stray matching pixels).",
+  visBlobMax: "Maximum matched fraction of frame to still count as a lock (lower to reject a colour that also matches the background).",
+  // Vision alerts tuning (all initial guesses except var_max, informed by a real reading)
+  visObstrVar: "Luma-variance ceiling for \"flat/textureless\" -- lower = stricter. Tuned from a real reading (400, vs. an ordinary scene's ~2700).",
+  visObstrDark: "Brightness ceiling, combined with flatness above, for the obstruction alert -- both conditions must hold.",
+  visClutter: "Visual-interest (edge-density) ceiling above which the scene counts as \"cluttered.\"",
+  visOverhead: "Same edge-density ceiling, for the top-of-frame \"overhead structure\" signal.",
+  visFocusBlur: "Edge-density floor below which (while still lit) the scene counts as defocused/blocked.",
+  visBacklit: "Brightness-delta floor (brightest patch minus average) for the backlit alert.",
+  visHighlight: "Highlight-fraction ceiling above which the scene counts as \"shiny.\"",
+  visLooming: "Motion-intercept-rate ceiling above which something counts as looming.",
+  visColorcast: "Colour-channel spread (max minus min of R/G/B) above which the scene counts as colour-cast.",
+  visMotionTarget: "Distance BELOW which the motion centroid counts as matching the tracked colour target.",
+};
+function applyHints(on){
+  for(const [id,text] of Object.entries(HINTS)){
+    const el=document.getElementById(id);
+    if(!el) continue;
+    if(on) el.title=text; else el.removeAttribute("title");
+  }
+}
+let hintsOn = localStorage.getItem("nano_hints")!=="off";
+$("hintsToggle").checked=hintsOn;
+applyHints(hintsOn);
+$("hintsToggle").onchange=()=>{
+  hintsOn=$("hintsToggle").checked;
+  localStorage.setItem("nano_hints", hintsOn?"on":"off");
+  applyHints(hintsOn);
+};
+
+let visManualSynced=false, blobTuneSynced=false, cameraEnableSynced=false;
 function onVision(v){
   const manualRow=$("visManualRow"), manualRow2=$("visManualRow2"), cross=$("visionCrosshair");
-  const ids=["visMotion2","visMotionCenter2","visTarget2","visIntercept2","visLuma2","visBumper2"];
+  const ids=["visMotion2","visMotionCenter2","visTarget2","visIntercept2","visMotionIntercept2",
+    "visMotionTargetMatch2","visLuma2","visObstructed2","visColorCast2","visEdgeDensity2",
+    "visOverhead2","visShiny2","visBacklit2","visFocusBlur2","visGpuDuty2","visBumper2"];
   if(!v){
     if(manualRow) manualRow.style.display="none";   // no GpuVision instance at all -- nothing to toggle
     if(manualRow2) manualRow2.style.display="none";
@@ -371,6 +470,9 @@ function onVision(v){
   if(!visManualSynced){    // reflect server state once, without fighting the user's own clicks
     $("visManual").checked=!!v.manual; $("visManual2").checked=!!v.manual; visManualSynced=true;
   }
+  if(!cameraEnableSynced && v.camera_enabled!=null){
+    $("visCameraEnable").checked=!!v.camera_enabled; cameraEnableSynced=true;
+  }
   // Sync the blob-tuning sliders to whatever's ACTUALLY active once (e.g. a target was
   // already calibrated from a previous session, or another browser tab) -- after that,
   // resetBlobTuneUI() on a fresh pick/clear keeps them in sync without fighting drags.
@@ -381,20 +483,42 @@ function onVision(v){
     $("visBlobMax").value=Math.round(mx*100); $("visBlobMaxV").textContent=Math.round(mx*100);
     blobTuneSynced=true;
   }
-  const paused=!!v.manual;
+  const camOff=(v.camera_enabled===false);
+  const paused=!!v.manual||camOff;
+  const pausedReason=camOff?"camera off":"paused (manual mode)";
   [$("visionPick"),$("visionClear")].forEach(b=>{ if(b) b.disabled=paused; });
   // A reported target has already passed the server's min/max blob-size gate (see
   // GpuVision._loop / the "Blob tracking tuning" sliders) -- that IS the lock condition
   // now, so there's no separate confidence floor here to fight the tuning sliders.
   const locked=!paused && !!v.target;
   const set=(id,txt)=>{ const el=$(id); if(el){ el.textContent=txt; el.style.opacity=paused?0.5:1; } };
-  set("visMotion2", paused?"paused (manual mode)":(v.motion*100).toFixed(1)+"%");
+  set("visMotion2", paused?pausedReason:(v.motion*100).toFixed(1)+"%");
   set("visMotionCenter2", paused?"–":(v.motion_center
     ? `${(v.motion_center[0]*100).toFixed(0)}%,${(v.motion_center[1]*100).toFixed(0)}%` : "none"));
   set("visTarget2", paused?"–":(v.target ? "locked "+(v.target[2]*100).toFixed(0)+"%"
                               : (v.has_target_color ? "searching" : "no target set")));
+  const alerts=v.alerts||{};
   set("visIntercept2", paused?"–":(v.target ? (v.intercept_rate*100).toFixed(0)+"%/s" : "–"));
+  set("visMotionIntercept2", paused?"–":(v.motion_intercept_rate*100).toFixed(0)+"%/s"
+    +(!paused && alerts.looming?" ⚠ looming":""));
+  set("visMotionTargetMatch2", paused?"–":(v.motion_target_match!=null
+    ? (v.motion_target_match*100).toFixed(0)+"%"+(alerts.motion_matches_target?" ✓ match":"") : "–"));
   set("visLuma2", paused?"–":(v.luma*100).toFixed(0)+"%");
+  const obEl=$("visObstructed2");
+  if(obEl){ obEl.textContent=paused?"–":
+      `var ${v.luma_variance.toFixed(0)}`+(alerts.obstructed?" ⚠ covered/dark":" clear");
+    obEl.style.color=(!paused && alerts.obstructed)?"var(--red)":""; obEl.style.opacity=paused?0.5:1; }
+  set("visColorCast2", paused?"–":(v.color_cast
+    ? `R${(v.color_cast[0]*100).toFixed(0)} G${(v.color_cast[1]*100).toFixed(0)} B${(v.color_cast[2]*100).toFixed(0)}`
+      +(alerts.colorcast?" ⚠ cast":"")
+    : "–"));
+  set("visEdgeDensity2", paused?"–":(v.edge_density*100).toFixed(0)+"%"+(alerts.clutter?" ⚠ cluttered":""));
+  set("visOverhead2", paused?"–":(v.overhead_edge_density*100).toFixed(0)+"%"+(alerts.overhead_alert?" ⚠ possible overhang":""));
+  set("visShiny2", paused?"–":(v.highlight_fraction*100).toFixed(0)+"%"+(alerts.shiny?" ⚠ shiny":""));
+  set("visBacklit2", paused?"–":
+    `Δ${((v.luma_max-v.luma)*100).toFixed(0)}%`+(alerts.backlit?" ⚠ backlit":" clear"));
+  set("visFocusBlur2", paused?"–":(alerts.focus_blur?"⚠ blurred/close":"clear"));
+  set("visGpuDuty2", paused?"–":(v.gpu_duty*100).toFixed(0)+"%");
   const bump=v.bumper||{alert:false,commanded:false,cmd_vel:[0,0],low_motion_secs:0};
   const bEl=$("visBumper2");
   if(bEl){ bEl.textContent=paused?"–":(bump.alert?"⚠ possible stall":"clear");
@@ -460,6 +584,34 @@ $("visDarkOn").oninput=()=>$("visDarkOnV").textContent=$("visDarkOn").value;
 $("visDarkOff").oninput=()=>$("visDarkOffV").textContent=$("visDarkOff").value;
 $("visDarkOn").onchange=syncDarkReflex;
 $("visDarkOff").onchange=syncDarkReflex;
+
+$("visionAlertsToggle").onclick=()=>{
+  const box=$("visionAlertsTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("visionAlertsToggle").textContent=(open?"▾":"▸")+" Vision alerts tuning";
+};
+// Vision alert thresholds -> web_control params (see PARAM_WHITELIST/telemetry.py's
+// _vision_alerts). All 0-100(-ish)% sliders over the backend's 0..1 fractions, same
+// conversion idiom as dark reflex/bumper, except the obstruction-flatness slider which
+// is raw variance units (not a percentage -- see gpu_vision.py's luma_variance).
+const VISION_ALERT_SLIDERS=[
+  ["visObstrVar","vision_obstruction_var_max",1],       // raw units, no /100
+  ["visObstrDark","vision_obstruction_dark_max",100],
+  ["visClutter","vision_clutter_alert",100],
+  ["visOverhead","vision_overhead_alert",100],
+  ["visFocusBlur","vision_focus_blur_max",100],
+  ["visBacklit","vision_backlit_delta_min",100],
+  ["visHighlight","vision_highlight_alert",100],
+  ["visLooming","vision_looming_alert",100],
+  ["visColorcast","vision_colorcast_alert",100],
+  ["visMotionTarget","vision_motiontarget_match_max",100],
+];
+VISION_ALERT_SLIDERS.forEach(([id,param,scale])=>{
+  const el=$(id), vEl=$(id+"V");
+  if(!el||!vEl) return;
+  el.oninput=()=>vEl.textContent=el.value;
+  el.onchange=()=>setParam("web_control",param,Number(el.value)/scale);
+});
 
 // Maps the displayed <img>'s rendered rect (accounting for object-fit:contain
 // letterboxing) in coordinates relative to #cam itself -- shared by the crosshair

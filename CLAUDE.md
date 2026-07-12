@@ -334,6 +334,56 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   run while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
   (browsers don't stream an HTTP/1.0 body to `fetch`). `GET /health/log` serves the
   tail of sys_monitor's durable outage log for the web "Health events" card.
+- **GPU vision** (`gpu_vision.py`, `gpu_vision_enable` param, default `true`): runs the
+  webcam through the H5's **Mali-450** instead of a plain passthrough — a headless
+  EGL/GLES2 context (raw ctypes, no `moderngl`/OpenCV) captures continuous YUYV,
+  converts to RGB in-shader, and runs everything else as GLSL ES 1.00 fragment shaders
+  reduced via a box-filter downsample chain (`build_downsample_chain`/
+  `run_downsample_chain`, ~1.9ms/pass measured on hardware) so only a handful of bytes
+  ever cross back to the CPU — never a full frame. **Core** (hardware-verified,
+  committed a881ddc): PIR motion-diff (`_DIFF_FS`) → `motion_score`/`motion_center`,
+  and calibrated colour-blob tracking (`_THRESHOLD_FS` + largest-blob selection) →
+  `target` (bearing/confidence), with live-tunable match tolerance + min/max blob-size
+  gating. **Tier-B**: kinetic-intercept alert (blob-area growth rate), flashlight/dark
+  reflex (opt-in, auto-`/led`), the optical virtual bumper (commanded-but-not-moving →
+  possible stall, in `telemetry.py`), and a **manual mode** (`POST /vision/manual`)
+  that fully stops `GpuVision` and swaps in the zero-cost direct `CameraStream`
+  passthrough live, no restart. Two on-demand debug MJPEG views mirror this same
+  reduction machinery for human eyes: `/stream_mask.mjpg` (the colour-threshold hit
+  mask) and `/stream_motion_mask.mjpg` (the PIR diff mask, reusing the same
+  `_MASK_VIEW_FS` shader unmodified against a different source texture) — both
+  viewer-gated (zero cost unwatched), toggled from the Camera tab.
+  **Cheap-tier batch** (2026-07-12, live-verified on hardware): five more raw signals —
+  `edge_density`/`overhead_edge_density` (a new 3-tap gradient shader, whole-frame and
+  cropped to the top 30% as an overhead-clearance heuristic), `luma_max` (free —
+  extends the existing dark-reflex luma readback with a max), `highlight_fraction`
+  (reuses the blob-tracking shader with a fixed white target in a separate FBO so it
+  never collides with the user's calibrated colour), and `motion_target_match` (pure
+  CPU distance between the motion and blob centroids). All threshold/alert logic lives
+  in `telemetry.py`'s `_vision_alerts` (NOT `gpu_vision.py`), mirroring the optical
+  bumper's "read live ROS params, not fixed constants" pattern — 9 alerts total
+  (`obstructed`/`clutter`/`overhead_alert`/`focus_blur`/`backlit`/`shiny`/`looming`/
+  `colorcast`/`motion_matches_target`), each with its own `vision_*` param, live
+  sliders under the Camera card's "▸ Vision alerts tuning". `vision_obstruction_var_max`
+  was retuned from a wrong-by-~100x guess (15) to 400 after a live reading showed an
+  ordinary scene reads `luma_variance` ~2700 — a reminder that these thresholds are
+  real hardware quantities, not proportions, and need checking against actual readings
+  before trusting a default. A software-measured **`gpu_duty`** ("pipeline load")
+  tracks the fraction of each frame's period spent in the shader+readback block —
+  measured 60-190%/tick on hardware with the full batch running, i.e. the vision loop
+  can fall behind its configured fps under load (degrades gracefully, no crash). A
+  **true hardware GPU-utilization reading was tried and removed**: a devfreq
+  frequency-ratio estimate (`sys_monitor`) turned out to always read "n/a" on this
+  board's kernel (no GPU devfreq node) and GPU temp just tracked CPU temp with no new
+  information — both pulled from the UI; `gpu_duty` was kept since it's a different,
+  demonstrably-useful number. A **master camera switch** (`POST /vision/camera_enable`,
+  the Camera tab's "📷 Camera enabled") fully stops BOTH `GpuVision` and the direct
+  passthrough (distinct from manual mode, which still runs the direct feed) — for
+  when the fuller pass set's cost isn't wanted. The Sensors tab's readouts AND every
+  tunable slider have hover explanations (native `title` attributes keyed by element
+  ID in `app.js`, not markup changes), toggleable/persisted via **💡 Show hints**.
+  Still not built: any autonomous consumer of the alert signals (all informational
+  only), the OLED-mirrored mask idea, and a 2nd/named colour target.
 - **Stress test mode** (`stress.py`, ROS-free; web "Stress test" card in System):
   `POST /stress/start {duration,workers?}` / `POST /stress/stop` / `GET /stress/status`.
   Deliberately loads every CPU core to validate the hardening tier (systemd watchdogs,
