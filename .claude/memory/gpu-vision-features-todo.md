@@ -1,11 +1,21 @@
 ---
 name: gpu-vision-features-todo
-description: GPU (Mali-450/GLES2) vision backlog/design history — core features built (see gpu-vision-implemented); 2026-07-12 batch BUILT (code written+smoke/unit-tested, not hardware-verified): colour-cast, obstruction, motion-intercept/looming, edge-density/clutter, overhead-structure, backlit, shiny-surface, focus-blur, motion-target-match -- 9 alerts total, all live-tunable via web UI; remaining unbuilt (2nd colour target, clutter velocity-throttle ACTION, personality hooks, self-diagnostics needing driving, docking aids, OLED mask-mirroring) plus rejected/hardware-blocked ideas
+description: GPU (Mali-450/GLES2) vision backlog/design history — NOW ESSENTIALLY CLEARED. 2026-07-13 batch built EVERYTHING remaining except docking aids + cliff detection (user-excluded) — named targets, clutter velocity-throttle (via caution clamp), anticipatory greeting, ambient colour mood, visual diary, novelty score, vibration + camera-freeze diagnostics, glare rejection, OLED mask mirror (see gpu-vision-implemented for status: code-complete, not hardware-verified). Still open — overhead-clearance camera-mount geometry check (needs hardware). Kept for design rationale + rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project
   originSessionId: 0511c092-56af-4656-9941-b2e947bb7aaf
 ---
+
+**STATUS 2026-07-13: this backlog is essentially cleared.** The user asked to "do all except the
+docking and cliff detection" and everything below that was still open got BUILT in that one
+dev-host session (named colour targets, clutter velocity-throttle via the caution clamp,
+anticipatory greeting, ambient colour mood, visual diary, novelty score, vibration +
+camera-freeze diagnostics, glare rejection, OLED mask mirroring) — see the 2026-07-13 section of
+[[gpu-vision-implemented]] for what/where/verification status (code-complete + unit/smoke/GL
+tested; NOT hardware-verified, NOT committed, NOT deployed). Still genuinely open: the
+overhead-clearance camera-mount geometry check (needs the physical robot); permanently excluded:
+docking aids + cliff detection. Everything below is kept as design rationale/history.
 
 User approved 2026-07-10 (session `0511c092`): two vision features to build using the Mali-450 GPU (GLES2 fragment shaders, not OpenCV — see [[h5-gpu-only-webcam-use]]). A GPU blacklist was briefly added the same session then reverted once these features were approved, so the `lima` driver is untouched — no re-enable step needed, `deploy/sbc-setup.sh` never shipped the blacklist.
 

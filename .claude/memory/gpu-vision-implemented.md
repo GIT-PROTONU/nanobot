@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-implemented
-description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view + 9 live-tunable alerts (obstruction var_max FIXED to 400 from real data), GPU utilization tried then REMOVED (devfreq useless on this board; pipeline-load KEPT), master camera on/off switch + camWait UX fix, hover hints -- ALL DEPLOYED + LIVE-VERIFIED on real hardware multiple times, COMMITTED+PUSHED (96f4913, 45a09e0), README.md/CLAUDE.md now document the whole subsystem"
+description: "GPU vision (PIR + blob-tracking + largest-blob selection + tunable blob-size gating + 4 Tier-B extensions + manual/direct mode + tunable optical bumper + colour tracking-mask debug view) BUILT, hardware-verified, and COMMITTED (a881ddc, 2026-07-12); lima boot-load bug + 3 manual-mode bugs found AND fixed. Plus 2026-07-12: motion-mask debug view + 9 live-tunable alerts (obstruction var_max FIXED to 400 from real data), master camera on/off switch + camWait UX fix, hover hints -- ALL DEPLOYED + LIVE-VERIFIED, COMMITTED+PUSHED (96f4913, 45a09e0). Plus 2026-07-13 'do all except docking+cliff' batch: named persistent colour targets, novelty score, camera-freeze + vibration diagnostics, glare rejection, OLED mask mirror, /vision/state -> behaviour reflexes (anticipatory greeting, looming/clutter caution = the velocity throttle, ambient mood, novelty boost), visual diary in reflection -- code-complete, 197 unit tests + smoke + dev-GPU GL harness pass, NOT hardware-verified/committed/deployed yet"
 metadata: 
   node_type: memory
   type: project
@@ -810,3 +810,78 @@ unconditionally in `__init__` (line ~415) — nothing in this session touched th
 reads like a narrow HTTP-server-accepting-connections-before-`__init__`-finishes startup race,
 most likely triggered by opening/refreshing the browser tab right as the restart was still
 settling. Not reproduced/investigated further; flagging in case it recurs.
+
+## "Do all except docking + cliff detection" batch (2026-07-13, dev-host session — CODE WRITTEN
+## + unit/smoke/GL-tested, NOT hardware-verified, NOT committed, NOT deployed)
+
+User asked to build EVERYTHING remaining in [[gpu-vision-features-todo]] except docking aids and
+cliff detection. Everything landed in one pass; full docs in CLAUDE.md's web_control GPU-vision
+bullet ("2026-07-13 batch"). Summary + verification status:
+
+**GpuVision (gpu_vision.py) new raw signals/state:**
+- `novelty` — CPU EMA background over the ALREADY-read-back wb_chain small colour buffer
+  (`update_novelty`, `NOVELTY_EMA_ALPHA=0.003` ≈ 22 s at 15 fps). The backlog's "2 extra GPU
+  passes" became pure CPU for free once the colour-cast chain existed. Unit-tested
+  (habituation, EMA rate, zero-on-identical).
+- `frame_age` + `zero_motion_secs` — camera-freeze inputs (device stopped delivering / delivers
+  the identical buffer; an EXACTLY-zero diff is implausible for a live sensor).
+- `set_glare_derate(k)` — blob confidence *= max(0, 1-k*highlight_fraction) before the blob_min/
+  max gate + intercept trend; k=0 default = byte-identical behaviour. Pushed live from
+  `_vision_state_tick` reading the `vision_glare_derate` param.
+- `set_oled_mask(bool)` + the OLED mask writer: rides thresh_chain's 160x120 stage → one more
+  `mask_view_prog` pass into a dedicated 128x64 FBO → `bytes(...)[0::4].translate(table)`
+  re-binarize → `write_oled_mask_blob` (`/dev/shm/nano_oled_mask.bin`, JSON header + raw,
+  atomic). **GL path actually executed on the dev PC's GPU** (scratchpad harness, synthetic red
+  square): mask coverage 3.2% vs 3.3% expected, centroid at the mirror-corrected position ✓.
+
+**telemetry.py**: `_vision_alerts` gained `novelty`/`camera_freeze`/`vibration` (12 alerts now),
+with `frozen` suppressing the stateful ones; `_vibration_alert` keeps an edge-density EMA sampled
+only while NOT commanded (the "how sharp does this room normally look" baseline) and confirms
+`vision_vibration_confirm_secs`. Frame adds `target_name`/`approach`/`oled_mask`/`novelty`/
+`frame_age`. 7 new whitelisted params.
+
+**web_server.py**: named colour-target palette (`vision_targets.json` — calibrations now SURVIVE
+RESTARTS, re-applied on boot; `GET /vision/targets`, `POST /vision/target_select|target_delete`;
+`/vision/calibrate` takes `name`; blob-tune syncs into the active entry), `POST /vision/oled_mask`
+(+ latched `/oled_mask` Bool, auto-dropped when manual mode / the camera switch stops capture),
+`_vision_state_tick` (0.5 s: glare-param push, approach detection = motion_intercept_rate >
+`vision_approach_rate` AND centred within `vision_approach_band`, publishes compact
+`/vision/state` JSON only while the pipeline is live), `_vision_diary_tick` (1 Hz piggyback on
+_publish_ping; the core rate-limits).
+
+**cognition.py**: visual diary (`record_vision_snapshot`/`vision_trend_text`/`get_vision_diary`,
+`vision_diary.json`, same mechanism as trait_history) folded into BOTH `reflect()` and
+`consolidate()` prompts ("What your camera has noticed over time: the room has got darker
+(60% -> 15%), and calmer"). `GET /llm/vision_diary`. Unit-tested (gating/cap/persist/trend).
+
+**behavior layer**: `presence.choose_beat` gained `boosts` (transient per-beat multipliers,
+distinct from the LLM-evolvable registry priority); `build_interpreter` gained `ambient_mood` +
+`beat_boosts` callables; the `feeling` state's on-entry is now `face(feel_face())` = LLM
+`drives.mood` wins, else the ambient tint (old hand-edited chart overrides still work —
+`drives` remains in context). `brain.Personality.tick_events(now, picked, vision=)` gained the
+vision fast rules: looming = edge-triggered caution startle (like pickup); clutter = hold caution
+≥ `clutter_caution` while it lasts and RELEASE to the remembered pre-clutter value after (unlike
+the one-way pickup nudge, this can't ratchet) — **this IS the backlog's clutter velocity-throttle
+ACTION**, routed through the existing caution→max_lin clamp (slam_nav `trait_motion`, still
+off by default), no new motor-authority path, zero slam_nav changes. `mood_node` subscribes
+`/vision/state` (3 s freshness window = stand-down), wires ambient mood (warmth=R−B >
+`ambient_warmth_delta` → `ambient_warm_face`, cool → `ambient_cool_face`), novelty boost
+(`novelty_boost`, full at novelty≈0.25), and `_maybe_greet_approach` (idle-only, rate-limited
+`greet_approach_min_interval`, emits greet face + a fire-and-forget `greeting` beat request —
+run_beat's quiet-hours muting applies). All new behavior params in robot.yaml `behavior:`.
+
+**oled_display**: `/oled_mask` (latched Bool) → a "mask" pseudo-mood in `_recompute_mood`
+(reflecting > mask > face/dashboard; words/shutdown still interrupt); `_mask_tick` renders the
+blob on the face timer with the blob seq as the dirty-check, "mask: waiting..." on a stale blob.
+
+**Tests**: 23 new unit tests (test_vision_reflexes.py, test_vision_diary.py,
+test_gpu_vision_helpers.py) — 197 total pass (`source install/setup.bash` +
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest src/behavior/test src/web_control/test` —
+the env var matters, launch_testing's pytest plugin is incompatible with this pytest and breaks
+collection otherwise). `pixi run smoke` green, with the smoke contract EXTENDED to the 5 new
+vision keys + 3 new alert keys. GL harness (scratchpad) ran the real shader sequence on the dev
+GPU. **Not run on hardware**: the OLED render itself (no panel here), approach/greeting live
+behaviour, vibration/freeze against a real camera, the /vision/state → mood_node loop.
+
+**Deliberately NOT built** (user excluded): docking aids (charge-LED confirmation, doorway bias)
+and cliff detection. **Still open**: the overhead-clearance camera-mount geometry check.
