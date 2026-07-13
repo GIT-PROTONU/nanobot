@@ -1,6 +1,6 @@
 ---
 name: software-features-todo
-description: "Software-only feature backlog (no new hardware), started 2026-07-13. APPROVED/TODO: named locations + go-to skill, IMU-fused odometry. Below that: the wider brainstorm (follow-me, voice, roam mode, sentry, odom autocal, push notifications, …) — ideas only, not approved"
+description: "Software-only feature backlog (no new hardware), started 2026-07-13. APPROVED/TODO: named locations + go-to skill, IMU-fused odometry, odom auto-calibration, wheel-slip cross-check. Below that: two brainstorm rounds (follow-me, voice, roam, sentry, … + outside-the-box: tap gestures, terrain-from-effort, WiFi fingerprint, chirp self-test, mirror detection, courier/alarm/games) — ideas only"
 metadata: 
   node_type: memory
   type: project
@@ -31,6 +31,17 @@ encoder odom). Directly improves SLAM scan-match quality and the pickup/relocali
 Both nodes are already co-resident in sensor_hub, so no new cross-process traffic. Watch:
 IMU yaw drifts slowly (no mag fusion guarantee) — fuse *rate/delta* yaw, not absolute yaw.
 
+**3. Odometry auto-calibration routine.** A skill that spins 360° (gyro-integrated as truth)
+and drives a short straight (lidar-verified), then solves ticks-per-metre + track width from
+the residuals — replaces the hand-tuned `robot.yaml` odom constants. Same spirit as the ESP32
+straight-line trim autocal. Natural to build AFTER IMU-fused odometry (item 2) since it
+leans on trusting the gyro.
+
+**4. Wheel-slip cross-check.** IMU gyro-z vs encoder-implied rotation rate disagree →
+slipping/dragged/stuck. Complements the optical bumper (which needs the camera on);
+near-free once item 2 exists. Consumers: caution fast-rule + a diagnostics alert; later the
+stuck-escape reflex.
+
 ## Brainstorm (2026-07-13, NOT approved — ideas to pick from)
 
 From the first round (see that session for detail): lidar **follow-me** (leg-cluster tracking
@@ -47,13 +58,6 @@ self-narrative so it survives reboots); **audio emotes** (generated beeps/chirps
 existing aplay path — faster/cheaper than TTS).
 
 Second round:
-- **Wheel-slip cross-check**: IMU gyro-z vs encoder-implied rotation rate disagree → slipping/
-  dragged/stuck. Complements the optical bumper (which needs the camera); near-free once
-  IMU-fused odometry exists. Consumer: caution fast-rule + a diagnostics alert.
-- **Odometry auto-calibration routine**: a skill that spins 360° (gyro-integrated) and drives
-  a short straight (lidar-verified), then solves ticks-per-metre + track width from the
-  residuals — replaces hand-tuned `robot.yaml` odom constants. Same spirit as the ESP32
-  straight-line trim autocal.
 - **Sentry/guard mode**: park at a named location, watch the already-computed motion score;
   on a spike → snapshot to disk, decision-log entry, optional TTS challenge. Composes named
   locations + PIR + schedule ("guard the hallway at night") with almost no new machinery.
@@ -73,6 +77,50 @@ Second round:
 - **Global relocalization**: today's lost-robot recovery is local-only (~0.5 m, see
   [[slam-autonomy-pickup-relocalize]]); a coarse global scan-match against the saved map
   would survive a true kidnap.
+
+## Outside-the-box brainstorm (2026-07-13, third round — NOT approved)
+
+New *virtual sensors* from hardware already on board, plus household-intelligence and
+play/character ideas:
+- **Knock/tap gesture input (IMU as a touch sensor)**: the BWT901CL streams accel at 200 Hz;
+  a knock on the chassis is a sharp, distinctive spike train. Detect single/double/triple
+  taps in `imu_driver`'s reader thread → a `/tap` event → wake from quiet hours, ack a
+  sentry alert, dismiss the alarm clock, "pet the robot" (playfulness nudge). A whole input
+  channel with zero new hardware.
+- **Floor-type from motor effort ("terrain from effort")**: commanded PWM duty vs achieved
+  encoder speed = rolling resistance → classify carpet vs hardwood, annotate map regions,
+  auto-adjust caution/speed per surface. Uses only signals already flowing.
+- **WiFi RSSI localization prior**: log `/proc/net/wireless` RSSI against SLAM pose; the
+  learned RSSI-per-area map is a coarse global-relocalization prior (helps true kidnap
+  recovery, where scan-match alone is ambiguous) — classic WiFi fingerprinting, one number/s.
+- **Chirp self-test + room acoustic fingerprint (speaker↔mic loop)**: play a short chirp,
+  listen with its own mic — (a) verifies the whole audio path end-to-end (today a dead
+  speaker is silent-invisible), (b) reverb/decay differs per room → coarse "which room am I
+  in by ear" cross-check, (c) muffled = under furniture/covered.
+- **Mirror detection via LED-blink correlation**: blink the ESP32 LED in a known pattern and
+  correlate against camera luma/blob response — a match = "that's me" (a mirror or glass).
+  Doubles as real safety: lidar reads mirrors as fake openings; flag those map cells.
+- **Courier mode**: detect an object placed on the robot (z-accel transient + raised rolling
+  resistance) → "take this to the kitchen" (named location) → announce arrival, wait for
+  tap/pickup to confirm delivery. Composes items already on this list.
+- **Physical alarm clock / come-get-you**: at a scheduled time, drive to a named location and
+  speak/beep with rising insistence until the PIR motion score says a human moved (or a tap
+  dismisses it). Schedule + go-to + TTS + PIR glued together.
+- **Household rhythm learning**: aggregate motion/luma/noise by hour-of-day-and-weekday
+  (same mechanism as the visual diary) → anticipate ("they usually come home around now" →
+  wait near the door beat), and flag anomalies ("lights on at 3am", "no movement all
+  Saturday"). The robot starts *knowing the house*, not just the room.
+- **Daily diary web page ("robot blog")**: a `GET /diary` page composed at reflection time —
+  LLM narrative + day's stats (odometer, beats, skills) + a couple of snapshots. Pure
+  composition of existing pieces; very high delight-per-effort.
+- **Dream journal**: during long/night reflection, have the smart model recombine the day's
+  decision log into a short surreal "dream", spoken once next morning. Zero new plumbing —
+  a reflection-mode prompt variant + one queued utterance.
+- **Games**: hide-and-seek (human hides, robot roams toward motion/novelty); red-light-
+  green-light (robot creeps while motion score is low, freezes theatrically when you move);
+  both fit the gated action tier + existing signals.
+- **Expressive fan**: the cooling fan is an audible actuator — a brief spin-up "sigh"/purr
+  as an emote (bounded so thermals always win). Gimmick tier, but literally free.
 
 Explicitly out (hardware or excluded): wheel velocity PID (single-channel encoders), overhead
 camera-geometry check (needs the robot), docking/cliff (user-excluded), on-device STT / face
