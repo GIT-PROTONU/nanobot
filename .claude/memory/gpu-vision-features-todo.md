@@ -1,6 +1,6 @@
 ---
 name: gpu-vision-features-todo
-description: GPU (Mali-450/GLES2) vision backlog/design history — NOW ESSENTIALLY CLEARED. 2026-07-13 batch built EVERYTHING remaining except docking aids + cliff detection (user-excluded) — named targets, clutter velocity-throttle (via caution clamp), anticipatory greeting, ambient colour mood, visual diary, novelty score, vibration + camera-freeze diagnostics, glare rejection, OLED mask mirror (see gpu-vision-implemented for status: code-complete, not hardware-verified). Still open — overhead-clearance camera-mount geometry check (needs hardware). Kept for design rationale + rejected/hardware-blocked ideas
+description: GPU (Mali-450/GLES2) vision backlog/design history — CLEARED. 2026-07-13 batch built EVERYTHING remaining except docking aids + cliff detection (user-excluded) — named targets, clutter velocity-throttle (via caution clamp), anticipatory greeting, ambient colour mood, visual diary, novelty score, vibration + camera-freeze diagnostics, glare rejection, OLED mask mirror; committed+pushed (e02dd58), deployed, and HARDWARE-VERIFIED same day (see gpu-vision-implemented). Still open — overhead-clearance camera-mount geometry check (needs hardware). Kept for design rationale + rejected/hardware-blocked ideas
 metadata: 
   node_type: memory
   type: project

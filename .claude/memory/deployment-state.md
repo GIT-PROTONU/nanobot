@@ -18,11 +18,24 @@ The robot board is **live at 192.168.178.141**, user `ibster` (sudo). See [[proj
 - The "Left to do" list at the bottom is ALL done (LDS spins via ESP32 PID, encoders live via ESP32, systemd installed).
 - ESP32 coprocessor is currently **disconnected** (unplugged/off) — firmware flash pending, deliberately deferred by the user.
 
-**PENDING as of 2026-07-10 (none of this is on the live board yet):**
+**PENDING as of 2026-07-10:**
 - New code since the last deploy: LDS idle spin-down toggle (`slam_nav.lds_idle_enable`), [[scheduled-routines]] (new `behavior.schedule_path` param + `schedule.json`). Needs `scripts/deploy.sh` (colcon build + restart covers the code; `DEPLOY_SOUL=1` only if you want a dev-authored `memory/schedule.json` pushed too — off by default).
-- **2026-07-13 mobile web-UI overhaul** (`web/style.css` rewrite + `index.html`/`chrome.js` tweaks, uncommitted at write time): per-tab hero sizing (compact/tall/hidden — settings tabs get the full screen on phones), floating pill bottom nav, chip-row map/cam controls, `#tab/view` hash deep-links, custom sliders. All element IDs + JS contracts preserved; verified headless-chromium against `dev_webui.py` at 390px + 1400px. Static files only — a deploy needs no rebuild beyond the rsync (web/ is symlinked into install/).
 - (A Mali-450 GPU blacklist was briefly added to `deploy/sbc-setup.sh` this same session, then reverted before ever being deployed — the GPU is going to be used for [[gpu-vision-features-todo]] instead. `sbc-setup.sh` is back to its original 5-step form; no re-run needed for this.)
-- **2026-07-13 "everything except docking+cliff" GPU-vision batch** (see [[gpu-vision-implemented]] 2026-07-13 section): named persistent colour targets, novelty score, camera-freeze + vibration diagnostics, glare rejection, OLED mask mirror, `/vision/state` → behaviour reflexes (anticipatory greeting, looming/clutter caution fast-rules = the clutter velocity throttle when slam_nav `trait_motion` is on, ambient mood tint, novelty-boosted looking beat), visual diary in reflection. Touches web_control + behavior + oled_display + robot.yaml + web/. Code-complete, 197 unit tests + smoke + a dev-GPU GL harness pass; NOT committed, NOT deployed, NOT hardware-verified. A plain `scripts/deploy.sh` covers it (python pkgs are editable; robot.yaml + web/ rsync along). First hardware checks: OLED mask render, cover-lens camera_freeze, walk-up approach greeting, /vision/state arriving in mood_node.
+
+**2026-07-13, DEPLOYED (commit e02dd58, pushed to main):** the mobile web-UI overhaul
+(`web/style.css` rewrite + `index.html`/`chrome.js` tweaks: per-tab hero sizing, floating
+pill bottom nav, chip-row map/cam controls, `#tab/view` hash deep-links, custom sliders) AND
+the "everything except docking+cliff" GPU-vision batch (see [[gpu-vision-implemented]]
+2026-07-13 section: named persistent colour targets, novelty score, camera-freeze + vibration
+diagnostics, glare rejection, OLED mask mirror, `/vision/state` → behaviour reflexes, visual
+diary) were both committed together and pushed. `pixi run smoke` passed, then `scripts/deploy.sh`
+ran clean — all 5 units (`nano-router/app/sensors/nav/map`) reported UP after restart.
+**HARDWARE-VERIFIED same day (2026-07-13)**: OLED mask render, cover-lens camera_freeze, walk-up
+approach greeting, and `/vision/state` reaching mood_node were all tested live on the robot and
+confirmed working. The GPU-vision backlog is now fully done (see [[gpu-vision-implemented]]) except
+the overhead-clearance camera-mount geometry check (needs more hardware work) and the
+user-excluded docking/cliff items. The mobile web-UI layout has not been separately confirmed on
+a real phone yet.
 
 ---- historical bring-up log (2026-06-17/18) below ----
 

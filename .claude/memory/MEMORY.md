@@ -1,6 +1,7 @@
 - [Project overview](project-overview.md) — Nano robot: NanoPi NEO Plus2 + ROS 2 Humble (pixi/RoboStack, rmw_zenoh), web UI served by web_control (rosbridge GONE since 2026-07-06)
 - [Architecture: two planes, three hubs](architecture-two-planes-three-hubs.md) — 2026-07-06 overhaul: rosbridge→SSE /telemetry gateway (lazy subs), app_hub (web+oled+behavior one process), systemd nano-robot.target + watchdog/MemoryMax, vitals blob (OLED/web IMU subs gone), `pixi run smoke` contract test; deploy needs one sbc-setup.sh re-run
 - [Memory in git](memory-in-git.md) — user ALWAYS wants memory committed to git; ~/.claude memory dir is symlinked to repo .claude/memory; commit memory changes
+- [Software features TODO](software-features-todo.md) — no-new-hardware backlog (2026-07-13): APPROVED = named locations + go-to skill, IMU-fused odometry; plus the wider brainstorm (follow-me, voice, roam, sentry, odom autocal, …)
 - [RoboStack build gotchas](robostack-build-gotchas.md) — Ninja generator + cmake<4 + explicit Python hints needed to colcon-build rosidl pkgs
 - [pytest run gotcha](pytest-run-gotcha.md) — the documented `pixi run python -m pytest src/...` FAILS (launch_testing plugin incompatible + workspace not sourced); use `source install/setup.bash` + `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
 - [Deployment state](deployment-state.md) — live board at 192.168.178.141, user ibster; deploy via ssh/scp; PENDING: LDS idle toggle + scheduled routines (2026-07-10), mobile web-UI overhaul + the 2026-07-13 GPU-vision batch (both uncommitted); bring-up log historical
