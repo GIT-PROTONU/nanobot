@@ -167,7 +167,8 @@ def merge_beats(overrides=None):
     return {name: Beat(**fields) for name, fields in merged.items()}
 
 
-def choose_beat(traits, registry, rng, camera_beats=True, last=None, beats=BEATS):
+def choose_beat(traits, registry, rng, camera_beats=True, last=None, beats=BEATS,
+                boosts=None):
     """Pure, deterministic (rng injected) idle-beat lottery — the heart of the dynamic,
     self-learning idle behaviour. Returns a beat name (a key of `beats`) or "" for "nothing
     eligible".
@@ -175,7 +176,10 @@ def choose_beat(traits, registry, rng, camera_beats=True, last=None, beats=BEATS
     Eligibility: the beat is in `beats`, ``enabled`` in the registry, its camera is allowed by
     ``camera_beats``, and every trait in its ``needs`` meets the threshold. Weight: the
     registry ``priority`` (the learnable base), scaled by the live ``trait`` axis if given
-    (0.5..1.5), and down-weighted by ``HABITUATION`` if it's the beat that just ran. A weighted
+    (0.5..1.5), down-weighted by ``HABITUATION`` if it's the beat that just ran, and finally
+    scaled by an optional per-beat ``boosts`` multiplier — a TRANSIENT, situational factor
+    (e.g. the node boosting "looking" while the GPU's novelty score says the room changed),
+    distinct from the registry priority which is the durable, LLM-evolvable base. A weighted
     random draw picks among the survivors — so higher-priority / on-trait beats fire more often
     but the mix stays varied and shifts as the personality evolves."""
     cands = []
@@ -195,6 +199,11 @@ def choose_beat(traits, registry, rng, camera_beats=True, last=None, beats=BEATS
             w *= 0.5 + clamp01(traits.get(axis, 0.5))          # 0.5..1.5 by the live trait
         if name == last:
             w *= HABITUATION                                    # boredom: avoid repeating
+        if boosts:
+            try:
+                w *= max(0.0, float(boosts.get(name, 1.0)))
+            except (TypeError, ValueError):
+                pass
         if w > 0:
             cands.append((name, w))
     if not cands:
@@ -281,8 +290,10 @@ statechart:
               - target: resting
                 guard: after(perform_secs) and next_step() == 'rest'
           # Wear the LLM's chosen baseline mood for a moment, then return to the dashboard.
+          # feel_face() = drives['mood'] if the LLM set one, else the node's live ambient
+          # tint (warm evening light -> a cosy face) -- see build_interpreter's ambient_mood.
           - name: feeling
-            on entry: face(drives['mood'])
+            on entry: face(feel_face())
             transitions:
               - target: resting
                 guard: after(feel_secs)
@@ -337,7 +348,7 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
                       traits=None, registry=None, drives=None, alpha=0.1, clock=None,
                       greet_face="happy", attend_face="looking",
                       attend_secs=2.0, feel_secs=2.5, rng=None, chart_path="", beats=None,
-                      tempo=None):
+                      tempo=None, ambient_mood=None, beat_boosts=None):
     """Parse + validate the chart and return (interpreter, clock), already advanced into
     `greeting`. `traits`/`registry`/`drives` seed the live personality (merged over the frozen
     defaults); `alpha` is the exponential-smoothing rate for `evolve`. `rng` (injected for
@@ -351,7 +362,14 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
     camera beats ("looking") the moment there's no LLM to process the frame, without rebuilding
     the interpreter. `tempo` is an optional zero-arg callable returning a live idle-cadence
     multiplier (>1 = sleepier), re-read on every guard evaluation — the node wires it to local
-    time-of-day so the robot naturally slows down at night (default: constant 1.0). Sismic is
+    time-of-day so the robot naturally slows down at night (default: constant 1.0).
+    `ambient_mood` is an optional zero-arg callable returning a face name (or "") — the room's
+    live mood tint (the node derives it from the GPU's colour-cast warmth): when the LLM hasn't
+    set a `drives['mood']` of its own, a non-empty ambient face is worn in the `feeling` state
+    instead, so the room's vibe rubs off without overriding a deliberate LLM choice.
+    `beat_boosts` is an optional zero-arg callable returning {beat: multiplier} — transient,
+    situational weights folded into each lottery draw (e.g. boosting "looking" while the GPU's
+    novelty score says the scene changed); 1.0/absent = no effect. Sismic is
     imported lazily so importing this module never needs it."""
     from sismic.interpreter import Interpreter
     from sismic.clock import SimulatedClock
@@ -359,6 +377,8 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
     beats = beats if beats is not None else BEATS
     camera_beats_fn = camera_beats if callable(camera_beats) else (lambda: bool(camera_beats))
     tempo_fn = tempo if callable(tempo) else (lambda: 1.0)
+    ambient_fn = ambient_mood if callable(ambient_mood) else (lambda: "")
+    boosts_fn = beat_boosts if callable(beat_boosts) else (lambda: None)
 
     # Live dicts (deep-copied so they never alias the frozen defaults).
     live_traits = copy.deepcopy(DEFAULT_TRAITS)
@@ -425,10 +445,11 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
 
     def decide_next():
         """Roll what happens after a beat: an energetic 'burst' (chain another, likelier at high
-        `energy`), else 'feel' (wear the baseline mood, if one is set), else 'rest'."""
+        `energy`), else 'feel' (wear the baseline mood — the LLM's, or the room's ambient tint),
+        else 'rest'."""
         if rng.random() < drive_prob(live_drives["energy"], BURST_MAX):
             perform_decision["next"] = "burst"
-        elif live_drives["mood"]:
+        elif live_drives["mood"] or ambient_fn():
             perform_decision["next"] = "feel"
         else:
             perform_decision["next"] = "rest"
@@ -436,11 +457,16 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
     def next_step():
         return perform_decision["next"]
 
+    def feel_face():
+        """The face the `feeling` state wears: the LLM's deliberate mood wins; otherwise the
+        room's live ambient tint (re-read on state entry, so it always reflects NOW)."""
+        return live_drives["mood"] or ambient_fn()
+
     def pick_beat():
         """The chart's per-cycle beat chooser: a priority-weighted, novelty-aware draw over the
         live (evolving) registry. Remembers what it picked so the next cycle can avoid it."""
         name = choose_beat(live_traits, live_registry, rng, camera_beats=camera_beats_fn(),
-                           last=last_beat["name"], beats=beats)
+                           last=last_beat["name"], beats=beats, boosts=boosts_fn())
         if name:
             last_beat["name"] = name
         return name
@@ -456,6 +482,7 @@ def build_interpreter(face, do_beat=None, greet_secs=3.0, idle_secs=90.0,
         "attend_next": attend_next,
         "decide_next": decide_next,
         "next_step": next_step,
+        "feel_face": feel_face,
         "apply_evolve": apply_evolve,
         "revert": revert,
         "greet_secs": float(greet_secs),

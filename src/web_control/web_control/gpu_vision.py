@@ -11,6 +11,7 @@ this reuses the proven context-creation pattern from).
 """
 import ctypes
 import ctypes.util
+import json
 import os
 import threading
 import time
@@ -392,6 +393,63 @@ void main() {
 """
 
 
+# Novelty/boredom background: per-frame EMA rate for the long-run "what the room
+# normally looks like" reference the novelty score diffs against. At 15 fps, 0.003
+# gives a ~22 s time constant -- brief motion barely moves the background (PIR already
+# covers "changed since last frame"), but a moved chair / new object fades INTO the
+# background over half a minute or so, exactly the "sustained change = novelty, then
+# habituate" behaviour wanted for the curiosity consumer.
+NOVELTY_EMA_ALPHA = 0.003
+
+# OLED tracking-mask mirror: the SSD1306 panel's resolution, the /dev/shm blob path
+# (one writer -- this module's GL thread -- atomic os.replace, JSON-header+binary, per
+# the repo's /dev/shm convention), and the re-binarize table. Box-filtering the 0/255
+# hit mask through the downsample chain turns it greyscale ("coverage fraction" per
+# enlarged texel), so it's thresholded back to true black/white right before the panel
+# -- done with bytes.translate (C speed), not a Python loop.
+OLED_MASK_FILE = "/dev/shm/nano_oled_mask.bin"
+OLED_MASK_W, OLED_MASK_H = 128, 64
+_OLED_THRESH_TABLE = bytes(255 if i >= 128 else 0 for i in range(256))
+
+
+def update_novelty(bg, pixels, n):
+    """One tick of the novelty/boredom score: mean |current - background| over the small
+    downsampled colour buffer (RGB of each RGBA cell), then ease the background toward the
+    current frame by NOVELTY_EMA_ALPHA. `bg` is a mutable list of floats (len n*3) updated
+    in place; `pixels` is the RGBA readback buffer. Returns the 0..1 novelty scalar.
+    Pure CPU over a buffer already read back every frame for the colour-cast signal --
+    zero extra GPU cost (the backlog's estimate of 2 extra GL passes turned out to be
+    unnecessary once the colour-cast chain existed). Kept a free function so it's
+    unit-testable without a GL context."""
+    total = 0.0
+    for i in range(n):
+        base = i * 3
+        for c in range(3):
+            cur = pixels[i * 4 + c]
+            diff = cur - bg[base + c]
+            if diff < 0:
+                diff = -diff
+            total += diff
+            bg[base + c] += NOVELTY_EMA_ALPHA * (cur - bg[base + c])
+    return (total / (n * 3)) / 255.0
+
+
+def write_oled_mask_blob(raw, w, h, seq, conf, path=OLED_MASK_FILE):
+    """Write the re-binarized mask bytes (one byte/pixel, 0 or 255, row-major top-down)
+    as the OLED mirror blob: one JSON header line + the raw payload, atomic replace
+    (same shape as lds_driver_py.scan_blob). Best-effort -- a full tmpfs just skips."""
+    header = json.dumps({"w": w, "h": h, "seq": seq, "t": time.time(),
+                         "conf": round(conf, 4)}).encode() + b"\n"
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(header)
+            f.write(raw)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def plan_downsample_stages(w, h, min_size=24):
     """Just the (w,h) sequence a downsample chain would halve through -- no GL calls,
     so the caller can pre-allocate real FBOs for each stage ONCE outside the per-frame
@@ -615,6 +673,13 @@ class GpuVision:
         self._overhead_edge_density = 0.0  # same, cropped to the top band (overhead clearance)
         self._highlight_fraction = 0.0     # shiny/reflective-surface signal
         self._motion_target_match = None   # distance between motion centroid and tracked target
+        self._novelty = 0.0                # sustained-change score vs. a slow EMA background
+        self._novelty_bg = None            # the EMA background (list of floats, lazily seeded)
+        self._frame_at = None              # monotonic of the last SUCCESSFUL camera capture
+        self._zero_motion_since = None     # monotonic since the diff went EXACTLY zero (freeze)
+        self._glare_derate = 0.0           # 0 = off; scales blob confidence down under glare
+        self._oled_mask_enable = False     # mirror the tracking mask to the OLED (blob writer)
+        self._oled_mask_seq = 0
         self._gpu_duty = 0.0                # software proxy: fraction of the frame period spent
                                              # in the shader+readback block (see gpu_duty's doc)
         self._viewers = 0                  # browser viewers of the JPEG tee (ref-counted)
@@ -752,6 +817,62 @@ class GpuVision:
         computed elsewhere in the same tick."""
         with self._lock:
             return self._motion_target_match
+
+    @property
+    def novelty(self):
+        """0..1 sustained-change ("something about the room is different") score: mean
+        difference between the current frame and a SLOW exponential-moving-average
+        background (see NOVELTY_EMA_ALPHA / update_novelty). Unlike motion_score (diff
+        vs. the PREVIOUS frame -- gone the instant motion stops), this stays high while
+        a changed scene persists and only fades as the change habituates into the
+        background -- a much better curiosity/looking-beat signal than raw motion."""
+        with self._lock:
+            return self._novelty
+
+    @property
+    def frame_age(self):
+        """Seconds since the last successful camera capture, or None before the first
+        frame. A growing age while running() means the V4L2 device has stopped
+        delivering (USB wedge, driver hang) -- the camera-freeze diagnostic's primary
+        input, distinct from the optical bumper's 'content isn't changing' case."""
+        with self._lock:
+            if self._frame_at is None:
+                return None
+            return time.monotonic() - self._frame_at
+
+    @property
+    def zero_motion_secs(self):
+        """How long the frame-diff has been EXACTLY zero (0.0 for a live sensor is
+        physically implausible -- real scenes always carry sensor noise), or 0.0 when
+        motion is nonzero / no diff has run yet. A long streak = the capture path is
+        handing back the same frozen buffer even though reads still 'succeed'."""
+        with self._lock:
+            if self._zero_motion_since is None:
+                return 0.0
+            return time.monotonic() - self._zero_motion_since
+
+    def set_glare_derate(self, k):
+        """Glare rejection for blob tracking: derate the reported blob confidence by
+        the frame's highlight_fraction -- confidence *= max(0, 1 - k*highlight) -- so a
+        hard specular reflection that happens to match the tracked hue can't hold a
+        confident false lock. k=0 (the default) is byte-identical to the old behaviour;
+        the derated confidence also feeds the min-blob-size gate, so heavy glare can
+        drop a borderline lock entirely. Live-tunable (vision_glare_derate param)."""
+        with self._lock:
+            self._glare_derate = max(0.0, float(k))
+
+    def set_oled_mask(self, enabled):
+        """Mirror the colour-tracking mask to the OLED: while on (and a target colour is
+        set), each tick also reduces the threshold mask to the panel's 128x64, re-
+        binarizes it, and writes /dev/shm/nano_oled_mask.bin for oled_display to render.
+        Off (the default) costs nothing -- the extra pass/readback is fully gated."""
+        with self._lock:
+            self._oled_mask_enable = bool(enabled)
+
+    @property
+    def oled_mask_enabled(self):
+        with self._lock:
+            return self._oled_mask_enable
 
     @property
     def gpu_duty(self):
@@ -999,6 +1120,13 @@ class GpuVision:
         flip_buf = make_readback_buffer(W, H)
         mask_flip_buf = make_readback_buffer(W, H)
         motion_mask_flip_buf = make_readback_buffer(W, H)
+        # OLED mask mirror: source = the thresh chain's smallest stage still >= the
+        # panel in both axes (160x120 for a 640x480 capture), so the final pass down to
+        # 128x64 is a modest ~1.25x/1.875x ratio instead of an aliasing 5x jump.
+        oled_src_tex = next((t for t, _f, sw_, sh_ in reversed(thresh_chain)
+                             if sw_ >= OLED_MASK_W and sh_ >= OLED_MASK_H), thresh_tex)
+        oled_mask_tex, oled_mask_fbo, _, _ = gl.make_fbo(OLED_MASK_W, OLED_MASK_H, GL_RGBA)
+        oled_mask_buf = make_readback_buffer(OLED_MASK_W, OLED_MASK_H)
         OVERHEAD_TOP_FRAC = 0.3   # fraction of frame height treated as "overhead" band
         cur_idx = 0
         have_prev = False
@@ -1029,6 +1157,8 @@ class GpuVision:
                 break
 
             gl_start = time.monotonic()   # gpu_duty: excludes the camera-read wait above
+            with self._lock:
+                self._frame_at = gl_start   # a capture just succeeded (camera-freeze input)
             g.glActiveTexture(GL_TEXTURE0)
             g.glBindTexture(GL_TEXTURE_2D, yuyv_tex)
             # `buf` (from cam.read()) is already a plain Python bytes object; ctypes
@@ -1072,6 +1202,15 @@ class GpuVision:
                     self._motion = score
                     self._motion_at = time.monotonic()
                     self._motion_center = center
+                    # Camera-freeze input: an EXACTLY-zero diff (sum_r == 0 across the
+                    # whole reduced buffer) is physically implausible for a live sensor
+                    # (real scenes always carry noise) -- a sustained streak means the
+                    # capture path is handing back the same frozen buffer.
+                    if sum_r == 0:
+                        if self._zero_motion_since is None:
+                            self._zero_motion_since = self._motion_at
+                    else:
+                        self._zero_motion_since = None
 
                 # Motion-intercept rate: same ring-buffer trick as the kinetic intercept
                 # alert below, but tracking the raw motion score instead of a calibrated
@@ -1116,6 +1255,9 @@ class GpuVision:
                 target_thresh = self._target_thresh
                 blob_min = self._blob_min_confidence
                 blob_max = self._blob_max_confidence
+                glare_k = self._glare_derate
+                glare_hl = self._highlight_fraction   # last tick's value -- fine for a derate
+                want_oled_mask = self._oled_mask_enable
             if target_color is not None:
                 g.glUseProgram(thresh_prog)
                 g.glActiveTexture(GL_TEXTURE0)
@@ -1135,6 +1277,30 @@ class GpuVision:
                 # the blob_min/max tuning sliders and the UI's locked/searching %.
                 sum_r, sum_g, sum_b = largest_blob_sums(tpixels, tsw, tsh)
                 confidence = sum_r / (n2 * 255.0)
+                # Glare rejection (opt-in, vision_glare_derate param via set_glare_derate):
+                # a hard specular highlight can spoof the hue threshold, so under glare the
+                # confidence -- and with it the min-blob-size gate below AND the kinetic-
+                # intercept trend -- is derated. k=0 (default) changes nothing.
+                if glare_k > 0.0:
+                    confidence *= max(0.0, 1.0 - glare_k * glare_hl)
+
+                # OLED mask mirror (gated -- costs nothing while off): ride the thresh
+                # chain's already-rendered intermediate stage closest above the panel
+                # size, one more modest-ratio pass down to exactly 128x64 (a single big
+                # jump from 640x480 would alias -- GL_LINEAR only blends 2x2 texels),
+                # re-binarize (box-filtered masks come out greyscale), write the blob.
+                if want_oled_mask:
+                    g.glUseProgram(mask_view_prog)
+                    g.glActiveTexture(GL_TEXTURE0)
+                    g.glBindTexture(GL_TEXTURE_2D, oled_src_tex)
+                    g.glUniform1i(u_mask_tex, 0)
+                    draw_fullscreen(gl, mask_view_prog, quad, oled_mask_fbo,
+                                    OLED_MASK_W, OLED_MASK_H)
+                    opix = readback_into(gl, OLED_MASK_W, OLED_MASK_H, oled_mask_buf)
+                    raw = bytes(opix)[0::4].translate(_OLED_THRESH_TABLE)
+                    self._oled_mask_seq += 1
+                    write_oled_mask_blob(raw, OLED_MASK_W, OLED_MASK_H,
+                                         self._oled_mask_seq, confidence)
                 # Blob-size gating: a valid lock needs BOTH a nonzero mask (a centroid to
                 # even compute) AND confidence inside [blob_min, blob_max] -- rejects
                 # noise (too small, below blob_min) and "matched almost the whole frame"
@@ -1234,8 +1400,21 @@ class GpuVision:
                 wg += wpixels[i * 4 + 1]
                 wb_sum += wpixels[i * 4 + 2]
             color_cast = (wr / wn / 255.0, wg / wn / 255.0, wb_sum / wn / 255.0)
+
+            # Novelty/boredom score: mean diff of this same already-read-back small
+            # colour buffer against a SLOW EMA background of the room (see
+            # update_novelty) -- sustained change scores high until it habituates,
+            # unlike the PIR diff which zeroes the instant motion stops. Zero extra GPU
+            # cost; the backlog's "2 extra passes" became pure CPU once wb_chain existed.
+            if self._novelty_bg is None or len(self._novelty_bg) != wn * 3:
+                self._novelty_bg = [float(wpixels[i * 4 + c])
+                                    for i in range(wn) for c in range(3)]
+                novelty = 0.0
+            else:
+                novelty = update_novelty(self._novelty_bg, wpixels, wn)
             with self._lock:
                 self._color_cast = color_cast
+                self._novelty = novelty
 
             # Visual "interest"/clutter signal: a static complement to PIR's "how much
             # just changed" -- how much texture/contrast is in the whole frame right

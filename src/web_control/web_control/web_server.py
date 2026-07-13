@@ -172,6 +172,27 @@ class WebServerNode(Node):
         self.declare_parameter("vision_looming_alert", 0.3)          # motion_intercept_rate above this
         self.declare_parameter("vision_colorcast_alert", 0.12)       # max-min colour_cast spread above this
         self.declare_parameter("vision_motiontarget_match_max", 0.15)  # distance BELOW this = "matches"
+        # 2026-07-13 batch: novelty score, camera-freeze + vibration diagnostics, glare
+        # rejection, the anticipatory-approach greeting signal -- all live-tunable via
+        # /param like the rest (see telemetry.PARAM_WHITELIST).
+        self.declare_parameter("vision_novelty_alert", 0.25)         # novelty score above this = "something changed"
+        self.declare_parameter("vision_camera_stall_secs", 2.0)      # frame age / exact-zero diff held this long = frozen
+        self.declare_parameter("vision_vibration_ratio", 0.5)        # driving edge_density below still-baseline*this = blur
+        self.declare_parameter("vision_vibration_confirm_secs", 1.5) # s the blur must hold before the vibration flag
+        self.declare_parameter("vision_glare_derate", 0.0)           # blob confidence *= 1-k*highlight_fraction (0 = off)
+        self.declare_parameter("vision_approach_rate", 0.5)          # motion growth (/s) above this = approaching
+        self.declare_parameter("vision_approach_band", 0.25)         # AND motion centred within +-this of frame centre
+        # Named colour-target palette: calibrations persist here and survive a restart
+        # (previously a picked colour was lost on every stack restart).
+        self.declare_parameter("vision_targets_path", "")   # "" -> ~/.local/state/nanobot/vision_targets.json
+        # Visual diary: a slow durable log of the scene scalars (luma/motion/edge/
+        # novelty/warmth) folded into the reflection prompts -- sensory continuity for
+        # the self-narrative, same mechanism as the trait trajectory.
+        self.declare_parameter("vision_diary_enable", True)
+        self.declare_parameter("vision_diary_period", 600.0)   # s between snapshots
+        self.declare_parameter("vision_diary_max", 288)        # ring size (288 @10min = 2 days)
+        self.declare_parameter("vision_diary_window", 86400.0) # trend window for the prompts (1 day)
+        self.declare_parameter("vision_diary_path", "")        # "" -> ~/.local/state/nanobot/vision_diary.json
         self.declare_parameter("mic_device", "")       # "" = auto-detect USB mic
         self.declare_parameter("mic_rate", 16000)      # Hz; 16k mono = 32 KB/s
         self.declare_parameter("tts_enabled", True)
@@ -277,12 +298,22 @@ class WebServerNode(Node):
         self._camera_disabled = False      # master off switch, see set_camera_enable() below
         self._dark_led_pub = None
         self._dark_led_on = False
+        # Named colour-target palette (persisted; empty when GPU vision is off).
+        self._vision_targets_path = os.path.expanduser(
+            g("vision_targets_path").value or "~/.local/state/nanobot/vision_targets.json")
+        self._vision_targets = {}
+        self._vision_target_active = None
+        self._vision_approach = False      # anticipatory-approach signal (see _vision_state_tick)
+        self._oled_mask_on = False         # OLED tracking-mask mirror state
+        self._oled_mask_pub = None
+        self._vision_state_pub = None
         if g("gpu_vision_enable").value:
             self._gpu_vision = GpuVision(
                 dev=g("cam_device").value or None,
                 width=g("cam_width").value, height=g("cam_height").value,
                 fps=g("cam_fps").value, logger=self.get_logger().info)
             self._gpu_vision.start()
+            self._load_vision_targets()    # re-apply the persisted calibration, if any
             # Publisher + timer always created (cheap, idle-safe) whenever GPU vision is
             # on, regardless of vision_dark_reflex_enable's startup value -- the tick
             # itself reads that param live, so toggling it via the web UI's /param POST
@@ -290,6 +321,17 @@ class WebServerNode(Node):
             # because the timer was never scheduled.
             self._dark_led_pub = self.create_publisher(Bool, "led", 5)
             self.create_timer(1.0, self._dark_reflex_tick)
+            # Compact vision-state feed for the behaviour layer (mood_node): the alert
+            # booleans + scalars its reflexes consume (approach greeting, looming/
+            # clutter caution, ambient colour mood, novelty-boosted curiosity). Only
+            # published while the pipeline is actually live, so a stale message can't
+            # drive a reflex (mood_node also applies its own freshness window). The
+            # same tick pushes the live vision_glare_derate param into the GL thread.
+            self._vision_state_pub = self.create_publisher(String, "vision/state", 5)
+            self._oled_mask_pub = self.create_publisher(
+                Bool, "oled_mask",
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            self.create_timer(0.5, self._vision_state_tick)
 
         self._mic = AudioStream(
             device=g("mic_device").value or None,
@@ -445,6 +487,11 @@ class WebServerNode(Node):
             trait_history_period=float(g("trait_history_period").value),
             trait_history_max=int(g("trait_history_max").value),
             trait_history_window=float(g("trait_history_window").value),
+            vision_diary_enable=bool(g("vision_diary_enable").value),
+            vision_diary_path=(g("vision_diary_path").value or None),
+            vision_diary_period=float(g("vision_diary_period").value),
+            vision_diary_max=int(g("vision_diary_max").value),
+            vision_diary_window=float(g("vision_diary_window").value),
             prelude_enable=bool(g("prelude_enable").value),
             camera_announce=bool(g("camera_announce").value),
             camera_face=str(g("camera_face").value or ""),
@@ -525,6 +572,7 @@ class WebServerNode(Node):
         self._announce_tick()                          # piggy-backs on this 1 Hz tick
         self._reflect_tick()                           # ditto (cheap when not due)
         self._llm_health_tick()                        # persistent "AI offline" indicator
+        self._vision_diary_tick()                      # visual diary (core rate-limits)
 
     # ---- HTTP teleop ---------------------------------------------------------
     def drive(self, data):
@@ -789,6 +837,9 @@ class WebServerNode(Node):
 
     def get_cog_log(self):
         return self._cog.get_cog_log()
+
+    def get_vision_diary(self):
+        return self._cog.get_vision_diary()
 
     def get_phrasebank(self):
         return self._cog.get_phrasebank()
@@ -1224,6 +1275,8 @@ class WebServerNode(Node):
         if want_enabled == (not self._camera_disabled):
             return {"ok": True, "camera_enabled": not self._camera_disabled}
         if not want_enabled:
+            if self._oled_mask_on:          # no live mask to mirror while capture is off
+                self._set_oled_mask_state(False)
             if self._gpu_vision is not None and not self._manual_mode:
                 self._gpu_vision.stop()     # release the V4L2 device
             self._camera_disabled = True
@@ -1248,6 +1301,8 @@ class WebServerNode(Node):
         if want == self._manual_mode:
             return {"ok": True, "manual_mode": self._manual_mode}
         if want:
+            if self._oled_mask_on:         # no live mask to mirror while GpuVision is stopped
+                self._set_oled_mask_state(False)
             self._gpu_vision.stop()        # release the V4L2 device before direct opens it
             self._manual_mode = True
         else:
@@ -1290,16 +1345,157 @@ class WebServerNode(Node):
             self._dark_led_on = False
             self._dark_led_pub.publish(Bool(data=False))
 
+    def _vision_state_tick(self):
+        """2 Hz vision->behaviour feed (only scheduled when GPU vision is on). Pushes
+        the live vision_glare_derate param into the GL thread, computes the
+        anticipatory-approach signal (motion growing fast AND centred = someone/
+        something coming toward the lens -- the greeting reflex's trigger, cheaper and
+        earlier than waiting for pickup), and publishes the compact /vision/state JSON
+        the behaviour node's reflexes consume. Nothing is published while the pipeline
+        is frozen (manual mode / camera off), so mood_node's freshness window naturally
+        stands the vision reflexes down."""
+        gv = self._gpu_vision
+        if gv is None:
+            return
+        g = self.get_parameter
+        gv.set_glare_derate(g("vision_glare_derate").value)
+        if self._manual_mode or self._camera_disabled or not gv.running():
+            self._vision_approach = False
+            return
+        rate = gv.motion_intercept_rate
+        center = gv.motion_center
+        self._vision_approach = (
+            rate > g("vision_approach_rate").value
+            and center is not None
+            and abs(center[0] - 0.5) < g("vision_approach_band").value
+            and gv.motion_score > 0.02)
+        cast = gv.color_cast
+        payload = {
+            "approach": self._vision_approach,
+            "looming": gv.motion_intercept_rate > g("vision_looming_alert").value,
+            "clutter": gv.edge_density > g("vision_clutter_alert").value,
+            "novelty": round(gv.novelty, 3),
+            # warmth: R-B of the scene's average colour -- positive = warm (evening
+            # lamps), negative = cool (daylight/fluorescent). The ambient-mood input.
+            "warmth": round(cast[0] - cast[2], 3) if cast else 0.0,
+            "motion": round(gv.motion_score, 3),
+        }
+        self._vision_state_pub.publish(String(data=json.dumps(payload)))
+
+    def _vision_diary_tick(self):
+        """1 Hz (piggybacked on _publish_ping): offer the current scene scalars to the
+        cognition core's visual diary; the core itself rate-limits to
+        vision_diary_period, so this is a couple of property reads when not due."""
+        gv = self._gpu_vision
+        if gv is None or self._manual_mode or self._camera_disabled or not gv.running():
+            return
+        cast = gv.color_cast
+        self._cog.record_vision_snapshot({
+            "luma": gv.luma, "motion": gv.motion_score, "edge": gv.edge_density,
+            "novelty": gv.novelty, "warmth": (cast[0] - cast[2]) if cast else 0.0})
+
+    def _set_oled_mask_state(self, enabled):
+        self._oled_mask_on = bool(enabled)
+        if self._gpu_vision is not None:
+            self._gpu_vision.set_oled_mask(self._oled_mask_on)
+        if self._oled_mask_pub is not None:
+            self._oled_mask_pub.publish(Bool(data=self._oled_mask_on))
+
+    def set_oled_mask(self, d):
+        """POST /vision/oled_mask {enabled: bool}: mirror the colour-tracking mask to
+        the physical OLED. web_control owns the arbitration signal (the latched
+        /oled_mask Bool) and gpu_vision writes the 128x64 blob; oled_display renders it
+        above the face but below reflection mode / spoken words / shutdown screens --
+        the same yield-the-panel model as every other owner."""
+        if self._gpu_vision is None:
+            return {"error": "gpu vision not enabled"}
+        want = bool((d or {}).get("enabled"))
+        if want and not self._gpu_vision.has_target_color:
+            return {"error": "no target colour calibrated -- nothing to mirror"}
+        self._set_oled_mask_state(want)
+        return {"ok": True, "oled_mask": self._oled_mask_on}
+
+    # ---- named colour-target palette ------------------------------------------
+    # Calibrations are stored under a NAME ("ball", "dock marker", ...) in a small
+    # persisted JSON file, one active at a time -- so a target survives a stack
+    # restart, and skills/the schedule/the UI can re-select one without re-calibrating.
+    # The GPU still tracks exactly ONE colour at a time (selection, not simultaneous
+    # multi-target -- the dock-approach/play use cases want "pick which", and one pass
+    # keeps the per-frame cost unchanged).
+    def _load_vision_targets(self):
+        """Read the palette + re-apply the persisted active target into GpuVision."""
+        data = read_json(self._vision_targets_path)
+        if isinstance(data, dict) and isinstance(data.get("targets"), dict):
+            self._vision_targets = {str(k)[:32]: v for k, v in data["targets"].items()
+                                    if isinstance(v, dict)}
+            active = data.get("active")
+            if active in self._vision_targets:
+                self._apply_vision_target(active)
+
+    def _save_vision_targets(self):
+        if not write_json(self._vision_targets_path,
+                          {"active": self._vision_target_active,
+                           "targets": self._vision_targets}):
+            self.get_logger().warning("vision targets: save failed")
+
+    def _apply_vision_target(self, name):
+        """Push a stored target's colour + blob tuning into the GL thread and mark it
+        active. set_target_color resets the tuning, so the stored tuning goes second."""
+        t = self._vision_targets[name]
+        try:
+            rgb = tuple(max(0.0, min(1.0, float(t[k]))) for k in ("r", "g", "b"))
+        except (KeyError, TypeError, ValueError):
+            return False
+        self._gpu_vision.set_target_color(rgb, float(t.get("threshold", 0.22)))
+        self._gpu_vision.set_blob_tuning(
+            min_confidence=t.get("min_confidence"), max_confidence=t.get("max_confidence"))
+        self._vision_target_active = name
+        return True
+
+    def get_vision_targets(self):
+        """GET /vision/targets: the palette + which one is live."""
+        return {"targets": self._vision_targets, "active": self._vision_target_active}
+
+    def vision_target_select(self, d):
+        """POST /vision/target_select {name}: make a stored calibration the live one."""
+        if self._gpu_vision is None:
+            return {"error": "gpu vision not enabled"}
+        name = str((d or {}).get("name") or "").strip()[:32]
+        if name not in self._vision_targets:
+            return {"error": f"no stored target named '{name}'"}
+        if not self._apply_vision_target(name):
+            return {"error": f"stored target '{name}' is malformed"}
+        self._save_vision_targets()
+        t = self._vision_targets[name]
+        return {"ok": True, "active": name, "target": t}
+
+    def vision_target_delete(self, d):
+        """POST /vision/target_delete {name}: forget a stored calibration. Deleting the
+        active one also stops tracking (there's nothing meaningful to fall back to)."""
+        name = str((d or {}).get("name") or "").strip()[:32]
+        if name not in self._vision_targets:
+            return {"error": f"no stored target named '{name}'"}
+        del self._vision_targets[name]
+        if self._vision_target_active == name:
+            self._vision_target_active = None
+            if self._gpu_vision is not None:
+                self._gpu_vision.set_target_color(None)
+        self._save_vision_targets()
+        return {"ok": True, "active": self._vision_target_active}
+
     def vision_calibrate(self, d):
         """POST /vision/calibrate: set or clear the GPU blob-tracker's target colour.
-        Body: {r,g,b (0..1), threshold?} to set, or {clear:true} to disable tracking.
-        The browser samples the pixel colour itself (canvas getImageData on the live
-        <img>) and posts the RGB value directly -- no server-side coordinate mapping
-        needed."""
+        Body: {r,g,b (0..1), threshold?, name?} to set, or {clear:true} to disable
+        tracking (the stored palette is kept). The browser samples the pixel colour
+        itself (canvas getImageData on the live <img>) and posts the RGB value directly
+        -- no server-side coordinate mapping needed. `name` (default "default") stores
+        the calibration in the named palette, persisted across restarts."""
         if self._gpu_vision is None:
             return {"error": "gpu vision not enabled"}
         if d.get("clear"):
             self._gpu_vision.set_target_color(None)
+            self._vision_target_active = None
+            self._save_vision_targets()
             return {"ok": True, "target_color": None}
         try:
             rgb = tuple(max(0.0, min(1.0, float(d[k]))) for k in ("r", "g", "b"))
@@ -1309,8 +1505,15 @@ class WebServerNode(Node):
             threshold = max(0.02, min(1.0, float(d.get("threshold", 0.22))))
         except (TypeError, ValueError):
             threshold = 0.22
+        name = str(d.get("name") or "default").strip()[:32] or "default"
         self._gpu_vision.set_target_color(rgb, threshold)
-        return {"ok": True, "target_color": list(rgb), "threshold": threshold}
+        self._vision_targets[name] = {"r": rgb[0], "g": rgb[1], "b": rgb[2],
+                                      "threshold": threshold,
+                                      "min_confidence": 0.0, "max_confidence": 1.0}
+        self._vision_target_active = name
+        self._save_vision_targets()
+        return {"ok": True, "target_color": list(rgb), "threshold": threshold,
+                "name": name}
 
     def vision_blob_tune(self, d):
         """POST /vision/blob_tune: adjust colour-match sensitivity and blob-size gating
@@ -1336,6 +1539,13 @@ class WebServerNode(Node):
             min_confidence=opt_float("min_confidence"),
             max_confidence=opt_float("max_confidence"))
         threshold, min_conf, max_conf = self._gpu_vision.blob_tuning
+        # Keep the active named target's stored tuning in sync, so re-selecting it
+        # later (or a restart) restores the tuned values, not the pick-time defaults.
+        active = self._vision_target_active
+        if active in self._vision_targets:
+            self._vision_targets[active].update(
+                threshold=threshold, min_confidence=min_conf, max_confidence=max_conf)
+            self._save_vision_targets()
         return {"ok": True, "threshold": threshold, "min_confidence": min_conf,
                 "max_confidence": max_conf}
 
@@ -1579,6 +1789,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/health/log": lambda n: n.get_health_log(),
         "/logs": lambda n: n.get_merged_log(),
         "/stress/status": lambda n: n.stress_status(),
+        "/vision/targets": lambda n: n.get_vision_targets(),
+        "/llm/vision_diary": lambda n: n.get_vision_diary(),
     }
     POST_JSON = {
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
@@ -1600,6 +1812,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/vision/blob_tune": lambda n, d: n.vision_blob_tune(d),
         "/vision/manual": lambda n, d: n.vision_manual(d),
         "/vision/camera_enable": lambda n, d: n.set_camera_enable(d),
+        "/vision/target_select": lambda n, d: n.vision_target_select(d),
+        "/vision/target_delete": lambda n, d: n.vision_target_delete(d),
+        "/vision/oled_mask": lambda n, d: n.set_oled_mask(d),
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.

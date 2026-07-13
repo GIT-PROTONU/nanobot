@@ -593,6 +593,8 @@ class Personality:
 
     def __init__(self, *, path="", logger=None, heartbeat_enable=True, brain_timeout=90.0,
                  nudge_pickup_caution=0.92, nudge_pickup_playful=0.3,
+                 nudge_looming_caution=0.85, clutter_caution=0.75,
+                 vision_caution_enable=True, vision_rule_period=2.0,
                  publish=None, save_period=15.0):
         self.path = path or os.path.expanduser("~/.local/state/nanobot/personality.json")
         self._log = logger or (lambda *_: None)
@@ -601,6 +603,20 @@ class Personality:
         self._brain_timeout = float(brain_timeout)
         self._nudge_caution = float(nudge_pickup_caution)
         self._nudge_playful = float(nudge_pickup_playful)
+        # Vision fast rules (same mechanism as the pickup nudge — Sismic `evolve`
+        # events, smoothed by the chart, revertible on brain_lost): a looming object is
+        # a one-shot startle toward nudge_looming_caution; visual clutter eases caution
+        # toward clutter_caution WHILE it lasts and back to the pre-clutter value once
+        # it clears — which, with slam_nav's trait_motion clamp on, IS the clutter
+        # velocity throttle (caution -> max_lin), reversibly and through the one
+        # existing motor-authority path rather than a new one.
+        self._nudge_looming = float(nudge_looming_caution)
+        self._clutter_caution = float(clutter_caution)
+        self._vision_enable = bool(vision_caution_enable)
+        self._vision_rule_period = float(vision_rule_period)
+        self._was_looming = False
+        self._clutter_baseline = None      # live caution before clutter started, or None
+        self._last_vision_rule = -1e9
         self._publish = publish or (lambda _s: None)
         self._save_period = float(save_period)
         self._interp = None
@@ -667,21 +683,60 @@ class Personality:
         self._brain_lost = False
         return came_back
 
-    def tick_events(self, now, picked):
-        """Queue the fast pick-up nudge + the heartbeat revert (both Sismic events, applied on
-        the node's next chart execute). Returns one of None / "lost" for the node to log."""
+    def tick_events(self, now, picked, vision=None):
+        """Queue the fast pick-up nudge, the vision fast rules (looming startle +
+        clutter caution, see _vision_rules), and the heartbeat revert (all Sismic
+        events, applied on the node's next chart execute). `vision` is the freshest
+        /vision/state dict, or None/{} when the camera pipeline is off or stale.
+        Returns one of None / "lost" for the node to log."""
         if self._interp is None or Event is None:
             return None
         if picked and not self._was_picked:                # being handled -> warier, less playful
             self._interp.queue(Event("evolve", registry={}, drives={}, traits={
                 "caution": self._nudge_caution, "playfulness": self._nudge_playful}))
         self._was_picked = picked
+        if self._vision_enable:
+            self._vision_rules(now, vision or {})
         if (self._heartbeat_enable and not self._brain_lost
                 and (now - self._last_brain) > self._brain_timeout):
             self._interp.queue(Event("brain_lost"))
             self._brain_lost = True
             return "lost"
         return None
+
+    def _vision_rules(self, now, vision):
+        """The vision->caution fast rules. Looming (something closing on the lens fast)
+        is edge-triggered like the pickup startle: one evolve toward the wary target.
+        Clutter (a visually busy floor — cables/toys lidar can't see at its scan
+        height) is level-held with a symmetric RELEASE: while it lasts, caution is
+        eased toward clutter_caution (never below where it already was); once it
+        clears, caution is eased back to the remembered pre-clutter value — so unlike
+        the one-way pickup nudge this can't permanently ratchet the personality, and
+        with slam_nav's trait_motion clamp it acts as a reversible speed throttle.
+        Rate-limited so the smoothing stays gentle."""
+        looming = bool(vision.get("looming"))
+        if looming and not self._was_looming:
+            self._interp.queue(Event("evolve", registry={}, drives={},
+                                     traits={"caution": self._nudge_looming}))
+        self._was_looming = looming
+        if (now - self._last_vision_rule) < self._vision_rule_period:
+            return
+        clutter = bool(vision.get("clutter"))
+        live = self._interp.context["traits"]
+        if clutter:
+            if self._clutter_baseline is None:
+                self._clutter_baseline = float(live.get("caution", 0.6))
+            target = max(self._clutter_baseline, self._clutter_caution)
+            self._interp.queue(Event("evolve", registry={}, drives={},
+                                     traits={"caution": target}))
+            self._last_vision_rule = now
+        elif self._clutter_baseline is not None:
+            if abs(float(live.get("caution", 0.6)) - self._clutter_baseline) < 0.02:
+                self._clutter_baseline = None              # released — back to normal
+            else:
+                self._interp.queue(Event("evolve", registry={}, drives={},
+                                         traits={"caution": self._clutter_baseline}))
+                self._last_vision_rule = now
 
     # ---- publish + persist --------------------------------------------------
     def publish_and_persist(self, now):

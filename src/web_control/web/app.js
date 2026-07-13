@@ -137,6 +137,60 @@ function setCamMode(mode){
 $("visionMaskToggle").onclick=()=>setCamMode("color");
 $("visionMotionMaskToggle").onclick=()=>setCamMode("motion");
 
+// OLED mask mirror: show the tracking mask on the robot's physical 128x64 panel
+// (POST /vision/oled_mask; gpu_vision writes /dev/shm/nano_oled_mask.bin, oled_display
+// renders it). lastOledMask is synced FROM telemetry in onVision, so this button always
+// toggles the real server state, not a local guess.
+let lastOledMask=false;
+$("visionOledMask").onclick=()=>{
+  fetch("/vision/oled_mask",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({enabled:!lastOledMask})})
+    .then(r=>r.json()).then(d=>{ if(d&&d.error) alert(d.error); }).catch(()=>{});
+};
+
+// Named colour-target palette (GET /vision/targets + select/delete): calibrations are
+// saved server-side under the name typed in #visionTargetName and survive restarts.
+function loadVisionTargets(){
+  fetch("/vision/targets").then(r=>r.ok?r.json():null).then(d=>{
+    if(!d||!d.targets) return;
+    const sel=$("visTargetSel"), names=Object.keys(d.targets);
+    sel.innerHTML="";
+    if(!names.length){ sel.innerHTML='<option value="">(none stored)</option>'; return; }
+    names.forEach(n=>{
+      const o=document.createElement("option");
+      o.value=n; o.textContent=n+(n===d.active?" (active)":"");
+      if(n===d.active) o.selected=true;
+      sel.appendChild(o);
+    });
+  }).catch(()=>{});
+}
+$("visTargetUse").onclick=()=>{
+  const name=$("visTargetSel").value;
+  if(!name) return;
+  fetch("/vision/target_select",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name})}).then(r=>r.json()).then(d=>{
+      if(d&&d.error){ alert(d.error); return; }
+      // the server restored the stored blob tuning -- sync the sliders to it
+      if(d&&d.target){
+        const t=d.target;
+        $("visBlobThresh").value=Math.round((t.threshold||0.22)*100);
+        $("visBlobThreshV").textContent=$("visBlobThresh").value;
+        $("visBlobMin").value=Math.round((t.min_confidence||0)*100);
+        $("visBlobMinV").textContent=$("visBlobMin").value;
+        $("visBlobMax").value=Math.round((t.max_confidence!=null?t.max_confidence:1)*100);
+        $("visBlobMaxV").textContent=$("visBlobMax").value;
+      }
+      loadVisionTargets();
+    }).catch(()=>{});
+};
+$("visTargetDel").onclick=()=>{
+  const name=$("visTargetSel").value;
+  if(!name || !confirm(`Forget the stored target colour "${name}"?`)) return;
+  fetch("/vision/target_delete",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name})}).then(()=>loadVisionTargets()).catch(()=>{});
+};
+loadVisionTargets();
+
 // Webcam mic: stream raw S16LE PCM from /audio.pcm and play it via the Web Audio
 // API. We schedule small AudioBuffers on a short jitter buffer (~180 ms) for low
 // latency; if playback falls behind (underrun) we resync to "now". Toggling off
@@ -267,7 +321,7 @@ $("visionPick").onclick=()=>visionPickArmed?disarmVisionPick():armVisionPick();
 $("visionClear").onclick=()=>{
   disarmVisionPick();
   fetch("/vision/calibrate",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({clear:true})}).catch(()=>{});
+    body:JSON.stringify({clear:true})}).then(()=>loadVisionTargets()).catch(()=>{});
   resetBlobTuneUI();   // clearing also resets tuning server-side, same as a fresh pick
 };
 $("cam").addEventListener("click",onCamPickClick);
@@ -452,6 +506,24 @@ const HINTS = {
   visLooming: "Motion-intercept-rate ceiling above which something counts as looming.",
   visColorcast: "Colour-channel spread (max minus min of R/G/B) above which the scene counts as colour-cast.",
   visMotionTarget: "Distance BELOW which the motion centroid counts as matching the tracked colour target.",
+  // 2026-07-13 batch
+  visTargetName2: "Which named palette entry is currently being tracked (see the Named targets row / the target-name box in the Camera view).",
+  visApproach2: "Motion growing fast AND centred in frame = someone/something walking up to the robot. Drives the behaviour layer's anticipatory greeting.",
+  visNovelty2: "How different the scene looks vs. a slow ~20s background average -- stays high while something is genuinely different, then habituates. Boosts the autonomous \"looking\" beat.",
+  visCamFreeze2: "Flags a capture path that stopped delivering frames (or keeps delivering the identical buffer) -- a USB/driver wedge, distinct from the optical bumper's wheel-stall case.",
+  visVibration2: "Image much blurrier while driving than the standing-still baseline -- excess chassis vibration (loose screw, wheel imbalance). A maintenance hint, not a stop.",
+  visTargetSel: "The persistent calibration palette -- pick a stored colour target and press Track to make it live.",
+  visTargetUse: "Make the selected stored target the live tracked colour (also restores its saved tuning).",
+  visTargetDel: "Forget the selected stored target. Deleting the active one stops tracking.",
+  visGlare: "Glare rejection: derates the blob lock confidence by the frame's specular-highlight fraction, so a shiny reflection matching the tracked hue can't hold a false lock. 0 = off.",
+  visNoveltyAlert: "Novelty score above which the \"scene changed\" alert fires.",
+  visCamStall: "Seconds without a new frame (or with an exactly-zero diff) before the camera counts as frozen.",
+  visVibRatio: "Driving edge-density below this fraction of the standing-still baseline counts as excess blur.",
+  visVibSecs: "How long the excess blur must hold before the vibration flag fires.",
+  visApproachRate: "Motion growth rate above which something counts as approaching.",
+  visApproachBand: "How close to frame centre the motion must be to count as approaching (rules out edge clutter).",
+  visionTargetName: "Name this calibration ('ball', 'dock marker', ...) -- every pick is saved to a persistent palette under this name.",
+  visionOledMask: "Mirror the tracking mask to the robot's physical OLED (128x64) -- the face yields while it's on.",
 };
 function applyHints(on){
   for(const [id,text] of Object.entries(HINTS)){
@@ -472,8 +544,9 @@ $("hintsToggle").onchange=()=>{
 let visManualSynced=false, blobTuneSynced=false, cameraEnableSynced=false;
 function onVision(v){
   const manualRow=$("visManualRow"), manualRow2=$("visManualRow2"), cross=$("visionCrosshair");
-  const ids=["visMotion2","visMotionCenter2","visTarget2","visIntercept2","visMotionIntercept2",
-    "visMotionTargetMatch2","visLuma2","visObstructed2","visColorCast2","visEdgeDensity2",
+  const ids=["visMotion2","visMotionCenter2","visTarget2","visTargetName2","visIntercept2",
+    "visMotionIntercept2","visMotionTargetMatch2","visApproach2","visNovelty2","visLuma2",
+    "visObstructed2","visCamFreeze2","visVibration2","visColorCast2","visEdgeDensity2",
     "visOverhead2","visShiny2","visBacklit2","visFocusBlur2","visGpuDuty2","visBumper2"];
   if(!v){
     if(manualRow) manualRow.style.display="none";   // no GpuVision instance at all -- nothing to toggle
@@ -520,6 +593,14 @@ function onVision(v){
   const paused=!!v.manual||camOff;
   const pausedReason=camOff?"camera off":"paused (manual mode)";
   [$("visionPick"),$("visionClear")].forEach(b=>{ if(b) b.disabled=paused; });
+  // OLED mask mirror: label + highlight follow the server state (v.oled_mask), so a
+  // toggle from another tab -- or the server auto-dropping it when the camera stops --
+  // is always reflected here.
+  lastOledMask=!!v.oled_mask;
+  const om=$("visionOledMask");
+  if(om){ om.disabled=paused;
+    om.classList.toggle("primary",lastOledMask);
+    om.textContent=lastOledMask?"🖥 Stop OLED mirror":"🖥 Mask → OLED"; }
   // A reported target has already passed the server's min/max blob-size gate (see
   // GpuVision._loop / the "Blob tracking tuning" sliders) -- that IS the lock condition
   // now, so there's no separate confidence floor here to fight the tuning sliders.
@@ -530,7 +611,16 @@ function onVision(v){
     ? `${(v.motion_center[0]*100).toFixed(0)}%,${(v.motion_center[1]*100).toFixed(0)}%` : "none"));
   set("visTarget2", paused?"–":(v.target ? "locked "+(v.target[2]*100).toFixed(0)+"%"
                               : (v.has_target_color ? "searching" : "no target set")));
+  set("visTargetName2", v.target_name||"–");
   const alerts=v.alerts||{};
+  set("visApproach2", paused?"–":(v.approach?"⚠ something approaching":"no"));
+  set("visNovelty2", paused?"–":((v.novelty||0)*100).toFixed(1)+"%"
+    +(alerts.novelty?" ⚠ scene changed":""));
+  const cfEl=$("visCamFreeze2");
+  if(cfEl){ cfEl.textContent=paused?"–":(alerts.camera_freeze?"⚠ FROZEN":"live"
+      +(v.frame_age!=null?` (${v.frame_age.toFixed(1)}s)`:""));
+    cfEl.style.color=(!paused && alerts.camera_freeze)?"var(--red)":""; cfEl.style.opacity=paused?0.5:1; }
+  set("visVibration2", paused?"–":(alerts.vibration?"⚠ excess blur while driving":"clear"));
   set("visIntercept2", paused?"–":(v.target ? (v.intercept_rate*100).toFixed(0)+"%/s" : "–"));
   set("visMotionIntercept2", paused?"–":(v.motion_intercept_rate*100).toFixed(0)+"%/s"
     +(!paused && alerts.looming?" ⚠ looming":""));
@@ -638,6 +728,13 @@ const VISION_ALERT_SLIDERS=[
   ["visLooming","vision_looming_alert",100],
   ["visColorcast","vision_colorcast_alert",100],
   ["visMotionTarget","vision_motiontarget_match_max",100],
+  ["visNoveltyAlert","vision_novelty_alert",100],
+  ["visCamStall","vision_camera_stall_secs",1],          // raw seconds, no /100
+  ["visVibRatio","vision_vibration_ratio",100],
+  ["visVibSecs","vision_vibration_confirm_secs",1],      // raw seconds
+  ["visApproachRate","vision_approach_rate",100],
+  ["visApproachBand","vision_approach_band",100],
+  ["visGlare","vision_glare_derate",1],                  // raw multiplier, no /100
 ];
 VISION_ALERT_SLIDERS.forEach(([id,param,scale])=>{
   const el=$(id), vEl=$(id+"V");
@@ -686,9 +783,10 @@ function onCamPickClick(e){
     ctx.drawImage($("cam"), 0, 0, r.iw, r.ih);
     data=ctx.getImageData(nx, ny, 1, 1).data;
   }catch(err){ disarmVisionPick(); return; }
+  const name=($("visionTargetName").value||"").trim()||"default";
   fetch("/vision/calibrate",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({r:data[0]/255, g:data[1]/255, b:data[2]/255, threshold:0.22})})
-    .catch(()=>{});
+    body:JSON.stringify({r:data[0]/255, g:data[1]/255, b:data[2]/255, threshold:0.22, name})})
+    .then(()=>loadVisionTargets()).catch(()=>{});
   resetBlobTuneUI();   // server resets threshold/min/max on every fresh colour pick -- match it
   disarmVisionPick();
 }

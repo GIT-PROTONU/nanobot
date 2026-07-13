@@ -47,6 +47,8 @@ Data sources (all lightweight — NO telemetry topics are subscribed anymore):
                                         default on; off keeps the face up while speaking)
     /oled_word       (String)         → one TTS word at a time, shown big+centred while
                                         speaking; "" returns to the face/dashboard (web_control)
+    /oled_mask       (Bool, latched)  → mirror the GPU colour-tracking mask (web_control);
+                                        frames come from /dev/shm/nano_oled_mask.bin
     /sys/class/thermal/thermal_zone0/temp → SBC CPU temp (cached file read)
     /proc/stat                        → SBC CPU busy % (delta-sampled file read)
     /proc/meminfo                     → SBC RAM used % (cached file read)
@@ -120,6 +122,11 @@ STAT_PATH = "/proc/stat"                                # cpu jiffies for busy %
 # OLED node (stopped via SIGTERM) knows which end-screen to show. /dev/shm is tmpfs the
 # stack user can write and is cleared on reboot.
 ACTION_FILE = "/dev/shm/nano_oled_action"
+# GPU vision's colour-tracking mask, pre-reduced to the panel's exact 128x64 and
+# re-binarized (one byte/pixel, 0/255) -- written by web_control's gpu_vision.py while
+# the web UI's "mirror mask to OLED" toggle is on; shown while /oled_mask is true.
+MASK_FILE = "/dev/shm/nano_oled_mask.bin"
+MASK_FRESH_S = 2.0     # blob older than this (writer stopped) -> "waiting" placeholder
 
 # Staleness windows: a source is "alive" only if it arrived within this many
 # seconds. Generous enough to ride out one missed message at each topic's rate.
@@ -192,6 +199,8 @@ class DisplayNode(Node):
         self._accent = ""               # effective emotion accent overlaid on the shape
         self._reflecting = False        # /oled_reflecting: owns the panel above everything
                                          # else except a spoken word or a shutdown/restart screen
+        self._mask_mode = False         # /oled_mask: mirror the GPU tracking mask (below
+                                         # reflecting, above the face/dashboard)
         self.speak_word = ""            # current TTS word (karaoke); "" = not speaking
         self.esp_temp = float("nan")
         self.esp_at = -1e9
@@ -258,6 +267,7 @@ class DisplayNode(Node):
         self.create_subscription(String, "oled_system", self._on_system, 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Bool, "oled_reflecting", self._on_reflecting, latched)
+        self.create_subscription(Bool, "oled_mask", self._on_mask, latched)
 
         # Dashboard ticks slowly; the face has its own faster timer that runs while a face is
         # shown (the default) and is cancelled (no wakeups) only while the dashboard is pinned.
@@ -292,6 +302,15 @@ class DisplayNode(Node):
         self._reflecting = bool(msg.data)
         self._recompute_mood()
 
+    def _on_mask(self, msg: Bool):
+        """GPU tracking-mask mirror on/off (web_control's /oled_mask, latched). A
+        sustained tool view like reflecting, not a mood — it borrows the face timer for
+        redraw pacing but renders the /dev/shm mask blob instead of eyes. The face
+        stands down for it (same yield-the-panel model as every other owner); spoken
+        words and shutdown/restart screens still interrupt it."""
+        self._mask_mode = bool(msg.data)
+        self._recompute_mood()
+
     def _on_dashboard(self, msg: Bool):
         """Web UI Dashboard toggle: pin the status dashboard always (True) or show the face
         (False, the default)."""
@@ -317,6 +336,8 @@ class DisplayNode(Node):
         _face_tick/_on_word/_on_system)."""
         if self._reflecting:
             new, new_acc = "reflecting", ""
+        elif self._mask_mode:
+            new, new_acc = "mask", ""
         else:
             new = "" if self.pin_dashboard else (self.face_mood or self.idle_face)
             # The emotion accent rides only an actively-requested mood — the resting idle face is plain.
@@ -810,6 +831,10 @@ class DisplayNode(Node):
                 self._sleepy(draw, zc)
             return
 
+        if self._mood == "mask":
+            self._mask_tick()
+            return
+
         if self._mood == "reflecting":
             # A slow spinner (not an eye shape at all -- reflection is a sustained
             # background-processing state, not a reactive expression) + a static
@@ -859,6 +884,49 @@ class DisplayNode(Node):
                 self._happy_eye(draw, lcx, cy, px, py, smiling)
                 self._happy_eye(draw, rcx, cy, px, py, smiling)
             self._accent_overlay(draw, lcx, rcx, cy)   # emotion overlay on top of the shape
+
+    # ---- GPU tracking-mask mirror ----
+    def _read_mask_blob(self):
+        """One JSON header line + w*h raw bytes (0/255) — written atomically by
+        gpu_vision.py, so a plain read never sees a torn frame. (None, None) on any
+        problem (absent, malformed, short read)."""
+        try:
+            with open(MASK_FILE, "rb") as f:
+                header = json.loads(f.readline().decode())
+                w, h = int(header["w"]), int(header["h"])
+                raw = f.read(w * h)
+            if len(raw) != w * h:
+                return None, None
+            return header, raw
+        except Exception:
+            return None, None
+
+    def _mask_tick(self):
+        """Render the tracking-mask blob (white = pixels matching the calibrated
+        colour). The blob's seq is the dirty-check — the panel flushes only when the
+        GPU actually produced a new mask frame, so a paused tracker costs nothing. A
+        stale/absent blob (no target colour set, capture stopped) shows a static
+        placeholder instead of a frozen mask masquerading as live."""
+        header, raw = self._read_mask_blob()
+        if header is None or (time.time() - float(header.get("t", 0))) > MASK_FRESH_S:
+            sig = ("mask", "stale")
+            if sig == self._face_sig:
+                return
+            self._face_sig = sig
+            with canvas(self.device) as draw:
+                msg = "mask: waiting..."
+                draw.text(((self.width - self._text_w(msg)) // 2, self.height // 2 - 4),
+                          msg, font=self.font, fill=255)
+            return
+        sig = ("mask", header.get("seq"))
+        if sig == self._face_sig:
+            return
+        self._face_sig = sig
+        w, h = int(header["w"]), int(header["h"])
+        img = Image.frombytes("L", (w, h), raw)
+        if (w, h) != (self.width, self.height):
+            img = img.resize((self.width, self.height))
+        self.device.display(img.convert("1"))
 
     # ---- shutdown ----
     def _shutdown_screen(self):

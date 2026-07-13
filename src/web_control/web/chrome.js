@@ -3,10 +3,40 @@
   "use strict";
   const $=id=>document.getElementById(id);
 
+  // ---- mobile hero sizing -------------------------------------------------
+  // Per-tab hero height state: "compact" | "tall" | "hidden". Visual tabs
+  // (drive/sim) default to a compact hero so you can drive by camera/lidar;
+  // the settings-style tabs default to hidden so their content gets the whole
+  // screen. #heroSize cycles the state for the CURRENT tab (remembered in
+  // localStorage); #heroReveal brings a hidden hero back. Pure CSS classes on
+  // #app — the desktop layout (min-width:880px) ignores them entirely.
+  const HERO_DEFAULT={drive:"compact",sim:"compact",speak:"hidden",ai:"hidden",
+    sensors:"hidden",system:"hidden"};
+  let heroPref={};
+  try{ heroPref=JSON.parse(localStorage.getItem("nano.heroPref")||"{}"); }catch(e){}
+  let curTab="drive";
+  const heroMode=()=>heroPref[curTab]||HERO_DEFAULT[curTab]||"compact";
+  function setHeroMode(m){
+    heroPref[curTab]=m;
+    try{ localStorage.setItem("nano.heroPref",JSON.stringify(heroPref)); }catch(e){}
+    applyHero();
+  }
+  function applyHero(){
+    const m=heroMode(), app=$("app");
+    app.classList.toggle("hero-tall",m==="tall");
+    app.classList.toggle("hero-hidden",m==="hidden");
+    $("heroSize").textContent=m==="tall"?"⌄":"⤢";
+    $("heroSize").title=m==="tall"?"Hide view":"Expand view";
+  }
+  $("heroSize").onclick=()=>setHeroMode(heroMode()==="compact"?"tall":"hidden");
+  $("heroReveal").onclick=()=>setHeroMode("compact");
+
   // bottom tab bar -> show one panel
   function showTab(name){
+    curTab=name;
     document.querySelectorAll("#tabbar button").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
     document.querySelectorAll(".panel").forEach(p=>p.classList.toggle("active",p.id==="panel-"+name));
+    applyHero();
   }
   document.querySelectorAll("#tabbar button").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
   $("statusChip").onclick=()=>showTab("system");
@@ -76,7 +106,14 @@
     setCmd=(v,w)=>{ baseSet(v,w); if(id===null) place(v,w); };
   })();
 
-  // initial UI state
-  showTab("drive");
-  showView("lidar");
+  // initial UI state (deep-linkable: /#sensors opens the Sensors tab,
+  // /#drive/cam opens Drive with the camera hero view)
+  function applyHash(){
+    const [t,v]=location.hash.slice(1).split("/");
+    if(document.getElementById("panel-"+t)) showTab(t);
+    if(v && document.getElementById("view-"+v)) showView(v);
+  }
+  showTab("drive"); showView("lidar");
+  applyHash();
+  window.addEventListener("hashchange",applyHash);
 })();

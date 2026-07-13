@@ -171,13 +171,15 @@ def main():
                 "motion", "motion_center", "target", "intercept_rate",
                 "motion_intercept_rate", "motion_target_match", "luma", "luma_variance",
                 "luma_max", "color_cast", "edge_density", "overhead_edge_density",
-                "highlight_fraction", "gpu_duty", "camera_enabled", "alerts", "bumper")
+                "highlight_fraction", "gpu_duty", "camera_enabled", "alerts", "bumper",
+                "target_name", "approach", "oled_mask", "novelty", "frame_age")
                 if k not in vision]
             check("vision frame has all keys", not missing, f"missing={missing}")
             alerts = vision.get("alerts") or {}
             missing_alerts = [k for k in (
                 "obstructed", "clutter", "overhead_alert", "focus_blur", "backlit",
-                "shiny", "looming", "colorcast", "motion_matches_target")
+                "shiny", "looming", "colorcast", "motion_matches_target",
+                "novelty", "camera_freeze", "vibration")
                 if k not in alerts]
             check("vision alerts has all keys", not missing_alerts, f"missing={missing_alerts}")
         else:

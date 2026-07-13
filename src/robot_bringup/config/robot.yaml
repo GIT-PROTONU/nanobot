@@ -282,6 +282,25 @@ behavior:
     brain_timeout: 1800.0     # s without an /cognition/evolve before reverting to baseline (>> reflect_period)
     nudge_pickup_caution: 0.92  # fast rule: being picked up eases caution toward this
     nudge_pickup_playful: 0.3   #            and playfulness toward this (startled)
+    # --- vision-driven reflexes (fed by web_control's /vision/state @2 Hz) ---
+    # All expression/trait-level: caution only moves motion through slam_nav's own
+    # clamped trait_motion mapping (opt-in there). The clutter rule doubles as the
+    # clutter VELOCITY THROTTLE when trait_motion is on: caution is held at >=
+    # clutter_caution while the floor looks busy (cables/toys below the lidar plane)
+    # and eased back to the pre-clutter value once it clears — reversible by design,
+    # through the one existing motor-authority path.
+    vision_fresh_secs: 3.0        # /vision/state older than this = vision reflexes stand down
+    vision_caution_enable: true   # looming/clutter -> caution fast rules
+    nudge_looming_caution: 0.85   # something closing on the lens fast: startle toward this
+    clutter_caution: 0.75         # visually busy floor: hold caution >= this (released after)
+    greet_approach_enable: true   # motion growing + centred = someone walking up -> greet
+    greet_approach_min_interval: 60.0  # s between anticipatory greetings
+    greet_approach_face: "happy"
+    ambient_mood_enable: true     # room light warmth tints the idle "feeling" face
+    ambient_warm_face: "happy"    # warm (lamps/evening) ambient light -> this face
+    ambient_cool_face: ""         # cool (daylight/fluorescent) -> this face ("" = none)
+    ambient_warmth_delta: 0.1     # |scene R-B| above this counts as warm/cool
+    novelty_boost: 1.5            # extra "looking"-beat lottery weight at full novelty (0 = off)
     # --- LLM-steerable "drives" (new expressive axes beyond the 4 traits) ---
     # The slow reflection can also nudge four DRIVES via the same /cognition/evolve event (same
     # guardrails: clamped 0..1, smoothed by smoothing_alpha, reverted on brain_lost, expression-
@@ -389,6 +408,25 @@ web_control:
     vision_looming_alert: 0.3            # motion_intercept_rate above this = something looming
     vision_colorcast_alert: 0.12         # colour_cast R/G/B spread above this = strong cast
     vision_motiontarget_match_max: 0.15  # motion-vs-target centroid distance below this = match
+    # 2026-07-13 batch: novelty + camera-freeze/vibration diagnostics + glare rejection
+    # + the anticipatory-approach signal, all live-tunable like the rest.
+    vision_novelty_alert: 0.25           # novelty (scene vs. slow background) above this = changed
+    vision_camera_stall_secs: 2.0        # no new frame / exactly-zero diff this long = frozen camera
+    vision_vibration_ratio: 0.5          # driving edge_density below still-baseline*this = blur
+    vision_vibration_confirm_secs: 1.5   # s the blur must hold before the vibration flag
+    vision_glare_derate: 0.0             # blob confidence *= 1 - k*highlight_fraction (0 = off)
+    vision_approach_rate: 0.5            # motion growth (/s) above this = something approaching
+    vision_approach_band: 0.25           # AND motion centred within +-this of frame centre
+    # Named colour-target palette (persisted; a calibration now survives restarts).
+    vision_targets_path: ""              # "" = ~/.local/state/nanobot/vision_targets.json
+    # Visual diary: slow log of the scene scalars folded into the reflection prompts
+    # ("the room got darker and calmer through the evening") — sensory continuity for
+    # the self-narrative, same mechanism as the trait trajectory.
+    vision_diary_enable: true
+    vision_diary_period: 600.0           # s between snapshots
+    vision_diary_max: 288                # ring size (288 @ 10 min = 2 days)
+    vision_diary_window: 86400.0         # trend window used in the prompts (1 day)
+    vision_diary_path: ""                # "" = ~/.local/state/nanobot/vision_diary.json
     # Stress test mode (web "Stress test" card, POST /stress/start|stop): niced (lowest
     # priority) CPU busy-loop worker subprocesses that peg every core without starving
     # this web server (see web_control/stress.py). Auto-stops regardless of the caller.

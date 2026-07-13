@@ -68,7 +68,10 @@ PARAM_WHITELIST = {
                     "vision_obstruction_var_max", "vision_obstruction_dark_max",
                     "vision_clutter_alert", "vision_overhead_alert", "vision_focus_blur_max",
                     "vision_backlit_delta_min", "vision_highlight_alert", "vision_looming_alert",
-                    "vision_colorcast_alert", "vision_motiontarget_match_max"},
+                    "vision_colorcast_alert", "vision_motiontarget_match_max",
+                    "vision_novelty_alert", "vision_camera_stall_secs",
+                    "vision_vibration_ratio", "vision_vibration_confirm_secs",
+                    "vision_glare_derate", "vision_approach_rate", "vision_approach_band"},
 }
 
 
@@ -104,6 +107,11 @@ class TelemetryHub:
         self._oled = {"face": "", "word": "", "brand": "", "system": ""}
         self._cmd_vel = (0.0, 0.0)     # (linear.x, angular.z), for the optical bumper
         self._low_motion_since = None  # monotonic ts the stall condition started, or None
+        # Vibration/looseness diagnostic state: a slow EMA of edge_density while NOT
+        # commanded to move (the scene's "how sharp does this room normally look"
+        # baseline), and when the driving-but-much-blurrier condition started.
+        self._edge_still_ema = None
+        self._vibration_since = None
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._latched_qos = latched
@@ -199,12 +207,43 @@ class TelemetryHub:
         return {"alert": held >= confirm_secs, "commanded": commanded,
                 "cmd_vel": [round(lin, 3), round(ang, 3)], "low_motion_secs": round(held, 2)}
 
-    def _vision_alerts(self, gv):
+    def _vibration_alert(self, now, gv):
+        """Vibration/looseness diagnostic: while driving, the image should stay roughly
+        as sharp as the room normally looks -- excess motion blur (edge_density far
+        below the standing-still baseline, held for a confirm window) indicates chassis
+        vibration (loose screw, wheel imbalance, worn caster). A maintenance flag, not
+        a stop. The baseline is a slow EMA sampled only while NOT commanded to move, so
+        it tracks lighting/scene changes without the drive itself polluting it."""
+        g = self._node.get_parameter
+        lin, ang = self._cmd_vel
+        moving = abs(lin) > g("vision_bumper_cmd_eps").value or \
+            abs(ang) > g("vision_bumper_cmd_eps").value
+        ed = gv.edge_density
+        if not moving:
+            self._edge_still_ema = (ed if self._edge_still_ema is None
+                                    else self._edge_still_ema + 0.05 * (ed - self._edge_still_ema))
+            self._vibration_since = None
+            return False
+        base = self._edge_still_ema
+        # No trustworthy baseline (never stood still yet, or a blank-wall scene with no
+        # texture to lose) -> can't tell blur from nothing-to-see; stay quiet.
+        if base is None or base < 0.02 or ed >= base * g("vision_vibration_ratio").value:
+            self._vibration_since = None
+            return False
+        if self._vibration_since is None:
+            self._vibration_since = now
+        return (now - self._vibration_since) >= g("vision_vibration_confirm_secs").value
+
+    def _vision_alerts(self, gv, now=None, frozen=False):
         """Turn GpuVision's raw scalar properties into ALERT booleans against LIVE
         web_control params (not fixed constants), same pattern as _optical_bumper --
         the web UI's sliders actually take effect immediately, no restart needed. Kept
-        in telemetry.py rather than gpu_vision.py so tuning never touches the GL thread."""
+        in telemetry.py rather than gpu_vision.py so tuning never touches the GL thread.
+        `frozen` (manual mode / camera master switch off) suppresses the stateful,
+        time-based alerts -- a deliberately stopped capture thread would otherwise read
+        as a "frozen camera", and a stale edge_density as vibration."""
         g = self._node.get_parameter
+        now = time.monotonic() if now is None else now
         luma = gv.luma
         obstructed = (gv.luma_variance < g("vision_obstruction_var_max").value
                       and luma < g("vision_obstruction_dark_max").value)
@@ -222,10 +261,26 @@ class TelemetryHub:
         colorcast = bool(cast) and (max(cast) - min(cast)) > g("vision_colorcast_alert").value
         match = gv.motion_target_match
         motion_matches_target = match is not None and match < g("vision_motiontarget_match_max").value
+        novel = gv.novelty > g("vision_novelty_alert").value
+        # Camera-freeze diagnostic: reads still "succeed" but the device stopped
+        # delivering (frame_age growing) OR keeps handing back the identical buffer
+        # (an exactly-zero diff for a while -- see GpuVision.zero_motion_secs). Means
+        # "recover the camera", where the optical bumper's low-but-nonzero-motion case
+        # means "the wheels stalled" -- same-looking numbers, different consumer.
+        if frozen:
+            camera_freeze = vibration = False
+            self._vibration_since = None
+        else:
+            stall = g("vision_camera_stall_secs").value
+            age = gv.frame_age
+            camera_freeze = ((age is not None and age > stall)
+                             or gv.zero_motion_secs > stall)
+            vibration = self._vibration_alert(now, gv)
         return {
             "obstructed": obstructed, "clutter": clutter, "overhead_alert": overhead,
             "focus_blur": focus_blur, "backlit": backlit, "shiny": shiny, "looming": looming,
             "colorcast": colorcast, "motion_matches_target": motion_matches_target,
+            "novelty": novel, "camera_freeze": camera_freeze, "vibration": vibration,
         }
 
     def _build(self):
@@ -288,9 +343,15 @@ class TelemetryHub:
                       if frozen else self._optical_bumper(now, motion_score))
             blob_threshold, blob_min, blob_max = gv.blob_tuning
             match = gv.motion_target_match
+            frame_age = gv.frame_age
             f["vision"] = {
                 "manual": manual,
                 "camera_enabled": camera_enabled,
+                "target_name": getattr(n, "_vision_target_active", None),
+                "approach": bool(getattr(n, "_vision_approach", False)),
+                "oled_mask": bool(getattr(n, "_oled_mask_on", False)),
+                "novelty": round(gv.novelty, 3),
+                "frame_age": round(frame_age, 2) if frame_age is not None else None,
                 "motion": round(motion_score, 3),
                 "motion_center": [round(v, 3) for v in motion_center] if motion_center else None,
                 "target": [round(v, 3) for v in target] if target else None,
@@ -307,7 +368,7 @@ class TelemetryHub:
                 "overhead_edge_density": round(gv.overhead_edge_density, 3),
                 "highlight_fraction": round(gv.highlight_fraction, 3),
                 "gpu_duty": round(gv.gpu_duty, 3),
-                "alerts": self._vision_alerts(gv),
+                "alerts": self._vision_alerts(gv, now=now, frozen=frozen),
                 "bumper": bumper,
             }
         # latched brain readouts, passed through as the raw JSON strings the page parses

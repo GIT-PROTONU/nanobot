@@ -1855,3 +1855,5 @@
 {"t": 1782909896.6934795, "trigger": "beat:pursuing", "state": "pursuing", "camera": true, "model": "", "prompt": "", "say": "", "mood": "", "status": "skipped-busy", "detail": "", "ms": 0}
 {"t": 1783287350.055007, "trigger": "life:offline", "state": "", "camera": false, "model": "phrasebank", "prompt": "", "say": "Cannot think deep. Sorry.", "mood": "sleepy", "status": "spoke", "detail": "", "ms": 0}
 {"t": 1783287351.054049, "trigger": "life:greeting", "state": "", "camera": false, "model": "phrasebank", "prompt": "", "say": "Hey there, ready to help.", "mood": "", "status": "spoke", "detail": "", "ms": 0}
+{"t": 1783924213.4665785, "trigger": "life:offline", "state": "", "camera": false, "model": "phrasebank", "prompt": "", "say": "Brain offline. Making do.", "mood": "sleepy", "status": "spoke", "detail": "", "ms": 0}
+{"t": 1783924214.4655983, "trigger": "life:greeting", "state": "", "camera": false, "model": "phrasebank", "prompt": "", "say": "Recharged and ready. Let's play.", "mood": "", "status": "spoke", "detail": "", "ms": 0}

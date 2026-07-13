@@ -183,7 +183,10 @@ class CognitionCore:
                  consolidate_every=6, self_model_max_chars=600,
                  trait_history_path=None, trait_history_enable=True,
                  trait_history_period=3600.0, trait_history_max=336,
-                 trait_history_window=604800.0, prelude_enable=True,
+                 trait_history_window=604800.0,
+                 vision_diary_path=None, vision_diary_enable=True,
+                 vision_diary_period=600.0, vision_diary_max=288,
+                 vision_diary_window=86400.0, prelude_enable=True,
                  prelude_face="focused", camera_announce=True, camera_face="looking",
                  workshop_enable=True, workshop_path=None,
                  workshop_dir="", workshop_rounds=1, workshop_min_runs=3,
@@ -279,6 +282,19 @@ class CognitionCore:
         self._trait_hist_path = trait_history_path or os.path.expanduser(
             "~/.local/state/nanobot/trait_history.json")
         self._trait_hist = self._load_trait_history()
+        # Visual diary: same mechanism as the trait trajectory, but for what the CAMERA
+        # has seen over time (luma/motion/edge/novelty/warmth scalars the GPU pipeline
+        # already computes each tick) -- so reflection can reason about "the room got
+        # darker and quieter through the evening", real sensory continuity instead of
+        # only the last few decision-log lines. The platform adapter (web_server's
+        # 1 Hz _vision_diary_tick) OFFERS snapshots; this class rate-limits + persists.
+        self._vision_diary_enable = bool(vision_diary_enable)
+        self._vision_diary_period = max(30.0, float(vision_diary_period))
+        self._vision_diary_max = max(8, int(vision_diary_max))
+        self._vision_diary_window = max(self._vision_diary_period, float(vision_diary_window))
+        self._vision_diary_path = vision_diary_path or os.path.expanduser(
+            "~/.local/state/nanobot/vision_diary.json")
+        self._vision_diary = self._load_vision_diary()
         # Skill workshop: reflection mode's experience-driven skill-synthesis loop (suggest ->
         # check -> rehearse -> trial -> adopt/retire). The pure ledger + gate live in skillsmith.py;
         # this class owns the LLM steps + the .md file writes. A trial skill is a normal,
@@ -407,6 +423,81 @@ class CognitionCore:
         """Web/diagnostic readout: the raw snapshots (oldest first) + the current trend line."""
         return {"enabled": self._trait_hist_enable, "snapshots": list(self._trait_hist),
                 "trend": self.trait_trend_text()}
+
+    # ---- visual diary (sensory continuity: what the camera has seen over time) ----
+    _VISION_DIARY_KEYS = ("luma", "motion", "edge", "novelty", "warmth")
+
+    def _load_vision_diary(self):
+        data = read_json(self._vision_diary_path)
+        snaps = data.get("snapshots") if isinstance(data, dict) else None
+        if not isinstance(snaps, list):
+            return []
+        return [s for s in snaps if isinstance(s, dict) and "t" in s][-self._vision_diary_max:]
+
+    def _save_vision_diary(self):
+        if not write_json(self._vision_diary_path, {"snapshots": self._vision_diary}):
+            self._log("vision diary: save failed")
+
+    def record_vision_snapshot(self, signals, force=False):
+        """Append the current scene scalars to the diary, at most once per period (or
+        `force`). `signals` is a dict with any of luma/motion/edge/novelty/warmth --
+        offered every second by the platform adapter, so the rate limit lives here.
+        Cheap + best-effort, like record_trait_snapshot."""
+        if not self._vision_diary_enable or not isinstance(signals, dict):
+            return False
+        now = time.time()
+        last = self._vision_diary[-1]["t"] if self._vision_diary else 0.0
+        if not force and (now - float(last or 0.0)) < self._vision_diary_period:
+            return False
+        snap = {"t": now}
+        for k in self._VISION_DIARY_KEYS:
+            if k in signals:
+                try:
+                    snap[k] = round(float(signals[k]), 3)
+                except (TypeError, ValueError):
+                    pass
+        if len(snap) < 2:
+            return False
+        self._vision_diary.append(snap)
+        del self._vision_diary[:-self._vision_diary_max]
+        self._save_vision_diary()
+        return True
+
+    def vision_trend_text(self, min_delta=0.08):
+        """A short plain-English line about how the SCENE has changed over the trailing
+        window -- "the room has got darker (42% -> 15%) and calmer" -- folded into the
+        reflect()/consolidate() prompts. "" when there's no history or nothing moved."""
+        if not self._vision_diary_enable or len(self._vision_diary) < 2:
+            return ""
+        now = time.time()
+        in_window = [s for s in self._vision_diary
+                     if (now - float(s.get("t", 0))) <= self._vision_diary_window]
+        if len(in_window) < 2:
+            in_window = self._vision_diary
+        base, cur = in_window[0], in_window[-1]
+        phrases = {
+            "luma": ("brighter", "darker"),
+            "motion": ("livelier", "calmer"),
+            "edge": ("busier-looking", "tidier-looking"),
+            "novelty": ("more unfamiliar", "more familiar"),
+            "warmth": ("warmer-lit", "cooler-lit"),
+        }
+        parts = []
+        for k, (up, down) in phrases.items():
+            if k not in base or k not in cur:
+                continue
+            old, new = float(base[k]), float(cur[k])
+            if abs(new - old) >= min_delta:
+                parts.append(f"{up if new > old else down} "
+                             f"({old * 100:.0f}% -> {new * 100:.0f}%)")
+        if not parts:
+            return ""
+        return "the room around you has got " + ", and ".join(parts)
+
+    def get_vision_diary(self):
+        """Web/diagnostic readout: the raw snapshots (oldest first) + the trend line."""
+        return {"enabled": self._vision_diary_enable, "snapshots": list(self._vision_diary),
+                "trend": self.vision_trend_text()}
 
     # ---- decision log -------------------------------------------------------
     def _load_cog_log(self):
@@ -1325,7 +1416,10 @@ class CognitionCore:
                        if self.self_narrative else "")
             trend = self.trait_trend_text()
             trendctx = f"\nHow you have been drifting lately: {trend}." if trend else ""
-            user = (f"Current traits: {self.traits_phrase()}.{selfctx}{trendctx}\nRecent events:\n"
+            vtrend = self.vision_trend_text()
+            visctx = f"\nWhat your camera has noticed over time: {vtrend}." if vtrend else ""
+            user = (f"Current traits: {self.traits_phrase()}.{selfctx}{trendctx}{visctx}"
+                    f"\nRecent events:\n"
                     f"{self.recent_events_text()}\n\nReflect and propose adjustments.")
             content = self.llm.complete(system, user, smart=True, json_object=True)
         finally:
@@ -1440,9 +1534,11 @@ class CognitionCore:
                 "narrative text.")
             trend = self.trait_trend_text()
             trendline = f"How your personality has drifted over time: {trend}\n\n" if trend else ""
+            vtrend = self.vision_trend_text()
+            visline = f"What your camera has noticed over time: {vtrend}\n\n" if vtrend else ""
             user = (f"Previous self-narrative:\n{self.self_narrative or '(none yet)'}\n\n"
                     f"Current traits (0..1): {self.traits_phrase()}\n\n"
-                    f"{trendline}"
+                    f"{trendline}{visline}"
                     f"Recent experience:\n{self.recent_events_text()}\n\n"
                     "Reflect on how you have changed, and write the updated self-narrative.")
             text = self.llm.complete(system, user, smart=True, json_object=False)

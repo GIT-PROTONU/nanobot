@@ -87,6 +87,21 @@ class MoodNode(Node):
             ("brain_timeout", 90.0),        # s without an evolve before reverting to baseline
             ("nudge_pickup_caution", 0.92), # fast rule: being picked up eases caution toward this
             ("nudge_pickup_playful", 0.3),  #            and playfulness toward this (startled)
+            # --- vision-driven reflexes (fed by web_control's /vision/state feed; all
+            #     expression/trait-level — motion only changes through slam_nav's own
+            #     clamped caution mapping, and only if its trait_motion opt-in is on) ---
+            ("vision_fresh_secs", 3.0),        # a /vision/state older than this = stand down
+            ("vision_caution_enable", True),   # looming/clutter -> caution fast rules
+            ("nudge_looming_caution", 0.85),   # looming startle eases caution toward this
+            ("clutter_caution", 0.75),         # clutter holds caution >= this, released after
+            ("greet_approach_enable", True),   # someone approaching -> anticipatory greeting
+            ("greet_approach_min_interval", 60.0),  # s between anticipatory greetings
+            ("greet_approach_face", "happy"),
+            ("ambient_mood_enable", True),     # room colour warmth tints the idle `feeling` face
+            ("ambient_warm_face", "happy"),    # warm light (lamps/evening) -> this face
+            ("ambient_cool_face", ""),         # cool light (daylight/fluorescent) -> this ("" = none)
+            ("ambient_warmth_delta", 0.1),     # |warmth| (R-B of the scene average) above this counts
+            ("novelty_boost", 1.5),            # extra "looking" lottery weight at full novelty (0 = off)
             # --- Purpose Engine + Pursuit driver (goals/reward + A/B) ---
             ("purpose_enable", True),       # run the goal/reward layer (else pure presence)
             ("purpose_period", 600.0),      # s between purpose reflections (reads the decision log)
@@ -140,6 +155,16 @@ class MoodNode(Node):
         self._quiet_start = float(g("quiet_start").value)
         self._quiet_end = float(g("quiet_end").value)
         self._night_tempo = max(1.0, float(g("night_tempo").value))
+        self._vision_fresh_secs = max(0.5, float(g("vision_fresh_secs").value))
+        self._greet_approach_enable = bool(g("greet_approach_enable").value)
+        self._greet_approach_min_interval = float(g("greet_approach_min_interval").value)
+        self._greet_approach_face = str(g("greet_approach_face").value or "happy")
+        self._ambient_enable = bool(g("ambient_mood_enable").value)
+        self._ambient_warm_face = str(g("ambient_warm_face").value or "")
+        self._ambient_cool_face = str(g("ambient_cool_face").value or "")
+        self._ambient_delta = max(0.01, float(g("ambient_warmth_delta").value))
+        self._novelty_boost = max(0.0, float(g("novelty_boost").value))
+        self._vision = ({}, -1e9)      # (latest /vision/state dict, monotonic arrival)
         self._schedule_path = _state_path(g("schedule_path").value, "schedule.json")
         _sched_data = load_json(self._schedule_path, logger=self.get_logger().warning) or {}
         self._schedule = Schedule(_sched_data.get("entries", []), logger=self.get_logger().warning)
@@ -204,6 +229,9 @@ class MoodNode(Node):
             heartbeat_enable=self.enrich_enable, brain_timeout=float(g("brain_timeout").value),
             nudge_pickup_caution=float(g("nudge_pickup_caution").value),
             nudge_pickup_playful=float(g("nudge_pickup_playful").value),
+            nudge_looming_caution=float(g("nudge_looming_caution").value),
+            clutter_caution=float(g("clutter_caution").value),
+            vision_caution_enable=bool(g("vision_caution_enable").value),
             publish=lambda s: self.traits_pub.publish(String(data=json.dumps(s))))
         self._brain = PurposeBrain(
             name=self._personality.name, enable=bool(g("purpose_enable").value),
@@ -250,6 +278,11 @@ class MoodNode(Node):
         self.create_subscription(Bool, "cognition/llm_ready", self._on_llm_ready, latched)
         # Human reward (from the web UI via web_control) -> A/B bandit credit.
         self.create_subscription(String, "cognition/reward", self._on_reward, 10)
+        # Compact vision-state feed from web_control (approach/looming/clutter/novelty/
+        # warmth @2 Hz, only while the GPU pipeline is live) — drives the anticipatory
+        # greeting, the looming/clutter caution fast rules, the ambient mood tint, and
+        # the novelty boost on the "looking" beat. Staleness = reflexes stand down.
+        self.create_subscription(String, "vision/state", self._on_vision, 5)
         # Reflection-mode state command (from the web UI toggle or our own auto trigger,
         # mediated by web_control).
         self.create_subscription(Bool, "reflect", self._on_reflect, latched)
@@ -286,7 +319,8 @@ class MoodNode(Node):
                 feel_secs=float(g("feel_secs").value),
                 rng=random.Random(),          # the idle-beat lottery + burst/attend gates
                 chart_path=_state_path(g("chart_path").value, "presence_chart.yaml"),
-                beats=self._beats, tempo=self._tempo)
+                beats=self._beats, tempo=self._tempo,
+                ambient_mood=self._ambient_mood, beat_boosts=self._beat_boosts)
             self._personality.attach(self._interp)
             self.get_logger().info(
                 f"behavior up: presence statechart (personality '{self._personality.name}', "
@@ -404,6 +438,84 @@ class MoodNode(Node):
         """Live gate passed to the chart's chooser: the admin toggle AND the LLM actually being
         usable right now (see the cognition/llm_ready subscription above)."""
         return self.camera_beats and self._llm_ready
+
+    # --- vision-state reflexes -------------------------------------------------
+    def _on_vision(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            self._vision = (data, time.monotonic())
+
+    def _vision_fresh(self):
+        """The latest /vision/state dict, or {} when none has arrived recently — a
+        stopped camera pipeline (manual mode / master switch / web_control down) simply
+        stops publishing, so staleness IS the stand-down signal."""
+        data, at = self._vision
+        return data if (time.monotonic() - at) < self._vision_fresh_secs else {}
+
+    def _ambient_mood(self):
+        """The room's mood tint for the chart's `feeling` state (used only when the LLM
+        hasn't set drives['mood'] itself): warm ambient light -> a cosy face, cool ->
+        the configured cool face (default none). Re-read on every state entry."""
+        if not self._ambient_enable:
+            return ""
+        warmth = self._vision_fresh().get("warmth")
+        if warmth is None:
+            return ""
+        try:
+            warmth = float(warmth)
+        except (TypeError, ValueError):
+            return ""
+        if warmth > self._ambient_delta:
+            return self._ambient_warm_face
+        if warmth < -self._ambient_delta:
+            return self._ambient_cool_face
+        return ""
+
+    def _beat_boosts(self):
+        """Transient lottery weights for the chart's beat chooser: a high novelty score
+        (the scene has visibly changed vs. its slow background) makes the camera
+        ("looking") beat proportionally likelier this cycle — curiosity about what's
+        new, without touching the LLM-owned registry priorities."""
+        if self._novelty_boost <= 0.0:
+            return None
+        try:
+            novelty = float(self._vision_fresh().get("novelty") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if novelty <= 0.0:
+            return None
+        # novelty is a mean-abs-diff fraction — ~0.25 is already a strongly changed
+        # scene, so full boost is reached there (novelty*4 clamped to 1).
+        return {"looking": 1.0 + self._novelty_boost * min(1.0, novelty * 4.0)}
+
+    def _maybe_greet_approach(self, now, stand):
+        """Anticipatory-approach greeting: web_control's /vision/state flags `approach`
+        when the motion saliency is growing fast AND centred (someone walking up) — so
+        greet BEFORE contact/pickup, the same expression-only shape as every beat: show
+        the face immediately, fire-and-forget the enrichment line. Only from true idle
+        (never interrupts motion/speech/a manual face) and rate-limited."""
+        if not self._greet_approach_enable or self._interp is None:
+            return
+        if stand or self._brain.reflecting:
+            return
+        if not self._vision_fresh().get("approach"):
+            return
+        if (now - self._beat_last.get("greet_approach", -1e9)) \
+                < self._greet_approach_min_interval:
+            return
+        self._beat_last["greet_approach"] = now
+        self._emit_face(self._greet_approach_face)
+        self.get_logger().info("something is approaching — greeting before contact")
+        if self.enrich_enable:
+            req = {"beat": "greeting", "state": "greeting",
+                   "prompt": ("Someone seems to be walking up to you right now. "
+                              "Greet them warmly in one short spoken line."),
+                   "camera": False, "audio": False, "face": self._greet_approach_face,
+                   "traits": self._personality.live_traits()}
+            self.cog_pub.publish(String(data=json.dumps(req)))
 
     def _on_reward(self, msg: String):
         """A human reward from the web UI: credit the A/B arm that produced the narrated line
@@ -550,6 +662,7 @@ class MoodNode(Node):
 
         try:
             self._auto_reflect(now, stand)                 # maybe enter/exit a self-started reflection
+            self._maybe_greet_approach(now, stand)         # anticipatory-approach greeting
             if not self._brain.reflecting:                 # don't interrupt a consolidation
                 self._check_schedule()
             # Reflection is a deliberate, sticky mode (only `wake` leaves it), so we skip the
@@ -569,7 +682,8 @@ class MoodNode(Node):
                     self._interp.queue(Event("standdown"))
                 elif (not stand) and dormant:
                     self._interp.queue(Event("resume"))
-            if self._personality.tick_events(now, picked) == "lost":   # fast rules + heartbeat
+            if self._personality.tick_events(now, picked,               # fast rules + heartbeat
+                                             vision=self._vision_fresh()) == "lost":
                 self.get_logger().warning(
                     "cognitive layer unreachable — reverting to baseline personality")
             self._interp.execute()

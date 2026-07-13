@@ -385,9 +385,50 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   auto-resets the stream `src` itself — no manual page refresh needed to get the feed
   back. The Sensors tab's readouts AND every tunable slider have hover explanations
   (native `title` attributes keyed by element ID in `app.js`, not markup changes),
-  toggleable/persisted via **💡 Show hints**. Still not built: any autonomous consumer
-  of the alert signals (all informational only), the OLED-mirrored mask idea, and a
-  2nd/named colour target.
+  toggleable/persisted via **💡 Show hints**.
+  **2026-07-13 batch (code-complete + unit/smoke/GL-tested on the dev PC, NOT yet
+  hardware-verified) — the backlog's remaining items, all built:**
+  - **Named colour targets**: calibrations persist to `vision_targets.json` under a
+    name (the "target name" box in the Camera view; default "default") and now
+    **survive restarts** (re-applied on boot). One target is tracked at a time —
+    selection, not simultaneous multi-target. `GET /vision/targets`,
+    `POST /vision/target_select|target_delete`; blob-tune edits sync into the active
+    entry; Sensors→Camera has the palette row.
+  - **Novelty score** (`GpuVision.novelty`): mean diff of the already-read-back small
+    colour buffer vs. a slow EMA background (`update_novelty`, `NOVELTY_EMA_ALPHA`
+    ~22 s) — sustained scene change scores high then habituates. Zero extra GPU cost.
+  - **Camera-freeze diagnostic** (`frame_age`/`zero_motion_secs` + the
+    `camera_freeze` alert): capture stopped delivering, or delivers the identical
+    buffer (exactly-zero diff) — "recover the camera", vs. the bumper's wheel-stall.
+  - **Vibration diagnostic** (`vibration` alert, telemetry.py): edge-density far
+    below the standing-still EMA baseline while driving = excess blur (loose screw /
+    imbalance). Maintenance hint.
+  - **Glare rejection** (`vision_glare_derate`, default 0=off): blob confidence is
+    derated by `highlight_fraction` so a specular reflection can't hold a false lock.
+  - **OLED mask mirror** (`POST /vision/oled_mask`, latched `/oled_mask` Bool +
+    `/dev/shm/nano_oled_mask.bin`): gpu_vision rides the thresh chain to 160×120 then
+    one more pass to exactly 128×64, re-binarizes (bytes.translate), writes the blob;
+    `oled_display` renders it as a "mask" owner (below reflecting/words/shutdown,
+    above the face). Auto-dropped when manual mode / the camera switch stops capture.
+  - **Vision→behaviour plumbing**: web_control publishes a compact `/vision/state`
+    JSON @2 Hz (approach/looming/clutter/novelty/warmth/motion, only while the
+    pipeline is live — staleness IS the stand-down signal). mood_node consumes it:
+    **anticipatory greeting** (motion growing + centred = someone walking up →
+    greet-face + a `greeting` beat, rate-limited, idle-only), **looming/clutter →
+    caution fast rules** in `brain.Personality` (looming = edge-triggered startle;
+    clutter = hold caution ≥ `clutter_caution` while it lasts and RELEASE to the
+    remembered pre-clutter value after — which, with slam_nav's `trait_motion` opt-in,
+    **is the clutter velocity throttle** through the existing caution→max_lin clamp,
+    no new motor-authority path), **ambient colour mood** (scene warmth R−B tints the
+    chart's `feeling` face via the injected `ambient_mood` — the LLM's `drives.mood`
+    always wins), and a **novelty boost** on the `looking` beat (transient `beat_boosts`
+    multiplier in `choose_beat`, distinct from the LLM-evolvable registry priority).
+  - **Visual diary** (`cognition.record_vision_snapshot`/`vision_trend_text`,
+    `vision_diary.json`): scene scalars sampled every `vision_diary_period` (10 min),
+    trend ("the room has got darker (60% → 15%), and calmer") folded into the
+    `reflect()`/`consolidate()` prompts like the trait trajectory. `GET /llm/vision_diary`.
+  Still not built: the overhead-clearance camera-mount geometry check (needs the
+  physical robot), and the docking/cliff items (explicitly excluded by the user).
 - **Stress test mode** (`stress.py`, ROS-free; web "Stress test" card in System):
   `POST /stress/start {duration,workers?}` / `POST /stress/stop` / `GET /stress/status`.
   Deliberately loads every CPU core to validate the hardening tier (systemd watchdogs,
