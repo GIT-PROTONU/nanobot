@@ -1,6 +1,6 @@
 ---
 name: software-features-todo
-description: "Software-only feature backlog (no new hardware), started 2026-07-13. APPROVED/TODO: named locations + go-to skill, IMU-fused odometry, odom auto-calibration, wheel-slip cross-check. Below that: two brainstorm rounds (follow-me, voice, roam, sentry, … + outside-the-box: tap gestures, terrain-from-effort, WiFi fingerprint, chirp self-test, mirror detection, courier/alarm/games) — ideas only"
+description: "Software-only feature backlog (no new hardware), started 2026-07-13. TODO (approved): named locations + go-to skill, IMU-fused odometry, odom auto-calibration, wheel-slip cross-check. NICE-TO-HAVE (all user-endorsed, no priority): follow-me, voice, roam, sentry, no-go zones, history graphs, path replay, conversation memory, audio emotes, map-change detection, push notifications, coverage map, odometer stats, TTS prosody, stuck-escape, global relocalization, tap gestures, terrain-from-effort, WiFi fingerprint, chirp self-test, mirror detection, courier mode, alarm clock, rhythm learning, diary page, dream journal, games, expressive fan"
 metadata: 
   node_type: memory
   type: project
@@ -42,7 +42,7 @@ slipping/dragged/stuck. Complements the optical bumper (which needs the camera o
 near-free once item 2 exists. Consumers: caution fast-rule + a diagnostics alert; later the
 stuck-escape reflex.
 
-## Brainstorm (2026-07-13, NOT approved — ideas to pick from)
+## Nice to have (user-endorsed 2026-07-13 — wanted, no deadline/priority; pick up when convenient)
 
 From the first round (see that session for detail): lidar **follow-me** (leg-cluster tracking
 in `/scan`, hold distance, under the existing caution clamps — most "alive" per line of code);
@@ -78,7 +78,7 @@ Second round:
   [[slam-autonomy-pickup-relocalize]]); a coarse global scan-match against the saved map
   would survive a true kidnap.
 
-## Outside-the-box brainstorm (2026-07-13, third round — NOT approved)
+## Nice to have — outside-the-box round (also user-endorsed 2026-07-13)
 
 New *virtual sensors* from hardware already on board, plus household-intelligence and
 play/character ideas:
