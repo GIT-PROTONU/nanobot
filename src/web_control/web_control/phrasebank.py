@@ -35,7 +35,7 @@ import threading
 import time
 
 from .jsonio import read_json, write_json
-from .llm import MOODS, _extract_json_list, coerce_mood
+from .llm import MOODS, _extract_json_list, coerce_mood, strip_em_dash
 
 # Situations Nano most often comments on, in *priority* order (first match wins), each with
 # a plain-English description (fed to the generator) naming the placeholders that fit it.
@@ -49,7 +49,7 @@ CATEGORIES = {
     "hot":       "its main board is running hot (about {temp} degrees C)",
     "cold":      "its main board is quite cool (about {temp} degrees C)",
     "busy":      "its processor is working hard (about {cpu}% CPU load)",
-    "idle":      "it is calm and idle — sitting level and still on the ground, nothing "
+    "idle":      "it is calm and idle, sitting level and still on the ground, nothing "
                  "notable happening",
     # --- lifecycle situations (NOT returned by classify(); the caller picks them by name at
     # the matching moment: startup / shutdown / restart / when the AI brain is unreachable).
@@ -66,7 +66,7 @@ CATEGORIES = {
     # when a call comes back empty (stumped) instead of going silent.
     "thinking":   "it has just been asked to do or say something and is taking a brief moment "
                   "to think before it answers. Reply with ONE-WORD fillers only (e.g. Hmm, "
-                  "Thinking, Wait) — said out loud the instant it starts working",
+                  "Thinking, Wait), said out loud the instant it starts working",
     "stumped":    "it tried to think of something to say but its mind came up blank this time, "
                   "and it shrugs the lost thought off lightly",
     # --- camera peek: a SHORT line spoken the INSTANT before it points its camera and takes a
@@ -74,7 +74,7 @@ CATEGORIES = {
     # the moment the camera is used, in parallel with the capture/vision call.
     "peeking":    "it is about to point its camera and take a quick look at what is in front of "
                   "it. Reply with ONE short spoken line announcing that it's taking a look (e.g. "
-                  "Let me see, Peeking now, Taking a look) — said out loud the instant it looks",
+                  "Let me see, Peeking now, Taking a look), said out loud the instant it looks",
 }
 # Built-in last-resort lines for the lifecycle categories, used when the bank has no entry for
 # them yet (e.g. it was never generated because the LLM has never been online). Offline-safe.
@@ -104,8 +104,6 @@ FALLBACK_LINES = {
                    {"say": "Let me see...", "mood": "focused"},
                    {"say": "Having a look around.", "mood": "focused"}],
 }
-# Lifecycle categories are picked by name, never by classify().
-LIFECYCLE_CATEGORIES = tuple(FALLBACK_LINES.keys())
 PLACEHOLDER_HELP = ("You may use these placeholders, which are filled with live values at "
                     "speak time: {name} (its name), {cpu} (CPU load percent), {mem} (memory "
                     "percent used), {temp} (main-board temperature in C), {tilt} (tilt angle "
@@ -163,16 +161,6 @@ def _fill(template, vars_):
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
-def strip_em_dash(text):
-    """Replace em dashes with a comma (or drop them where a comma would look silly, e.g.
-    right before terminal punctuation) — models reach for '—' by default and it doesn't
-    read naturally spoken aloud. Applied to every line as it enters the bank (_parse_lines),
-    so new phrases can never contain one; also used to clean the existing bank in place."""
-    out = re.sub(r"\s*—\s*", ", ", str(text or ""))
-    out = re.sub(r",\s*([,.!?])", r"\1", out)     # ", ." / ",," -> "." / ","
-    return re.sub(r"\s{2,}", " ", out).strip()
-
-
 def soul_system(persona, traits, name="Nano"):
     """The shared system prompt describing Nano's spoken voice + the placeholder contract.
     Used by both full (re)generation and incremental growth so they share one voice."""
@@ -181,7 +169,7 @@ def soul_system(persona, traits, name="Nano"):
         f"You write short spoken one-liners for a small mobile robot named {name}. "
         f"{(persona + ' ') if persona else ''}Its personality on a 0..1 scale is: "
         f"{traitline}. Lines are spoken aloud through a tiny speaker: brief and natural "
-        "to hear (at most ~20 words, no emoji, no markdown, no stage directions). "
+        "to hear (at most ~20 words, no emoji, no markdown, no em dashes, no stage directions). "
         + PLACEHOLDER_HELP)
 
 
@@ -211,10 +199,6 @@ class PhraseBank:
     def _save(self):
         if not write_json(self.path, self._data):
             self._log("phrasebank: save failed")
-
-    def is_empty(self):
-        with self._lock:
-            return not any(self._data.get("categories", {}).values())
 
     def stats(self):
         with self._lock:

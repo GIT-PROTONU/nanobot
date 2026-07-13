@@ -1120,7 +1120,6 @@ loadSkills();
 // puts it on trial; it auto-adopts after enough good runs + 👍 (no errors) or auto-retires on
 // errors/👎. Keep/Kill are the manual overrides (POST to web_control / the dev harness).
 function fmtTrial(t){
-  const net=(t.reward_pos||0)-(t.reward_neg||0);
   const stat=`runs ${t.runs||0} · 👍${t.reward_pos||0} 👎${t.reward_neg||0}`
     +((t.errors)?` · ⚠${t.errors}`:"");
   const badge=t.status==="adopted"?`<span class="ls" style="color:#7fd">adopted</span>`

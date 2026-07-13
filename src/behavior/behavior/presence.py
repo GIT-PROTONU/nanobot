@@ -93,7 +93,6 @@ BEATS = {
 }
 
 # Personality schema + the frozen fail-safe baseline the heartbeat reverts to.
-TRAIT_KEYS = ("curiosity", "extraversion", "caution", "playfulness")
 DEFAULT_TRAITS = {"curiosity": 0.5, "extraversion": 0.5, "caution": 0.6, "playfulness": 0.5}
 # The discretionary idle beats + their LEARNABLE weights. `priority` is the base lottery
 # weight (evolvable); `needs` gates the beat on trait thresholds; `trait` scales the weight by

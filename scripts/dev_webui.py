@@ -59,13 +59,14 @@ sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 sys.path.insert(0, os.path.join(_ROOT, "src", "behavior"))   # ROS-free presence chart
 
 from web_control.tts import TtsEngine, VOICES, clamp                 # noqa: E402
-from web_control.llm import LlmClient                        # noqa: E402
+from web_control.llm import LlmClient, load_openrouter_key  # noqa: E402
 from web_control.skills import resolve_skills_dir            # noqa: E402
 from web_control.jsonio import read_json, write_json         # noqa: E402  (atomic dev-state I/O)
 from web_control.stress import StressTest                    # noqa: E402  (ROS-free CPU stress)
+from web_control import procstats                            # noqa: E402  (shared /proc reads)
 # The SAME cognition core the robot runs — one base to maintain (see cognition.py).
 from web_control.cognition import (                          # noqa: E402
-    CognitionCore, REFLECT_TRAITS, REFLECT_DRIVES, DRIVE_MOODS)
+    CognitionCore, sanitize_personality_patch)
 # The SAME brain orchestration the robot's behaviour node runs (Purpose Engine + Pursuit
 # driver), ROS-free — so the dev harness exercises the real goal/reward/A-B layer, not a copy.
 from behavior.brain import Personality, PurposeBrain, Schedule  # noqa: E402
@@ -87,23 +88,9 @@ def _dev_state(name):
     return os.path.join(DEV_STATE_DIR, name)
 
 
-def _load_openrouter_key():
-    """If $OPENROUTER_API_KEY isn't already set, load it from memory/openrouter_key (one
-    line, gitignored) so you don't have to export it every shell session. Falls back to the
-    old scripts/.openrouter_key location. No-op (never overwrites) if the env var is set."""
-    if os.environ.get("OPENROUTER_API_KEY", "").strip():
-        return
-    for path in (_dev_state("openrouter_key"),
-                 os.path.join(_HERE, ".openrouter_key")):
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                os.environ["OPENROUTER_API_KEY"] = key
-            return
+load_openrouter_key(_ROOT)   # memory/openrouter_key -> $OPENROUTER_API_KEY (shared helper)
 
 
-_load_openrouter_key()
 
 
 # Decision-log file (same JSON-lines format the robot's web_server uses). A robot.yaml
@@ -226,41 +213,6 @@ def _load_cfg(section):
         return {}
 
 
-def _clamp01f(v, default=0.5):
-    try:
-        return max(0.0, min(1.0, float(v)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _sanitize_personality_patch(d):
-    """Coerce/clamp a web-UI personality edit to {traits?, registry?, drives?} (untrusted
-    input) before it's applied as a HARD evolve. Mirrors web_server._sanitize_personality_patch
-    (duplicated, not imported, so this harness stays importable without rclpy)."""
-    out = {}
-    if isinstance(d.get("traits"), dict):
-        out["traits"] = {k: _clamp01f(d["traits"][k]) for k in REFLECT_TRAITS if k in d["traits"]}
-    if isinstance(d.get("drives"), dict):
-        dv = {k: _clamp01f(d["drives"][k]) for k in REFLECT_DRIVES if k in d["drives"]}
-        if d["drives"].get("mood") in DRIVE_MOODS:
-            dv["mood"] = d["drives"]["mood"]
-        out["drives"] = dv
-    if isinstance(d.get("registry"), dict):
-        reg = {}
-        for name, patch in d["registry"].items():
-            if not isinstance(name, str) or not isinstance(patch, dict):
-                continue
-            p = {}
-            if "priority" in patch:
-                p["priority"] = _clamp01f(patch["priority"])
-            if "enabled" in patch:
-                p["enabled"] = bool(patch["enabled"])
-            if p:
-                reg[name] = p
-        out["registry"] = reg
-    return out
-
-
 class DevState:
     """The bits of the robot node the page's endpoints need — minus ROS."""
 
@@ -300,7 +252,7 @@ class DevState:
         # dev-harness restart. The announce schedule piggy-backs on _health_loop.
         self._settings = self._load_tts_settings()
         self._apply_tts_settings()
-        self._cpu_prev = self._cpu_sample()
+        self._cpu_prev = procstats.cpu_sample()
         self._announce_next = time.monotonic() + float(self._settings["announce_interval"])
         # Seed the web-tunable LLM settings from robot.yaml, then let any persisted UI changes
         # (memory/llm.json) win — so a model id picked in the browser sticks across restarts.
@@ -560,7 +512,7 @@ class DevState:
         if self._settings["announce"] and (
                 not old["announce"]
                 or self._settings["announce_interval"] != old["announce_interval"]):
-            self._cpu_prev = self._cpu_sample()
+            self._cpu_prev = procstats.cpu_sample()
             self._announce_next = time.monotonic() + float(self._settings["announce_interval"])
         return self._settings
 
@@ -592,63 +544,10 @@ class DevState:
     def announce_now(self):
         if not self.tts.available():
             return
-        text = self._compose_stats(self._cpu_percent(), self._mem_percent(),
-                                   self._cpu_temp())
+        cpu, self._cpu_prev = procstats.cpu_percent(self._cpu_prev)
+        text = procstats.compose_stats(cpu, procstats.mem_percent(), procstats.cpu_temp())
         if text:
             self.tts.say(text)
-
-    def _compose_stats(self, cpu, mem, temp):
-        parts = []
-        if cpu == cpu:
-            parts.append(f"C P U {cpu:.0f} percent")
-        if mem == mem:
-            parts.append(f"RAM {mem:.0f} percent")
-        if temp == temp:
-            parts.append(f"Temperature {temp:.0f} degrees")
-        if not parts:
-            return "No data"
-        return ". ".join(parts)
-
-    def _cpu_sample(self):
-        try:
-            with open("/proc/stat") as f:
-                parts = [int(x) for x in f.readline().split()[1:]]
-            idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
-            return idle, sum(parts)
-        except Exception:
-            return None
-
-    def _cpu_percent(self):
-        cur = self._cpu_sample()
-        pct = float("nan")
-        if cur and self._cpu_prev:
-            di, dt = cur[0] - self._cpu_prev[0], cur[1] - self._cpu_prev[1]
-            if dt > 0:
-                pct = 100.0 * (1.0 - di / dt)
-        self._cpu_prev = cur
-        return pct
-
-    def _mem_percent(self):
-        try:
-            tot = avail = 0
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        tot = int(line.split()[1])
-                    elif line.startswith("MemAvailable:"):
-                        avail = int(line.split()[1])
-                    if tot and avail:
-                        break
-            return 100.0 * (tot - avail) / tot if tot else float("nan")
-        except Exception:
-            return float("nan")
-
-    def _cpu_temp(self):
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp") as f:
-                return int(f.read().strip()) / 1000.0
-        except Exception:
-            return float("nan")
 
     def oled_state(self):
         """The exact inputs the physical OLED renders from, for the web UI's client-side mirror.
@@ -793,7 +692,7 @@ class DevState:
         set_personality (see web_server.py): sets exactly + re-baselines so it isn't smoothed
         away or reverted by a brain_lost heartbeat. No ROS topic here — straight to the same
         Personality object the chart loop drives (this process IS the "node")."""
-        patch = _sanitize_personality_patch(data if isinstance(data, dict) else {})
+        patch = sanitize_personality_patch(data if isinstance(data, dict) else {})
         if not patch:
             return {"error": "empty or invalid personality patch"}
         reg = None

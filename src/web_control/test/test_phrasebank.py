@@ -48,6 +48,19 @@ def test_strip_em_dash():
     assert strip_em_dash("one — two — three") == "one, two, three"
     assert "—" not in strip_em_dash("trailing dash—")
     assert strip_em_dash("no dash here.") == "no dash here."
+    # en dash + horizontal bar are the same TTS/OLED problem as the em dash
+    assert strip_em_dash("cool – calm ― collected") == "cool, calm, collected"
+    assert strip_em_dash("word—word") == "word, word"          # unspaced em dash
+    assert strip_em_dash("— leading dash") == "leading dash"   # never start with a comma
+    assert strip_em_dash("5-10 degrees") == "5-10 degrees"     # plain hyphens untouched
+
+
+def test_tts_clean_strips_dashes():
+    # tts._clean is the final net: everything say() speaks (and the OLED karaoke words)
+    # goes through it, LLM-generated or not.
+    from web_control.tts import _clean
+    assert _clean("Hello — world") == "Hello, world"
+    assert "—" not in _clean("markdown *and* a dash — gone")
 
 
 def test_grow_never_admits_em_dash(tmp_path):

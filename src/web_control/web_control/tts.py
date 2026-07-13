@@ -38,6 +38,8 @@ import threading
 import time
 import wave
 
+from .llm import strip_em_dash
+
 # English voices: UK default, Lancaster, Scottish (the install script prunes to
 # these three to keep the rootfs lean).
 VOICES = ("en-gb", "en-gb-x-gbclan", "en-gb-scotland")
@@ -87,10 +89,11 @@ def clamp(v, lo, hi):
 
 
 def _clean(text):
-    """Make user text safe to speak — drops markdown/non-speech symbols
-    (* _ ` ~ # | $ \\ [ ] { }) and collapses whitespace so
+    """Make user text safe to speak — em/en dashes become a comma pause (espeak and the
+    OLED font can't handle them; see llm.strip_em_dash), then markdown/non-speech symbols
+    (* _ ` ~ # | $ \\ [ ] { }) are dropped and whitespace collapsed so
     the karaoke word split is clean."""
-    t = (text or "")
+    t = strip_em_dash(text)
     for ch in ("<", ">", "&", "*", "_", "`", "~", "#", "|", "$", "\\", "[", "]", "{", "}"):
         t = t.replace(ch, " ")
     return " ".join(t.split())

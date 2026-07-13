@@ -27,7 +27,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
 sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 
-from web_control.llm import LlmClient, _extract_json      # noqa: E402
+from web_control.llm import LlmClient, _extract_json, load_openrouter_key  # noqa: E402
 
 TRAITS = ("curiosity", "extraversion", "caution", "playfulness")
 # Dev tooling keeps its state in the project-local memory/ folder (visible/editable in the
@@ -36,22 +36,7 @@ TRAITS = ("curiosity", "extraversion", "caution", "playfulness")
 DEFAULT_OUT = os.path.join(_ROOT, "memory", "personality.json")
 
 
-def _load_openrouter_key():
-    """$OPENROUTER_API_KEY wins; else load it from a one-line memory/openrouter_key file
-    (gitignored) so this can be run without exporting the env var every session."""
-    if os.environ.get("OPENROUTER_API_KEY", "").strip():
-        return
-    for path in (os.path.join(_ROOT, "memory", "openrouter_key"),
-                 os.path.join(_HERE, ".openrouter_key")):
-        if os.path.isfile(path):
-            with open(path, encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                os.environ["OPENROUTER_API_KEY"] = key
-            return
-
-
-_load_openrouter_key()
+load_openrouter_key(_ROOT)   # memory/openrouter_key -> $OPENROUTER_API_KEY (shared helper)
 
 DESIGNER_SYSTEM = (
     "You design the initial personality for Nano, a small expressive mobile robot that "

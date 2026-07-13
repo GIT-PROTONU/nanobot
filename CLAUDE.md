@@ -497,9 +497,9 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
     `/skills/*`, `/tts*` + the brain card, so the AI/Skills/Brain cards + Speak box can be
     tested in a browser locally (telemetry/joystick/map show offline — no /telemetry). Reads
     the persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`, or —
-    if unset — a one-line `memory/openrouter_key` file (gitignored; `_load_openrouter_key()`
-    in `dev_webui.py`/`dev_tts_test.py`/`personality_creator.py`/`pregenerate_phrases.py`,
-    falling back to the old `scripts/.openrouter_key` path for back-compat).
+    if unset — a one-line `memory/openrouter_key` file (gitignored; `llm.load_openrouter_key()`,
+    the ONE shared loader called by `dev_webui.py`/`dev_tts_test.py`/`personality_creator.py`/
+    `pregenerate_phrases.py`, falling back to the old `scripts/.openrouter_key` path).
 - **Cognition core (`cognition.py`, ROS-free).** ALL the LLM-personality *logic* — generate +
   express, the say/chat/observe/look paths, the statechart beat executor, the skill library
   invocation, the phrase bank, the decision log, slow reflection, lifecycle speech — lives in

@@ -28,23 +28,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "src", "web_control"))
 
 from web_control.tts import TtsEngine            # noqa: E402
-from web_control.llm import LlmClient, MOODS     # noqa: E402
-
-
-def _load_openrouter_key():
-    """$OPENROUTER_API_KEY wins; else load it from a one-line memory/openrouter_key file
-    (gitignored) so this can be run without exporting the env var every session."""
-    if os.environ.get("OPENROUTER_API_KEY", "").strip():
-        return
-    _root = os.path.join(_HERE, "..")
-    for path in (os.path.join(_root, "memory", "openrouter_key"),
-                 os.path.join(_HERE, ".openrouter_key")):
-        if os.path.isfile(path):
-            with open(path, encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                os.environ["OPENROUTER_API_KEY"] = key
-            return
+from web_control.llm import LlmClient, MOODS, load_openrouter_key  # noqa: E402
 
 
 def main():
@@ -72,7 +56,7 @@ def main():
 
     mood = None
     if args.llm:
-        _load_openrouter_key()
+        load_openrouter_key(os.path.join(_HERE, ".."))
         client = LlmClient(enabled=True, api_key="", model=args.model, persona=args.persona,
                            logger=_log)               # api_key="" -> OPENROUTER_API_KEY env
         if not client.available():

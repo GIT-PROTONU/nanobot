@@ -41,6 +41,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist
 
+from . import procstats
 from .jsonio import read_json, write_json
 from .mjpeg_camera import CameraStream
 from .gpu_vision import GpuVision
@@ -49,7 +50,7 @@ from .telemetry import TelemetryHub
 from .tts import TtsEngine, VOICES, clamp
 from .llm import LlmClient
 from .skills import resolve_skills_dir
-from .cognition import CognitionCore, REFLECT_TRAITS, REFLECT_DRIVES, DRIVE_MOODS
+from .cognition import CognitionCore, sanitize_personality_patch
 from .stress import StressTest
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
@@ -102,10 +103,6 @@ LLM_PARAM_FOR = {
 # the llm_persona param. So one run of the creator + a restart updates the whole character.
 # (Chat-history / log-ring sizes + the trait list now live in cognition.CognitionCore.)
 
-# SBC vitals for the spoken stats (same cheap /proc + thermal reads the OLED uses).
-THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
-STAT_PATH = "/proc/stat"
-MEMINFO_PATH = "/proc/meminfo"
 SCAN_FILE = "/dev/shm/nano_scan.bin"          # compact lidar blob (for the read-lidar skill)
 VITALS_FILE = "/dev/shm/nano_vitals.json"     # sys_monitor's aggregated body snapshot
 
@@ -354,7 +351,7 @@ class WebServerNode(Node):
         self._cpu_prev = None                          # (idle, total) jiffies for CPU%
         self._settings = self._load_settings()
         self._apply_engine()
-        self._cpu_prev = self._cpu_sample()
+        self._cpu_prev = procstats.cpu_sample()
         self._announce_next = time.monotonic() + float(self._settings["announce_interval"])
 
         web_dir = os.path.join(get_package_share_directory("web_control"), "web")
@@ -407,7 +404,7 @@ class WebServerNode(Node):
             logger=self.get_logger().info,
             max_duration=float(g("stress_max_duration").value),
             abort_temp_c=float(g("stress_temp_abort_c").value),
-            read_temp=self._cpu_temp)
+            read_temp=procstats.cpu_temp)
 
         # ---- Cognition core (shared, ROS-free) ----------------------------------
         # ALL the LLM-personality logic lives in web_control.cognition.CognitionCore, shared
@@ -712,7 +709,7 @@ class WebServerNode(Node):
         if self._settings["announce"] and (
                 not old["announce"]
                 or self._settings["announce_interval"] != old["announce_interval"]):
-            self._cpu_prev = self._cpu_sample()
+            self._cpu_prev = procstats.cpu_sample()
             self._announce_next = time.monotonic() + float(self._settings["announce_interval"])
         return self._settings
 
@@ -733,22 +730,11 @@ class WebServerNode(Node):
     def announce_now(self):
         if not self._tts.available():
             return
-        text = self._compose_stats(self._cpu_percent(), self._mem_percent(),
-                                   self._cpu_temp())
+        # Busy % since the previous sample (the gap between announcements).
+        cpu, self._cpu_prev = procstats.cpu_percent(self._cpu_prev)
+        text = procstats.compose_stats(cpu, procstats.mem_percent(), procstats.cpu_temp())
         if text:
             self._tts.say(text)
-
-    def _compose_stats(self, cpu, mem, temp):
-        parts = []
-        if cpu == cpu:                                 # not NaN
-            parts.append(f"C P U {cpu:.0f} percent")
-        if mem == mem:
-            parts.append(f"RAM {mem:.0f} percent")
-        if temp == temp:
-            parts.append(f"Temperature {temp:.0f} degrees")
-        if not parts:
-            return "No data"
-        return ". ".join(parts)
 
     # ---- LLM (OpenRouter) personality ---------------------------------------
     def _llm_settings_file(self):
@@ -821,7 +807,7 @@ class WebServerNode(Node):
         being smoothed/reverted like an LLM-reflection nudge. Applied server-side too (not just
         published) so a fast GET right after a POST already reflects it, even before the
         behaviour node's next tick round-trips back over /cognition/traits."""
-        patch = _sanitize_personality_patch(data if isinstance(data, dict) else {})
+        patch = sanitize_personality_patch(data if isinstance(data, dict) else {})
         if not patch:
             return {"error": "empty or invalid personality patch"}
         reg = None
@@ -1182,14 +1168,10 @@ class WebServerNode(Node):
     def _cpu_percent_quick(self):
         """A short standalone CPU% sample for the snapshot — does NOT touch _cpu_prev
         (which belongs to the periodic stats announcer), so the two never interfere."""
-        a = self._cpu_sample()
+        a = procstats.cpu_sample()
         time.sleep(0.12)
-        b = self._cpu_sample()
-        if a and b:
-            di, dt = b[0] - a[0], b[1] - a[1]
-            if dt > 0:
-                return 100.0 * (1.0 - di / dt)
-        return float("nan")
+        pct, _ = procstats.cpu_percent(a)
+        return pct
 
     def _imu_state(self):
         """(moving, tilt) from the vitals blob — either may be None when the source is
@@ -1208,7 +1190,7 @@ class WebServerNode(Node):
         """A short plain-English description of how the robot's body feels right now,
         for the LLM to react to. Only includes sources that are present + fresh."""
         parts = []
-        cpu, mem, temp = self._cpu_percent_quick(), self._mem_percent(), self._cpu_temp()
+        cpu, mem, temp = self._cpu_percent_quick(), procstats.mem_percent(), procstats.cpu_temp()
         if cpu == cpu:                                  # not NaN
             parts.append(f"CPU load {cpu:.0f}%")
         if mem == mem:
@@ -1237,7 +1219,7 @@ class WebServerNode(Node):
     def _sensor_signals(self):
         """The same body state as _sensor_snapshot(), but structured for the phrase bank's
         classifier (NaN/None where a source is missing or stale)."""
-        cpu, mem, temp = self._cpu_percent_quick(), self._mem_percent(), self._cpu_temp()
+        cpu, mem, temp = self._cpu_percent_quick(), procstats.mem_percent(), procstats.cpu_temp()
         moving, tilt = self._imu_state()
         susp_l, susp_r = self._susp_eff()
         pickup = 2 if (susp_l and susp_r) else (1 if (susp_l or susp_r) else 0)
@@ -1622,48 +1604,6 @@ class WebServerNode(Node):
             self._llm_offline_reassert = now               # best-effort re-assert
             self._face_pub.publish(String(data=face))
 
-    def _cpu_sample(self):
-        try:
-            with open(STAT_PATH) as f:
-                parts = [int(x) for x in f.readline().split()[1:]]
-            idle = parts[3] + (parts[4] if len(parts) > 4 else 0)  # idle + iowait
-            return idle, sum(parts)
-        except Exception:
-            return None
-
-    def _cpu_percent(self):
-        """Busy % since the previous sample (the gap between announcements)."""
-        cur = self._cpu_sample()
-        pct = float("nan")
-        if cur and self._cpu_prev:
-            di, dt = cur[0] - self._cpu_prev[0], cur[1] - self._cpu_prev[1]
-            if dt > 0:
-                pct = 100.0 * (1.0 - di / dt)
-        self._cpu_prev = cur
-        return pct
-
-    def _mem_percent(self):
-        try:
-            tot = avail = 0
-            with open(MEMINFO_PATH) as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        tot = int(line.split()[1])
-                    elif line.startswith("MemAvailable:"):
-                        avail = int(line.split()[1])
-                    if tot and avail:
-                        break
-            return 100.0 * (tot - avail) / tot if tot else float("nan")
-        except Exception:
-            return float("nan")
-
-    def _cpu_temp(self):
-        try:
-            with open(THERMAL_PATH) as f:
-                return int(f.read().strip()) / 1000.0
-        except Exception:
-            return float("nan")
-
     def destroy_node(self):
         try:
             self._stress.stop()
@@ -1717,43 +1657,6 @@ def _parse_health_line(line):
         return datetime.fromisoformat(ts).timestamp(), msg
     except (ValueError, IndexError):
         return 0.0, line
-
-
-def _clamp01f(v, default=0.5):
-    """Like tts.clamp but float-preserving (tts.clamp rounds to int — wrong for 0..1 axes)."""
-    try:
-        return max(0.0, min(1.0, float(v)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _sanitize_personality_patch(d):
-    """Coerce/clamp a web-UI personality edit to {traits?, registry?, drives?} (untrusted
-    input) before it's published as a HARD /cognition/evolve. Traits/drive scalars clamp to
-    0..1; `mood` must be one of the known OLED faces; registry patches only touch
-    priority/enabled per beat (needs/trait stay code/file-config, not web-editable)."""
-    out = {}
-    if isinstance(d.get("traits"), dict):
-        out["traits"] = {k: _clamp01f(d["traits"][k]) for k in REFLECT_TRAITS if k in d["traits"]}
-    if isinstance(d.get("drives"), dict):
-        dv = {k: _clamp01f(d["drives"][k]) for k in REFLECT_DRIVES if k in d["drives"]}
-        if d["drives"].get("mood") in DRIVE_MOODS:
-            dv["mood"] = d["drives"]["mood"]
-        out["drives"] = dv
-    if isinstance(d.get("registry"), dict):
-        reg = {}
-        for name, patch in d["registry"].items():
-            if not isinstance(name, str) or not isinstance(patch, dict):
-                continue
-            p = {}
-            if "priority" in patch:
-                p["priority"] = _clamp01f(patch["priority"])
-            if "enabled" in patch:
-                p["enabled"] = bool(patch["enabled"])
-            if p:
-                reg[name] = p
-        out["registry"] = reg
-    return out
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):

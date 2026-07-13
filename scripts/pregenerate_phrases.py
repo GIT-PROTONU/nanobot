@@ -28,7 +28,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
 sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 
-from web_control.llm import LlmClient                       # noqa: E402
+from web_control.llm import LlmClient, load_openrouter_key  # noqa: E402
 from web_control.phrasebank import PhraseBank, CATEGORIES   # noqa: E402
 
 ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
@@ -37,22 +37,7 @@ ROBOT_YAML = os.path.join(_ROOT, "src", "robot_bringup", "config", "robot.yaml")
 DEV_STATE_DIR = os.path.join(_ROOT, "memory")
 
 
-def _load_openrouter_key():
-    """$OPENROUTER_API_KEY wins; else load it from a one-line memory/openrouter_key file
-    (gitignored) so this can be run without exporting the env var every session."""
-    if os.environ.get("OPENROUTER_API_KEY", "").strip():
-        return
-    for path in (os.path.join(DEV_STATE_DIR, "openrouter_key"),
-                 os.path.join(_HERE, ".openrouter_key")):
-        if os.path.isfile(path):
-            with open(path, encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                os.environ["OPENROUTER_API_KEY"] = key
-            return
-
-
-_load_openrouter_key()
+load_openrouter_key(_ROOT)   # memory/openrouter_key -> $OPENROUTER_API_KEY (shared helper)
 
 
 def _cfg(section):

@@ -54,6 +54,46 @@ SHAPE_FACES = ("looking", "focused")
 LLM_HISTORY_MAX = 8          # chat turns kept for context (user+assistant messages)
 
 
+def clamp01f(v, default=0.5):
+    """Clamp to 0..1 keeping floats (tts.clamp rounds to int — wrong for trait axes)."""
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def sanitize_personality_patch(d):
+    """Coerce/clamp a web-UI personality edit to {traits?, registry?, drives?} (untrusted
+    input) before it's applied as a HARD evolve (/cognition/evolve on the robot, the direct
+    brain call on the dev harness). Traits/drive scalars clamp to 0..1; `mood` must be one
+    of the known OLED faces; registry patches only touch priority/enabled per beat
+    (needs/trait stay code/file-config, not web-editable). Shared by web_server.py and
+    scripts/dev_webui.py — it lives here next to the REFLECT_TRAITS/REFLECT_DRIVES/
+    DRIVE_MOODS vocabulary that defines it."""
+    out = {}
+    if isinstance(d.get("traits"), dict):
+        out["traits"] = {k: clamp01f(d["traits"][k]) for k in REFLECT_TRAITS if k in d["traits"]}
+    if isinstance(d.get("drives"), dict):
+        dv = {k: clamp01f(d["drives"][k]) for k in REFLECT_DRIVES if k in d["drives"]}
+        if d["drives"].get("mood") in DRIVE_MOODS:
+            dv["mood"] = d["drives"]["mood"]
+        out["drives"] = dv
+    if isinstance(d.get("registry"), dict):
+        reg = {}
+        for name, patch in d["registry"].items():
+            if not isinstance(name, str) or not isinstance(patch, dict):
+                continue
+            p = {}
+            if "priority" in patch:
+                p["priority"] = clamp01f(patch["priority"])
+            if "enabled" in patch:
+                p["enabled"] = bool(patch["enabled"])
+            if p:
+                reg[name] = p
+        out["registry"] = reg
+    return out
+
+
 def compose_face(base, accent):
     """Combine an action eye-shape with an emotion accent into the OLED face string the panel
     renders (oled_display._on_face parses "shape:emotion"). Returns "looking:happy" for a

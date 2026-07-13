@@ -50,19 +50,49 @@ DEFAULT_SMART_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_VISION_MODEL = "openrouter/free"
 MAX_SAY = 240          # chars; keep spoken lines short (TTS hard-caps at 300 anyway)
 
+
+def load_openrouter_key(root):
+    """If $OPENROUTER_API_KEY isn't already set, load it from <root>/memory/openrouter_key
+    (one line, gitignored), falling back to the legacy <root>/scripts/.openrouter_key.
+    Shared by every ROS-free dev entry point (dev_webui / dev_tts_test /
+    personality_creator / pregenerate_phrases). No-op (never overwrites) when the env
+    var is set — the runtime nodes read the key via robot.yaml/env as usual."""
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        return
+    for path in (os.path.join(root, "memory", "openrouter_key"),
+                 os.path.join(root, "scripts", ".openrouter_key")):
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                os.environ["OPENROUTER_API_KEY"] = key
+            return
+
 # The fixed framing every request gets, on top of the user-tunable persona. We force a
 # strict, tiny JSON shape so the reply is trivial + safe to parse and act on.
 SYSTEM_BASE = (
     "You are the voice and face of a small mobile robot named Nano. You speak short "
     "spoken lines out loud through a tiny speaker and show a simple face on a small "
     "OLED screen. Stay in character and keep replies brief and natural to hear aloud "
-    "(at most ~30 words, one or two sentences, no emoji, no markdown, no stage "
-    "directions). Reply with ONLY a compact JSON object and nothing else, of the form "
+    "(at most ~30 words, one or two sentences, no emoji, no markdown, no em dashes, "
+    "no stage directions). Reply with ONLY a compact JSON object and nothing else, of the form "
     '{"say": "the spoken line", "mood": "MOOD"} where MOOD is exactly one of: '
     + ", ".join(MOODS)
     + ". The mood is the face you show while saying the line; pick the one that "
     "best fits it."
 )
+
+
+def strip_em_dash(text):
+    """Replace em/en dashes with a comma (or drop them where a comma would look silly,
+    e.g. right before terminal punctuation) — models reach for '—' by default, it doesn't
+    read naturally spoken aloud, and neither espeak-ng nor the OLED font handles the
+    character. Applied to every LLM line headed for TTS (generate() below), to every line
+    entering the phrase bank, and again as a net in tts._clean() for non-LLM text."""
+    out = re.sub(r"\s*[\u2013\u2014\u2015]+\s*", ", ", str(text or ""))
+    out = re.sub(r",\s*([,.!?])", r"\1", out)     # ", ." / ",," -> "." / ","
+    out = re.sub(r"^,\s*", "", out)               # never start with the comma
+    return re.sub(r"\s{2,}", " ", out).strip()
 
 
 def coerce_mood(mood):
@@ -369,7 +399,7 @@ class LlmClient:
         if content is None:
             return None
         obj = _extract_json(content)
-        say = str(obj.get("say") or "").strip()[:MAX_SAY]
+        say = strip_em_dash(obj.get("say"))[:MAX_SAY]
         if not say:
             # No usable JSON line. We deliberately do NOT speak the raw content as a
             # fallback: for a reasoning model that would read its chain-of-thought aloud.

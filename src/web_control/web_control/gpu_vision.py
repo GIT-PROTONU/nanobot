@@ -870,11 +870,6 @@ class GpuVision:
             self._oled_mask_enable = bool(enabled)
 
     @property
-    def oled_mask_enabled(self):
-        with self._lock:
-            return self._oled_mask_enable
-
-    @property
     def gpu_duty(self):
         """SOFTWARE proxy for "how loaded is the vision pipeline," NOT a true hardware
         occupancy percentage: fraction of the frame period spent in the shader-submit +

@@ -101,7 +101,6 @@ _BUF_TYPE = 1          # V4L2_BUF_TYPE_VIDEO_CAPTURE
 _MEMORY_MMAP = 1
 _FIELD_NONE = 1
 _MJPG = _fourcc(b'MJPG')
-FOURCC_MJPG = _MJPG
 FOURCC_YUYV = _fourcc(b'YUYV')          # public: gpu_vision.py requests this format
 
 
