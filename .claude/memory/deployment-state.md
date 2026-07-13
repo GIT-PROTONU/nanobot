@@ -20,6 +20,7 @@ The robot board is **live at 192.168.178.141**, user `ibster` (sudo). See [[proj
 
 **PENDING as of 2026-07-10 (none of this is on the live board yet):**
 - New code since the last deploy: LDS idle spin-down toggle (`slam_nav.lds_idle_enable`), [[scheduled-routines]] (new `behavior.schedule_path` param + `schedule.json`). Needs `scripts/deploy.sh` (colcon build + restart covers the code; `DEPLOY_SOUL=1` only if you want a dev-authored `memory/schedule.json` pushed too — off by default).
+- **2026-07-13 mobile web-UI overhaul** (`web/style.css` rewrite + `index.html`/`chrome.js` tweaks, uncommitted at write time): per-tab hero sizing (compact/tall/hidden — settings tabs get the full screen on phones), floating pill bottom nav, chip-row map/cam controls, `#tab/view` hash deep-links, custom sliders. All element IDs + JS contracts preserved; verified headless-chromium against `dev_webui.py` at 390px + 1400px. Static files only — a deploy needs no rebuild beyond the rsync (web/ is symlinked into install/).
 - (A Mali-450 GPU blacklist was briefly added to `deploy/sbc-setup.sh` this same session, then reverted before ever being deployed — the GPU is going to be used for [[gpu-vision-features-todo]] instead. `sbc-setup.sh` is back to its original 5-step form; no re-run needed for this.)
 
 ---- historical bring-up log (2026-06-17/18) below ----
