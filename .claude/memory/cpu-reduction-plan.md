@@ -39,6 +39,14 @@ Camera view; ~1.0 core of that is rclpy executor wait-set churn):**
 Realistic combined outcome: idle ~50% → ~20–25%. User approved queueing all three
 (2026-07-14); implementation order suggestion was 2+3 first (small, low-risk), then 1.
 
+Related finding (2026-07-14, live-verified — NOT a bug, no fix needed): the web UI's
+master camera switch (`POST /vision/camera_enable`) DOES fully stop the gpu_vision
+thread + release V4L2 (confirmed via API toggle + top -H: thread gone, fresh thread on
+re-enable). The user-reported "no effect on CPU in the webui" is because it only
+removes ~20–30% of ONE core ≈ 5–8 points on the all-cores CPU% readout, which jitters
+about that much anyway — while app_hub's main-thread executor churn (untouched by the
+switch) dominates. Once TODO items 1+2 land, the switch's effect should become visible.
+
 ---
 
 Historical plan from the 2026-06-23 profiling session (measurements in
