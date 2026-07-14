@@ -36,6 +36,45 @@ Camera view; ~1.0 core of that is rclpy executor wait-set churn):**
    `ser.read(in_waiting or 1)` → thousands of tiny wakeups/s at 115200 baud; read with a
    minimum chunk (e.g. 128–256 B) + timeout instead so the reader wakes ~40×/s.
 
+**Added 2026-07-14 (second test pass on the live board):**
+
+4. **THERMAL — fix the fan FIRST (hardware).** Live: fan commanded 100% duty yet CPU
+   84.9°C and climbing, past the 75°C and 80°C passive trip points → the kernel was
+   actively throttling (measured 1008 MHz vs the 1104 MHz cap; trips at
+   75/80/85/90/95, critical 105). So ALL CPU% measurements this session are inflated
+   by a reduced clock, and compute is being lost to heat. [[cooling-fan-control]]
+   always said physical fan wiring was unconfirmed — this measurement says it is NOT
+   effective (unwired, not spinning, or insufficient). Verify GPIO22→MOSFET→fan
+   hardware. Only after cooling works: optionally raise `scaling_max_freq`
+   1104000→1368000 (the OPP exists in the DT; +24% clock = same work reads ~20%
+   lower) — do it with a stress-test + temp watch.
+5. **/wheel_ticks 30→15 Hz (firmware one-liner).** `main.cpp` ~line 480 publishes
+   every 33 ms — the fastest topic in the graph, waking sensor_hub's executor (and
+   app_hub's when the UI is open) 30×/s to feed a 15 Hz odom. 33→66 ms costs nothing
+   (odom integrates cumulative counts).
+6. **Disable default QoS-event handlers (part of the executor tax).** rclpy Humble
+   attaches one default incompatible-QoS `QoSEventHandler` waitable to EVERY pub+sub
+   (`qos_event.py` `elif self.use_default_callbacks:`) — profile showed
+   `qos_event.add_to_wait_set/get_num_entities` hot, and the stack has ~200 pubs+subs.
+   Fix: pass `PublisherEventCallbacks(use_default_callbacks=False)` /
+   `SubscriptionEventCallbacks(use_default_callbacks=False)` — cleanest as a small
+   monkeypatch of `create_event_handlers`→`[]` in the three hub mains (one shared
+   helper), losing only the incompatible-QoS warning log (irrelevant: single vendor,
+   fixed QoS). Verify on dev-PC sim first.
+7. **Drop parameter services on non-tunable nodes.** Every node carries 6 param
+   services = 6 wait-set entities; telemetry's PARAM_WHITELIST only tunes
+   imu_driver/lds_driver/wheel_odometry/slam_nav/sys_monitor/web_control. `behavior`,
+   `oled_display`, `map_bridge` can construct with
+   `start_parameter_services=False` (params still load from robot.yaml overrides) —
+   18 fewer entities iterated per spin, mostly in app_hub.
+
+Measured but left alone: zenohd-serial ~8% (no strace on board; small fish),
+uvcvideo kworkers ~5% (inherent at 15 fps capture), journal quiet (no log spam).
+Entity counts measured live (`ros2 node info`): app_hub ≈103 subs+pubs+services
+(web_control 57 + behavior 30 + oled 16) + timers + qos-event waitables; sensor_hub
+≈50; slam_nav ≈25 — the per-spin rebuild iterates all of them, which is why the
+executor tax dwarfs the callbacks.
+
 Realistic combined outcome: idle ~50% → ~20–25%. User approved queueing all three
 (2026-07-14); implementation order suggestion was 2+3 first (small, low-risk), then 1.
 
