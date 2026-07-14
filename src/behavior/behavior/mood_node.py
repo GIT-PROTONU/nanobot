@@ -61,7 +61,7 @@ SELF_ECHO_WINDOW = 1.5   # s: a /oled_face equal to our own recent publish = our
 
 class MoodNode(Node):
     def __init__(self):
-        super().__init__("behavior")
+        super().__init__("behavior", start_parameter_services=False)
         self.declare_parameters("", [
             ("enable", True),
             ("tick_rate", 4.0),       # Hz the statechart is stepped (after() resolution)

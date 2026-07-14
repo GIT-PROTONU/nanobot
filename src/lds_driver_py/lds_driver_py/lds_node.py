@@ -37,6 +37,11 @@ CMD = 0xFA
 IDX_LO = 0xA0
 BAD_MASK = 0xC0      # invalid (0x80) | low-signal (0x40)
 RAYS = 360
+# Minimum bytes per serial read: at ~10 KB/s this paces wakeups to ~40-45/s
+# instead of the thousands/s that `read(in_waiting or 1)` causes when bytes
+# trickle in one at a time. LdsParser.feed() buffers+resyncs on CMD/checksum
+# regardless of how many bytes arrive per read, so any chunk size is safe.
+MIN_READ_CHUNK = 256
 # Compact scan blob for the web UI (see scan_blob.write_scan_blob): the browser polls it
 # same-origin (served by web_control from /dev/shm) and draws it directly — so /scan (the
 # heaviest message) no longer has to be bridged over rosbridge just to show the lidar.
@@ -170,7 +175,7 @@ class LdsNode(Node):
                     self._stop.wait(2.0)
                     continue
             try:
-                chunk = self.ser.read(self.ser.in_waiting or 1)
+                chunk = self.ser.read(max(self.ser.in_waiting, MIN_READ_CHUNK))
             except Exception as exc:
                 if self._stop.is_set():
                     return

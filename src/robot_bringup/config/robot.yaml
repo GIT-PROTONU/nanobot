@@ -37,7 +37,9 @@ wheel_odometry:
     wheel_separation: 0.16    # metres between wheel contact points
     invert_left: false        # SBC-side fallback (normally inverted on the ESP32)
     invert_right: false
-    publish_rate: 15.0        # Hz, odom/TF publish rate (retunable live via web UI slider)
+    publish_rate: 10.0        # Hz, odom/TF publish rate (retunable live via web UI slider;
+                               # matches slam_nav's control_rate, was 15 — cuts executor
+                               # wakeups in sensor_hub/slam_nav/app_hub with no functional loss)
     publish_tf: true
     odom_frame: "odom"
     base_frame: "base_link"
@@ -179,10 +181,13 @@ imu_driver:
     publish_rate: 1.0         # Hz; /imu/data rate (slider 1..200; raise live for tuning).
                               # The device stream rate auto-follows this (1 Hz = minimal
                               # CPU/serial load; also caps euler/web/mag output below).
-    euler_rate: 25.0          # Hz; /imu/euler only feeds the web angle display
+    euler_rate: 5.0           # Hz; /imu/euler only feeds the web angle display (via the
+                              # vitals blob, not the raw topic) — sys_monitor is the only
+                              # subscriber and just wants the freshest sample, so this only
+                              # matters as a cap if publish_rate is ever raised live
     mag_rate: 10.0            # Hz; /imu/mag is slow-moving + unused by the UI
-    web_rate: 15.0            # Hz; /imu/web (|accel|,|gyro|,rate) summary for the UI so
-                              # the browser need not subscribe to the full /imu/data rate
+    web_rate: 5.0             # Hz; /imu/web (|accel|,|gyro|,rate) summary — same story as
+                              # euler_rate above, sys_monitor-only, no raw-topic UI reader
     output_rate_hz: 0         # 0 = device streams at publish_rate; >0 pins it
 
 # ---- Dev-PC-only: Gazebo hardware stand-in (see bringup.launch.py sim:=true) ------------

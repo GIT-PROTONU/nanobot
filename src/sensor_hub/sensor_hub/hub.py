@@ -54,8 +54,32 @@ def _sd_notify(msg):
         pass
 
 
+def _disable_default_qos_event_callbacks():
+    """rclpy Humble attaches a default incompatible-QoS warning waitable to EVERY
+    publisher/subscription (PublisherEventCallbacks/SubscriptionEventCallbacks
+    default to use_default_callbacks=True) — one more entity the executor's
+    per-spin wait-set rebuild has to iterate, across ~200 pubs+subs stack-wide.
+    This stack is single-vendor with fixed QoS profiles, so the warning is never
+    actionable; force it off process-wide by patching the (keyword-only)
+    constructors before any node is built. (Deliberately duplicated in each hub
+    main, same rationale as _sd_notify.)"""
+    from rclpy import qos_event
+
+    def _patch(cls):
+        orig_init = cls.__init__
+
+        def _init(self, *, use_default_callbacks=True, **kwargs):
+            orig_init(self, use_default_callbacks=False, **kwargs)
+
+        cls.__init__ = _init
+
+    _patch(qos_event.SubscriptionEventCallbacks)
+    _patch(qos_event.PublisherEventCallbacks)
+
+
 def main():
     rclpy.init()
+    _disable_default_qos_event_callbacks()
     nodes = []
     for cls in NODE_CLASSES:
         try:

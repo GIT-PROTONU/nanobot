@@ -25,7 +25,7 @@ MAP_FILE = "/dev/shm/nano_map.bin"
 
 class MapBridgeNode(Node):
     def __init__(self):
-        super().__init__("map_bridge")
+        super().__init__("map_bridge", start_parameter_services=False)
         self.declare_parameters("", [
             ("map_file", MAP_FILE),
             ("frame_id", "odom"),

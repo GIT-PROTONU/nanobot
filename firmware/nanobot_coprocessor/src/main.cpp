@@ -477,7 +477,11 @@ static void zenohTask(void*){
     uint32_t now = millis();
 
     uint8_t buf[40];
-    if (now - t_ticks >= 33){                                // wheel_ticks @~30 Hz
+    if (now - t_ticks >= 66){                                // wheel_ticks @~15 Hz (was
+                                                              // ~30 Hz; odom integrates
+                                                              // cumulative counts, so the
+                                                              // faster rate bought nothing
+                                                              // but extra SBC executor wakeups)
       t_ticks = now;
       zpub_put(P_ticks, buf, cdr_i64arr2(buf,(int64_t)g_left_ticks,(int64_t)g_right_ticks));
     }

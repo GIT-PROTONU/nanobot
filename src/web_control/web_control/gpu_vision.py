@@ -482,10 +482,18 @@ def plan_downsample_stages(w, h, min_size=24):
     return sizes
 
 
-def build_downsample_chain(gl, w, h, min_size=24):
-    """Allocate the persistent FBO chain ONCE (call during setup, not per-frame)."""
-    return [gl.make_fbo(cw, ch, GL_RGBA, filt=GL_LINEAR)
-            for cw, ch in plan_downsample_stages(w, h, min_size)]
+def build_downsample_chain(gl, w, h, min_size=24, drop_last=False):
+    """Allocate the persistent FBO chain ONCE (call during setup, not per-frame).
+    drop_last=True builds every stage EXCEPT the final halving -- used when the last
+    stage's output is instead drawn into a shared slot of the stats atlas (see the
+    GpuVision setup code): the caller runs this chain, then does one more
+    draw_fullscreen from its last texture straight into the atlas, so the final
+    2x box-filter halving still happens, just targeting a shared FBO instead of a
+    private one-per-signal FBO."""
+    stages = plan_downsample_stages(w, h, min_size)
+    if drop_last:
+        stages = stages[:-1]
+    return [gl.make_fbo(cw, ch, GL_RGBA, filt=GL_LINEAR) for cw, ch in stages]
 
 
 def run_downsample_chain(gl, copy_prog, quad, src_tex, chain):
@@ -523,6 +531,24 @@ def readback_into(gl, w, h, buf):
 
 def make_readback_buffer(w, h):
     return (ctypes.c_ubyte * (w * h * 4))()
+
+
+def extract_atlas_slot(atlas_buf, atlas_w, slot_x, slot_w, slot_h, dst_buf):
+    """Copy one slot_w x slot_h slot at x-offset slot_x out of a wider shared atlas
+    readback (RGBA8, row-major) into dst_buf, which is its own contiguous slot_w x
+    slot_h buffer -- lets every downstream consumer keep indexing dst_buf exactly as
+    if it had been read back on its own. One `memmove` per row (row_bytes each); at
+    the atlas's tiny size (a couple dozen rows) this is negligible next to the GL
+    work it replaces (a whole extra glReadPixels call's driver-side overhead)."""
+    row_bytes = slot_w * 4
+    src_stride = atlas_w * 4
+    src_off0 = slot_x * 4
+    for row in range(slot_h):
+        ctypes.memmove(
+            ctypes.byref(dst_buf, row * row_bytes),
+            ctypes.byref(atlas_buf, row * src_stride + src_off0),
+            row_bytes)
+    return dst_buf
 
 
 def largest_blob_sums(pixels, w, h):
@@ -642,10 +668,15 @@ def make_quad_vbo(gl):
     return quad
 
 
-def draw_fullscreen(gl, prog, quad, fbo, w, h):
+def draw_fullscreen(gl, prog, quad, fbo, w, h, x0=0, y0=0):
+    """x0/y0 let the caller target a sub-rectangle of a larger shared FBO (the stats
+    atlas) instead of always writing the whole framebuffer -- the fullscreen quad's
+    NDC -1..1 range is remapped by glViewport to exactly that pixel rect, and nothing
+    outside it is touched (no clear happens here), so multiple slots can share one
+    FBO without stepping on each other."""
     g = gl.gl
     g.glBindFramebuffer(GL_FRAMEBUFFER, fbo)
-    g.glViewport(0, 0, w, h)
+    g.glViewport(x0, y0, w, h)
     g.glUseProgram(prog)
     g.glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, quad)
     g.glEnableVertexAttribArray(0)
@@ -1109,20 +1140,41 @@ class GpuVision:
         highlight_tex, highlight_fbo, _, _ = gl.make_fbo(W, H, GL_RGBA, filt=GL_LINEAR)
         # Pre-allocated ONCE, reused every frame -- see build_downsample_chain's
         # docstring for why (a real leak, found + fixed on hardware).
-        diff_chain = build_downsample_chain(gl, W, H)
-        thresh_chain = build_downsample_chain(gl, W, H)
-        luma_chain = build_downsample_chain(gl, W, H)
+        # drop_last=True: each chain's FINAL halving is instead drawn straight into a
+        # shared slot of the stats atlas below (one readback for all 7 signals instead
+        # of 7) -- see the atlas setup right after small_w/small_h.
+        diff_chain = build_downsample_chain(gl, W, H, drop_last=True)
+        thresh_chain = build_downsample_chain(gl, W, H, drop_last=True)
+        luma_chain = build_downsample_chain(gl, W, H, drop_last=True)
         # Colour-cast (white-balance drift) chain: reuses copy_prog/_COPY_FS verbatim
         # (no new shader) straight on cur_tex (the RGB frame, not a luminance/threshold
         # derivative), so R/G/B stay separable instead of collapsing to one grey value.
-        wb_chain = build_downsample_chain(gl, W, H)
-        edge_chain = build_downsample_chain(gl, W, H)          # visual-interest/clutter
-        crop_chain = build_downsample_chain(gl, W, H)          # overhead-clearance (cropped edge)
-        highlight_chain = build_downsample_chain(gl, W, H)     # shiny/reflective-surface
+        wb_chain = build_downsample_chain(gl, W, H, drop_last=True)
+        edge_chain = build_downsample_chain(gl, W, H, drop_last=True)      # visual-interest/clutter
+        crop_chain = build_downsample_chain(gl, W, H, drop_last=True)     # overhead-clearance (cropped edge)
+        highlight_chain = build_downsample_chain(gl, W, H, drop_last=True)  # shiny/reflective-surface
         # Readback buffers, also pre-allocated once (same reasoning as the FBO chains --
         # per-frame ctypes allocation churn is real, avoidable cost; a chain's final
         # stage size is fixed for the whole session since W/H never change).
         small_w, small_h = plan_downsample_stages(W, H)[-1]
+        # Stats atlas (CPU-reduction-plan option (b)): the 7 small per-signal stat
+        # reductions above (diff/thresh/luma/wb/edge/crop/highlight) all converge to
+        # the SAME final (small_w, small_h) size (same W/H, same min_size=24 chain for
+        # all of them), so their LAST halving pass can target adjacent slots of one
+        # shared FBO -- one glReadPixels covers all 7 instead of 7 separate calls,
+        # each of which carries its own fixed driver-side overhead beyond just the
+        # wait (already mostly eliminated by the Phase 1/2/3 batching). Laid out as a
+        # single row; still tiny (e.g. ~140x20 px at 640x480 capture).
+        STATS_SLOTS = 7
+        (SLOT_DIFF, SLOT_THRESH, SLOT_LUMA, SLOT_WB,
+         SLOT_EDGE, SLOT_CROP, SLOT_HIGHLIGHT) = range(STATS_SLOTS)
+        stats_atlas_tex, stats_atlas_fbo, ATLAS_W, ATLAS_H = gl.make_fbo(
+            small_w * STATS_SLOTS, small_h, GL_RGBA, filt=GL_NEAREST)
+        atlas_buf = make_readback_buffer(ATLAS_W, ATLAS_H)
+        # Per-signal buffers: Phase 3 (CPU scoring) still consumes these exact
+        # contiguous small_w x small_h buffers unchanged -- Phase 2 fills each one
+        # with a cheap CPU-side row-copy out of the single atlas readback, instead of
+        # each signal owning its own glReadPixels call.
         diff_buf = make_readback_buffer(small_w, small_h)
         thresh_buf = make_readback_buffer(small_w, small_h)
         luma_buf = make_readback_buffer(small_w, small_h)
@@ -1185,6 +1237,39 @@ class GpuVision:
             cur_tex, cur_fbo, _, _ = rgb[cur_idx]
             draw_fullscreen(gl, yuyv_prog, quad, cur_fbo, W, H)
 
+            # Snapshot every gating/tunable value ONCE up front. None of them depend on
+            # this tick's GPU results (target_color etc. are user-set state; the viewer
+            # counts are external ref-counts), so reading them before Phase 1 instead of
+            # interleaved through the tick (as before this restructure) changes nothing
+            # observable -- it only lets Phase 1 below decide up front which optional
+            # passes to submit.
+            with self._lock:
+                target_color = self._target_color
+                target_thresh = self._target_thresh
+                blob_min = self._blob_min_confidence
+                blob_max = self._blob_max_confidence
+                glare_k = self._glare_derate
+                glare_hl = self._highlight_fraction   # last tick's value -- fine for a derate
+                want_oled_mask = self._oled_mask_enable
+            with self._jpeg_cond:
+                want_jpeg = self._viewers > 0
+            with self._mask_jpeg_cond:
+                want_mask = self._mask_viewers > 0
+            with self._motion_mask_jpeg_cond:
+                want_motion_mask = self._motion_mask_viewers > 0
+
+            # ---- Phase 1: submit EVERY draw this tick needs, back-to-back, with no
+            # glReadPixels in between (see the CPU-reduction-plan memory: the original
+            # shape interleaved draw->read->draw->read for 7-9 passes/frame, and on a
+            # tile-based/deferred GPU (Mali/lima) each glReadPixels forces the driver to
+            # flush + wait for THAT pass specifically -- N passes meant N full stalls.
+            # Submitting every draw first lets the driver queue/overlap the independent
+            # jobs; by the time Phase 2 below reads the first one, later jobs are often
+            # already in flight or done, so the CUMULATIVE wait collapses toward one
+            # drain instead of N. Draw order still has to respect GPU-side texture
+            # dependencies (crop reads edge_tex, so edge must draw first; oled_mask/mask
+            # views read a chain's output, so they're sequenced after that chain) --
+            # readback ORDER never matters, only draw submission order does.
             if have_prev:
                 prev_tex, _, _, _ = rgb[1 - cur_idx]
                 g.glUseProgram(diff_prog)
@@ -1195,15 +1280,161 @@ class GpuVision:
                 g.glUniform1i(u_cur, 0)
                 g.glUniform1i(u_prev, 1)
                 draw_fullscreen(gl, diff_prog, quad, diff_fbo, W, H)
+                diff_pre_tex, _, _ = run_downsample_chain(gl, copy_prog, quad, diff_tex, diff_chain)
+                g.glActiveTexture(GL_TEXTURE0)
+                g.glBindTexture(GL_TEXTURE_2D, diff_pre_tex)
+                draw_fullscreen(gl, copy_prog, quad, stats_atlas_fbo, small_w, small_h,
+                                x0=SLOT_DIFF * small_w)
+                if want_motion_mask and jpeg_enc is not None:
+                    g.glUseProgram(mask_view_prog)
+                    g.glActiveTexture(GL_TEXTURE0)
+                    g.glBindTexture(GL_TEXTURE_2D, diff_tex)
+                    g.glUniform1i(u_mask_tex, 0)
+                    draw_fullscreen(gl, mask_view_prog, quad, motion_mask_flip_fbo, W, H)
 
-                small_tex, sw, sh = run_downsample_chain(gl, copy_prog, quad, diff_tex, diff_chain)
-                pixels = readback_into(gl, sw, sh, diff_buf)
-                n = sw * sh
+            if target_color is not None:
+                g.glUseProgram(thresh_prog)
+                g.glActiveTexture(GL_TEXTURE0)
+                g.glBindTexture(GL_TEXTURE_2D, cur_tex)
+                g.glUniform1i(u_tex, 0)
+                g.glUniform3f(u_target, *target_color)
+                g.glUniform1f(u_thresh, target_thresh)
+                draw_fullscreen(gl, thresh_prog, quad, thresh_fbo, W, H)
+                thresh_pre_tex, _, _ = run_downsample_chain(gl, copy_prog, quad, thresh_tex, thresh_chain)
+                g.glActiveTexture(GL_TEXTURE0)
+                g.glBindTexture(GL_TEXTURE_2D, thresh_pre_tex)
+                draw_fullscreen(gl, copy_prog, quad, stats_atlas_fbo, small_w, small_h,
+                                x0=SLOT_THRESH * small_w)
+                if want_oled_mask:
+                    g.glUseProgram(mask_view_prog)
+                    g.glActiveTexture(GL_TEXTURE0)
+                    g.glBindTexture(GL_TEXTURE_2D, oled_src_tex)
+                    g.glUniform1i(u_mask_tex, 0)
+                    draw_fullscreen(gl, mask_view_prog, quad, oled_mask_fbo,
+                                    OLED_MASK_W, OLED_MASK_H)
+                if want_mask and jpeg_enc is not None:
+                    g.glUseProgram(mask_view_prog)
+                    g.glActiveTexture(GL_TEXTURE0)
+                    g.glBindTexture(GL_TEXTURE_2D, thresh_tex)
+                    g.glUniform1i(u_mask_tex, 0)
+                    draw_fullscreen(gl, mask_view_prog, quad, mask_flip_fbo, W, H)
+
+            g.glUseProgram(luma_prog)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
+            g.glUniform1i(u_luma_tex, 0)
+            draw_fullscreen(gl, luma_prog, quad, luma_fbo, W, H)
+            luma_pre_tex, _, _ = run_downsample_chain(gl, copy_prog, quad, luma_tex, luma_chain)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, luma_pre_tex)
+            draw_fullscreen(gl, copy_prog, quad, stats_atlas_fbo, small_w, small_h,
+                            x0=SLOT_LUMA * small_w)
+
+            wb_pre_tex, _, _ = run_downsample_chain(gl, copy_prog, quad, cur_tex, wb_chain)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, wb_pre_tex)
+            draw_fullscreen(gl, copy_prog, quad, stats_atlas_fbo, small_w, small_h,
+                            x0=SLOT_WB * small_w)
+
+            g.glUseProgram(edge_prog)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
+            g.glUniform1i(u_edge_tex, 0)
+            g.glUniform2f(u_edge_texel, 1.0 / W, 1.0 / H)
+            draw_fullscreen(gl, edge_prog, quad, edge_fbo, W, H)
+            edge_pre_tex, _, _ = run_downsample_chain(gl, copy_prog, quad, edge_tex, edge_chain)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, edge_pre_tex)
+            draw_fullscreen(gl, copy_prog, quad, stats_atlas_fbo, small_w, small_h,
+                            x0=SLOT_EDGE * small_w)
+
+            g.glUseProgram(crop_prog)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, edge_tex)
+            g.glUniform1i(u_crop_tex, 0)
+            g.glUniform1f(u_top_frac, OVERHEAD_TOP_FRAC)
+            draw_fullscreen(gl, crop_prog, quad, crop_fbo, W, H)
+            crop_pre_tex, _, _ = run_downsample_chain(gl, copy_prog, quad, crop_tex, crop_chain)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, crop_pre_tex)
+            draw_fullscreen(gl, copy_prog, quad, stats_atlas_fbo, small_w, small_h,
+                            x0=SLOT_CROP * small_w)
+
+            g.glUseProgram(thresh_prog)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
+            g.glUniform1i(u_tex, 0)
+            g.glUniform3f(u_target, 1.0, 1.0, 1.0)      # fixed: pure white = specular highlight
+            g.glUniform1f(u_thresh, 0.12)                # fixed: fairly strict "near-white" match
+            draw_fullscreen(gl, thresh_prog, quad, highlight_fbo, W, H)
+            highlight_pre_tex, _, _ = run_downsample_chain(gl, copy_prog, quad, highlight_tex, highlight_chain)
+            g.glActiveTexture(GL_TEXTURE0)
+            g.glBindTexture(GL_TEXTURE_2D, highlight_pre_tex)
+            draw_fullscreen(gl, copy_prog, quad, stats_atlas_fbo, small_w, small_h,
+                            x0=SLOT_HIGHLIGHT * small_w)
+
+            if want_jpeg and jpeg_enc is not None:
+                g.glActiveTexture(GL_TEXTURE0)
+                g.glBindTexture(GL_TEXTURE_2D, cur_tex)
+                draw_fullscreen(gl, flip_prog, quad, flip_fbo, W, H)
+
+            # ---- Phase 2: ONE glReadPixels for all 7 stat-atlas slots (option (b) of
+            # the CPU-reduction-plan design -- was 7 separate glReadPixels calls, each
+            # carrying its own fixed driver-side overhead beyond the wait that Phase
+            # 1/2 batching above already collapsed), then a cheap per-slot CPU-side
+            # row-copy (extract_atlas_slot) into each signal's own contiguous buffer
+            # so Phase 3 below stays byte-for-byte the same as before this atlas
+            # change -- it still just consumes diff_pixels/tpixels/lpixels/etc. The
+            # full-resolution debug/tee buffers (motion mask, oled mask, colour mask,
+            # JPEG tee) are a different scale entirely and stay their own readbacks;
+            # their framebuffers still need an explicit re-bind since draw_fullscreen
+            # moved GL_FRAMEBUFFER on to whatever was submitted next in Phase 1.
+            dsw = tsw = lsw = wsw = esw = csw = hsw = small_w
+            dsh = tsh = lsh = wsh = esh = csh = hsh = small_h
+            g.glBindFramebuffer(GL_FRAMEBUFFER, stats_atlas_fbo)
+            atlas_pixels = readback_into(gl, ATLAS_W, ATLAS_H, atlas_buf)
+
+            if have_prev:
+                diff_pixels = extract_atlas_slot(
+                    atlas_pixels, ATLAS_W, SLOT_DIFF * small_w, small_w, small_h, diff_buf)
+                if want_motion_mask and jpeg_enc is not None:
+                    g.glBindFramebuffer(GL_FRAMEBUFFER, motion_mask_flip_fbo)
+                    motion_mask_pixels = readback_into(gl, W, H, motion_mask_flip_buf)
+
+            if target_color is not None:
+                tpixels = extract_atlas_slot(
+                    atlas_pixels, ATLAS_W, SLOT_THRESH * small_w, small_w, small_h, thresh_buf)
+                if want_oled_mask:
+                    g.glBindFramebuffer(GL_FRAMEBUFFER, oled_mask_fbo)
+                    opix = readback_into(gl, OLED_MASK_W, OLED_MASK_H, oled_mask_buf)
+                if want_mask and jpeg_enc is not None:
+                    g.glBindFramebuffer(GL_FRAMEBUFFER, mask_flip_fbo)
+                    mask_pixels = readback_into(gl, W, H, mask_flip_buf)
+
+            lpixels = extract_atlas_slot(
+                atlas_pixels, ATLAS_W, SLOT_LUMA * small_w, small_w, small_h, luma_buf)
+            wpixels = extract_atlas_slot(
+                atlas_pixels, ATLAS_W, SLOT_WB * small_w, small_w, small_h, wb_buf)
+            epixels = extract_atlas_slot(
+                atlas_pixels, ATLAS_W, SLOT_EDGE * small_w, small_w, small_h, edge_buf)
+            cpixels = extract_atlas_slot(
+                atlas_pixels, ATLAS_W, SLOT_CROP * small_w, small_w, small_h, crop_buf)
+            hpixels = extract_atlas_slot(
+                atlas_pixels, ATLAS_W, SLOT_HIGHLIGHT * small_w, small_w, small_h, highlight_buf)
+
+            if want_jpeg and jpeg_enc is not None:
+                g.glBindFramebuffer(GL_FRAMEBUFFER, flip_fbo)
+                flip_pixels = readback_into(gl, W, H, flip_buf)
+
+            # ---- Phase 3: pure CPU scoring + JPEG encode. All GPU submission and
+            # readback is done; nothing below touches the GL context.
+            if have_prev:
+                n = dsw * dsh
                 sum_r = sum_g = sum_b = 0
                 for i in range(n):
-                    sum_r += pixels[i * 4]
-                    sum_g += pixels[i * 4 + 1]
-                    sum_b += pixels[i * 4 + 2]
+                    sum_r += diff_pixels[i * 4]
+                    sum_g += diff_pixels[i * 4 + 1]
+                    sum_b += diff_pixels[i * 4 + 2]
                 score = (sum_r / n) / 255.0
                 # Motion-saliency bounding center: same weighted-centroid trick as blob
                 # tracking, "for free" from the same reduction pass (see _DIFF_FS).
@@ -1245,15 +1476,7 @@ class GpuVision:
                 # below, reusing mask_view_prog (_MASK_VIEW_FS) verbatim on diff_tex --
                 # its R channel is already the per-pixel change magnitude (see _DIFF_FS),
                 # so no new shader is needed, just a different source texture.
-                with self._motion_mask_jpeg_cond:
-                    want_motion_mask = self._motion_mask_viewers > 0
                 if want_motion_mask and jpeg_enc is not None:
-                    g.glUseProgram(mask_view_prog)
-                    g.glActiveTexture(GL_TEXTURE0)
-                    g.glBindTexture(GL_TEXTURE_2D, diff_tex)
-                    g.glUniform1i(u_mask_tex, 0)
-                    draw_fullscreen(gl, mask_view_prog, quad, motion_mask_flip_fbo, W, H)
-                    motion_mask_pixels = readback_into(gl, W, H, motion_mask_flip_buf)
                     try:
                         motion_mask_jpeg = jpeg_enc.encode(motion_mask_pixels, W, H)
                         with self._motion_mask_jpeg_cond:
@@ -1263,25 +1486,7 @@ class GpuVision:
                     except Exception as exc:
                         self._log(f"gpu_vision: motion mask JPEG encode failed: {exc}")
 
-            with self._lock:
-                target_color = self._target_color
-                target_thresh = self._target_thresh
-                blob_min = self._blob_min_confidence
-                blob_max = self._blob_max_confidence
-                glare_k = self._glare_derate
-                glare_hl = self._highlight_fraction   # last tick's value -- fine for a derate
-                want_oled_mask = self._oled_mask_enable
             if target_color is not None:
-                g.glUseProgram(thresh_prog)
-                g.glActiveTexture(GL_TEXTURE0)
-                g.glBindTexture(GL_TEXTURE_2D, cur_tex)
-                g.glUniform1i(u_tex, 0)
-                g.glUniform3f(u_target, *target_color)
-                g.glUniform1f(u_thresh, target_thresh)
-                draw_fullscreen(gl, thresh_prog, quad, thresh_fbo, W, H)
-
-                tsmall_tex, tsw, tsh = run_downsample_chain(gl, copy_prog, quad, thresh_tex, thresh_chain)
-                tpixels = readback_into(gl, tsw, tsh, thresh_buf)
                 n2 = tsw * tsh
                 # Largest-blob selection (not a global sum over every matching pixel) --
                 # see largest_blob_sums's docstring. confidence stays normalized by the
@@ -1303,13 +1508,6 @@ class GpuVision:
                 # jump from 640x480 would alias -- GL_LINEAR only blends 2x2 texels),
                 # re-binarize (box-filtered masks come out greyscale), write the blob.
                 if want_oled_mask:
-                    g.glUseProgram(mask_view_prog)
-                    g.glActiveTexture(GL_TEXTURE0)
-                    g.glBindTexture(GL_TEXTURE_2D, oled_src_tex)
-                    g.glUniform1i(u_mask_tex, 0)
-                    draw_fullscreen(gl, mask_view_prog, quad, oled_mask_fbo,
-                                    OLED_MASK_W, OLED_MASK_H)
-                    opix = readback_into(gl, OLED_MASK_W, OLED_MASK_H, oled_mask_buf)
                     raw = bytes(opix)[0::4].translate(_OLED_THRESH_TABLE)
                     self._oled_mask_seq += 1
                     write_oled_mask_blob(raw, OLED_MASK_W, OLED_MASK_H,
@@ -1362,6 +1560,16 @@ class GpuVision:
                         expansion = max(0.0, (confidence - c0) / dt)
                 with self._lock:
                     self._intercept_rate = expansion
+
+                if want_mask and jpeg_enc is not None:
+                    try:
+                        mask_jpeg = jpeg_enc.encode(mask_pixels, W, H)
+                        with self._mask_jpeg_cond:
+                            self._mask_jpeg = mask_jpeg
+                            self._mask_jpeg_seq += 1
+                            self._mask_jpeg_cond.notify_all()
+                    except Exception as exc:
+                        self._log(f"gpu_vision: mask JPEG encode failed: {exc}")
             else:
                 target_hist.clear()
                 with self._lock:
@@ -1369,13 +1577,6 @@ class GpuVision:
                     self._motion_target_match = None
 
             # Flashlight/dark reflex: global average luminance, same reduction machinery.
-            g.glUseProgram(luma_prog)
-            g.glActiveTexture(GL_TEXTURE0)
-            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
-            g.glUniform1i(u_luma_tex, 0)
-            draw_fullscreen(gl, luma_prog, quad, luma_fbo, W, H)
-            lsmall_tex, lsw, lsh = run_downsample_chain(gl, copy_prog, quad, luma_tex, luma_chain)
-            lpixels = readback_into(gl, lsw, lsh, luma_buf)
             ln = lsw * lsh
             lsum = 0
             lmax = 0
@@ -1404,8 +1605,6 @@ class GpuVision:
             # reduction chain, run straight on cur_tex instead of a luminance/threshold
             # derivative, so R/G/B stay separable -- one more reduction-chain instance,
             # no new shader code. Runs unconditionally every frame, like luma.
-            wtex, wsw, wsh = run_downsample_chain(gl, copy_prog, quad, cur_tex, wb_chain)
-            wpixels = readback_into(gl, wsw, wsh, wb_buf)
             wn = wsw * wsh
             wr = wg = wb_sum = 0
             for i in range(wn):
@@ -1432,14 +1631,6 @@ class GpuVision:
             # Visual "interest"/clutter signal: a static complement to PIR's "how much
             # just changed" -- how much texture/contrast is in the whole frame right
             # now. Runs unconditionally every frame, same as luma/colour-cast.
-            g.glUseProgram(edge_prog)
-            g.glActiveTexture(GL_TEXTURE0)
-            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
-            g.glUniform1i(u_edge_tex, 0)
-            g.glUniform2f(u_edge_texel, 1.0 / W, 1.0 / H)
-            draw_fullscreen(gl, edge_prog, quad, edge_fbo, W, H)
-            esmall_tex, esw, esh = run_downsample_chain(gl, copy_prog, quad, edge_tex, edge_chain)
-            epixels = readback_into(gl, esw, esh, edge_buf)
             en = esw * esh
             esum = 0
             for i in range(en):
@@ -1451,14 +1642,6 @@ class GpuVision:
             # _CROP_TOP_FS) -- a coarse "is there structure above the lidar's 2D scan
             # plane" heuristic, not a distance measurement (see overhead_edge_density's
             # docstring for the caveats).
-            g.glUseProgram(crop_prog)
-            g.glActiveTexture(GL_TEXTURE0)
-            g.glBindTexture(GL_TEXTURE_2D, edge_tex)
-            g.glUniform1i(u_crop_tex, 0)
-            g.glUniform1f(u_top_frac, OVERHEAD_TOP_FRAC)
-            draw_fullscreen(gl, crop_prog, quad, crop_fbo, W, H)
-            csmall_tex, csw, csh = run_downsample_chain(gl, copy_prog, quad, crop_tex, crop_chain)
-            cpixels = readback_into(gl, csw, csh, crop_buf)
             cn = csw * csh
             csum = 0
             for i in range(cn):
@@ -1473,15 +1656,6 @@ class GpuVision:
             # calibrated blob-tracking pass above -- same program object, different
             # uniform values set immediately before this draw call, so it can never
             # collide with (or be affected by) whatever colour the user has calibrated.
-            g.glUseProgram(thresh_prog)
-            g.glActiveTexture(GL_TEXTURE0)
-            g.glBindTexture(GL_TEXTURE_2D, cur_tex)
-            g.glUniform1i(u_tex, 0)
-            g.glUniform3f(u_target, 1.0, 1.0, 1.0)      # fixed: pure white = specular highlight
-            g.glUniform1f(u_thresh, 0.12)                # fixed: fairly strict "near-white" match
-            draw_fullscreen(gl, thresh_prog, quad, highlight_fbo, W, H)
-            hsmall_tex, hsw, hsh = run_downsample_chain(gl, copy_prog, quad, highlight_tex, highlight_chain)
-            hpixels = readback_into(gl, hsw, hsh, highlight_buf)
             hn = hsw * hsh
             hsum = 0
             for i in range(hn):
@@ -1490,42 +1664,15 @@ class GpuVision:
             with self._lock:
                 self._highlight_fraction = highlight_fraction
 
-            with self._jpeg_cond:
-                want_jpeg = self._viewers > 0
             if want_jpeg and jpeg_enc is not None:
-                g.glActiveTexture(GL_TEXTURE0)
-                g.glBindTexture(GL_TEXTURE_2D, cur_tex)
-                draw_fullscreen(gl, flip_prog, quad, flip_fbo, W, H)
-                pixels = readback_into(gl, W, H, flip_buf)
                 try:
-                    jpeg = jpeg_enc.encode(pixels, W, H)
+                    jpeg = jpeg_enc.encode(flip_pixels, W, H)
                     with self._jpeg_cond:
                         self._jpeg = jpeg
                         self._jpeg_seq += 1
                         self._jpeg_cond.notify_all()
                 except Exception as exc:
                     self._log(f"gpu_vision: JPEG encode failed: {exc}")
-
-            # Tracking-mask debug view: same viewer-gated shape as the tee above, but
-            # also needs a target colour actually set -- thresh_tex only has meaningful
-            # content when the threshold pass above ran (target_color is not None).
-            with self._mask_jpeg_cond:
-                want_mask = self._mask_viewers > 0
-            if want_mask and jpeg_enc is not None and target_color is not None:
-                g.glUseProgram(mask_view_prog)
-                g.glActiveTexture(GL_TEXTURE0)
-                g.glBindTexture(GL_TEXTURE_2D, thresh_tex)
-                g.glUniform1i(u_mask_tex, 0)
-                draw_fullscreen(gl, mask_view_prog, quad, mask_flip_fbo, W, H)
-                mask_pixels = readback_into(gl, W, H, mask_flip_buf)
-                try:
-                    mask_jpeg = jpeg_enc.encode(mask_pixels, W, H)
-                    with self._mask_jpeg_cond:
-                        self._mask_jpeg = mask_jpeg
-                        self._mask_jpeg_seq += 1
-                        self._mask_jpeg_cond.notify_all()
-                except Exception as exc:
-                    self._log(f"gpu_vision: mask JPEG encode failed: {exc}")
 
             g.glFinish()
             with self._lock:

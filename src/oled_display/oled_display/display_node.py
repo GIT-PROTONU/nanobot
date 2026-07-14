@@ -166,7 +166,7 @@ def _primary_ip() -> str:
 
 class DisplayNode(Node):
     def __init__(self):
-        super().__init__("oled_display")
+        super().__init__("oled_display", start_parameter_services=False)
         self.declare_parameters("", [
             ("i2c_bus", 1), ("i2c_address", 0x3C),
             ("width", 128), ("height", 64),
