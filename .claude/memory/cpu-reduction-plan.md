@@ -1,15 +1,40 @@
 ---
 name: cpu-reduction-plan
-description: "Idle-CPU reduction plan — STATUS 2026-07-06: tier 2 (SLAM still-skip) + 3a (np.packbits) built; tier 1 obsolete; tier 3b landed differently (oled merged into app_hub, NOT sensor_hub — cross-process sub tax remains); UI-open cost killed by rosbridge removal"
+description: "CPU reduction TODO — 2026-07-14 re-profile done (50% idle / 60% UI-open): three NEW approved-for-todo levers = (1) executor-wakeup cut (IMU topic rates / in-process handoff, odom 15→10), (2) gpu_vision fps drop, (3) LDS serial read batching; old tier plan below is history"
 metadata: 
   node_type: memory
   type: project
   originSessionId: 0b7a90af-3716-490a-8ac2-008ec20c8677
 ---
 
-Plan from the 2026-06-23 profiling session (measurements in [[sbc-cpu-profile]]). Goal the
-user set: **reduce CPU without reducing any sensor data rate or functionality.** Idle
-baseline ≈ 83% of one core.
+**TODO (2026-07-14, user asked to queue these — from the post-overhaul re-profile in
+[[sbc-cpu-profile]]; baselines: ~50% of 4 cores idle, ~60% with the web UI open on the
+Camera view; ~1.0 core of that is rclpy executor wait-set churn):**
+
+1. **Cut executor wakeups (~1.0 core at stake, biggest lever).** sys_monitor is the ONLY
+   subscriber of /imu/euler (25 Hz) + /imu/web (15 Hz) and is co-resident with imu_driver
+   in sensor_hub — either hand samples over in-process (queue/direct call, keep the topics
+   publishing at a low debug rate) or just drop both rates to ~5 Hz in robot.yaml. Also
+   odom publish_rate 15→10 Hz (nav's control loop is already 10 Hz; odom wakes sensor_hub's
+   timer + nav + app_hub subs). NOTE the web-slider live-tuning contract on these rates —
+   don't break the "raise live for tuning" path, and mind that /imu/euler feeds the web
+   angle display via telemetry (served from the vitals blob, so a low topic rate is fine).
+2. **Lower gpu_vision fps (~0.38 core idle, mostly the synchronous glReadPixels stall —
+   scales ~linearly with fps).** Halving fps ≈ 0.15–0.2 core back, same alerts with slower
+   reaction. gpu_duty already runs >100% under the full pass set, so the loop never hits
+   its configured rate anyway.
+3. **Batch the LDS serial read (~0.15 core).** `lds_node.py:173` does
+   `ser.read(in_waiting or 1)` → thousands of tiny wakeups/s at 115200 baud; read with a
+   minimum chunk (e.g. 128–256 B) + timeout instead so the reader wakes ~40×/s.
+
+Realistic combined outcome: idle ~50% → ~20–25%. User approved queueing all three
+(2026-07-14); implementation order suggestion was 2+3 first (small, low-risk), then 1.
+
+---
+
+Historical plan from the 2026-06-23 profiling session (measurements in
+[[sbc-cpu-profile]]). Goal the user set: **reduce CPU without reducing any sensor data
+rate or functionality.** Idle baseline then ≈ 83% of one core.
 
 **STATUS (2026-07-05, user asked to "optimise for low cpu and ram"):**
 - **Tier 1 (IMU auto-rate): OBSOLETE, do not build.** robot.yaml now ships
