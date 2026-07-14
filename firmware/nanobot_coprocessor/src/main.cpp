@@ -157,6 +157,13 @@ static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RAD
 // UART2 link). Lets you watch the LDS + control stay live under load; 0 disables it.
 #define STATUS_PRINT_MS 3000
 
+// Low-power mode while the SBC link is down (boot race, SBC off, or a drop): downclock the
+// CPU instead of idling at full speed. 80 MHz is still PLL-locked, so the APB bus (and thus
+// UART baud timing for both the zenoh link and the LDS RX) stays accurate — only the core
+// clock drops, so this is safe to flip live with no re-init. 0 disables (stays at 240 MHz).
+#define CPU_MHZ_NORMAL    240
+#define CPU_MHZ_LOWPOWER   80
+
 // Link-connect watchdog. The ESP boots in ~1 s but the SBC takes ~30-60 s to bring up the
 // serial zenohd. If the ESP boots first, its repeated failed serial handshakes leave the
 // link in a state that an in-process z_open() retry won't re-sync — historically the only
@@ -272,6 +279,19 @@ static size_t cdr_i64arr2(uint8_t* b, int64_t a, int64_t bb){
 static z_owned_session_t s;
 static volatile bool ready = false;       // written Core 0 (zenohTask), read Core 1 (loop watchdog)
 static volatile uint32_t g_boot_ms = 0;   // millis() at boot — link-connect watchdog reference
+
+// `ready` only means z_open() succeeded LOCALLY — opening a UART peripheral needs no peer,
+// so it goes true even with nothing wired to the other end (confirmed on the bench: it
+// reaches "zenoh CONNECTED" with the link cable unplugged). The only real evidence the SBC
+// is actually there is a received /esp32_ping (g_ping_seen — the runtime-liveness watchdog's
+// signal, reset false on every (re)connect, set true only by ping_cb actually firing). Used
+// to gate the LDS spin + CPU low-power mode below so they track true SBC presence, not just
+// "the ESP tried". Falls back to bare `ready` if the ping watchdog is compiled out.
+#if LINK_RX_TIMEOUT_MS
+static inline bool linkAlive(){ return ready && g_ping_seen; }
+#else
+static inline bool linkAlive(){ return ready; }
+#endif
 // rmw_zenoh liveliness token = makes a publisher visible in the ROS graph. Format:
 // @ros2_lv/<domain>/<zid>/<nid>/<eid>/MP/%/%/<node>/%<topic>/<type>/<typehash>/<qos>
 static z_owned_liveliness_token_t g_lv[12]; static int g_lv_n = 0;
@@ -555,13 +575,24 @@ static bool debounceSusp(int pin, bool& cand, uint8_t& stable, bool cur){
 }
 
 void setup(){
-  Serial.begin(115200); delay(300);
-  Serial.println("\n[nano] zenoh-pico coprocessor boot");
-
+  // Motor safety FIRST — before Serial or anything else. The H-bridge IN pins sit in
+  // their ROM-bootloader default (floating input) from power-on until something drives
+  // them; Serial.begin()'s startup + the settle delay below used to be the first thing
+  // that ran, stretching that floating window to ~300ms+ and letting it read as a brief
+  // uncommanded spin on power-up. Drive them low immediately, then hand off to the LEDC
+  // PWM channels (which also default to a 0 duty = low output).
+  pinMode(LEFT_IN_FWD,OUTPUT);  digitalWrite(LEFT_IN_FWD,LOW);
+  pinMode(LEFT_IN_REV,OUTPUT);  digitalWrite(LEFT_IN_REV,LOW);
+  pinMode(RIGHT_IN_FWD,OUTPUT); digitalWrite(RIGHT_IN_FWD,LOW);
+  pinMode(RIGHT_IN_REV,OUTPUT); digitalWrite(RIGHT_IN_REV,LOW);
   for (int c=0;c<4;c++) ledcSetup(c,PWM_FREQ_HZ,PWM_RES_BITS);
   ledcAttachPin(LEFT_IN_FWD,CH_LEFT_FWD); ledcAttachPin(LEFT_IN_REV,CH_LEFT_REV);
   ledcAttachPin(RIGHT_IN_FWD,CH_RIGHT_FWD); ledcAttachPin(RIGHT_IN_REV,CH_RIGHT_REV);
   applyMotors(0,0);
+
+  Serial.begin(115200); delay(300);
+  Serial.println("\n[nano] zenoh-pico coprocessor boot");
+
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
   // SBC cooling fan PWM — start at the boot duty so there's airflow before the SBC connects.
   ledcSetup(CH_FAN,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(FAN_PIN,CH_FAN);
@@ -609,6 +640,23 @@ void setup(){
 void loop(){   // Core 1: real-time control
   static uint32_t last_pid=0, last_ctl=0, last_sens=0, last_slow=0;
   uint32_t now = millis();
+  bool alive = linkAlive();   // true only once the SBC has actually pinged us (see linkAlive())
+
+#if CPU_MHZ_LOWPOWER
+  // millis()/FreeRTOS ticks come from a hardware timer independent of the CPU clock, so the
+  // watchdog deadlines and PID loop rates below stay correctly timed at either frequency.
+  // last_mode starts at an invalid sentinel (not "false") so the first loop() iteration
+  // always applies — otherwise a board that boots and never truly connects (linkAlive()
+  // stays false from power-on, same as the last_mode default) would never actually downclock.
+  static int8_t last_mode = -1;
+  int8_t want_mode = alive ? 1 : 0;
+  if (want_mode != last_mode){
+    last_mode = want_mode;
+    setCpuFrequencyMhz(alive ? CPU_MHZ_NORMAL : CPU_MHZ_LOWPOWER);
+    Serial.printf("[nano] link %s: CPU -> %d MHz\n", alive ? "up" : "down",
+                  alive ? CPU_MHZ_NORMAL : CPU_MHZ_LOWPOWER);
+  }
+#endif
 
 #if LINK_CONNECT_DEADLINE_MS
   // Link-connect watchdog: never came up within the deadline → reboot and re-handshake the
@@ -649,7 +697,13 @@ void loop(){   // Core 1: real-time control
     // Drain UART1 here, not every loop: every frame carries the current RPM, so flushing
     // the buffer right before the PID gives the freshest speed and skips idle polling.
     while (Serial1.available()) ldsFeed((uint8_t)Serial1.read());
-    ldsControl((now-last_pid)/1000.0f); last_pid=now;
+    // Park the spin motor while the SBC link is down (boot race, SBC off, or a drop) —
+    // g_lds_target defaults to LDS_TARGET_RPM at boot and just sits there otherwise, so
+    // without this the LDS keeps spinning even with the SBC fully powered off. Resumes
+    // on its own the instant `ready` goes true again (zenohTask, Core 0).
+    if (alive) ldsControl((now-last_pid)/1000.0f);
+    else { g_lds_duty = 0; ledcWrite(CH_LDS, 0); }
+    last_pid=now;
   }
 #else
   (void)last_pid;

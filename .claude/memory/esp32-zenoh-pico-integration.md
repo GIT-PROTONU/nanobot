@@ -31,3 +31,14 @@ The ESP32 coprocessor was ported from micro-ROS to **native zenoh-pico** (firmwa
 Link-connect watchdog (June 2026): if the ESP boots before the SBC's serial zenohd, its repeated failed handshakes leave the serial link in a state an in-process `z_open()` retry won't re-sync — the only cure was a manual ESP power-cycle (a fresh boot sends a clean InitSyn the now-listening router accepts). Fixed in firmware by a Core-1 watchdog: if `ready` isn't reached within `LINK_CONNECT_DEADLINE_MS` (default 40 s) of boot, `esp_restart()` itself (== the manual power-cycle; also rescues a z_open() wedged on Core 0). `ready` made volatile, `g_boot_ms` seeded in setup(). Shorter deadline = faster auto-recovery once the SBC is up, but more wasted reboots while it's still booting — tune on hardware. **Not yet flashed/verified on hardware as of this note.**
 
 Runtime reconnect (2026-06-22): the *router restart after a good connect* gap is now handled by an **SBC→ESP liveness ping**. The always-on `web_control` node publishes `/esp32_ping` (Int32) at 1 Hz (independent of any browser); the firmware subscribes and, if `ready` but no ping for `LINK_RX_TIMEOUT_MS` (8 s), `esp_restart()`s to re-handshake. **Fails safe:** the timer arms only after the first ping is seen (`g_ping_seen`), so a topic mismatch / feature-off never causes a reboot. Subscriber needs no liveliness token (only publishers do). `std_msgs` added to web_control package.xml. Not yet flashed/verified as of this note. Both watchdogs share the same `esp_restart()` remedy as the connect-deadline one above.
+
+**GOTCHA (found 2026-07-14, bench-verified): `ready` alone is NOT proof the SBC is present.**
+`z_open()` for the serial transport succeeds as soon as it opens the local UART peripheral —
+that needs no peer to respond, so `ready` goes true even with the UART2 link cable completely
+unplugged (confirmed on the bench: board printed "zenoh CONNECTED" with nothing wired to
+GPIO16/17). The only reliable evidence of a real SBC is `g_ping_seen` (set true only inside
+`ping_cb`, i.e. an actual `/esp32_ping` message was received; reset false on every (re)connect
+attempt). Added a `linkAlive()` helper (`return ready && g_ping_seen`) in firmware and switched
+the new LDS-park / CPU-low-power gating (below, and see [[esp32-coprocessor]]) to use it instead
+of bare `ready` — anything that needs to know "is the SBC actually there" should use
+`linkAlive()`, not `ready`.

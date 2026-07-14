@@ -30,3 +30,23 @@ spin motor (reads its RPM off UART1 RX=GPIO14).
 (ESP32 FPU unsafe). Counts are now signed; `wheel_odometry` integrates them unchanged. This
 matters for [[slam-nav]] (unsigned counts made /odom read reverse as forward). Related:
 [[deployment-state]], [[project-overview]].
+
+**Low-power + safety additions (2026-07-14):**
+- **LDS spin motor parks and CPU downclocks to 80 MHz whenever the SBC isn't genuinely
+  present** (gated on `linkAlive()` — see [[esp32-zenoh-pico-integration]] — NOT bare `ready`,
+  which false-positives). Before this fix the LDS PID ran unconditionally off `g_lds_target`
+  (defaults to 300 rpm at boot) regardless of SBC state, so the lidar kept spinning even with
+  the SBC fully powered off. Restores to 240 MHz / resumes spin instantly on reconnect. 80 MHz
+  is still PLL-locked so APB/UART baud timing is unaffected.
+- **Motor H-bridge pins (25/26/27/33) are driven low as the very first lines of `setup()`**,
+  before `Serial.begin()`'s ~300ms startup delay — fixes an observed brief uncommanded spin on
+  ESP power-up (the pins sat in their floating ROM-bootloader default for that whole window
+  previously).
+- Drive-motor safety was already adequate and needed no change: `CMD_TIMEOUT_MS` (500ms)
+  zeroes both wheel duties independent of the zenoh link state, so a disconnected/absent SBC
+  already meant zero motor duty within 500ms of boot.
+- PWM is 20kHz/10-bit for all 4 LEDC channels (drive motors, LDS spin, SBC fan) — see
+  `PWM_FREQ_HZ`/`PWM_RES_BITS` near the top of main.cpp. Considered dropping to 5kHz; PWM
+  frequency is unrelated to the hardware ground-fault incident (see
+  [[esp32-hardware-fried-ground-fix]]) since the ESP32 GPIOs only drive DRV8871's logic-level
+  IN pins, not the motor current directly — change deferred, not yet made.
