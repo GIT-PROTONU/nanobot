@@ -39,8 +39,11 @@ green). Specifically:
   `pio run -t upload` on `/dev/ttyUSB0`), 6, 7: all done as originally scoped.
 - Item 4 (fan): **intentionally left alone** — user confirmed the fan is
   disconnected on purpose, not a bug to chase.
-- **Not yet done: a fresh on-board re-profile** to measure the actual combined win
-  (the plan's 50%→20-25% idle estimate was never re-measured after this batch).
+- **Re-profiled same day** (see [[sbc-cpu-profile]]): UI-open total dropped from
+  ~60% to ~38-43% of 4 cores (a real, measured ~30-35% relative cut), sensor_hub
+  roughly halved (71%→37%), app_hub 123%→84%, nav_node 25%→12.5%. Done via `/proc`
+  jiffies deltas, NOT py-spy (no passwordless sudo for it on the board). True
+  UI-CLOSED idle number still not re-measured (browser was connected throughout).
 - Minor architectural leftover, still open, low priority: OLED's `/imu/web`+
   `/lds_hz` subs still cross a process boundary into `app_hub` (noted in the
   2026-07-06 overhaul, unaffected by this batch) — revisit only if a future profile

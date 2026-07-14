@@ -1,11 +1,48 @@
 ---
 name: sbc-cpu-profile
-description: "Where the NanoPi H5's CPU goes; 2026-07-14 post-overhaul re-profile: ~60% of 4 cores, >half of it rclpy executor wait-set-rebuild machinery across the 3 hubs; older rosbridge-era profiles kept below for history"
+description: "Where the NanoPi H5's CPU goes; 2026-07-14 CPU-reduction batch re-profile (SAME DAY, after commit 2f582f9): UI-open total dropped ~60%→~38-43% of 4 cores; per-hub before/after below. Older rosbridge-era + pre-batch profiles kept for history"
 metadata: 
   node_type: memory
   type: project
   originSessionId: f0a4bf50-cc12-4361-a366-bfe320e5ba22
 ---
+
+**Update (2026-07-14, SAME DAY re-profile after the CPU-reduction batch landed —
+commit `2f582f9`, deployed via `scripts/deploy.sh`).** Method: `/proc/<pid>/stat`
+utime+stime jiffies delta over a clean 15s window (HZ=100) for system total (from
+`/proc/stat`) + each hub PID, cross-checked against `top -bn1`/`top -bH`. Conditions:
+web UI open with 3 established connections from the user's browser (comparable to
+the prior "UI-open" baseline, though not confirmed to be specifically on the Camera
+view). **py-spy unavailable this session** (needs `sudo`, no passwordless sudoers
+rule for it and no password available non-interactively — only `stack.sh`
+operations have a scoped NOPASSWD rule) — this was a coarser per-process/per-thread
+`/proc` profile, not a stack-sampled one.
+
+**Headline: system busy dropped from ~60% of 4 cores (pre-batch, UI-open-camera) to
+~38-43% (two 10s/15s samples: 43.2%, 37.6%)** — i.e. roughly a 30-35% relative cut,
+achieved with the UI open (the harder case). Per-hub before → after (both UI-open):
+- **app_hub: 123% → 83.7%** (main + gpu_vision thread + oled/behavior). Two hot
+  threads observed via `top -bH` (72.7% + 36.4%, main thread confirmed as the PID
+  itself at 36.4%) — couldn't attribute the 72.7% thread to gpu_vision specifically
+  without py-spy, but the total drop is consistent with the QoS-event patch +
+  param-service opt-out + the gpu_vision batched-draws/stats-atlas restructure all
+  landing in the same hub.
+- **sensor_hub: 71% → 37.1%** (main 52%→27.3%, LDS reader 18%→9.1% — roughly halved,
+  matches the LDS serial-read-batching estimate closely; IMU reader thread not
+  broken out this pass).
+- **nav_node: 25% → 12.5%** (QoS-event patch + param-service opt-out; a single
+  `top -bH` snapshot showed near-0% since the robot was stationary/no active goal —
+  the 12.5% is from the jiffies-delta average over the full window, more reliable).
+- **zenohd-serial: 8% → 5.5%** (router; not a direct target of this batch, in the
+  noise).
+- map_bridge + uvcvideo kworkers: ~1-2% each, unchanged/negligible, as before.
+
+Caveat: this is a like-for-like UI-open comparison, not the true idle (UI-closed)
+baseline the original plan's "50%→20-25%" estimate was framed around — the user's
+browser was already connected throughout this profiling session and disconnecting
+it wasn't practical mid-session. The measured UI-open win (~60%→~38-43%) is real and
+substantial regardless. Re-profile with the UI fully closed for a true idle number
+if that comparison matters later.
 
 **2026-07-06 UPDATE: rosbridge no longer exists** — the browser now rides web_control's
 SSE /telemetry gateway (lazy subs, one shared frame; see
