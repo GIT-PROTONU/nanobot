@@ -1,6 +1,6 @@
 ---
 name: sbc-cpu-profile
-description: "Where the NanoPi H5's CPU goes (2026-06 profiles); rosbridge was the dominant UI-open cost — DELETED 2026-07-06 (SSE gateway replaced it); numbers below predate the 3-hub overhaul"
+description: "Where the NanoPi H5's CPU goes; 2026-07-14 post-overhaul re-profile: ~60% of 4 cores, >half of it rclpy executor wait-set-rebuild machinery across the 3 hubs; older rosbridge-era profiles kept below for history"
 metadata: 
   node_type: memory
   type: project
@@ -95,6 +95,44 @@ Profiler scripts (per-process + per-thread /proc utime+stime samplers, and the l
 micro-benchmarks) were one-off in /tmp on the board; re-derive from this note if needed.
 The actionable reduction plan from this session is in [[cpu-reduction-plan]] (user will
 decide scope later — nothing implemented yet).
+
+**Update (2026-07-14) — POST-overhaul re-profile (the "re-profile pending" from
+[[cpu-reduction-plan]]). All sensors up, web UI open on the Camera view, robot idle.
+Total ~60% of 4 cores (~2.4 cores), load avg ~2.7, no swap/iowait, RAM healthy (312 MB
+used).** Method: top -H per hub + py-spy 0.4.2 (now at `~/bin/py-spy` on the board,
+aarch64 from the PyPI wheel; needs sudo) `record --format raw` 20 s per hub, aggregated
+by thread + deepest project frame. Per-process: app_hub 123% (main 88 + gpu_vision
+thread 31), sensor_hub 71% (main 52 + LDS reader 18 + IMU reader ~6), nav_node 25%,
+zenohd-serial 8%, uvcvideo kworkers ~5%, map_bridge ~1.
+- **HEADLINE: ~1.3 cores (>half the total burn) is pure rclpy Humble executor
+  machinery**, not callbacks: app_hub main = 84% executor bookkeeping, sensor_hub 54%,
+  nav_node 84%. Leaf lines are wait-set REBUILD work (`_wait_for_ready_callbacks`,
+  `qos_event.py` add_to_wait_set/get_num_entities per entity, `callback_groups.can_execute`,
+  `waitable.__add__`, contextlib enter/exit churn) — Humble's pure-Python
+  SingleThreadedExecutor tears down + rebuilds the whole wait set (every sub/timer/
+  service + per-entity QoS-event waitables of ALL co-resident nodes) on EVERY spin_once
+  wakeup. Cost = wakeup rate × total entities; the hub merge (great for RAM) multiplies
+  the per-wakeup entity count. Wakeup drivers: sensor_hub /imu/euler 25 Hz + /imu/web
+  15 Hz (sys_monitor is their ONLY subscriber and is co-resident!) + /wheel_ticks +
+  odom 15 Hz timer; app_hub telemetry-open lazy subs (/odom etc.) + oled/mood/telemetry
+  timers; nav /odom + /scan + 10 Hz control timer.
+- **gpu_vision thread 31%**: 58% = `readback_into` glReadPixels stall (synchronous GPU
+  pipeline drain, ~0.18 core), ~21% = live-view fullscreen draw + tjCompress2 JPEG
+  (only while the Camera view is watched, by design), rest V4L2 read + downsample chain.
+- **LDS serial reader ~0.19 core**: `lds_node.py:173` `ser.read(in_waiting or 1)` wakes
+  per-few-bytes at 115200 baud → thousands of tiny reads/s. Batch the blocking read
+  (min-chunk + timeout) for a cheap ~0.15-core win.
+- Real work is small: SLAM math ~3% of a core while idle (still-skip works), app
+  callbacks (telemetry tick/oled/mood/vision-state) ~0.14 core, odom ~0.05.
+- py-spy caveat learned: HTTP keep-alive handler threads blocked in `socket.readinto`
+  are miscounted as "active" by py-spy (native recv) — looked like 23% of app_hub
+  samples but top -H shows ~0.5% real. Always cross-check py-spy buckets against top -H
+  per-thread CPU.
+- Remedy ranking (NOT yet implemented): (1) cut executor wakeups — in-process handoff
+  or rate-drop for /imu/euler+/imu/web (only sys_monitor reads them), odom 15→10 Hz;
+  (2) batch the LDS serial read; (3) lower gpu_vision fps if the readback stall
+  matters (gpu_duty already >100% under full pass set); (4) structural: leaner spin
+  loop / cached wait set (Humble has no EventsExecutor) — big lift, last resort.
 
 **Update (2026-07-04) — "80% CPU" investigated; new dominant waster = map_bridge.**
 Load avg 5.9 on 4 cores, web UI open. Sustained per-process (of 400%): rosbridge ~85-93,
