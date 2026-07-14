@@ -332,6 +332,10 @@ class NavNode(Node):
                 self.lds_idle_rpm = float(p.value)
             elif p.name == "lds_active_rpm":
                 self.lds_active_rpm = float(p.value)
+                if self._lds_active:
+                    # currently spinning -> apply the new setpoint now, not just at the
+                    # next idle<->active transition, so the web slider feels live
+                    self.lds_rpm_pub.publish(Float32(data=self.lds_active_rpm))
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------

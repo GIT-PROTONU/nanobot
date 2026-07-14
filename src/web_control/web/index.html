@@ -58,7 +58,7 @@
             <!-- single <span> child: #mapWait is a flex centerer, and bare inline
                  children would each become their own flex item and reflow -->
             <div id="mapWait"><span>waiting for map… is the lidar spinning?<br>
-              (set <b>LDS target</b> &gt; 0 rpm in <b>Sensors</b>)</span></div>
+              (set <b>Spin target</b> &gt; 0 rpm in <b>Sensors</b> → Lidar (LDS))</span></div>
           </div>
           <button id="mapFit" class="overlay-btn">⤢ Fit</button>
         </div>
@@ -435,14 +435,28 @@
               <span>points</span><b id="ldsPts">–</b>
               <span>lost/rev</span><b id="ldsLost">–</b>
               <span>rx errors</span><b id="ldsErr">–</b>
+              <span>spin</span><b id="espLdsRpm">–</b>
+              <span>spin frames</span><b id="espLdsHz">–</b>
+              <span>spin duty</span><b id="espLdsDuty">–</b>
             </div>
             <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
               <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
+            <div class="field"><label>Spin target <span id="ldsTgtV">300</span> rpm</label>
+              <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
+            <label class="switch"><input type="checkbox" id="navLdsIdleEnable" checked><span class="track"></span>
+              Idle spin-down</label>
+            <div class="field"><label>Spin down after <span id="navLdsIdleV">60</span>s idle</label>
+              <input id="navLdsIdle" type="range" min="0" max="300" step="10" value="60"></div>
             <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
               <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
               bad-checksum packets since start (climbing fast = degraded serial RX wiring).
               When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
-              UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.</p>
+              UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.
+              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets the
+              rpm to resume to (applied immediately while spinning, else at the next wake).
+              <b>Idle spin-down</b> parks the spin motor (0 rpm) after this long with no
+              motion/goal/exploring, and wakes instantly on a new goal, exploring, teleop
+              motion, pickup, or relocalizing — untick to keep the lidar always spinning.</p>
           </div>
           <div class="card">
             <h2>Camera (GPU vision)</h2>
@@ -629,20 +643,15 @@
               <span>R wheel</span><b id="espSuspR">–</b>
               <span>temp</span><b id="espTemp">–</b>
               <span>hall</span><b id="espHall">–</b>
-              <span>LDS spin</span><b id="espLdsRpm">–</b>
-              <span>LDS frames</span><b id="espLdsHz">–</b>
-              <span>LDS duty</span><b id="espLdsDuty">–</b>
             </div>
-            <div class="field"><label>LDS target <span id="ldsTgtV">300</span> rpm</label>
-              <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>
                 <option value="0">force down — ignore pick-up</option>
                 <option value="1">force up — simulate pick-up</option>
               </select></div>
-            <p class="hint">Live from the ESP32 (zenoh-pico over UART). Slider publishes
-              <b>/lds_target_rpm</b> (PID spin setpoint). The override publishes
+            <p class="hint">Live from the ESP32 (zenoh-pico over UART). LDS spin telemetry
+              + target rpm moved to the <b>Lidar (LDS)</b> card above. The override publishes
               <b>/pickup_override</b> so pick-up-gated behaviour (SLAM freeze, mood reflex)
               can be tested off the ground; the L/R rows keep showing the real switches.
               Resets to auto on page reload.</p>
@@ -670,15 +679,7 @@
               moving for that long ("off" = never). <b>Auto-relocalize</b> is the local
               lost-robot recovery (wide scan-match + spin); <b>Pause SLAM when picked up</b>
               freezes mapping while both wheels are off the ground. All apply live, no
-              restart.</p>
-            <label class="switch"><input type="checkbox" id="navLdsIdleEnable" checked><span class="track"></span>
-              LDS idle spin-down</label>
-            <div class="field"><label>LDS idle spin-down <span id="navLdsIdleV">60</span>s</label>
-              <input id="navLdsIdle" type="range" min="0" max="300" step="10" value="60"></div>
-            <p class="hint">Parks the lidar spin motor after this long with no motion/goal/
-              exploring (0 = never spin down). Wakes instantly on a new goal, exploring,
-              teleop motion, pickup, or relocalizing. Untick to disable the whole behaviour
-              and keep the lidar always spinning, regardless of the timeout below.</p>
+              restart. LDS idle spin-down moved to the <b>Lidar (LDS)</b> card above.</p>
           </div>
         </section>
 

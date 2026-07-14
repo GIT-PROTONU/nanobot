@@ -56,10 +56,15 @@ $("navPickupPause").onchange=e=>setParam("slam_nav","pickup_pause",e.target.chec
 $("navLdsIdleEnable").onchange=e=>setParam("slam_nav","lds_idle_enable",e.target.checked);
 $("navLdsIdle").oninput=()=>$("navLdsIdleV").textContent=Number($("navLdsIdle").value)===0?"off":$("navLdsIdle").value;
 $("navLdsIdle").onchange=()=>setParam("slam_nav","lds_idle_timeout",Number($("navLdsIdle").value));
-// LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
+// LDS spin-speed setpoint -> slam_nav's lds_active_rpm param (the rpm to resume to).
+// NOT a direct /lds_target_rpm publish: slam_nav owns that topic (idle spin-down
+// toggles it between active/idle), and publishing over it here would win on every
+// browser (re)connect and fight the parked state -- which is why spin-down was never
+// observed. slam_nav applies the new rpm immediately if currently spinning, or at the
+// next wake if currently parked.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
-function publishLdsTgt(){ pub("/lds_target_rpm",Number($("ldsTgt").value)); }
+function publishLdsTgt(){ setParam("slam_nav","lds_active_rpm",Number($("ldsTgt").value)); }
 // Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
 $("pickupOv").onchange=()=>publishPickupOv();
 function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value)); }
@@ -81,9 +86,9 @@ $("fanStart").oninput=()=>$("fanStartV").textContent=$("fanStart").value;
 $("fanStart").onchange=()=>setParam("sys_monitor","fan_temp_min",Number($("fanStart").value));
 // On (re)connect, push the current Auto/override state once so the node matches the UI.
 function syncFan(){ setFanOverride($("fanAuto").checked?-1:Number($("fanOv").value)/100); }
-// On (re)connect, push the slider's current value once so the robot's spin setpoint
-// matches the UI without a manual drag (the firmware boots at 300 rpm; this keeps the
-// shown value authoritative even if it differs).
+// On (re)connect, push the slider's current value once so slam_nav's active-rpm param
+// matches the UI without a manual drag. Safe to call on every reconnect now that this
+// only sets the param slam_nav reads, not the /lds_target_rpm topic it owns.
 function syncLdsTgt(){ publishLdsTgt(); }
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
