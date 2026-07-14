@@ -212,6 +212,19 @@ class ImuNode(Node):
                     self.ser = serial.Serial(self.port, self.baud, timeout=0.2)
                     self._need_reconfig.clear()
                     self._configure_device()
+                    # The very first configure right after opening the port can be lost
+                    # (suspected: the CH340 adapter's DTR toggle on open resets the
+                    # BWT901CL, which is still finishing its own power-on cycle when the
+                    # unlock/RRATE bytes land) -- the device then silently keeps
+                    # streaming its 200 Hz factory default while `_dev_hz` (and the
+                    # publish-gate fast path in `_handle`) already trust the requested
+                    # rate, so /imu/data publishes at the raw 200 Hz instead of
+                    # `publish_rate`. Confirmed on hardware: simply re-sending the exact
+                    # same config (e.g. re-touching the web UI rate slider) always fixes
+                    # it once the port is stable -- so repeat it once here after a brief
+                    # settle instead of waiting on the user to notice and retune.
+                    time.sleep(0.5)
+                    self._configure_device()
                     self.get_logger().info(
                         f"BWT901CL open on {self.port} @{self.baud} "
                         f"(stream {self._dev_hz} Hz, publish {self.publish_rate:g} Hz)")

@@ -144,12 +144,13 @@ class _GL:
 
     def close(self):
         """Tear down every GL object THEN the EGL context, so repeatedly starting/
-        stopping GpuVision (e.g. toggling manual mode) doesn't leak a little more each
-        cycle. `eglDestroyContext` alone is supposed to implicitly free everything
-        associated with the context per the EGL/GL spec, but confirmed on hardware this
-        isn't fully honored by `lima` (a reverse-engineered driver) -- toggling manual
-        mode repeatedly grew RSS by ~3-4MB per cycle with only eglDestroyContext, not
-        plateauing. Explicit glDelete* calls (more likely to be correctly implemented
+        stopping GpuVision (e.g. toggling the camera off/on) doesn't leak a little
+        more each cycle. `eglDestroyContext` alone is supposed to implicitly free
+        everything associated with the context per the EGL/GL spec, but confirmed on
+        hardware this isn't fully honored by `lima` (a reverse-engineered driver) --
+        repeated start/stop cycles grew RSS by ~3-4MB per cycle with only
+        eglDestroyContext, not plateauing. Explicit glDelete* calls (more likely to be
+        correctly implemented
         than the implicit context-teardown path) close that gap. Deletion must happen
         BEFORE releasing the context (eglMakeCurrent(NONE)) -- GL calls need a current
         context. Safe to call even if construction partially failed."""
@@ -259,6 +260,23 @@ varying vec2 v_uv;
 void main() {
     vec2 uv = pos * 0.5 + 0.5;
     v_uv = vec2(1.0 - uv.x, uv.y);
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+"""
+
+# The camera is physically mounted upside down, so the very first pass (raw YUYV -> RGB,
+# which produces `cur_tex` -- the single frame every other pass reads: diff/threshold/luma/
+# edge/colour-cast/novelty AND the browser tee) samples rows top-to-bottom REVERSED. Doing
+# it here, once, at the source means every downstream consumer (analysis + display) just
+# sees an already-upright frame with no further changes -- no interaction with the
+# unrelated column-mirror quirk _FLIP_VS corrects (that's a horizontal-only artifact on a
+# separate axis, still needed as-is for the browser tee/mask views).
+_VFLIP_VS = b"""
+attribute vec2 pos;
+varying vec2 v_uv;
+void main() {
+    vec2 uv = pos * 0.5 + 0.5;
+    v_uv = vec2(uv.x, 1.0 - uv.y);
     gl_Position = vec4(pos, 0.0, 1.0);
 }
 """
@@ -585,8 +603,8 @@ class JpegEncoder:
 
     def close(self):
         """Free the compressor instance. A fresh JpegEncoder is created every time
-        GpuVision._loop() (re)starts (e.g. toggling manual mode) -- without this, each
-        cycle leaked a `tjInitCompress()` handle's internal buffers/tables (DCT/
+        GpuVision._loop() (re)starts (e.g. toggling the camera off/on) -- without
+        this, each cycle leaked a `tjInitCompress()` handle's internal buffers/tables (DCT/
         quantization tables, row buffers) with no way to reclaim them, forever.
         Confirmed a real contributor on hardware: RSS kept growing ~3-4MB/cycle even
         after GLContext.close() explicitly deleted every GL object, which pointed at a
@@ -1025,14 +1043,14 @@ class GpuVision:
             gl.close()
             self._run = False
             return
-        # Retry a handful of times: when switching OFF manual mode, the direct
-        # CameraStream backend releases the V4L2 device ASYNCHRONOUSLY in its own
-        # thread (a viewer's remove_viewer() just sets a flag; the actual close()
-        # happens once that thread notices) -- confirmed on hardware this creates a
-        # real, reproducible "[Errno 16] Device or resource busy" race right after
-        # toggling manual mode off. The busy condition is transient (clears within a
-        # few hundred ms once the other backend's thread catches up), so retry instead
-        # of giving up on the very first attempt.
+        # Retry a handful of times: the direct CameraStream backend (the fallback used
+        # when GPU vision is off/unavailable) releases the V4L2 device ASYNCHRONOUSLY
+        # in its own thread (a viewer's remove_viewer() just sets a flag; the actual
+        # close() happens once that thread notices) -- confirmed on hardware this can
+        # create a real, reproducible "[Errno 16] Device or resource busy" race if the
+        # two backends' ownership windows ever overlap. The busy condition is
+        # transient (clears within a few hundred ms once the other backend's thread
+        # catches up), so retry instead of giving up on the very first attempt.
         cam = None
         last_exc = None
         for attempt in range(6):
@@ -1053,7 +1071,7 @@ class GpuVision:
                    f"bytesperline={cam.bytesperline}")
         W, H = cam.width, cam.height
 
-        yuyv_prog = gl.program(_QUAD_VS, _YUYV_TO_RGB_FS)
+        yuyv_prog = gl.program(_VFLIP_VS, _YUYV_TO_RGB_FS)
         u_half_width = gl.gl.glGetUniformLocation(yuyv_prog, b"half_width")
         copy_prog = gl.program(_QUAD_VS, _COPY_FS)
         diff_prog = gl.program(_QUAD_VS, _DIFF_FS)
@@ -1604,7 +1622,7 @@ if __name__ == "__main__":
         for _ in range(5):
             buf = cam.read(1000)
         W, H = cam.width, cam.height
-        yuyv_prog = gl.program(_QUAD_VS, _YUYV_TO_RGB_FS)
+        yuyv_prog = gl.program(_VFLIP_VS, _YUYV_TO_RGB_FS)
         u_half_width = gl.gl.glGetUniformLocation(yuyv_prog, b"half_width")
         thresh_prog = gl.program(_QUAD_VS, _THRESHOLD_FS)
         u_tex = gl.gl.glGetUniformLocation(thresh_prog, b"tex")
@@ -1657,7 +1675,7 @@ if __name__ == "__main__":
     assert buf is not None, "no frame captured"
     print(f"got frame: {len(buf)} bytes (expect {cam.width*cam.height*2})")
 
-    yuyv_prog = gl.program(_QUAD_VS, _YUYV_TO_RGB_FS)
+    yuyv_prog = gl.program(_VFLIP_VS, _YUYV_TO_RGB_FS)
     u_half_width = gl.gl.glGetUniformLocation(yuyv_prog, b"half_width")
     quad = make_quad_vbo(gl)
     W, H = cam.width, cam.height

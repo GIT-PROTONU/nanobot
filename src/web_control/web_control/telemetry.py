@@ -239,9 +239,9 @@ class TelemetryHub:
         web_control params (not fixed constants), same pattern as _optical_bumper --
         the web UI's sliders actually take effect immediately, no restart needed. Kept
         in telemetry.py rather than gpu_vision.py so tuning never touches the GL thread.
-        `frozen` (manual mode / camera master switch off) suppresses the stateful,
-        time-based alerts -- a deliberately stopped capture thread would otherwise read
-        as a "frozen camera", and a stale edge_density as vibration."""
+        `frozen` (camera master switch off) suppresses the stateful, time-based
+        alerts -- a deliberately stopped capture thread would otherwise read as a
+        "frozen camera", and a stale edge_density as vibration."""
         g = self._node.get_parameter
         now = time.monotonic() if now is None else now
         luma = gv.luma
@@ -323,19 +323,18 @@ class TelemetryHub:
         if self._selftest:
             f["selftest"] = self._selftest
         gv = getattr(n, "_gpu_vision", None)
-        manual = bool(getattr(n, "_manual_mode", False))
         camera_enabled = not bool(getattr(n, "_camera_disabled", False))
         if gv is not None:
             # Plain thread-safe Python properties, not a ROS topic -- no subscription
             # needed, just read on each tick (gpu_vision.py runs continuously regardless
-            # of telemetry clients, so this is never stale) -- UNLESS manual mode OR the
-            # master camera-disable switch has stopped GpuVision's capture thread
-            # entirely (see WebServerNode.vision_manual / set_camera_enable), in which
-            # case these properties are frozen at their last value before the stop, not
-            # live. Still report them (harmless, and lets the UI show "last known"
-            # state) but `manual`/`camera_enabled` let the page grey them out / label
-            # them stale instead of implying they're updating.
-            frozen = manual or not camera_enabled
+            # of telemetry clients, so this is never stale) -- UNLESS the master
+            # camera-disable switch has stopped GpuVision's capture thread entirely
+            # (see WebServerNode.set_camera_enable), in which case these properties are
+            # frozen at their last value before the stop, not live. Still report them
+            # (harmless, and lets the UI show "last known" state) but `camera_enabled`
+            # lets the page grey them out / label them stale instead of implying
+            # they're updating.
+            frozen = not camera_enabled
             target = gv.target
             motion_center = gv.motion_center
             motion_score = gv.motion_score
@@ -345,7 +344,6 @@ class TelemetryHub:
             match = gv.motion_target_match
             frame_age = gv.frame_age
             f["vision"] = {
-                "manual": manual,
                 "camera_enabled": camera_enabled,
                 "target_name": getattr(n, "_vision_target_active", None),
                 "approach": bool(getattr(n, "_vision_approach", False)),

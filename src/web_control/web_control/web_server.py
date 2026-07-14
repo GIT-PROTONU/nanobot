@@ -284,14 +284,13 @@ class WebServerNode(Node):
 
         # The direct hardware-MJPEG passthrough is ALWAYS constructed (cheap -- lazily
         # opens the camera only once a viewer actually connects, same as before
-        # GPU vision existed) so it's available as manual mode's fallback backend even
-        # when GPU vision is the default. Idle cost is zero either way.
+        # GPU vision existed) so it's available as the fallback backend when GPU
+        # vision is off/unavailable. Idle cost is zero either way.
         self._cam_direct = CameraStream(
             dev=g("cam_device").value or None,
             width=g("cam_width").value, height=g("cam_height").value,
             fps=g("cam_fps").value, logger=self.get_logger().info)
         self._gpu_vision = None
-        self._manual_mode = False          # see vision_manual() / the `_cam` property below
         self._camera_disabled = False      # master off switch, see set_camera_enable() below
         self._dark_led_pub = None
         self._dark_led_on = False
@@ -1233,13 +1232,12 @@ class WebServerNode(Node):
         _stream_mjpeg/the mask streams, already treats a None/no-camera backend as
         "503, no camera", so this needed no new handling downstream); otherwise the
         direct hardware-MJPEG passthrough (CameraStream, zero CPU/GPU cost) when GPU
-        vision is off entirely OR manual mode is on, else GpuVision's JPEG tee. Both
-        `_cam_direct` and `_gpu_vision` share the same add_viewer/get_frame/
-        remove_viewer/running shape, so every existing caller needed zero other
-        changes to become manual-mode-aware."""
+        vision is off/unavailable, else GpuVision's JPEG tee. Both `_cam_direct` and
+        `_gpu_vision` share the same add_viewer/get_frame/remove_viewer/running shape,
+        so every existing caller needed zero other changes."""
         if self._camera_disabled:
             return None
-        if self._gpu_vision is None or self._manual_mode:
+        if self._gpu_vision is None:
             return self._cam_direct
         return self._gpu_vision
 
@@ -1249,48 +1247,22 @@ class WebServerNode(Node):
         for when the extra cheap-tier vision passes' CPU/GPU cost isn't wanted right
         now (see gpu-vision-implemented memory's gpu_duty finding: the fuller pass set
         can run 60-190% of the frame budget per tick). Disabling stops GpuVision's
-        capture thread entirely if it was running (releasing the V4L2 device, same as
-        vision_manual's ON path); re-enabling resumes it (unless manual mode is also
-        on, in which case there's nothing GPU-side to resume -- the direct passthrough
-        just starts working again on its own, it's already lazy/per-viewer)."""
+        capture thread entirely if it was running (releasing the V4L2 device);
+        re-enabling resumes it."""
         want_enabled = bool(d.get("enabled", True))
         if want_enabled == (not self._camera_disabled):
             return {"ok": True, "camera_enabled": not self._camera_disabled}
         if not want_enabled:
             if self._oled_mask_on:          # no live mask to mirror while capture is off
                 self._set_oled_mask_state(False)
-            if self._gpu_vision is not None and not self._manual_mode:
+            if self._gpu_vision is not None:
                 self._gpu_vision.stop()     # release the V4L2 device
             self._camera_disabled = True
         else:
             self._camera_disabled = False
-            if self._gpu_vision is not None and not self._manual_mode:
+            if self._gpu_vision is not None:
                 self._gpu_vision.start()    # reacquire + resume PIR/blob/luma/dark-reflex
         return {"ok": True, "camera_enabled": not self._camera_disabled}
-
-    def vision_manual(self, d):
-        """POST /vision/manual {enabled: bool}: flip between GpuVision's camera
-        ownership and the direct hardware-MJPEG passthrough, live, no restart needed.
-        Manual mode = zero GPU/CPU vision cost (no PIR, no blob tracking, no dark
-        reflex -- GpuVision's capture thread is fully stopped, releasing the V4L2
-        device so the direct backend can open it; the C270 only exposes one true
-        capture-capable node, see memory gpu-vision-camera-architecture, so exactly one
-        backend may hold the camera at a time). A no-op if GPU vision was never enabled
-        (there's nothing to switch away from -- already always direct)."""
-        if self._gpu_vision is None:
-            return {"error": "gpu vision not enabled -- camera is already direct"}
-        want = bool(d.get("enabled"))
-        if want == self._manual_mode:
-            return {"ok": True, "manual_mode": self._manual_mode}
-        if want:
-            if self._oled_mask_on:         # no live mask to mirror while GpuVision is stopped
-                self._set_oled_mask_state(False)
-            self._gpu_vision.stop()        # release the V4L2 device before direct opens it
-            self._manual_mode = True
-        else:
-            self._manual_mode = False
-            self._gpu_vision.start()       # reacquire + resume PIR/blob/luma/dark-reflex
-        return {"ok": True, "manual_mode": self._manual_mode}
 
     def _dark_reflex_tick(self):
         """Flashlight/dark reflex: auto-toggle /led from the GPU's average frame
@@ -1301,12 +1273,12 @@ class WebServerNode(Node):
         either way (one param read + one property read per second)."""
         if self._gpu_vision is None or self._dark_led_pub is None:
             return
-        # Manual mode OR the master camera-disable switch both stop GpuVision entirely
-        # (see vision_manual / set_camera_enable) -- .luma would be frozen at whatever
-        # it last was, not a live reading. Treat it the same as "disabled": release the
-        # LED rather than act on stale data.
+        # The master camera-disable switch stops GpuVision entirely (see
+        # set_camera_enable) -- .luma would be frozen at whatever it last was, not a
+        # live reading. Treat it the same as "disabled": release the LED rather than
+        # act on stale data.
         if (not self.get_parameter("vision_dark_reflex_enable").value
-                or self._manual_mode or self._camera_disabled):
+                or self._camera_disabled):
             if self._dark_led_on:            # was on when disabled -- don't leave it stuck
                 self._dark_led_on = False
                 self._dark_led_pub.publish(Bool(data=False))
@@ -1334,14 +1306,14 @@ class WebServerNode(Node):
         something coming toward the lens -- the greeting reflex's trigger, cheaper and
         earlier than waiting for pickup), and publishes the compact /vision/state JSON
         the behaviour node's reflexes consume. Nothing is published while the pipeline
-        is frozen (manual mode / camera off), so mood_node's freshness window naturally
-        stands the vision reflexes down."""
+        is frozen (camera off), so mood_node's freshness window naturally stands the
+        vision reflexes down."""
         gv = self._gpu_vision
         if gv is None:
             return
         g = self.get_parameter
         gv.set_glare_derate(g("vision_glare_derate").value)
-        if self._manual_mode or self._camera_disabled or not gv.running():
+        if self._camera_disabled or not gv.running():
             self._vision_approach = False
             return
         rate = gv.motion_intercept_rate
@@ -1369,7 +1341,7 @@ class WebServerNode(Node):
         cognition core's visual diary; the core itself rate-limits to
         vision_diary_period, so this is a couple of property reads when not due."""
         gv = self._gpu_vision
-        if gv is None or self._manual_mode or self._camera_disabled or not gv.running():
+        if gv is None or self._camera_disabled or not gv.running():
             return
         cast = gv.color_cast
         self._cog.record_vision_snapshot({
@@ -1713,7 +1685,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/brain/reflect": lambda n, d: n.brain_reflect(d),
         "/vision/calibrate": lambda n, d: n.vision_calibrate(d),
         "/vision/blob_tune": lambda n, d: n.vision_blob_tune(d),
-        "/vision/manual": lambda n, d: n.vision_manual(d),
         "/vision/camera_enable": lambda n, d: n.set_camera_enable(d),
         "/vision/target_select": lambda n, d: n.vision_target_select(d),
         "/vision/target_delete": lambda n, d: n.vision_target_delete(d),
@@ -1885,10 +1856,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _stream_mjpeg(self):
         # Resolve the active camera backend ONCE, at the start of this streaming
         # session, not on every call -- `node._cam` is a property that can swap
-        # between GpuVision and the direct hardware-MJPEG CameraStream (manual mode,
-        # see WebServerNode.vision_manual). Pinning it here means a mid-stream toggle
-        # takes effect on the NEXT connection, not this already-open one -- avoids
-        # split-brain viewer-count accounting between two different backend objects.
+        # between GpuVision and the direct hardware-MJPEG CameraStream (GPU vision
+        # off/unavailable, see WebServerNode._cam). Pinning it here means a mid-stream
+        # toggle takes effect on the NEXT connection, not this already-open one --
+        # avoids split-brain viewer-count accounting between two different backend
+        # objects.
         cam = self._node._cam if self._node is not None else self._stream
         if cam is None:
             self.send_error(503, "no camera")
@@ -1923,12 +1895,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         """GET /stream_mask.mjpg: the live colour-threshold mask (white = matches the
         calibrated target colour, black = doesn't) instead of the normal camera feed --
         "where is the tracked colour actually showing up." Only meaningful while GPU
-        vision owns the camera (not manual mode) AND a target colour is calibrated;
-        both are checked up front so this fails fast with a clear reason instead of
-        hanging on a mask frame that will never be computed."""
+        vision owns the camera AND a target colour is calibrated; both are checked up
+        front so this fails fast with a clear reason instead of hanging on a mask
+        frame that will never be computed."""
         gv = getattr(self._node, "_gpu_vision", None) if self._node is not None else None
-        if gv is None or getattr(self._node, "_manual_mode", False):
-            self.send_error(503, "gpu vision not active (off, or in manual/direct mode)")
+        if gv is None:
+            self.send_error(503, "gpu vision not active")
             return
         if not gv.has_target_color:
             self.send_error(503, "no target colour set -- pick one first")
@@ -1963,12 +1935,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         """GET /stream_motion_mask.mjpg: the live PIR/motion-diff mask (brighter = more
         change since the last frame) instead of the normal camera feed -- "where is
         something actually moving," as opposed to the colour mask's "where is the
-        tracked colour." Only meaningful while GPU vision owns the camera (not manual
-        mode); unlike the colour mask, no target colour needs to be set -- motion diff
-        runs unconditionally once a second frame has arrived."""
+        tracked colour." Only meaningful while GPU vision owns the camera; unlike the
+        colour mask, no target colour needs to be set -- motion diff runs
+        unconditionally once a second frame has arrived."""
         gv = getattr(self._node, "_gpu_vision", None) if self._node is not None else None
-        if gv is None or getattr(self._node, "_manual_mode", False):
-            self.send_error(503, "gpu vision not active (off, or in manual/direct mode)")
+        if gv is None:
+            self.send_error(503, "gpu vision not active")
             return
         gv.add_motion_mask_viewer()
         self.close_connection = True

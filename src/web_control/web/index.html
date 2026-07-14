@@ -115,9 +115,6 @@
             <button id="visionMaskToggle" class="btn">🎭 Show tracking mask</button>
             <button id="visionMotionMaskToggle" class="btn">👣 Show motion mask</button>
             <button id="visionOledMask" class="btn">🖥 Mask → OLED</button>
-            <label class="switch" id="visManualRow" style="display:none">
-              <input type="checkbox" id="visManual"><span class="track"></span>
-              🎥 Manual (no GPU)</label>
           </div>
           <div class="meter"><span class="lbl">in</span><span class="bar"><i id="micBar"></i></span><b id="micPct">–</b></div>
           <p class="hint" id="camHint" style="display:none">USB webcam MJPEG (<b>/stream.mjpg</b>)
@@ -132,11 +129,7 @@
             <b>🎭 Show tracking mask</b> swaps the feed to a black/white view of exactly which
             pixels match the calibrated colour right now — needs a target colour set first, or
             it'll show an error. <b>🖥 Mask → OLED</b> mirrors that same mask to the robot's
-            physical OLED panel (128×64, re-binarized) — the face yields while it's on.
-            <b>🎥 Manual mode</b> (only shown when GPU vision is on) swaps
-            the feed to the raw hardware MJPEG passthrough — zero CPU/GPU cost, but
-            PIR/blob-tracking/dark-reflex/mask view all pause while it's on (nothing to analyse
-            without the GPU capture running).</p>
+            physical OLED panel (128×64, re-binarized) — the face yields while it's on.</p>
         </div>
       </div>
     </section>
@@ -455,9 +448,6 @@
             <h2>Camera (GPU vision)</h2>
             <label class="switch"><input type="checkbox" id="visCameraEnable" checked><span class="track"></span>
               📷 Camera enabled</label>
-            <label class="switch" id="visManualRow2" style="display:none">
-              <input type="checkbox" id="visManual2"><span class="track"></span>
-              🎥 Manual mode (direct feed, no GPU)</label>
             <div class="kv">
               <span>motion</span><b id="visMotion2">–</b>
               <span>motion center</span><b id="visMotionCenter2">–</b>
@@ -553,10 +543,7 @@
             </div>
             <p class="hint">Continuous on-GPU frame-diff ("PIR") + optional colour-blob
               tracking + luminance, computed whether or not the video view is open (all
-              off when <b>gpu_vision_enable</b> is false). <b>Manual mode</b> bypasses the
-              whole GPU pipeline for a raw hardware MJPEG passthrough — zero CPU/GPU cost,
-              but PIR/blob-tracking/dark-reflex/mask view all pause while it's on (same
-              toggle as the one above the Camera view). <b>Motion center</b>/
+              off when <b>gpu_vision_enable</b> is false). <b>Motion center</b>/
               <b>intercept rate</b> are the motion-saliency and kinetic-intercept Tier-B
               extensions. <b>Motion intercept</b> is the same looming-alert math applied to
               raw motion instead of a calibrated target — no colour needs to be set. <b>Lens

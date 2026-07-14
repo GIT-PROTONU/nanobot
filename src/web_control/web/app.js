@@ -326,25 +326,9 @@ $("visionClear").onclick=()=>{
 };
 $("cam").addEventListener("click",onCamPickClick);
 
-// Manual mode: direct hardware-MJPEG passthrough, bypassing GPU vision entirely
-// (zero CPU/GPU cost, but pauses PIR/blob-tracking/dark-reflex -- see WebServerNode.
-// vision_manual). Two checkboxes drive the same server state -- one over the Camera
-// view, one on the Sensors "Camera (GPU vision)" card, so the pipeline can be killed
-// without switching views. Both are synced FROM telemetry (see onVision), so these
-// handlers only fire on a genuine user click, not the programmatic sync; each also
-// mirrors its own state onto the other checkbox immediately, instead of waiting for
-// the next telemetry tick to catch up.
-function setVisManual(enabled){
-  $("visManual").checked=enabled; $("visManual2").checked=enabled;
-  fetch("/vision/manual",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({enabled})}).catch(()=>{});
-}
-$("visManual").onchange=()=>setVisManual($("visManual").checked);
-$("visManual2").onchange=()=>setVisManual($("visManual2").checked);
-
 // Master camera on/off (see set_camera_enable in web_server.py) -- stops GpuVision AND
-// the direct passthrough entirely, distinct from manual mode (which still runs the
-// direct passthrough). Same synced-from-telemetry shape as setVisManual above.
+// the direct passthrough entirely. Synced FROM telemetry (see onVision), so this
+// handler only fires on a genuine user click, not the programmatic sync.
 $("visCameraEnable").onchange=()=>{
   const enabled=$("visCameraEnable").checked;
   fetch("/vision/camera_enable",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -462,8 +446,7 @@ const HINTS = {
   sysWifi: "WiFi signal strength (dBm) and link quality (green ≥ -60dBm, amber ≥ -75, red below).",
   sysUp: "Time since this stack process last started (not the board's boot time).",
   // Camera (GPU vision) card -- toggles
-  visCameraEnable: "Master camera switch -- turns off BOTH GPU vision AND the direct passthrough entirely. Distinct from Manual mode, which still runs the direct feed.",
-  visManual2: "Bypasses the whole GPU pipeline for a raw hardware MJPEG passthrough -- zero CPU/GPU cost, but PIR/blob-tracking/dark-reflex/mask views all pause while on.",
+  visCameraEnable: "Master camera switch -- turns off BOTH GPU vision AND the direct passthrough entirely.",
   visDarkAuto: "Auto-toggles the ESP32's /led from frame brightness, with hysteresis (on/off thresholds must stay apart to avoid flicker).",
   // Camera card -- readouts
   visMotion2: "PIR-style motion score: average per-pixel frame-to-frame change (0-100%). Near zero = static scene.",
@@ -541,27 +524,17 @@ $("hintsToggle").onchange=()=>{
   applyHints(hintsOn);
 };
 
-let visManualSynced=false, blobTuneSynced=false, cameraEnableSynced=false;
+let blobTuneSynced=false, cameraEnableSynced=false;
 function onVision(v){
-  const manualRow=$("visManualRow"), manualRow2=$("visManualRow2"), cross=$("visionCrosshair");
+  const cross=$("visionCrosshair");
   const ids=["visMotion2","visMotionCenter2","visTarget2","visTargetName2","visIntercept2",
     "visMotionIntercept2","visMotionTargetMatch2","visApproach2","visNovelty2","visLuma2",
     "visObstructed2","visCamFreeze2","visVibration2","visColorCast2","visEdgeDensity2",
     "visOverhead2","visShiny2","visBacklit2","visFocusBlur2","visGpuDuty2","visBumper2"];
   if(!v){
-    if(manualRow) manualRow.style.display="none";   // no GpuVision instance at all -- nothing to toggle
-    if(manualRow2) manualRow2.style.display="none";
     if(cross) cross.style.display="none";
     ids.forEach(id=>{ const el=$(id); if(el) el.textContent="off"; });
     return;
-  }
-  // The manual-mode rows only make sense when a GpuVision instance exists to switch
-  // away from/back to (gpu_vision_enable was true at startup) -- shown regardless of
-  // whether manual mode is currently on, so the operator can toggle it either way.
-  if(manualRow) manualRow.style.display="flex";
-  if(manualRow2) manualRow2.style.display="flex";
-  if(!visManualSynced){    // reflect server state once, without fighting the user's own clicks
-    $("visManual").checked=!!v.manual; $("visManual2").checked=!!v.manual; visManualSynced=true;
   }
   if(!cameraEnableSynced && v.camera_enabled!=null){
     $("visCameraEnable").checked=!!v.camera_enabled; cameraEnableSynced=true;
@@ -590,8 +563,8 @@ function onVision(v){
       $("cam").src=camStreamUrl(); $("cam").style.display="block"; hideCamWait();
     }
   }
-  const paused=!!v.manual||camOff;
-  const pausedReason=camOff?"camera off":"paused (manual mode)";
+  const paused=camOff;
+  const pausedReason="camera off";
   [$("visionPick"),$("visionClear")].forEach(b=>{ if(b) b.disabled=paused; });
   // OLED mask mirror: label + highlight follow the server state (v.oled_mask), so a
   // toggle from another tab -- or the server auto-dropping it when the camera stops --
