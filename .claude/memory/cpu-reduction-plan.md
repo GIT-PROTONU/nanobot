@@ -19,10 +19,19 @@ Camera view; ~1.0 core of that is rclpy executor wait-set churn):**
    timer + nav + app_hub subs). NOTE the web-slider live-tuning contract on these rates —
    don't break the "raise live for tuning" path, and mind that /imu/euler feeds the web
    angle display via telemetry (served from the vitals blob, so a low topic rate is fine).
-2. **Lower gpu_vision fps (~0.38 core idle, mostly the synchronous glReadPixels stall —
-   scales ~linearly with fps).** Halving fps ≈ 0.15–0.2 core back, same alerts with slower
-   reaction. gpu_duty already runs >100% under the full pass set, so the loop never hits
-   its configured rate anyway.
+2. **gpu_vision readback restructure (preferred over a plain fps drop; ~0.38 core idle,
+   mostly glReadPixels stalls).** The loop does 7–9 INTERLEAVED draw→readback cycles per
+   frame (gpu_vision.py `_loop`), each read draining the pipeline the pass before it just
+   filled. Board probe (2026-07-14, Mesa 25.0.7 lima): `GL_NV_pixel_buffer_object` +
+   `GL_EXT_map_buffer_range` + `GL_OES_mapbuffer` + `EGL_KHR_fence_sync`/`GL_OES_EGL_sync`
+   are ALL exposed, and desktop-GL bindAPI works. Design, in order of effort: (a) reorder
+   to submit ALL passes then do ALL readbacks — N stalls → 1; (b) pack the small stat
+   outputs into one tiny "stats atlas" FBO (viewport regions) — 1 readback total; (c)
+   double-buffer results and read back the PREVIOUS frame's atlas, optionally gated by an
+   EGL fence poll — zero stall (Mesa only waits on the producing job; a frame-old job is
+   done), costs 1 frame (~66 ms) of signal latency, fine for the alerts. PBO path exists
+   as a bonus but (a)–(c) work with plain glReadPixels. A cam_fps drop stays the trivial
+   fallback lever.
 3. **Batch the LDS serial read (~0.15 core).** `lds_node.py:173` does
    `ser.read(in_waiting or 1)` → thousands of tiny wakeups/s at 115200 baud; read with a
    minimum chunk (e.g. 128–256 B) + timeout instead so the reader wakes ~40×/s.
