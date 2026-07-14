@@ -22,9 +22,14 @@ The robot board is **live at 192.168.178.141**, user `ibster` (sudo). See [[proj
   [[esp32-coprocessor]] for the current firmware behavior (LDS-park + CPU low-power on genuine
   SBC absence, motor-pin boot-safety).
 
-**PENDING as of 2026-07-10:**
-- New code since the last deploy: LDS idle spin-down toggle (`slam_nav.lds_idle_enable`), [[scheduled-routines]] (new `behavior.schedule_path` param + `schedule.json`). Needs `scripts/deploy.sh` (colcon build + restart covers the code; `DEPLOY_SOUL=1` only if you want a dev-authored `memory/schedule.json` pushed too — off by default).
-- (A Mali-450 GPU blacklist was briefly added to `deploy/sbc-setup.sh` this same session, then reverted before ever being deployed — the GPU is going to be used for [[gpu-vision-features-todo]] instead. `sbc-setup.sh` is back to its original 5-step form; no re-run needed for this.)
+**2026-07-10 items are now DEPLOYED**: LDS idle spin-down toggle (`slam_nav.lds_idle_enable`) and [[scheduled-routines]] both went out with later deploys.
+(A Mali-450 GPU blacklist was briefly added to `deploy/sbc-setup.sh` this same session, then reverted before ever being deployed — the GPU is going to be used for [[gpu-vision-features-todo]] instead. `sbc-setup.sh` is back to its original 5-step form; no re-run needed for this.)
+
+**2026-07-14, DEPLOYED (commit b7f36d5, pushed to main):** consolidated all LDS web-UI
+controls into one card + fixed the reason LDS idle spin-down was never observed — see
+[[lds-idle-spindown-ui-fix]]. `pixi run smoke` passed, `scripts/deploy.sh slam_nav
+web_control` ran clean (all 5 units UP), and the fix was verified live: `POST /param`
+changing `slam_nav`'s `lds_active_rpm` moved the measured spin rpm immediately.
 
 **2026-07-13, DEPLOYED (commit e02dd58, pushed to main):** the mobile web-UI overhaul
 (`web/style.css` rewrite + `index.html`/`chrome.js` tweaks: per-tab hero sizing, floating
