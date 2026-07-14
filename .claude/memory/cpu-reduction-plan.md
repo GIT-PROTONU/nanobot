@@ -1,11 +1,50 @@
 ---
 name: cpu-reduction-plan
-description: "CPU reduction TODO — 2026-07-14 re-profile done (50% idle / 60% UI-open): three NEW approved-for-todo levers = (1) executor-wakeup cut (IMU topic rates / in-process handoff, odom 15→10), (2) gpu_vision fps drop, (3) LDS serial read batching; old tier plan below is history"
+description: "CPU reduction TODO — items 1/2/3/5/6/7 ALL BUILT+deployed+hardware-verified 2026-07-14 (commit 2f582f9): param services, QoS-event patch, LDS batching, odom/IMU rate drops, gpu_vision batched-draws+stats-atlas restructure, ESP32 wheel_ticks 30→15Hz flashed. Only fan (item 4, left alone on purpose — disconnected) and gpu_vision option (c) remain open. Old tier plan below is history"
 metadata: 
   node_type: memory
   type: project
   originSessionId: 0b7a90af-3716-490a-8ac2-008ec20c8677
 ---
+
+**STATUS (2026-07-14, same-day follow-up session — everything queued is now shipped
+except the fan):** all of items 1/2/3/5/6/7 below are DONE, committed
+(`2f582f9`), deployed to the board via `scripts/deploy.sh`, and hardware-verified
+(units active, `gpu_vision: GL context up, renderer=Mali450`, no errors in 30s of
+post-restart logs; smoke test + a synthetic-frame old-vs-new comparison harness both
+green). Specifically:
+- Item 1 (executor-wakeup cut): done via the **plain rate-drop path**, not the
+  in-process-handoff alternative — `wheel_odometry.publish_rate` 15→10Hz,
+  `imu_driver.euler_rate`/`web_rate` 25/15→5Hz (moot today since `publish_rate=1Hz`
+  already caps them lower still, but bounds future publish_rate-raised debugging).
+  Plus the QoS-event patch (item 6) and param-service opt-out (item 7), see below.
+- Item 2 (gpu_vision): **both (a) and (b) built**, NOT just the plain fps-drop
+  fallback. (a) restructured `_loop` into submit-all-draws → read-all-pixels →
+  all-CPU-scoring phases (was N interleaved draw→read stalls/frame). (b) went
+  further: the 7 small per-signal stat reductions (motion/blob/luma/color-cast/
+  edge/overhead/highlight) now render into ONE shared "stats atlas" FBO via
+  viewport-offset slots (`draw_fullscreen` gained `x0`/`y0`; `build_downsample_chain`
+  gained `drop_last=True` to skip each chain's own final stage) — **1 glReadPixels
+  total instead of 7**, each slot cheaply extracted back into its own contiguous
+  buffer (`extract_atlas_slot`, `ctypes.memmove` per row) so every downstream CPU
+  scoring function is byte-for-byte unchanged. Verified via a synthetic-frame
+  comparison harness (loads the pristine pre-session module + the edited one side by
+  side, feeds both identical fake-camera frames through a lockstep queue-based
+  camera, diffs every public readout) across 4 cases (target set/unset × viewers
+  attached/not) — 0 mismatches each time, both after (a) alone and after (a)+(b).
+  **Not built: option (c)** (double-buffer + EGL-fence-gated read of the PREVIOUS
+  frame's atlas — true zero-stall, costs ~1 frame/66ms of alert latency) — only
+  worth it if a re-profile after (a)+(b) still shows gpu_vision hot.
+- Item 3 (LDS batching), 5 (ESP32 `/wheel_ticks` 30→15Hz, flashed via
+  `pio run -t upload` on `/dev/ttyUSB0`), 6, 7: all done as originally scoped.
+- Item 4 (fan): **intentionally left alone** — user confirmed the fan is
+  disconnected on purpose, not a bug to chase.
+- **Not yet done: a fresh on-board re-profile** to measure the actual combined win
+  (the plan's 50%→20-25% idle estimate was never re-measured after this batch).
+- Minor architectural leftover, still open, low priority: OLED's `/imu/web`+
+  `/lds_hz` subs still cross a process boundary into `app_hub` (noted in the
+  2026-07-06 overhaul, unaffected by this batch) — revisit only if a future profile
+  shows it still matters.
 
 **TODO (2026-07-14, user asked to queue these — from the post-overhaul re-profile in
 [[sbc-cpu-profile]]; baselines: ~50% of 4 cores idle, ~60% with the web UI open on the

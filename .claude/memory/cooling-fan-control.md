@@ -33,6 +33,11 @@ pattern): **ESP32 is a dumb PWM actuator, the SBC owns the policy.**
 **Firmware + SBC side ARE deployed** (updated 2026-07-05): the fan code has shipped in every
 firmware flash since late June (the GPIO reassign kept CH_FAN=5 on GPIO22; motors were
 confirmed working on this firmware 2026-07-04) and sys_monitor publishes `/fan_pwm` on the
-board. Still unverified: the **physical fan/MOSFET wiring** — GPIO22 doesn't appear in
-`nanopi-neo-plus2-pinmap.md` (the canonical wiring doc), so confirm a fan is actually hooked
-up before trusting the duty readout to mean moving air.
+board.
+
+**2026-07-14 measurement (fan cmd 100%, CPU 84.9°C, kernel throttling) is NOT a bug to
+chase**: user confirmed (2026-07-14, same day as [[cpu-reduction-plan]]'s CPU batch) the
+physical fan is **disconnected on purpose**. Don't propose fan-wiring fixes or flag the
+ineffective-cooling reading as an open issue — it's expected given no fan is attached.
+The software path (ESP32 PWM + sys_monitor curve + web override) is still correct and
+deployed; only the physical fan itself is intentionally not there.
