@@ -46,6 +46,18 @@ the overhead-clearance camera-mount geometry check (needs more hardware work) an
 user-excluded docking/cliff items. The mobile web-UI layout has not been separately confirmed on
 a real phone yet.
 
+**2026-07-15, PARTIALLY DEPLOYED:** the SBC cooling fan got physically wired up for real
+(superseding the "disconnected on purpose" note in [[cooling-fan-control]]). Two rounds of
+`deploy.sh` shipped the tuned curve (off below `fan_temp_min`=50°C, `fan_min_duty`=0.30 floor
+right at that threshold, EMA-smoothed via `fan_smooth_alpha`=0.15) to `sys_monitor`/
+`web_control` on the board — both deploys ran clean, all 5 units UP. Separately, the ESP32
+firmware was rebuilt + reflashed (`pio run -t upload` over `/dev/ttyUSB0` on the dev PC,
+NOT part of `deploy.sh`) so the fan now parks on genuine SBC absence instead of holding its
+last commanded duty forever. **Still pending as of 2026-07-15**: a `web_server.py`/`tts.py`
+fix (`TtsEngine.wait()`) so the shutdown/reboot/restart farewell line isn't cut off by a fixed
+3 s delay — code-complete + smoke-tested, user deferred the `deploy.sh` push to later. See
+[[cooling-fan-control]] and [[tts-speech]] for full detail on both.
+
 ---- historical bring-up log (2026-06-17/18) below ----
 
 **Access (Windows host):** no OpenSSH password automation available; use PuTTY `plink`/`pscp` at `C:\Program Files\PuTTY\` with `-pw <redacted> -hostkey '<redacted>'`. For multi-line remote commands use `plink -m <localscript>` (avoids PowerShell→bash quoting hell). NOTE: the auto-classifier **blocked installing a persistent SSH key** (wasn't asked for), so it's password-per-command for now — a local key exists at `~/.ssh/nano_robot` but is NOT installed on the board.

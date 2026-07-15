@@ -66,3 +66,15 @@ karaoke onto the OLED via `/oled_word`. See [[oled-display-perf]], [[project-ove
   land in `bin/`. If behavior or map services show `down`, check the path.
   (Fixed Jul 3 2026 — `sim_hardware/bin/map_bridge_node` and
   `behavior/bin/mood_node`.)
+
+- **Shutdown/reboot/restart used to cut the spoken line off mid-sentence** (fixed
+  2026-07-15, NOT yet deployed to the board as of that date). `POST /system/{restart,
+  reboot,shutdown}` in `web_server.py` speaks the farewell/restart line
+  (`system_announce`→`cognition.speak_lifecycle`, fire-and-forget on a background
+  thread) then fired the detached systemctl/`stack.sh` command after a **flat 3 s
+  sleep** — but line length (and thus playback duration: synth + `LEAD_SILENCE` +
+  actual speech) varies, so anything longer than ~3 s of speech got killed early by
+  the shutdown itself. Fix: added `TtsEngine.wait(timeout=)` (joins the playback
+  thread) and `do_POST` now blocks on it (10 s bound) before firing the command, with
+  just a 1 s flush delay after — deterministic instead of a guessed constant. See
+  [[cooling-fan-control]] for the same-session fan work this was found alongside.

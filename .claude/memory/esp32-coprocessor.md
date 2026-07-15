@@ -50,3 +50,14 @@ matters for [[slam-nav]] (unsigned counts made /odom read reverse as forward). R
   frequency is unrelated to the hardware ground-fault incident (see
   [[esp32-hardware-fried-ground-fix]]) since the ESP32 GPIOs only drive DRV8871's logic-level
   IN pins, not the motor current directly — change deferred, not yet made.
+
+**2026-07-15: SBC cooling fan now gets the same `linkAlive()` park treatment as the LDS
+spin motor above.** The fan previously had NO watchdog at all — deliberately, so a brief
+SBC hiccup wouldn't stop cooling — but that meant it also just held its last commanded duty
+forever after a genuine, intentional SBC shutdown (user: "when the sbc is off but power
+still on fan still runs, should be off"). Now `ledcWrite(CH_FAN, …)` only applies
+`g_fan_duty` while `alive`; otherwise it's forced to 0 (and `g_fan_duty` itself zeroed) and
+resumes the instant `sys_monitor` reconnects. `FAN_BOOT_DUTY` changed 0.4→0.0 (now moot —
+the gate zeroes it within one 100 Hz tick of boot regardless). Built + flashed via
+`pio run -t upload` over `/dev/ttyUSB0`. See [[cooling-fan-control]] for the SBC-side curve
+tuning done alongside this in the same session.
