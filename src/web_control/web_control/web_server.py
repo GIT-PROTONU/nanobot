@@ -1699,9 +1699,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/llm/look": lambda n, d: n.llm_look(),
     }
     # /system/*: (OLED end-screen hint, spoken line, detached command, HTTP reply).
-    # Detached + new session so the command survives do_down killing this very web
-    # server; the 3 s delay lets the response flush + the spoken line play first.
-    # Reboot/poweroff need the scoped NOPASSWD sudo rule for systemctl (sbc-setup.sh).
+    # Detached + new session so the command survives do_down killing this very web server;
+    # do_POST below blocks on tts.wait() until the spoken line actually finishes (lines vary
+    # in length, so a fixed delay could cut one off) before firing it, with a short flush
+    # delay after. Reboot/poweroff need the scoped NOPASSWD sudo rule for systemctl (sbc-setup.sh).
     POST_SYSTEM = {
         "/system/restart": ("restart", "restart",
                             'bash "$HOME/Nano/scripts/stack.sh" restart',
@@ -1761,7 +1762,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             oled, line, cmd, reply = system
             self._set_oled_action(oled)        # which end-screen the OLED shows
             self._node.system_announce(line)   # speak the farewell/restart line first
-            self._run_detached(cmd, delay=3)
+            if self._tts is not None:
+                # Wait for the actual utterance to finish (length varies, so a fixed delay
+                # can cut it off mid-sentence) before firing the action; bounded so a stuck
+                # audio pipeline can't block shutdown/reboot/restart forever.
+                self._tts.wait(timeout=10)
+            self._run_detached(cmd, delay=1)   # just enough for the HTTP response to flush
             return self._respond(200, reply)
         if path == "/tts":
             # Speak a line and karaoke its words to the OLED. Body: {"text","voice"?}.

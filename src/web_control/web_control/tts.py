@@ -221,6 +221,15 @@ class TtsEngine:
             self._cancel_locked()
         self._on_word("")                             # blank the OLED → dashboard
 
+    def wait(self, timeout=None):
+        """Block until the in-flight utterance's playback thread exits (no-op if nothing
+        is speaking). For callers that must not act until speech has actually finished —
+        e.g. system_announce before running the shutdown/reboot/restart command, since the
+        line's length (and thus playback duration) varies and a fixed delay can cut it off."""
+        t = self._thread
+        if t is not None:
+            t.join(timeout)
+
     # ---- internals -----------------------------------------------------------
     def _cancel_locked(self):
         """Signal the worker to stop and kill its playback. Caller holds _lock."""

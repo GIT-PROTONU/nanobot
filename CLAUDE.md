@@ -171,7 +171,12 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint), `/fan_pwm`
   (Float32 0..1 → SBC cooling-fan LEDC PWM; published by `sys_monitor` from the CPU-temp
   curve, web-overridable), `/motor_trim` (Float32 manual straight-line trim set/reset —
-  see below). Publishes
+  see below). **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
+  a dropped link, or the SBC genuinely powered off — same `linkAlive()`-gated treatment as
+  the LDS spin-motor park below; there's no SBC heat to move if the SBC isn't running, and
+  it resumes the instant `sys_monitor` reconnects (2026-07-15 fix — it used to hold its last
+  commanded duty forever on link loss, so the fan kept running after a clean SBC shutdown).
+  Publishes
   `/wheel_ticks` (Int64MultiArray `[L,R]`) from **single-channel** rising-edge GPIO-
   interrupt counts (**signed by commanded direction** — the encoders have no 2nd channel,
   so the ISR signs each tick by the last `/cmd_vel` wheel direction), `/left_wheel_suspended` +
@@ -475,6 +480,13 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   Both binaries run **only while speaking** (zero idle cost). The web "Speak" box
   reuses the old OLED-text field; it no longer publishes `/oled_text` (that brand
   override still works if published manually). HTTP POST on purpose (server owns audio+timing).
+  - **`TtsEngine.wait(timeout=)`** blocks until the in-flight utterance's playback thread
+    exits. `POST /system/{restart,reboot,shutdown}` (`web_server.py`) speaks the matching
+    farewell/restart line (`system_announce`→`cognition.speak_lifecycle`) then calls this
+    (10 s bound) before firing the detached systemctl/stack.sh command — **fixed 2026-07-15**:
+    it used to fire after a flat 3 s sleep regardless of the line's actual length, so a longer
+    line got cut off mid-sentence by the shutdown/reboot itself. Not yet deployed as of
+    2026-07-15 (user deferred the push to the board).
   - **Voice/volume/speed/pitch** are tuned in the UI and applied directly to
     espeak-ng's `-v`/`-a`/`-s` flags. They + the stats announcer are **persisted**
     to `~/.local/state/nanobot/tts.json` (override with
@@ -684,9 +696,14 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
 - Tune live: `imu_driver`/`lds_driver_py` expose `publish_rate` as a settable param;
   the web UI sliders POST `/param`, which calls `/<node>/set_parameters` (whitelisted).
   The IMU's device stream rate auto-follows `publish_rate` (`output_rate_hz: 0`).
-  `sys_monitor.fan_temp_min` (the "Fan starts at" slider on the web Cooling fan card) is
-  whitelisted the same way — the °C below which the auto curve idles the fan at 0% duty
-  before ramping up to `fan_temp_max`=70°C.
+  `sys_monitor.fan_temp_min`/`fan_min_duty`/`fan_smooth_alpha` (the Cooling fan card's "Fan
+  starts at" / "Floor duty" / "Smoothing" sliders) are whitelisted the same way. The auto
+  curve is fully OFF below `fan_temp_min` (50°C default), jumps straight to `fan_min_duty`
+  (30% default — a floor above the fan's own stall/dead-band duty so it doesn't crawl too
+  weakly to move air) right at that threshold, ramps linearly to `fan_max_duty` (100%) by
+  `fan_temp_max`=70°C, and is EMA-smoothed (`fan_smooth_alpha`, default 0.15) so CPU-temp
+  noise doesn't make it audibly hunt tick-to-tick. None of these `/param` values persist
+  across a `sys_monitor` restart — `robot.yaml` is the durable source of truth.
 
 ## Deploying to the live board (from a dev host)
 - One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — `rsync`s `src/`+`scripts/` over the

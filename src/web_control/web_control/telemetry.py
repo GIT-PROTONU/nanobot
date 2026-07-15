@@ -62,7 +62,7 @@ PARAM_WHITELIST = {
     "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
                  "robot_radius", "stuck_timeout", "relocalize", "pickup_pause",
                  "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm"},
-    "sys_monitor": {"fan_override", "fan_temp_min"},
+    "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
                     "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",
                     "vision_obstruction_var_max", "vision_obstruction_dark_max",

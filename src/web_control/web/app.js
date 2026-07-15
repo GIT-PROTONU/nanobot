@@ -84,6 +84,15 @@ $("fanOv").onchange=()=>{ if(!$("fanAuto").checked) setFanOverride(Number($("fan
 // curve idles at 0% duty; the ramp runs from here up to fan_temp_max=70°C).
 $("fanStart").oninput=()=>$("fanStartV").textContent=$("fanStart").value;
 $("fanStart").onchange=()=>setParam("sys_monitor","fan_temp_min",Number($("fanStart").value));
+// Fan floor duty -> sys_monitor fan_min_duty param (0..1 duty at/below "Fan starts at" —
+// keeps the ramp above the fan's own stall/dead-band duty instead of crawling too weakly
+// to move air).
+$("fanFloor").oninput=()=>$("fanFloorV").textContent=$("fanFloor").value;
+$("fanFloor").onchange=()=>setParam("sys_monitor","fan_min_duty",Number($("fanFloor").value)/100);
+// Fan smoothing -> sys_monitor fan_smooth_alpha param (0..1 EMA rate on the auto-curve
+// duty; lower = smoother/slower response, 100% = unsmoothed passthrough).
+$("fanSmooth").oninput=()=>$("fanSmoothV").textContent=$("fanSmooth").value;
+$("fanSmooth").onchange=()=>setParam("sys_monitor","fan_smooth_alpha",Number($("fanSmooth").value)/100);
 // On (re)connect, push the current Auto/override state once so the node matches the UI.
 function syncFan(){ setFanOverride($("fanAuto").checked?-1:Number($("fanOv").value)/100); }
 // On (re)connect, push the slider's current value once so slam_nav's active-rpm param

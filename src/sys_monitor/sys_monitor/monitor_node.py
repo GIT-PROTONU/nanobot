@@ -79,6 +79,12 @@ class MonitorNode(Node):
         self.declare_parameter("fan_min_duty", 0.0)    # duty at/below fan_temp_min
         self.declare_parameter("fan_max_duty", 1.0)    # duty at/above fan_temp_max
         self.declare_parameter("fan_override", -1.0)   # <0 = auto; 0..1 = forced duty
+        # Low-pass the auto-curve duty so a noisy/bursty CPU-temp reading doesn't make the
+        # fan visibly change speed every tick. alpha is the fraction of the gap to the new
+        # target duty closed per tick (1.0 = unsmoothed passthrough); manual override bypasses
+        # this and applies instantly, since that's a deliberate user action.
+        self.declare_parameter("fan_smooth_alpha", 0.15)
+        self._fan_duty = None                          # EMA state (None until first tick)
         self.fan_pub = self.create_publisher(Float32, "/fan_pwm", 10)
 
         self.pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -324,20 +330,34 @@ class MonitorNode(Node):
             self.get_logger().warning(f"[health] {ln}")
 
     def _publish_fan(self, cpu_t):
-        """Publish the cooling-fan duty (0..1) on /fan_pwm: web override if set, else a
-        linear ramp on CPU temperature. If temp is unreadable, fail safe to fan_max_duty."""
+        """Publish the cooling-fan duty (0..1) on /fan_pwm: web override if set (applied
+        instantly), else fully off below fan_temp_min and a linear ramp from fan_min_duty
+        (a floor above the fan's stall/dead-band duty) to fan_max_duty above it, EMA-smoothed
+        (fan_smooth_alpha) so tick-to-tick temp noise doesn't make the fan audibly hunt. If
+        temp is unreadable, fail safe to fan_max_duty."""
         override = self.get_parameter("fan_override").value
         lo_d = self.get_parameter("fan_min_duty").value
         hi_d = self.get_parameter("fan_max_duty").value
         if override is not None and override >= 0.0:
             duty = override
-        elif cpu_t != cpu_t:                       # NaN: no thermal zone -> cool at full
-            duty = hi_d
+            self._fan_duty = duty      # keep EMA state current so auto resumes smoothly
         else:
-            lo_t = self.get_parameter("fan_temp_min").value
-            hi_t = self.get_parameter("fan_temp_max").value
-            frac = 0.0 if hi_t <= lo_t else (cpu_t - lo_t) / (hi_t - lo_t)
-            duty = lo_d + max(0.0, min(1.0, frac)) * (hi_d - lo_d)
+            if cpu_t != cpu_t:                      # NaN: no thermal zone -> cool at full
+                target = hi_d
+            else:
+                lo_t = self.get_parameter("fan_temp_min").value
+                hi_t = self.get_parameter("fan_temp_max").value
+                if cpu_t <= lo_t:
+                    target = 0.0         # below the ramp: fan fully off, not lo_d
+                elif hi_t <= lo_t:
+                    target = hi_d        # degenerate config (max <= min): snap to full
+                else:
+                    frac = max(0.0, min(1.0, (cpu_t - lo_t) / (hi_t - lo_t)))
+                    target = lo_d + frac * (hi_d - lo_d)
+            alpha = max(0.0, min(1.0, self.get_parameter("fan_smooth_alpha").value))
+            self._fan_duty = target if self._fan_duty is None \
+                else self._fan_duty + alpha * (target - self._fan_duty)
+            duty = self._fan_duty
         self.fan_pub.publish(Float32(data=float(max(0.0, min(1.0, duty)))))
 
 

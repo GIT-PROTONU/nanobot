@@ -75,9 +75,12 @@
 // this firmware uses no I2C). The ESP can't source fan current — drive the fan through a
 // logic-level MOSFET/transistor gated by this pin. CONFIRM the pin against your wiring.
 #define FAN_PIN       22
-// Fan duty held at boot until the SBC's sys_monitor takes over /fan_pwm (~30-60 s into
-// SBC bring-up) and kept on link loss (no watchdog stop) so cooling never silently dies.
-#define FAN_BOOT_DUTY 0.4f
+// Fan is parked (0 duty) whenever the SBC link isn't alive — boot race (before sys_monitor
+// takes over /fan_pwm, ~30-60 s into SBC bring-up), a dropped link, or the SBC genuinely
+// powered off — same "track true SBC presence" gating as the LDS spin motor below. There's
+// no heat to move once the SBC isn't running, so the fan shouldn't run either. g_fan_duty
+// just holds the last /fan_pwm value; only applied to hardware while alive.
+#define FAN_BOOT_DUTY 0.0f
 
 #define PWM_FREQ_HZ   20000
 #define PWM_RES_BITS  10
@@ -598,7 +601,7 @@ void setup(){
   Serial.println("\n[nano] zenoh-pico coprocessor boot");
 
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
-  // SBC cooling fan PWM — start at the boot duty so there's airflow before the SBC connects.
+  // SBC cooling fan PWM — off until the SBC link is alive (see FAN_BOOT_DUTY above).
   ledcSetup(CH_FAN,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(FAN_PIN,CH_FAN);
   ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
 
@@ -757,8 +760,11 @@ void loop(){   // Core 1: real-time control
     last_ctl=now;
     if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){ g_left_duty=0; g_right_duty=0; }
     applyMotors(g_left_duty, g_right_duty);
-    // Fan has NO cmd watchdog (unlike motors): cooling must persist if /cmd_vel stops.
-    ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
+    // Fan tracks true SBC presence (like the LDS park above), not a /cmd_vel-style command
+    // watchdog: park it whenever the link isn't alive (boot race, drop, or the SBC genuinely
+    // off) since there's no SBC heat to move, and resume the instant sys_monitor reconnects.
+    if (alive) ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
+    else       { g_fan_duty = 0; ledcWrite(CH_FAN, 0); }
   }
   if (now-last_sens >= 100){                                // suspension debounce + LED @10 Hz
     last_sens=now;

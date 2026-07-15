@@ -225,11 +225,19 @@ sys_monitor:
     # Cooling fan: publishes a PWM duty (0..1) on /fan_pwm that the ESP32 actuates
     # (firmware FAN_PIN). Auto curve ramps the fan with the SBC CPU temperature; the
     # web UI Fan card overrides it (sets fan_override) and can retune where the ramp
-    # starts (sets fan_temp_min, the "Fan starts at" slider). All retunable live.
-    fan_temp_min: 45.0        # °C: below this the fan idles at fan_min_duty
+    # starts (fan_temp_min, "Fan starts at") and its floor (fan_min_duty, "Floor duty").
+    # All retunable live.
+    fan_temp_min: 50.0        # °C: below this the fan is fully OFF (not fan_min_duty)
     fan_temp_max: 70.0        # °C: at/above this the fan runs at fan_max_duty
-    fan_min_duty: 0.0         # 0..1 duty at/below fan_temp_min (raise if the fan stalls low)
+    fan_min_duty: 0.30        # 0..1 duty at the bottom of the ramp, right at fan_temp_min —
+                              # a floor above the fan's stall/dead-band duty, so the ramp
+                              # doesn't spend its low end spinning the fan too weakly to move
+                              # air (same issue the wheel motors had, see MOTOR_MIN_DUTY).
+                              # Only applies once cpu_temp crosses fan_temp_min; below that
+                              # the fan is off, not idling at this duty.
     fan_max_duty: 1.0         # 0..1 duty at/above fan_temp_max
+    fan_smooth_alpha: 0.15    # 0..1 EMA smoothing on the auto-curve duty (1.0 = unsmoothed);
+                              # lower = slower/smoother fan response to CPU-temp noise
     fan_override: -1.0        # <0 = auto (use the curve); 0..1 = forced fixed duty
 
 # ---- Behaviour layer (Sismic statechart) ------------------------------------

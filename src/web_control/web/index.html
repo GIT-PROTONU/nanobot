@@ -625,13 +625,20 @@
             </div>
             <label class="switch"><input type="checkbox" id="fanAuto" checked><span class="track"></span>
               Auto (track CPU temp)</label>
-            <div class="field"><label>Fan starts at <span id="fanStartV">45</span> °C</label>
-              <input id="fanStart" type="range" min="30" max="65" step="1" value="45"></div>
+            <div class="field"><label>Fan starts at <span id="fanStartV">50</span> °C</label>
+              <input id="fanStart" type="range" min="30" max="65" step="1" value="50"></div>
+            <div class="field"><label>Floor duty <span id="fanFloorV">30</span> %</label>
+              <input id="fanFloor" type="range" min="0" max="60" step="5" value="30"></div>
+            <div class="field"><label>Smoothing <span id="fanSmoothV">15</span> %</label>
+              <input id="fanSmooth" type="range" min="5" max="100" step="5" value="15"></div>
             <div class="field"><label>Override <span id="fanOvV">50</span> %</label>
               <input id="fanOv" type="range" min="0" max="100" step="5" value="50" disabled></div>
-            <p class="hint">SBC fan PWM on the ESP32 (<b>/fan_pwm</b>). Auto ramps from 0% at
-              <b>Fan starts at</b> up to full at 70°C; turn Auto off to force a fixed speed
-              instead.</p>
+            <p class="hint">SBC fan PWM on the ESP32 (<b>/fan_pwm</b>). Auto is off below
+              <b>Fan starts at</b>, then jumps to <b>Floor duty</b> and ramps up to full at
+              70°C — the floor keeps the fan above its own stall/dead-band duty instead of
+              crawling too weakly to move air once it does turn on.
+              <b>Smoothing</b> is how fast the auto speed can change (lower = smoother, slower
+              to react); turn Auto off to force a fixed speed instead.</p>
           </div>
           <div class="card">
             <h2>Coprocessor (ESP32)</h2>
