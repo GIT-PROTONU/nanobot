@@ -60,7 +60,8 @@ PARAM_WHITELIST = {
     "lds_driver": {"publish_rate"},
     "wheel_odometry": {"publish_rate"},
     "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
-                 "robot_radius", "stuck_timeout", "relocalize", "pickup_pause",
+                 "robot_radius", "stuck_timeout", "goal_no_path_timeout", "relocalize",
+                 "pickup_pause",
                  "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
@@ -94,6 +95,7 @@ class TelemetryHub:
         self._plan = []               # [[x, y], ...] downsampled
         self._diag = ({}, STALE)      # ({key: value}, arrival monotonic)
         self._ticks = None            # (l, r)
+        self._stray = None            # (l, r) ticks seen while stopped -- bad-encoder-signal diagnostic
         self._tick_cnt = 0            # wheel_ticks messages seen (for the rate readout)
         self._tick_win = (0, time.monotonic())
         self._tick_hz = 0.0
@@ -124,6 +126,7 @@ class TelemetryHub:
             "/lds_target_rpm": (pub(Float32, "lds_target_rpm", 5), self._mk_lds_rpm),
             "/pickup_override": (pub(Int8, "pickup_override", latched), self._mk_pickup),
             "/selftest": (pub(Bool, "selftest", 5), self._mk_bool),
+            "/reset_ticks": (pub(Bool, "reset_ticks", 5), self._mk_bool),
             "/slam_nav/go_home": (pub(Bool, "slam_nav/go_home", 5), self._mk_bool),
             "/slam_nav/save_map": (pub(Bool, "slam_nav/save_map", 5), self._mk_bool),
             "/oled_face": (node._face_pub, self._mk_face),
@@ -301,6 +304,7 @@ class TelemetryHub:
             "esp": {"hb": hb, "hb_age": round(now - hb_at, 2),
                     "temp": esp_temp, "temp_age": round(now - esp_temp_at, 2),
                     "hall": self._hall, "ticks": self._ticks,
+                    "stray": self._stray,
                     "tick_hz": round(self._tick_hz, 1)},
             "lds": self._lds,
             "oled": self._oled,
@@ -384,6 +388,7 @@ class TelemetryHub:
         s(sub(Path, "plan", self._on_plan, 2))
         s(sub(DiagnosticArray, "diagnostics", self._on_diag, 2))
         s(sub(Int64MultiArray, "wheel_ticks", self._on_ticks, 5))
+        s(sub(Int64MultiArray, "wheel_stray_ticks", self._on_stray, 5))
         s(sub(Int32, "esp32_heartbeat", self._on_hb, 2))
         s(sub(Float32, "esp32_temp", self._on_esp_temp, 2))
         s(sub(Int32, "esp32_hall", self._on_hall, 2))
@@ -438,6 +443,11 @@ class TelemetryHub:
         if len(d) >= 2:
             self._ticks = (d[0], d[1])
         self._tick_cnt += 1
+
+    def _on_stray(self, msg):
+        d = list(msg.data)
+        if len(d) >= 2:
+            self._stray = (d[0], d[1])
 
     def _on_hb(self, msg):
         self._hb = (msg.data, time.monotonic())

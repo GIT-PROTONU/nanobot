@@ -106,6 +106,12 @@ class NavNode(Node):
             ("trail_max", 400),          # breadcrumb ring-buffer length; 0 = off
             ("stuck_timeout", 0.0),      # s commanded-but-not-moving before abort; 0 = off
             ("stuck_eps", 0.04),         # m: movement below this counts as "not moving"
+            ("goal_no_path_timeout", 20.0),  # s with no path found before giving up on the
+                                              # goal (else an unreachable goal sits latched
+                                              # forever -- and, since it counts as "needs
+                                              # scans", keeps LDS idle spin-down from ever
+                                              # kicking in even though nothing is moving);
+                                              # 0 = off, never give up
             # --- LDS idle spin-down (power/wear/noise: park the spin motor when it's not
             #     earning its keep — stationary + no reason to expect fresh scans soon) ---
             ("lds_idle_enable", True),    # master on/off for the spin-down behaviour
@@ -173,6 +179,8 @@ class NavNode(Node):
         self._trail_max = int(g("trail_max").value)
         self.stuck_timeout = float(g("stuck_timeout").value)
         self.stuck_eps = float(g("stuck_eps").value)
+        self.goal_no_path_timeout = float(g("goal_no_path_timeout").value)
+        self._no_path_since = None
         self.lds_idle_enable = bool(g("lds_idle_enable").value)
         self.lds_idle_timeout = float(g("lds_idle_timeout").value)
         self.lds_idle_rpm = float(g("lds_idle_rpm").value)
@@ -308,6 +316,8 @@ class NavNode(Node):
                     self._goal_is_frontier = False
             elif p.name == "stuck_timeout":
                 self.stuck_timeout = float(p.value)
+            elif p.name == "goal_no_path_timeout":
+                self.goal_no_path_timeout = float(p.value)
             elif p.name == "relocalize":
                 self.relocalize = bool(p.value)
                 if not self.relocalize:
@@ -545,6 +555,7 @@ class NavNode(Node):
         self._goal = (msg.pose.position.x, msg.pose.position.y)
         self._goal_is_frontier = False           # a human/explicit goal wins over exploring
         self._next_replan = 0.0                  # plan immediately on the next tick
+        self._no_path_since = None                # fresh goal, fresh no-path grace period
         self.get_logger().info(f"goal set: ({self._goal[0]:.2f}, {self._goal[1]:.2f})")
 
     def _on_go_home(self, _msg):
@@ -552,6 +563,7 @@ class NavNode(Node):
         self._goal = self.home
         self._goal_is_frontier = False
         self._next_replan = 0.0
+        self._no_path_since = None
         self.get_logger().info("go home: heading to map origin")
 
     def _on_save_map(self, _msg):
@@ -616,6 +628,22 @@ class NavNode(Node):
             self._publish_path()                 # always publish so the UI shows the plan
             if not self._path:
                 self.get_logger().warning("no path to goal", throttle_duration_sec=3.0)
+                if self._no_path_since is None:
+                    self._no_path_since = now
+                elif (self.goal_no_path_timeout > 0
+                      and now - self._no_path_since > self.goal_no_path_timeout):
+                    # Give up: an unreachable goal would otherwise sit latched forever —
+                    # and since a set goal counts as "needs scans" for LDS idle spin-down
+                    # (_update_lds_idle), a stuck goal also silently keeps the lidar
+                    # spinning indefinitely even though the robot is doing nothing.
+                    self.get_logger().warning(
+                        f"goal abandoned: no path for {now - self._no_path_since:.0f}s")
+                    self._goal, self._path, self._goal_is_frontier = None, [], False
+                    self._no_path_since = None
+                    self._publish_path()
+                    return
+            else:
+                self._no_path_since = None
 
         gx, gy = self._goal
         if math.hypot(gx - self.px, gy - self.py) < self.goal_tol:

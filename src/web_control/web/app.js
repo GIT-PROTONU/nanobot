@@ -68,6 +68,10 @@ function publishLdsTgt(){ setParam("slam_nav","lds_active_rpm",Number($("ldsTgt"
 // Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
 $("pickupOv").onchange=()=>publishPickupOv();
 function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value)); }
+// Zero the ESP32's raw + stray tick counters (bench calibration / clearing a stray-tick
+// count after fixing a wiring issue); wheel_odometry re-seeds itself off the same topic
+// so /odom doesn't jump.
+$("espResetTicks").addEventListener("click",()=>{ pub("/reset_ticks",true); $("espStray").style.color=""; });
 // Fan override -> sys_monitor fan_override param.
 // v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
 const setFanOverride=v=>setParam("sys_monitor","fan_override",v);
@@ -791,6 +795,12 @@ function onEsp(e, susp){
   }
   if(e.ticks) $("espTicks").textContent=`${e.ticks[0]} / ${e.ticks[1]}`;
   if(e.tick_hz!=null) $("espTickHz").textContent=e.tick_hz.toFixed(0)+" Hz";
+  if(e.stray){
+    const bad=e.stray[0]!==0||e.stray[1]!==0;
+    const el=$("espStray");
+    el.textContent=`${e.stray[0]} / ${e.stray[1]}`;
+    el.style.color=bad?"var(--red)":"var(--green)";
+  }
   suspTxt("espSuspL",susp[0]); suspTxt("espSuspR",susp[1]);
   if(e.temp!=null && e.temp_age<5){
     $("espTemp").textContent=e.temp.toFixed(1)+"°C"; OLED.tel({espTemp:e.temp});

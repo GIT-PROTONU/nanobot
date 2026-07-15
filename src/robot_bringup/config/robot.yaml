@@ -125,6 +125,11 @@ slam_nav:
     stuck_timeout: 0.0             # s of commanded-but-no-motion before aborting goal; 0 = off.
                                    # Live-tunable.
     stuck_eps: 0.04                # m: movement below this counts as "not moving"
+    goal_no_path_timeout: 20.0     # s with zero path found before giving up on the goal;
+                                   # 0 = off (never give up). Without this an unreachable
+                                   # goal sits latched forever and -- since a set goal counts
+                                   # as "needs scans" -- also silently blocks LDS idle
+                                   # spin-down forever. Live-tunable.
     # --- LDS idle spin-down: park the spin motor (power/wear/noise) once there's no
     #     reason to expect fresh scans soon -- stationary, no goal, not exploring, not
     #     picked up/relocalizing. Wakes instantly the moment any of those change. ---

@@ -27,7 +27,7 @@ from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Quaternion, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Int64MultiArray
+from std_msgs.msg import Bool, Int64MultiArray
 from tf2_ros import TransformBroadcaster
 
 from robot_msgs.msg import WheelEncoders
@@ -92,6 +92,12 @@ class EncoderNode(Node):
             history=HistoryPolicy.KEEP_LAST, depth=10)
         self.create_subscription(
             Int64MultiArray, ticks_topic, self._on_ticks, ticks_qos)
+        # The ESP32's /reset_ticks (bench calibration / clearing a stray-tick count)
+        # zeros its raw counters — without this, the next _publish() would see the raw
+        # count fall from its old cumulative value to 0 and integrate that as a huge
+        # phantom reverse motion. Re-seeding via _have_ticks (the same path used for the
+        # very first message) makes the next real sample the new zero point instead.
+        self.create_subscription(Bool, "reset_ticks", self._on_reset_ticks, 5)
 
         self.publish_rate = max(1.0, float(rate))
         self._timer = self.create_timer(1.0 / self.publish_rate, self._publish)
@@ -118,6 +124,11 @@ class EncoderNode(Node):
             # Seed the deltas so the first integration step doesn't lurch.
             self._prev_l, self._prev_r = self.left_ticks, self.right_ticks
             self._have_ticks = True
+
+    def _on_reset_ticks(self, msg: Bool):
+        if msg.data:
+            self._have_ticks = False
+            self.get_logger().info("wheel_odometry: raw ticks reset (re-seeding)")
 
     # --- odometry integration / publishing -----------------------------------
     def _publish(self):

@@ -650,7 +650,9 @@
               <span>R wheel</span><b id="espSuspR">–</b>
               <span>temp</span><b id="espTemp">–</b>
               <span>hall</span><b id="espHall">–</b>
+              <span>stray ticks L/R</span><b id="espStray">–</b>
             </div>
+            <button id="espResetTicks" class="btn">🔁 Reset ticks</button>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>
@@ -661,7 +663,12 @@
               + target rpm moved to the <b>Lidar (LDS)</b> card above. The override publishes
               <b>/pickup_override</b> so pick-up-gated behaviour (SLAM freeze, mood reflex)
               can be tested off the ground; the L/R rows keep showing the real switches.
-              Resets to auto on page reload.</p>
+              Resets to auto on page reload. <b>Stray ticks</b> = ticks the ESP32 counted
+              while that wheel was commanded (and settled) stopped — should stay at 0;
+              a rising count with the robot motionless means encoder-line noise
+              (ground bounce, a loose signal wire), not real rotation. <b>Reset ticks</b>
+              zeros both counters (and the stray counters) for a clean baseline —
+              odometry re-seeds automatically so /odom doesn't jump.</p>
           </div>
           <div class="card">
             <h2>Navigation (slam_nav)</h2>
@@ -683,7 +690,12 @@
               <b>Motion</b> in the Map view). <b>Stop distance</b> = obstacle range ahead that
               triggers a reactive stop+replan; <b>Robot radius</b> = obstacle inflation used by
               the planner. <b>Stuck timeout</b> aborts a goal if commanded but not actually
-              moving for that long ("off" = never). <b>Auto-relocalize</b> is the local
+              moving for that long ("off" = never). A goal with NO path at all (unreachable
+              on the current map) is separately given up on after
+              <b>goal_no_path_timeout</b> (20 s default, settable via <b>/param</b>) — without
+              this an unreachable goal sat latched forever, which also silently kept the LDS
+              idle spin-down from ever kicking in (a set goal counts as "still needs scans").
+              <b>Auto-relocalize</b> is the local
               lost-robot recovery (wide scan-match + spin); <b>Pause SLAM when picked up</b>
               freezes mapping while both wheels are off the ground. All apply live, no
               restart. LDS idle spin-down moved to the <b>Lidar (LDS)</b> card above.</p>

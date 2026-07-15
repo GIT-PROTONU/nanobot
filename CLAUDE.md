@@ -192,6 +192,17 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (**tune on hardware**) holds `/lds_target_rpm` by driving the motor PWM, output on
   `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 1; UART1 is drained once
   per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
+- **Bad-encoder-signal diagnostic (2026-07-15, built, not yet flashed/deployed)**: a
+  per-wheel `/wheel_stray_ticks` (Int64MultiArray `[L,R]`, same cadence as `/wheel_ticks`)
+  counts ISR ticks that land while that wheel is commanded **and settled** (`STRAY_SETTLE_MS`
+  = 300 ms coast-down grace period after duty→0) stopped — a real coast-down tick isn't
+  noise, but anything after that settle window can only be electrical noise/ground-bounce
+  on the encoder GPIO (relevant given the earlier [[esp32-hardware-fried-ground-fix]]
+  ground-bounce failure). Cheap bool check in the ISR, no FPU. Web Coprocessor card shows
+  it (red if nonzero) with a **🔁 Reset ticks** button (`/reset_ticks` Bool) that zeros
+  both `/wheel_ticks` and `/wheel_stray_ticks` on the ESP32; `wheel_odometry` also watches
+  `/reset_ticks` and re-seeds its prev-tick baseline (`_have_ticks=False`) so `/odom`
+  doesn't see a fake huge jump when the raw counters reset.
 - **Straight-line trim autocal**: the mismatched gearmotors are rebalanced by a single
   trim factor in `applyMotors` (`l*=(1-t)`, `r*=(1+t)`; positive = robot was pulling
   right). While a straight drive is commanded (equal duties, wheels on the ground, enough

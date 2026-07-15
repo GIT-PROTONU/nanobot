@@ -8,7 +8,11 @@
 //   sub  lds_target_rpm        std_msgs/Float32          -> LDS spin-speed PID setpoint
 //   sub  fan_pwm               std_msgs/Float32 (0..1)   -> SBC cooling fan PWM duty
 //   sub  motor_trim            std_msgs/Float32 (-0.3..0.3) -> manual L/R trim set/reset
+//   sub  reset_ticks           std_msgs/Bool (true)      -> zero wheel_ticks + wheel_stray_ticks
 //   pub  wheel_ticks           std_msgs/Int64MultiArray  [L,R] raw cumulative counts
+//   pub  wheel_stray_ticks     std_msgs/Int64MultiArray  [L,R] cumulative ticks seen while the
+//                                                         wheel was commanded+settled stopped
+//                                                         (bad-encoder-signal diagnostic)
 //   pub  wheel_trim            std_msgs/Float32          active straight-line trim (1 Hz)
 //   pub  left/right_wheel_suspended std_msgs/Bool        per-wheel off-ground switch
 //   pub  esp32_temp            std_msgs/Float32          die temperature (C)
@@ -90,8 +94,12 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define MAX_LINEAR_SPEED  0.4f
 #define MAX_ANGULAR_SPEED 3.0f
 #define CMD_TIMEOUT_MS    500
+// Grace period after a wheel's duty drops to 0 before its ticks count as "stray" (see
+// g_left_stray/g_right_stray) -- real wheel inertia keeps ticking briefly after power
+// cuts, that's not encoder noise and shouldn't be flagged as such.
+#define STRAY_SETTLE_MS   300
 #define INVERT_LEFT  false
-#define INVERT_RIGHT false
+#define INVERT_RIGHT true   // 2026-07-15: right motor's fwd/rev harness pins were swapped
 // Stiction deadband compensation: the gearmotors don't move below ~60% duty (only a
 // full-scale 0.4 m/s command — duty 0.63 after the v+w normalization — moved at all, and
 // in-place turns at 0.37 duty didn't). Remap any command above MOTOR_DEADZONE from
@@ -238,8 +246,17 @@ static volatile bool     g_ping_seen = false;  // arm the runtime watchdog only 
 RTC_NOINIT_ATTR static uint32_t g_fping_reboots;
 #endif
 
-static void IRAM_ATTR leftEncISR()  { g_left_ticks  += g_left_dir; }
-static void IRAM_ATTR rightEncISR() { g_right_ticks += g_right_dir; }
+// Bad-encoder-signal diagnostic: a tick that lands while a wheel is commanded (and has
+// settled) stopped can only be electrical noise/ground-bounce on that GPIO, never real
+// rotation — count those separately so the SBC can flag a wheel with a flaky encoder
+// signal instead of silently corrupting /odom. `g_left_stopped`/`g_right_stopped` are
+// set on Core 1 (real-time control loop, see STRAY_SETTLE_MS below) and only READ here;
+// a plain bool check keeps the ISR FPU-free like the direction signing above.
+static volatile int32_t  g_left_stray = 0, g_right_stray = 0;    // cumulative, never auto-cleared
+static volatile bool     g_left_stopped = true, g_right_stopped = true;
+
+static void IRAM_ATTR leftEncISR()  { g_left_ticks  += g_left_dir;  if (g_left_stopped)  g_left_stray++;  }
+static void IRAM_ATTR rightEncISR() { g_right_ticks += g_right_dir; if (g_right_stopped) g_right_stray++; }
 
 static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
@@ -309,15 +326,17 @@ static void declare_lv(const char* topic, const char* type, int eid){
 
 // one publisher + its rmw attachment identity
 struct ZPub { z_owned_publisher_t p; int64_t seq; uint8_t gid[16]; };
-static ZPub P_ticks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim;
+static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim;
 
 // Single source of truth for every publisher: topic/type, the attachment GID tag
 // (last GID byte, unique per publisher) and the liveliness entity id (lv_eid, also
 // unique). The declare loop and the liveliness loop both walk this, so the two can't
-// drift. These wire identities are PROVEN-GOOD against the live graph — don't renumber.
+// drift. These wire identities are PROVEN-GOOD against the live graph — don't renumber
+// existing entries; new ones just take the next free tag/eid (11 was free).
 struct PubDef { ZPub* zp; const char* topic; const char* type; uint8_t gid_tag; int lv_eid; bool lds_only; };
 static const PubDef PUBS[] = {
   { &P_ticks, "wheel_ticks",           T_I64A, 1, 1, false },
+  { &P_strayTicks, "wheel_stray_ticks", T_I64A, 11, 11, false },
   { &P_suspL, "left_wheel_suspended",  T_BOOL, 2, 2, false },
   { &P_suspR, "right_wheel_suspended", T_BOOL, 3, 3, false },
   { &P_temp,  "esp32_temp",            T_F32,  4, 4, false },
@@ -392,6 +411,18 @@ static void cmd_cb(z_loaned_sample_t* sm, void*){
 static void led_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 5){ g_led = b[4]!=0; g_led_dirty = true; }
 }
+// /reset_ticks (Bool, true = reset): zeros the raw + stray counters for a clean baseline
+// (bench calibration, or clearing a stray-tick count after fixing a wiring issue). The
+// SBC side (wheel_odometry) also watches this topic to re-seed its own prev-tick state,
+// else the next /odom integration step would see a huge fake jump from the old cumulative
+// count down to 0.
+static void reset_ticks_cb(z_loaned_sample_t* sm, void*){
+  uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 5 && b[4]!=0){
+    g_left_ticks = g_right_ticks = 0;
+    g_left_stray = g_right_stray = 0;
+    Serial.println("[nano] wheel ticks reset");
+  }
+}
 static void ldstgt_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_lds_target = f>0?f:0; }
 }
@@ -431,7 +462,7 @@ static bool zenohConnect(){
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
-  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim;   // kept alive (static)
+  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset;   // kept alive (static)
   z_owned_closure_sample_t cl;
   z_view_keyexpr_t ke;
   z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
@@ -446,6 +477,9 @@ static bool zenohConnect(){
   z_view_keyexpr_from_str_unchecked(&ke, KE("motor_trim",T_F32));
   z_closure_sample(&cl, trim_cb, NULL, NULL);
   z_declare_subscriber(z_session_loan(&s), &sub_trim, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  z_view_keyexpr_from_str_unchecked(&ke, KE("reset_ticks",T_BOOL));
+  z_closure_sample(&cl, reset_ticks_cb, NULL, NULL);
+  z_declare_subscriber(z_session_loan(&s), &sub_reset, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
 #if LINK_RX_TIMEOUT_MS
   static z_owned_subscriber_t sub_ping;
   z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
@@ -487,6 +521,7 @@ static void zenohTask(void*){
                                                               // but extra SBC executor wakeups)
       t_ticks = now;
       zpub_put(P_ticks, buf, cdr_i64arr2(buf,(int64_t)g_left_ticks,(int64_t)g_right_ticks));
+      zpub_put(P_strayTicks, buf, cdr_i64arr2(buf,(int64_t)g_left_stray,(int64_t)g_right_stray));
     }
     // suspension: publish immediately on change (every ~2 ms loop), so the web UI
     // tracks a wheel lifting/dropping with no lag; the 1 Hz block below republishes
@@ -760,6 +795,14 @@ void loop(){   // Core 1: real-time control
     last_ctl=now;
     if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){ g_left_duty=0; g_right_duty=0; }
     applyMotors(g_left_duty, g_right_duty);
+    // Stray-tick gating: a wheel counts as "stopped" STRAY_SETTLE_MS after its commanded
+    // duty last went to exactly 0 (coast-down grace period), and un-stops the instant a
+    // nonzero duty is commanded again.
+    static uint32_t l_zero_since=0, r_zero_since=0;
+    if (g_left_duty  != 0.0f){ l_zero_since=0; g_left_stopped=false; }
+    else { if (!l_zero_since) l_zero_since=now; g_left_stopped = (now-l_zero_since) >= STRAY_SETTLE_MS; }
+    if (g_right_duty != 0.0f){ r_zero_since=0; g_right_stopped=false; }
+    else { if (!r_zero_since) r_zero_since=now; g_right_stopped = (now-r_zero_since) >= STRAY_SETTLE_MS; }
     // Fan tracks true SBC presence (like the LDS park above), not a /cmd_vel-style command
     // watchdog: park it whenever the link isn't alive (boot race, drop, or the SBC genuinely
     // off) since there's no SBC heat to move, and resume the instant sys_monitor reconnects.
