@@ -1,6 +1,6 @@
 ---
 name: lds-idle-spindown-ui-fix
-description: "2026-07-14: consolidated all LDS UI into one card + fixed why idle spin-down was never observed (web UI reconnect resync fought slam_nav's owned topic)"
+description: "LDS idle spin-down never observed: 2026-07-14 fixed a web-UI reconnect-resync bug, 2026-07-15 fixed a 2nd cause (unreachable goal latches forever, not yet deployed)"
 metadata: 
   node_type: memory
   type: project
@@ -40,3 +40,25 @@ web_control design this pattern lives in.
 
 Verified live on hardware: `POST /param {slam_nav, lds_active_rpm, 200}` moved the
 measured spin rpm from ~297→193 immediately; restored to 300 after.
+
+**2026-07-15: a SECOND, different root cause found — an unreachable goal latches forever
+and silently blocks idle-park too (not yet deployed).** User reported "LDS is not
+spinning down when the robot is not moving" on live hardware. Traced via
+`journalctl -u nano-nav`: a `goal_pose` click during earlier testing (`goal set: (0.78,
+-0.09)` at 20:21:18) hit `no path to goal` at 20:24:26/33 and was never cleared — no
+mechanism in `nav_node.py` ever gives up on a goal with zero path. 25+ minutes later the
+goal was still latched, live telemetry's `plan` field was still the same stale 2-point
+path, and `_update_lds_idle`'s `needs_scans` counts `self._goal is not None` as a reason
+to stay active — so the LDS was correctly never parking, even though the robot was
+completely stationary the whole time. `stuck_timeout` (existing watchdog) doesn't cover
+this case: it only fires when *commanded but not moving*, and an unreachable goal with an
+empty path never commands motion at all.
+
+**Fix**: new `goal_no_path_timeout` param (20.0s default, 0=off, live-tunable via
+`/param`) in `nav_node.py` — if replanning finds zero path for longer than this, the goal
+is abandoned (`"goal abandoned: no path for Ns"` log, goal/path cleared, published empty).
+Reset on every fresh goal (`_on_goal`/`_on_go_home`) so a new goal always gets its own
+full grace period. `_explore_step` frontiers are unaffected (only adopted if already
+confirmed reachable). Whitelisted for `/param` (`PARAM_WHITELIST["slam_nav"]`) and
+documented in `robot.yaml` + the web UI's Navigation card hint. Smoke test + full colcon
+build both pass; **not yet deployed to the board**.

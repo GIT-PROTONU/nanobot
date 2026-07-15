@@ -61,3 +61,19 @@ resumes the instant `sys_monitor` reconnects. `FAN_BOOT_DUTY` changed 0.4→0.0 
 the gate zeroes it within one 100 Hz tick of boot regardless). Built + flashed via
 `pio run -t upload` over `/dev/ttyUSB0`. See [[cooling-fan-control]] for the SBC-side curve
 tuning done alongside this in the same session.
+
+**2026-07-15: right motor harness pins were swapped** — `INVERT_RIGHT` flipped
+`false`→`true` (fwd/rev pins for the right DRV8871 were crossed vs the left). This is what
+let the robot drive correctly for the first time this session; firmware rebuilt ~20:12
+local, right before the test session's nav_node boot, so very likely already flashed.
+
+**2026-07-15: bad-encoder-signal diagnostic + tick reset (built, NOT yet flashed).**
+New `/wheel_stray_ticks` (Int64MultiArray [L,R]) counts ISR ticks landing while a wheel is
+commanded+settled stopped (`STRAY_SETTLE_MS`=300ms coast-down grace) — should read 0;
+nonzero with the robot motionless means encoder-line noise/ground-bounce, not real
+rotation (relevant given the ground-bounce origin of the earlier
+[[esp32-hardware-fried-ground-fix]] failure). New `/reset_ticks` (Bool) zeros both
+`wheel_ticks` and `wheel_stray_ticks`; `wheel_odometry` also watches it and re-seeds its
+prev-tick baseline so `/odom` doesn't jump. Web Coprocessor card: "stray ticks L/R"
+readout (red if nonzero) + "🔁 Reset ticks" button. `pio run` build verified clean; not
+yet flashed to hardware.
