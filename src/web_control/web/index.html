@@ -412,7 +412,35 @@
               <span>|gyro|</span><b id="imuG">–</b>
               <span>rate</span><b id="imuHz">–</b>
               <span>mag xyz</span><b id="imuMag">–</b>
+              <span>mag magnitude</span><b id="imuMagMag">–</b>
+              <span>mag noise (2s)</span><b id="imuMagNoise">–</b>
+              <span>worst noise seen</span><b id="imuMagWorst">0.0</b>
             </div>
+            <div class="chiprow">
+              <button id="imuMagResetWorst" class="btn">↺ Reset worst-seen</button>
+            </div>
+            <p class="hint">Mounting-position interference check (all client-side, no extra
+              load): hold the loose IMU near each candidate spot — motors, ESP32, wiring, metal
+              chassis — and watch <b>mag magnitude</b>/<b>noise</b>; a jump means magnetic or
+              electrical interference there. To find out WHICH nearby part is the culprit, hold
+              it close to one at a time and briefly toggle that part — spin the LDS (Lidar
+              card), flip the cooling fan override (System card), or nudge the drive joystick —
+              watching for a spike here. <b>Worst noise seen</b> peak-holds the biggest jump
+              since the last reset, so you don't have to stare at it while walking the sensor
+              around. Raw sensor counts — useful only to compare spots, not an absolute field
+              reading.</p>
+            <div class="imu3d-scene"><div class="imu3d-cam"><div class="imu3d-rig" id="imu3dRig">
+              <div class="imu3d-body">
+                <div class="face front"></div><div class="face back"></div>
+                <div class="face left"></div><div class="face right"></div>
+                <div class="face top"></div><div class="face bottom"></div>
+              </div>
+              <div class="imu3d-wheel left"></div>
+              <div class="imu3d-wheel right"></div>
+            </div></div></div>
+            <p class="hint imu3d-hint">Live attitude, rendered client-side (CSS 3D, no
+              extra network/CPU load) from the same <b>roll/pitch/yaw</b> above — blue face is
+              front. Tilt/turn the robot and check the model follows.</p>
             <div class="field"><label>Publish rate <span id="imuRateV">1</span> Hz</label>
               <input id="imuRate" type="range" min="1" max="200" step="1" value="1"></div>
             <div class="chiprow">
@@ -428,6 +456,27 @@
               ~9.8 afterwards. <b>Start/Stop mag cal</b> while slowly rotating the robot through all
               orientations — check <b>mag xyz</b> sweeps smoothly, not stuck at one value. Always
               <b>Save</b> to persist to flash, else it resets on power-cycle.</p>
+            <div class="kv">
+              <span>stationary for</span><b id="driftStill">–</b>
+              <span>roll drift</span><b id="driftRoll">–</b>
+              <span>pitch drift</span><b id="driftPitch">–</b>
+              <span>yaw drift</span><b id="driftYaw">–</b>
+              <span>yaw rate</span><b id="driftRate">–</b>
+            </div>
+            <p class="hint" id="driftLast"></p>
+            <p class="hint">Drift check: while the robot sits still (not driven, wheels
+              grounded) roll/pitch/yaw shouldn't change at all — any change here is gyro bias
+              or magnetometer interference, not real motion. Leave it parked for a while to get
+              a reading; the line above persists after it moves again so you don't have to
+              watch it live.</p>
+            <div class="field inline">mount offset (mm) x <input id="imuOffX" type="number" value="0" step="1">
+              y <input id="imuOffY" type="number" value="0" step="1">
+              z <input id="imuOffZ" type="number" value="0" step="1"></div>
+            <p class="hint">Where the IMU actually sits, in mm from the robot's centre
+              (x forward, y left, z up). If it's not at the centre, turning the robot makes the
+              accelerometer see extra lever-arm acceleration on top of the real motion — set this
+              and the driver subtracts it before publishing, so <b>|accel|</b> stays correct
+              during rotation. Leave at 0,0,0 if the IMU is centred.</p>
           </div>
           <div class="card">
             <h2>Odometry</h2>

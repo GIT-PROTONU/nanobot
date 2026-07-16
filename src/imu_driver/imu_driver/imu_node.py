@@ -12,6 +12,15 @@ Publishes a coherent set once per cycle (on the angle frame):
 
 Best-effort: if pyserial or the port is missing the node still spins (logs once)
 so the rest of the stack is unaffected.
+
+Mounting offset: if the IMU isn't at the robot's centre of rotation (base_link
+origin), its accelerometer also picks up lever-arm acceleration from the robot's
+own rotation -- centripetal (omega x (omega x r)) and tangential (alpha x r), on
+top of the true body acceleration. `offset_{x,y,z}_mm` (REP-103: x fwd, y left,
+z up, mm from base_link) lets the web UI record where the sensor actually sits;
+`lever_arm_correction` subtracts that lever-arm term every cycle so /imu/data
+and /imu/web report the acceleration an IMU AT the centre would have seen. Gyro
+needs no correction -- angular velocity is the same everywhere on a rigid body.
 """
 import math
 import struct
@@ -60,6 +69,25 @@ def _dev_rate_for(hz):
     return 200
 
 
+def _cross(u, v):
+    ux, uy, uz = u
+    vx, vy, vz = v
+    return (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
+
+
+def lever_arm_correction(acc, gyro, alpha, offset_m):
+    """Subtract the lever-arm acceleration an IMU at `offset_m` (metres, from the
+    rotation centre) picks up from the body's own rotation, returning the
+    acceleration an IMU AT the centre would read. `gyro` is angular velocity
+    (rad/s), `alpha` its rate of change (rad/s^2, finite-differenced between
+    samples). No-op (returns `acc` unchanged) when the offset is zero."""
+    if offset_m == (0.0, 0.0, 0.0):
+        return acc
+    centripetal = _cross(gyro, _cross(gyro, offset_m))
+    tangential = _cross(alpha, offset_m)
+    return tuple(a - t - c for a, t, c in zip(acc, tangential, centripetal))
+
+
 def euler_to_quat(roll, pitch, yaw):
     """ZYX (yaw-pitch-roll) Euler angles in radians -> (x, y, z, w)."""
     cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
@@ -85,6 +113,9 @@ class ImuNode(Node):
             ("mag_rate", 10.0),         # /imu/mag is slow-moving + unused by the UI
             ("web_rate", 15.0),         # /imu/web (accel|/|gyro| summary for the UI)
             ("output_rate_hz", 0),      # device stream rate; 0 = auto-follow publish
+            ("offset_x_mm", 0.0),       # IMU mounting offset from base_link centre
+            ("offset_y_mm", 0.0),       # (REP-103: x fwd, y left, z up), mm --
+            ("offset_z_mm", 0.0),       # see lever_arm_correction above
         ])
         g = self.get_parameter
         self.frame_id = g("frame_id").value
@@ -105,6 +136,12 @@ class ImuNode(Node):
         # deserializing the full 50 Hz Imu (covariances and all) just for two numbers.
         self.web_rate = max(0.0, float(g("web_rate").value))
         self._web_period = (1.0 / self.web_rate) if self.web_rate > 0 else None
+        self._offset_m = (g("offset_x_mm").value / 1000.0,
+                           g("offset_y_mm").value / 1000.0,
+                           g("offset_z_mm").value / 1000.0)
+        self._prev_gyro = None          # for finite-differencing angular acceleration
+        self._prev_gyro_t = None        # (only exercised while an offset is set)
+        self._alpha = (0.0, 0.0, 0.0)   # last angular acceleration, rad/s^2
         self._next_pub = 0.0
         self._next_eul = 0.0
         self._next_mag = 0.0
@@ -262,6 +299,15 @@ class ImuNode(Node):
             elif p.name == "output_rate_hz":
                 self.force_rate = int(p.value)
                 self._need_reconfig.set()
+            elif p.name in ("offset_x_mm", "offset_y_mm", "offset_z_mm"):
+                x, y, z = self._offset_m
+                if p.name == "offset_x_mm":
+                    x = float(p.value) / 1000.0
+                elif p.name == "offset_y_mm":
+                    y = float(p.value) / 1000.0
+                else:
+                    z = float(p.value) / 1000.0
+                self._offset_m = (x, y, z)
         return SetParametersResult(successful=True)
 
     def _reader(self):
@@ -347,7 +393,15 @@ class ImuNode(Node):
         if t == T_ACC:
             self.acc = (a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE)
         elif t == T_GYRO:
-            self.gyro = (a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE)
+            gyro = (a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE)
+            if self._offset_m != (0.0, 0.0, 0.0):
+                now = time.monotonic()
+                if self._prev_gyro is not None:
+                    dt = now - self._prev_gyro_t
+                    if dt > 1e-4:
+                        self._alpha = tuple((g - p) / dt for g, p in zip(gyro, self._prev_gyro))
+                self._prev_gyro, self._prev_gyro_t = gyro, now
+            self.gyro = gyro
         elif t == T_MAG:
             self.mag = (float(a), float(b), float(c))
         elif t == T_ANGLE:
@@ -390,6 +444,7 @@ class ImuNode(Node):
         # instead, and nothing else on the board consumes /imu/data by default, so only
         # build + serialize it when something actually subscribes. On an idle/autonomous
         # robot this skips ~50 Hz of pointless serialization (the biggest idle CPU lever).
+        acc = lever_arm_correction(self.acc, self.gyro, self._alpha, self._offset_m)
         if self.pub_imu.get_subscription_count() > 0:
             roll, pitch, yaw = (v * DEG2RAD for v in self.euler_deg)
             qx, qy, qz, qw = euler_to_quat(roll, pitch, yaw)
@@ -397,7 +452,7 @@ class ImuNode(Node):
             imu.header.stamp = stamp
             imu.orientation.x, imu.orientation.y, imu.orientation.z, imu.orientation.w = qx, qy, qz, qw
             imu.angular_velocity.x, imu.angular_velocity.y, imu.angular_velocity.z = self.gyro
-            imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z = self.acc
+            imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z = acc
             self.pub_imu.publish(imu)
 
         # /imu/euler — drives the web UI angle readout; its own (lower) rate.
@@ -423,7 +478,7 @@ class ImuNode(Node):
         # browser drop its 50 Hz /imu/data subscription, cutting rosbridge's load.
         if self._web_period is not None and mono >= self._next_web:
             self._next_web = mono + self._web_period
-            ax, ay, az = self.acc
+            ax, ay, az = acc
             gx, gy, gz = self.gyro
             web = self._web_msg
             web.header.stamp = stamp

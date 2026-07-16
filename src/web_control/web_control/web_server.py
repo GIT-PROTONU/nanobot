@@ -154,6 +154,14 @@ class WebServerNode(Node):
         self.declare_parameter("vision_bumper_cmd_eps", 0.03)      # m/s or rad/s floor to count as "commanded"
         self.declare_parameter("vision_bumper_motion_floor", 0.01)  # gpu motion score below this = "nothing moved"
         self.declare_parameter("vision_bumper_confirm_secs", 0.6)   # s the stall condition must hold before alerting
+        # IMU drift check (telemetry.py's _imu_drift_tick): while the robot is
+        # provably stationary (same "not commanded" test as the bumper/vibration
+        # checks above, reusing vision_bumper_cmd_eps, + wheels grounded), any change
+        # in the reported roll/pitch/yaw isn't real motion -- it's gyro bias or
+        # magnetometer interference (see the selftest-spin-imu-mismatch investigation).
+        # Purely observational; a still period shorter than this is too brief to be a
+        # meaningful reading and isn't latched into the last-result summary.
+        self.declare_parameter("imu_drift_min_secs", 10.0)
         # Cheap GPU-vision alert thresholds (2026-07-12 batch, see gpu_vision.py's raw
         # signals + telemetry.py's _vision_alerts): all informational only, all live
         # web UI sliders, all initial guesses pending real hardware tuning.

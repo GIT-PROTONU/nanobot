@@ -32,7 +32,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int64MultiArray, String
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import MagneticField
 from diagnostic_msgs.msg import DiagnosticArray
@@ -60,7 +60,7 @@ STALE = -1e9
 
 # ---- POST /param whitelist: node -> settable parameter names -------------------
 PARAM_WHITELIST = {
-    "imu_driver": {"publish_rate"},
+    "imu_driver": {"publish_rate", "euler_rate", "offset_x_mm", "offset_y_mm", "offset_z_mm"},
     "lds_driver": {"publish_rate"},
     "wheel_odometry": {"publish_rate"},
     "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
@@ -79,7 +79,8 @@ PARAM_WHITELIST = {
                     "vision_colorcast_alert", "vision_motiontarget_match_max",
                     "vision_novelty_alert", "vision_camera_stall_secs",
                     "vision_vibration_ratio", "vision_vibration_confirm_secs",
-                    "vision_glare_derate", "vision_approach_rate", "vision_approach_band"},
+                    "vision_glare_derate", "vision_approach_rate", "vision_approach_band",
+                    "imu_drift_min_secs"},
 }
 
 
@@ -113,6 +114,10 @@ class TelemetryHub:
         self._fan = None
         self._selftest = ""
         self._mag = None              # (x, y, z) raw counts, for eyeballing IMU cal quality
+        self._eul = None              # (roll, pitch, yaw deg, arrival monotonic) -- direct
+                                       # /imu/euler sub, NOT the 1 Hz vitals blob (see _on_eul)
+        self._drift_base = None       # (r0, p0, y0, start monotonic) while stationary, else None
+        self._drift_last = ""         # latched summary of the last completed still period
         self._imu_cal_status = ""     # latched, from imu_driver's calibration routine
         self._purpose = self._task = self._experiments = self._schedule = ""  # latched JSON
         self._oled = {"face": "", "word": "", "brand": "", "system": ""}
@@ -249,6 +254,53 @@ class TelemetryHub:
             self._vibration_since = now
         return (now - self._vibration_since) >= g("vision_vibration_confirm_secs").value
 
+    def _imu_drift_tick(self, now):
+        """IMU drift check: while the robot is provably stationary (not commanded to
+        move, same eps as the bumper/vibration checks above, AND both wheels
+        grounded -- not mid pick-up), the reported roll/pitch/yaw shouldn't change at
+        all. Any change IS the drift -- gyro bias or magnetometer interference (see
+        the selftest-spin-imu-mismatch investigation), not real motion. Purely
+        observational, like the other alerts here: nothing acts on it, it just
+        answers "is my IMU trustworthy at rest" from the web UI.
+        Returns the live in-progress reading (zeros while moving) plus `last`, a
+        latched one-line summary of the most recently completed still period long
+        enough to mean anything (>= imu_drift_min_secs)."""
+        n = self._node
+        g = n.get_parameter
+        lin, ang = self._cmd_vel
+        eps = g("vision_bumper_cmd_eps").value
+        commanded = abs(lin) > eps or abs(ang) > eps
+        grounded = not any(n._susp_eff())
+        still = grounded and not commanded and self._eul is not None
+        if not still:
+            if self._drift_base is not None:
+                self._latch_drift(now, g("imu_drift_min_secs").value)
+            self._drift_base = None
+            return {"still_s": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
+                    "yaw_per_min": 0.0, "last": self._drift_last}
+        r, p, y, _ = self._eul
+        if self._drift_base is None:
+            self._drift_base = (r, p, y, now)
+        dr, dp, dy, dur = self._drift_since(r, p, y, now)
+        return {"still_s": round(dur, 1), "roll": round(dr, 2), "pitch": round(dp, 2),
+                "yaw": round(dy, 2),
+                "yaw_per_min": round(dy / dur * 60.0, 2) if dur > 0.5 else 0.0,
+                "last": self._drift_last}
+
+    def _drift_since(self, r, p, y, now):
+        r0, p0, y0, t0 = self._drift_base
+        dy = ((y - y0 + 180.0) % 360.0) - 180.0     # wrap-aware (yaw is -180..180)
+        return r - r0, p - p0, dy, now - t0
+
+    def _latch_drift(self, now, min_secs):
+        r, p, y, _ = self._eul
+        dr, dp, dy, dur = self._drift_since(r, p, y, now)
+        if dur < min_secs:
+            return                # too brief to mean anything -- don't overwrite the last real reading
+        rate = dy / dur * 60.0 if dur > 0.5 else 0.0
+        self._drift_last = (f"{dur:.0f}s stationary: yaw {dy:+.2f}° ({rate:+.2f}°/min), "
+                             f"roll {dr:+.2f}°, pitch {dp:+.2f}°")
+
     def _vision_alerts(self, gv, now=None, frozen=False):
         """Turn GpuVision's raw scalar properties into ALERT booleans against LIVE
         web_control params (not fixed constants), same pattern as _optical_bumper --
@@ -321,12 +373,18 @@ class TelemetryHub:
             "lds": self._lds,
             "oled": self._oled,
         }
-        # IMU summary + tilt ride the vitals blob (same keys the page always used);
-        # omitted entirely when sys_monitor isn't writing — the page shows "lost".
-        for k in ("imu", "eul"):
-            sec = vitals.get(k)
-            if isinstance(sec, dict) and sec.get("age") is not None:
-                f[k] = sec
+        # IMU |accel|/|gyro| summary rides the vitals blob (numeric labels only, 1 Hz
+        # is plenty); omitted entirely when sys_monitor isn't writing — the page shows
+        # "lost". eul is its OWN direct sub (self._eul, not the blob) — the 3D
+        # orientation view needs it fresh every frame, and the blob only updates once
+        # a second regardless of imu_driver's rate (see _on_eul).
+        sec = vitals.get("imu")
+        if isinstance(sec, dict) and sec.get("age") is not None:
+            f["imu"] = sec
+        if self._eul is not None:
+            r, p, y, at = self._eul
+            f["eul"] = {"r": r, "p": p, "y": y, "age": round(now - at, 2)}
+        f["imu_drift"] = self._imu_drift_tick(now)
         if self._odom:
             f["odom"] = [round(v, 3) for v in self._odom]
         if self._plan:
@@ -414,6 +472,11 @@ class TelemetryHub:
         s(sub(Float32, "fan_pwm", self._on_fan, 2))
         s(sub(String, "selftest_result", self._on_selftest, 2))
         s(sub(MagneticField, "imu/mag", self._on_mag, 2))
+        # Direct sub (not the 1 Hz vitals blob) -- the 3D orientation view needs eul
+        # fresh every frame, and sys_monitor's own /imu/euler sub only feeds its once-
+        # a-second blob write, so routing through it silently capped the browser to
+        # ~1 Hz updates no matter how fast imu_driver itself published.
+        s(sub(Vector3Stamped, "imu/euler", self._on_eul, 5))
         s(sub(String, "imu_calibrate_status", self._mk_str("_imu_cal_status"), self._latched_qos))
         s(sub(Twist, "cmd_vel", self._on_cmd_vel, 5))   # optical virtual bumper correlation
         # OLED mirror inputs (the page renders a client-side copy of the panel)
@@ -490,6 +553,10 @@ class TelemetryHub:
     def _on_mag(self, msg):
         m = msg.magnetic_field
         self._mag = (round(m.x, 1), round(m.y, 1), round(m.z, 1))
+
+    def _on_eul(self, msg):            # x=roll, y=pitch, z=yaw (deg) -- imu_driver's /imu/euler
+        v = msg.vector
+        self._eul = (v.x, v.y, v.z, time.monotonic())
 
     def _on_cmd_vel(self, msg):
         self._cmd_vel = (msg.linear.x, msg.angular.z)

@@ -218,6 +218,13 @@ imu_driver:
     web_rate: 5.0             # Hz; /imu/web (|accel|,|gyro|,rate) summary — same story as
                               # euler_rate above, sys_monitor-only, no raw-topic UI reader
     output_rate_hz: 0         # 0 = device streams at publish_rate; >0 pins it
+    # Mounting offset from base_link's centre (REP-103: x=fwd, y=left, z=up), mm.
+    # Web-editable (IMU card). If nonzero, accel is corrected for the lever-arm
+    # (centripetal + tangential) effect of rotating off-centre before publish —
+    # see lever_arm_correction() in imu_node.py. Gyro needs no correction.
+    offset_x_mm: 0.0
+    offset_y_mm: 0.0
+    offset_z_mm: 0.0
 
 # ---- Dev-PC-only: Gazebo hardware stand-in (see bringup.launch.py sim:=true) ------------
 # Not launched on the board. Replaces lds_driver/imu_driver's hardware reads with Gazebo
@@ -432,6 +439,11 @@ web_control:
     vision_bumper_cmd_eps: 0.03        # m/s or rad/s floor to count as "commanded to move"
     vision_bumper_motion_floor: 0.01   # gpu motion score below this = "nothing visibly moved"
     vision_bumper_confirm_secs: 0.6    # s the stall condition must hold before alerting
+    # IMU drift check: while stationary (not commanded + wheels grounded, same test
+    # as above), any roll/pitch/yaw change is gyro bias/mag interference, not real
+    # motion. Live readout in the IMU card; a still period shorter than this isn't
+    # latched into the last-result summary (too brief to mean anything).
+    imu_drift_min_secs: 10.0
     # Cheap GPU-vision alert thresholds (2026-07-12 batch): all informational only, all
     # live-tunable from the same Sensors > Camera card -- see telemetry.py's
     # _vision_alerts. Still initial guesses pending real hardware tuning EXCEPT

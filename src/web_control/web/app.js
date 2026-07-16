@@ -31,7 +31,20 @@ function pub(topic,value){
 }
 const setNodeRate=(node,hz)=>setParam(node,"publish_rate",hz);
 $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
-$("imuRate").onchange=()=>setNodeRate("imu_driver",Number($("imuRate").value));
+// Also retunes euler_rate (not just publish_rate/imu_data) -- /imu/euler is what
+// feeds the 3D orientation view, and it has its own independent rate cap in
+// imu_driver, so leaving it behind made the slider look like it did nothing for
+// that view even at 200 Hz.
+$("imuRate").onchange=()=>{
+  const hz=Number($("imuRate").value);
+  setNodeRate("imu_driver",hz);
+  setParam("imu_driver","euler_rate",hz);
+};
+// IMU mounting offset (mm from robot centre, REP-103 x/y/z) -> imu_driver's
+// offset_{x,y,z}_mm, which drives its lever-arm accel correction (imu_node.py).
+[["imuOffX","offset_x_mm"],["imuOffY","offset_y_mm"],["imuOffZ","offset_z_mm"]].forEach(([id,param])=>{
+  $(id).onchange=()=>setParam("imu_driver",param,Number($(id).value));
+});
 // IMU calibration (WitMotion 5-byte hex protocol, see imu_driver._do_calibrate) — the
 // four steps are separate button presses since accel cal needs the robot held still
 // and mag cal needs it physically rotated; status comes back async via imuCalStatus.
@@ -444,9 +457,10 @@ function onFrame(f){
     const el=$("mapTestOut"); el.style.display="block"; el.textContent=f.selftest; }
   // IMU mag readout for eyeballing calibration quality (see the IMU card's hint) +
   // the async status line from imu_driver._publish_cal_status.
-  if(f.imuMag) $("imuMag").textContent=f.imuMag.map(v=>v.toFixed(1)).join(", ");
+  if(f.imuMag) onImuMag(f.imuMag);
   if(f.imuCalStatus && f.imuCalStatus!==rawImuCal){ rawImuCal=f.imuCalStatus;
     const el=$("imuCalOut"); el.style.display="block"; el.textContent=f.imuCalStatus; }
+  if(f.imu_drift) onImuDrift(f.imu_drift);
   // Brain readouts arrive as the same latched JSON strings the behaviour node
   // publishes; only re-render when they actually change (frames tick ~5 Hz).
   if(f.purpose && f.purpose!==rawPurpose){ rawPurpose=f.purpose; renderPurpose(f.purpose); }
@@ -886,12 +900,54 @@ setInterval(()=>{
   if(lastImuT && performance.now()-lastImuT<3500) return;   // fresh: onImu owns the text
   const el=$("imuHz"); el.textContent="lost"; el.style.color="var(--red)";
 },1000);
+// IMU drift check (telemetry.py's _imu_drift_tick): live while the robot is
+// provably stationary, "last" is a latched one-line summary that persists once it
+// starts moving again -- see the IMU card's hint for what this means.
+function onImuDrift(d){
+  $("driftStill").textContent=d.still_s>0 ? d.still_s.toFixed(1)+"s" : "moving";
+  $("driftRoll").textContent=d.still_s>0 ? d.roll.toFixed(2)+"°" : "–";
+  $("driftPitch").textContent=d.still_s>0 ? d.pitch.toFixed(2)+"°" : "–";
+  $("driftYaw").textContent=d.still_s>0 ? d.yaw.toFixed(2)+"°" : "–";
+  $("driftRate").textContent=d.still_s>0 ? d.yaw_per_min.toFixed(2)+"°/min" : "–";
+  $("driftLast").textContent=d.last||"";
+}
+// IMU mounting-position interference check -- entirely client-side (the raw mag
+// xyz was already sent every frame for the "mag xyz" readout; this just derives
+// magnitude + a rolling peak-to-peak "noise" off it in the browser instead of
+// adding any backend/ROS computation). See the IMU card's hint for how to use it.
+let magHist=[];             // [[performance.now() ms, magnitude], ...] trailing ~2s
+let magWorst=0;             // peak-to-peak noise seen since the last reset
+function onImuMag(xyz){
+  $("imuMag").textContent=xyz.map(v=>v.toFixed(1)).join(", ");
+  const mag=Math.hypot(xyz[0], xyz[1], xyz[2]);
+  $("imuMagMag").textContent=mag.toFixed(1);
+  const now=performance.now();
+  magHist.push([now, mag]);
+  while(magHist.length && now-magHist[0][0]>2000) magHist.shift();
+  if(magHist.length<2) return;
+  const vals=magHist.map(p=>p[1]);
+  const noise=Math.max(...vals)-Math.min(...vals);
+  $("imuMagNoise").textContent=noise.toFixed(1);
+  if(noise>magWorst){ magWorst=noise; $("imuMagWorst").textContent=magWorst.toFixed(1); }
+}
+$("imuMagResetWorst").onclick=()=>{ magWorst=0; magHist=[]; $("imuMagWorst").textContent="0.0"; };
 function onEul(m){
   if(m.age>=4 || m.r==null) return;
   $("imuR").textContent=m.r.toFixed(1)+"°";
   $("imuP").textContent=m.p.toFixed(1)+"°";
   $("imuY").textContent=m.y.toFixed(1)+"°";
   OLED.tel({roll:m.r, pitch:m.p});
+  updateImu3d(m.r, m.p, m.y);
+}
+// IMU 3D attitude view (see style.css's .imu3d-* block): a CSS-only cube+wheels
+// rig, re-oriented by writing one `transform` string per frame -- no canvas, no
+// render loop, nothing server-side. rotateY/X/Z map onto the model's forward=+Z,
+// right=+X, up=-Y rest pose so this composes to the same Z*Y*X (yaw-pitch-roll)
+// matrix imu_driver's euler_to_quat uses, just expressed as CSS transforms.
+function updateImu3d(rollDeg, pitchDeg, yawDeg){
+  const rig=$("imu3dRig");
+  if(!rig) return;
+  rig.style.transform=`rotateY(${-yawDeg}deg) rotateX(${-pitchDeg}deg) rotateZ(${rollDeg}deg)`;
 }
 
 function fmtUptime(s){

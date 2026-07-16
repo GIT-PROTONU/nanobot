@@ -275,6 +275,39 @@ input[type=range]:disabled::-moz-range-thumb{background:var(--muted)}
   background:radial-gradient(circle at 50% 35%,#8dc0ff,var(--accent) 60%,#2f73c9);
   box-shadow:0 8px 22px rgba(0,0,0,.55),inset 0 2px 4px rgba(255,255,255,.3)}
 
+/* IMU 3D attitude view — pure CSS 3D (transform-only, GPU-composited), fed by the
+   same roll/pitch/yaw already in the telemetry frame. No canvas/WebGL/render loop:
+   the transform string is just re-set on each onEul() call (~5 Hz, app.js), so idle
+   cost is one style write per frame -- no client CPU draw work, no extra server load. */
+.imu3d-scene{width:170px;height:140px;margin:6px auto 2px;perspective:520px}
+.imu3d-cam,.imu3d-rig,.imu3d-body{width:100%;height:100%;position:relative;
+  transform-style:preserve-3d}
+.imu3d-cam{transform:rotateX(-18deg) rotateY(-28deg)}
+/* The transform only gets a fresh value once per telemetry frame (~200ms @ the
+   default 5 Hz telemetry_rate) -- a short transition would ease in then sit still
+   until the next update, reading as a stutter. Matching the transition length to
+   the update period instead makes each step continuously interpolate into the
+   next, so it reads as smooth motion even though updates are sparse -- all on the
+   client, no extra network/server work. */
+.imu3d-rig{transition:transform .2s linear}
+.imu3d-body .face{position:absolute;left:50%;top:50%;background:var(--surface-3);
+  border:1px solid var(--border-strong)}
+.imu3d-body .face.front,.imu3d-body .face.back{width:64px;height:34px;margin:-17px 0 0 -32px}
+.imu3d-body .face.left,.imu3d-body .face.right{width:96px;height:34px;margin:-17px 0 0 -48px}
+.imu3d-body .face.top,.imu3d-body .face.bottom{width:64px;height:96px;margin:-48px 0 0 -32px}
+.imu3d-body .face.front{background:var(--accent);border-color:var(--accent);transform:translateZ(48px)}
+.imu3d-body .face.back{transform:rotateY(180deg) translateZ(48px)}
+.imu3d-body .face.right{transform:rotateY(90deg) translateZ(32px)}
+.imu3d-body .face.left{transform:rotateY(-90deg) translateZ(32px)}
+.imu3d-body .face.top{transform:rotateX(90deg) translateZ(17px)}
+.imu3d-body .face.bottom{transform:rotateX(-90deg) translateZ(17px)}
+.imu3d-wheel{position:absolute;left:50%;top:50%;width:40px;height:40px;margin:-20px 0 0 -20px;
+  border-radius:50%;border:2px solid var(--bg);
+  background:radial-gradient(circle at 35% 35%,var(--muted),var(--bg) 72%)}
+.imu3d-wheel.right{transform:translateX(44px) rotateY(90deg)}
+.imu3d-wheel.left{transform:translateX(-44px) rotateY(-90deg)}
+.imu3d-hint{text-align:center}
+
 .hint{color:var(--muted);font-size:11.5px;line-height:1.55;margin:2px 0 0}
 body.no-tips .hint{display:none!important}
 kbd{background:var(--surface-2);border:1px solid var(--border);border-radius:5px;
