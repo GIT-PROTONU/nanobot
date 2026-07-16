@@ -562,6 +562,18 @@ const HINTS = {
   visApproachBand: "How close to frame centre the motion must be to count as approaching (rules out edge clutter).",
   visionTargetName: "Name this calibration ('ball', 'dock marker', ...) -- every pick is saved to a persistent palette under this name.",
   visionOledMask: "Mirror the tracking mask to the robot's physical OLED (128x64) -- the face yields while it's on.",
+  // IMU card -- SLAM error margins. Grounded in slam_nav's params: the scan matcher
+  // corrects heading by up to ±6.9° per scan (match_ang 0.12 rad); a parked robot
+  // re-matches after ~0.3° drift (still_ang), so slow bias is continuously absorbed.
+  imuA: "Total acceleration magnitude. Parked it must read gravity: 9.81 ±0.3 green, ±1.0 amber, worse red -- off means the accel needs calibrating (tilts the fused roll/pitch/yaw SLAM leans on). Colour-graded only while stationary; driving legitimately moves it.",
+  imuG: "Gyro magnitude. Parked it should be ~0: ≤1°/s green, ≤3 amber, above red (uncorrected bias or vibration). Graded only while stationary.",
+  imuMagNoise: "Peak-to-peak wobble of the mag field magnitude over 2s, plus that wobble as a % of the field -- ~0.6° of heading error per 1%. ≤2% green (≤~1° wobble), ≤6% amber, above red: eats half+ of the scan matcher's ±6.9°/scan correction window.",
+  imuMagWorst: "Biggest 2s mag wobble since the last reset (raw counts) -- peak-hold for walking the loose IMU around candidate mounting spots.",
+  driftStill: "How long the robot has been provably stationary (not commanded, wheels grounded). The drift numbers below only accumulate -- and only get colour-graded -- during this.",
+  driftRoll: "Roll change while parked. Should be ~0: ≤0.3° green, ≤1° amber, above red. 2D SLAM ignores roll directly, but real movement here means bad accel cal or vibration tilting the scan plane.",
+  driftPitch: "Pitch change while parked. Same margins as roll: ≤0.3° green, ≤1° amber, above red.",
+  driftYaw: "Total yaw change this still period. Graded against the scan matcher's ±6.9°/scan correction budget: ≤1° green, ≤3.5° (half window) amber, above red. Slow drift is auto-corrected (SLAM re-matches after ~0.3°); a sudden JUMP past ~7° between scans is what actually loses localization.",
+  driftRate: "Yaw drift normalized to °/min -- the IMU heading-health number. ≤1°/min green (a real gyro-bias level); 1-6 amber (SLAM still corrects it, but run the mag cal / check mounting); ≥6 red -- that's magnetometer interference territory, the prime suspect for the erratic self-test SPIN check and map corruption.",
 };
 function applyHints(on){
   for(const [id,text] of Object.entries(HINTS)){
@@ -882,6 +894,19 @@ setInterval(()=>{
   el.style.color = alive ? "var(--green)" : "var(--red)";
 },1000);
 
+// SLAM error margins -- what "within margin" means for the IMU numbers below.
+// Grounded in slam_nav's actual parameters, not guesses: the scan matcher corrects
+// the IMU/odom heading prior by up to match_ang (0.12 rad = ±6.9°) EVERY scan, and
+// the parked still-skip resumes matching after only ~0.3° of accumulated drift
+// (still_ang) -- so slow gyro bias is continuously absorbed. What actually loses
+// localization is a heading error bigger than that window between two scans, i.e.
+// a sudden magnetometer jump (interference), not slow drift. Colours: green = well
+// inside the budget, amber = SLAM still fine but worth recalibrating, red = bad
+// enough to corrupt the map / the likely SPIN-check culprit.
+function slamGrade(el, v, warn, bad){
+  el.style.color = v>=bad ? "var(--red)" : v>=warn ? "var(--amber)" : "var(--green)";
+}
+let driftStillS=0;   // >0 while provably stationary (gates the |accel|/|gyro| grading)
 let lastImuT=0;
 function onImu(m){
   // frame imu: {a:|accel| m/s^2, g:|gyro| rad/s, hz:actual /imu/data Hz, age:s}.
@@ -890,6 +915,12 @@ function onImu(m){
   lastImuT=performance.now()-m.age*1000;
   $("imuA").textContent=m.a.toFixed(2);
   $("imuG").textContent=(m.g*180/Math.PI).toFixed(1);
+  // Grade only while provably stationary -- driving legitimately moves both numbers.
+  // Stationary, |accel| must read gravity (9.81) and |gyro| ~0 (residual = bias/noise).
+  if(driftStillS>0){
+    slamGrade($("imuA"), Math.abs(m.a-9.81), 0.3, 1.0);
+    slamGrade($("imuG"), m.g*180/Math.PI, 1.0, 3.0);
+  } else { $("imuA").style.color=""; $("imuG").style.color=""; }
   const el=$("imuHz"); el.textContent=m.hz.toFixed(0)+" Hz"; el.style.color="";
   OLED.tel({imuHz:m.hz});
 }
@@ -904,11 +935,22 @@ setInterval(()=>{
 // provably stationary, "last" is a latched one-line summary that persists once it
 // starts moving again -- see the IMU card's hint for what this means.
 function onImuDrift(d){
+  driftStillS=d.still_s;
   $("driftStill").textContent=d.still_s>0 ? d.still_s.toFixed(1)+"s" : "moving";
   $("driftRoll").textContent=d.still_s>0 ? d.roll.toFixed(2)+"°" : "–";
   $("driftPitch").textContent=d.still_s>0 ? d.pitch.toFixed(2)+"°" : "–";
   $("driftYaw").textContent=d.still_s>0 ? d.yaw.toFixed(2)+"°" : "–";
   $("driftRate").textContent=d.still_s>0 ? d.yaw_per_min.toFixed(2)+"°/min" : "–";
+  if(d.still_s>0){
+    // Roll/pitch: 2D SLAM never reads them, but real movement here = bad accel cal
+    // or vibration tilting the scan plane. Yaw is graded against the scan-matcher's
+    // ±6.9°/scan correction window (amber at half of it); the RATE is the health
+    // number -- ≥6°/min is interference-grade, not normal gyro bias.
+    slamGrade($("driftRoll"),  Math.abs(d.roll),  0.3, 1.0);
+    slamGrade($("driftPitch"), Math.abs(d.pitch), 0.3, 1.0);
+    slamGrade($("driftYaw"),   Math.abs(d.yaw),   1.0, 3.5);
+    slamGrade($("driftRate"),  Math.abs(d.yaw_per_min), 1.0, 6.0);
+  } else for(const id of ["driftRoll","driftPitch","driftYaw","driftRate"]) $(id).style.color="";
   $("driftLast").textContent=d.last||"";
 }
 // IMU mounting-position interference check -- entirely client-side (the raw mag
@@ -927,7 +969,13 @@ function onImuMag(xyz){
   if(magHist.length<2) return;
   const vals=magHist.map(p=>p[1]);
   const noise=Math.max(...vals)-Math.min(...vals);
-  $("imuMagNoise").textContent=noise.toFixed(1);
+  // Raw counts are only comparable spot-to-spot, but noise as a % OF the field is an
+  // absolute health number: a transverse wobble of x% of the field is ~0.6x° of
+  // heading wobble, so 6% ≈ 3.4° -- half the scan-matcher's ±6.9° correction window.
+  const pct=mag>1 ? noise/mag*100 : 0;
+  const nEl=$("imuMagNoise");
+  nEl.textContent=noise.toFixed(1)+(mag>1 ? ` (${pct.toFixed(1)}%)` : "");
+  if(mag>1) slamGrade(nEl, pct, 2, 6); else nEl.style.color="";
   if(noise>magWorst){ magWorst=noise; $("imuMagWorst").textContent=magWorst.toFixed(1); }
 }
 $("imuMagResetWorst").onclick=()=>{ magWorst=0; magHist=[]; $("imuMagWorst").textContent="0.0"; };

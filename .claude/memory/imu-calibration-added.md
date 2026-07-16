@@ -39,3 +39,16 @@ value. Both ride existing/new telemetry fields, no new hardware readback needed.
 measurably tightens the self-test SPIN drift documented in
 [[selftest-spin-imu-mismatch]] — if the drift persists after a clean mag cal, that
 points harder at wheel slip instead.
+
+**2026-07-16 follow-up (same day, later session): SLAM error margins in the IMU card.**
+User asked "what error values are within margin for good SLAM" — added live
+green/amber/red grading (client-side only: `app.js` `slamGrade()` + HINTS entries +
+`index.html` hint text; no server change, smoke-tested). Margins are DERIVED from
+slam_nav's real tuning, not guesses: scan matcher corrects heading up to `match_ang`
+0.12 rad = **±6.9°/scan**, parked still-skip re-matches after `still_ang` ~0.3°, so slow
+drift is continuously absorbed — the map-loser is a sudden mag *jump* > ~7° between
+scans. Graded readouts (stationary-gated via the drift check's `still_s`): yaw drift
+rate ≤1°/min green / <6 amber / ≥6 red; yaw total vs half-window 3.5°; roll/pitch drift
+0.3°/1°; |accel| 9.81±0.3/±1; |gyro| ≤1/≤3 °/s; mag noise now also shown as **% of
+field** (~0.6° heading wobble per 1%), ≤2% green / ≤6% amber. NOT yet deployed to the
+board.

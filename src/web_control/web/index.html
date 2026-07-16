@@ -428,7 +428,10 @@
               watching for a spike here. <b>Worst noise seen</b> peak-holds the biggest jump
               since the last reset, so you don't have to stare at it while walking the sensor
               around. Raw sensor counts — useful only to compare spots, not an absolute field
-              reading.</p>
+              reading — but the <b>%</b> next to <b>mag noise</b> IS absolute: wobble as a
+              fraction of the field ≈ 0.6° of heading error per 1%, so ≤ 2% is good for SLAM
+              (≤ ~1° wobble), and past 6% (~3.4°, half the scan-matcher's per-scan correction
+              window) the mount is bad enough to corrupt the map.</p>
             <div class="imu3d-scene"><div class="imu3d-cam"><div class="imu3d-rig" id="imu3dRig">
               <div class="imu3d-body">
                 <div class="face front"></div><div class="face back"></div>
@@ -469,6 +472,19 @@
               or magnetometer interference, not real motion. Leave it parked for a while to get
               a reading; the line above persists after it moves again so you don't have to
               watch it live.</p>
+            <p class="hint"><b>Margins for good SLAM</b> (colour-graded live, derived from
+              slam_nav's actual tuning): the scan matcher corrects the IMU heading by up to
+              <b>±6.9° every scan</b> (<b>match_ang</b>) and a parked robot re-matches after just
+              ~0.3° of drift, so <em>slow</em> drift is absorbed continuously — what actually
+              loses localization is a sudden yaw <em>jump</em> past ~7° between scans, i.e.
+              magnetometer interference. <span style="color:var(--green)">green</span> = well
+              within margin, <span style="color:var(--amber)">amber</span> = SLAM still fine but
+              recalibrate (accel/mag cal above, or move the IMU), <span
+              style="color:var(--red)">red</span> = map-corrupting. Parked targets:
+              <b>yaw rate</b> ≤ 1°/min (amber to 6, red above — interference territory, the
+              prime suspect for the erratic self-test SPIN check), <b>roll/pitch drift</b>
+              ≤ 0.3° (red past 1°), <b>|accel|</b> 9.81 ± 0.3 m/s², <b>|gyro|</b> ≤ 1°/s,
+              <b>mag noise</b> ≤ 2% of the field (~0.6° heading wobble per 1%).</p>
             <div class="field inline">mount offset (mm) x <input id="imuOffX" type="number" value="0" step="1">
               y <input id="imuOffY" type="number" value="0" step="1">
               z <input id="imuOffZ" type="number" value="0" step="1"></div>
