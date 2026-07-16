@@ -77,3 +77,24 @@ rotation (relevant given the ground-bounce origin of the earlier
 prev-tick baseline so `/odom` doesn't jump. Web Coprocessor card: "stray ticks L/R"
 readout (red if nonzero) + "🔁 Reset ticks" button. `pio run` build verified clean; not
 yet flashed to hardware.
+
+**2026-07-16 (later session): off-ground switch polarity FLIPPED + trim autocal DISABLED.**
+- **`SUSPEND_ACTIVE_HIGH` flipped `false`→`true`** (main.cpp ~L70). The previous session
+  (see [[slam-map-rotation-encoder-trim]]) had concluded the two switches were
+  *inconsistent per-wheel* (so no single flag could be right). On reflection + direct user
+  instruction ("down should be up, up should be down") the global polarity was simply
+  **inverted** — the switch reads HIGH (INPUT_PULLUP) while the wheel is LIFTED, LOW while
+  on the ground. So `true` is now correct: **`left/right_wheel_suspended == true` MEANS the
+  wheel is UP / lifted (robot suspended).** This re-opens `pickup_pause` correctness — but
+  verify on hardware before re-enabling `pickup_pause: true` in robot.yaml.
+- **`TRIM_AUTOCAL` disabled (1→0) + `TRIM_DEFAULT = -0.10` added.** The autocal was
+  converging the WRONG way: the robot veers LEFT, but autocal's encoder-signed imbalance
+  pushed trim positive (more left veer). So autocal is off and a fixed negative starting
+  offset (boost left / cut right) counteracts the leftward veer; `TRIM_DEFAULT` is now the
+  NVS fallback (overrides the old +0.22). Tune live with `POST /motor_trim` (or the web
+  Coprocessor card slider — see [[web-publish-topic-namespace-gotcha]]). Value persists to
+  NVS once driven straight. **Note:** the earlier +0.22 was for a RIGHT veer diagnosis; the
+  current robot veers LEFT, hence the sign flip. If it still veers left after -0.10, push
+  the slider further negative (toward -0.30).
+- Both changes built + **flashed** (`pio run -t upload` over /dev/ttyUSB0) and deployed in
+  the same session as the web trim slider.

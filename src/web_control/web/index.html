@@ -847,6 +847,15 @@
             <button id="espResetTicks" class="btn">🔁 Reset ticks</button>
             <div class="field"><label>Accel ramp <span id="motorAccelV">3.0</span> duty/s</label>
               <input id="motorAccel" type="range" min="0.3" max="8" step="0.1" value="3.0"></div>
+            <div class="field"><label>Wheel trim <span id="motorTrimV">0.00</span> <span id="motorTrimLive" class="live"></span></label>
+              <input id="motorTrim" type="range" min="-0.30" max="0.30" step="0.01" value="0.00"></div>
+            <button id="motorTrimReset" class="btn">↺ Reset trim to 0</button>
+            <p class="hint"><b>Wheel trim</b> rebalances the mismatched gearmotors so a forward
+              command goes straight. If the robot drifts <b>left</b>, push the slider
+              <b>negative</b> (boost left / cut right); if it drifts <b>right</b>, push
+              <b>positive</b>. The live value (in parentheses) is what the ESP32 is actually
+              using and is persisted to its flash, so it survives a reboot — the slider
+              re-syncs to it on load. <b>Reset trim to 0</b> clears the rebalance.</p>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>

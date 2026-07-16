@@ -67,11 +67,10 @@
 #define RIGHT_ENC      5
 #define LEFT_SUSPEND_PIN   4
 #define RIGHT_SUSPEND_PIN 21
-#define SUSPEND_ACTIVE_HIGH false  // switch reads HIGH (INPUT_PULLUP) while the wheel is ON the
-                                    // ground (switch open); lifted = pin pulled LOW. The previous
-                                    // `true` inverted this, so the robot reported "suspended" while
-                                    // driving — which froze SLAM (pickup_pause) and blocked the
-                                    // straight-line trim autocal.
+#define SUSPEND_ACTIVE_HIGH true   // switch reads HIGH (INPUT_PULLUP) while the wheel is OFF the
+                                   // ground (lifted); on the ground (switch closed) = pin pulled LOW.
+                                   // Flipped 2026-07-16 so "suspended" now means lifted (up), not
+                                   // down.
 #define LED_PIN        2
 // LDS data link = UART1 (Serial1). UART1's default pins (9/10) are the SPI flash, but the
 // peripheral routes through the GPIO matrix, so RX is remapped to GPIO14 (TX=GPIO13 stays
@@ -139,7 +138,11 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // std_msgs/Float32 on /motor_trim to set it directly (0 = reset); current value is
 // republished on /wheel_trim at 1 Hz and in the status line below.
 // (Compiled out under WHEEL_PID_ENABLED — a velocity PID equalizes the wheels itself.)
-#define TRIM_AUTOCAL    1
+#define TRIM_AUTOCAL    0   // disabled: the encoder-signed autocal was converging the WRONG way on
+                            // this board (robot veers LEFT, but autocal pushed trim positive => more
+                            // left veer). Set a fixed TRIM_DEFAULT below instead and tune via /motor_trim.
+#define TRIM_DEFAULT    -0.10f  // starting straight-line offset; NEGATIVE = boost left / cut right,
+                                // counteracting a leftward veer. Tune live with POST /motor_trim.
 #define TRIM_MAX        0.30f   // |trim| clamp — beyond this something is broken, not unmatched
 #define TRIM_CAL_HZ     5       // adaptation windows/s (200 ms of ticks each)
 #define TRIM_CAL_GAIN   0.08f   // fraction of the measured imbalance folded in per window
@@ -683,9 +686,9 @@ void setup(){
   pinMode(RIGHT_ENC,INPUT_PULLUP); attachInterrupt(digitalPinToInterrupt(RIGHT_ENC),rightEncISR,RISING);
   pinMode(LEFT_SUSPEND_PIN,INPUT_PULLUP); pinMode(RIGHT_SUSPEND_PIN,INPUT_PULLUP);
 
-  // Straight-line trim from NVS (0 until the first calibration drive / manual set).
+  // Straight-line trim from NVS (falls back to TRIM_DEFAULT if never calibrated / saved).
   g_prefs.begin("nano", false);
-  g_trim = g_trim_saved = clampf(g_prefs.getFloat("trim", 0), -TRIM_MAX, TRIM_MAX);
+  g_trim = g_trim_saved = clampf(g_prefs.getFloat("trim", TRIM_DEFAULT), -TRIM_MAX, TRIM_MAX);
   Serial.printf("[nano] wheel trim from NVS: %.3f\n", (double)g_trim);
 
 #if LDS_ENABLED

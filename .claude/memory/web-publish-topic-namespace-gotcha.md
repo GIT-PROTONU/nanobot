@@ -42,3 +42,15 @@ POSTs as `topic`) unchanged so `map.js` didn't need to change.
 subscribed topic name in the target node before assuming a prefix will resolve. If
 slam_nav (or any node) is ever given a real ROS namespace later, this whole class of
 `pub(Bool, "slam_nav/x", ...)` call would need re-auditing in the other direction.
+
+**2026-07-16 (later session): `/motor_trim` added to the whitelist.** New entry
+`"/motor_trim": (pub(Float32, "motor_trim", 5), self._mk_motor_trim)` — the ROS topic
+is bare `"motor_trim"` (no `/slam_nav/` prefix; the ESP32 subscribes to the bare name,
+same namespace situation as the go_home fix). `_mk_motor_trim` rejects values outside
+`±TRIM_MAX` (0.30) rather than clamping, so an out-of-range POST is silently ignored
+instead of silently saturating — a deliberate deviation from the clamp-everywhere pattern
+of the other helpers, because a saturated trim would hide a tuning mistake. The live
+value echoes back on the `esp.wheel_trim` field of the `/telemetry` frame (telemetry.py
+subscribes `/wheel_trim`) and is shown on the web Coprocessor card's **Wheel trim** slider.
+Backed by the ESP32 straight-line trim (see [[esp32-coprocessor]],
+[[slam-map-rotation-encoder-trim]]).

@@ -54,6 +54,7 @@ PLAN_MAX_PTS = 64        # planned-path polyline is downsampled to at most this 
 LDS_RPM_MAX = 400.0      # clamp on the /lds_target_rpm setpoint a browser may publish
 MOTOR_ACCEL_MIN = 0.3    # clamp on the /motor_accel ramp rate (duty/s) -- matches the
 MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.cpp)
+TRIM_MAX = 0.30          # ESP32 firmware's TRIM_MAX -- |wheel_trim| rebalance range (main.cpp)
 GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- half of slam_nav's default
                          # map_size_m (24m); a goal outside the map would otherwise sit
                          # latched until goal_no_path_timeout reaps it ~20s later
@@ -113,6 +114,7 @@ class TelemetryHub:
         self._hb = (None, STALE)      # (/esp32_heartbeat counter, arrival)
         self._esp_temp = (None, STALE)
         self._hall = None
+        self._wheel_trim = None     # live straight-line trim from the ESP32 (/wheel_trim)
         self._lds = {}                # rpm / hz / duty
         self._fan = None
         self._selftest = ""
@@ -147,6 +149,10 @@ class TelemetryHub:
             "/reset_ticks": (pub(Bool, "reset_ticks", 5), self._mk_bool),
             # ESP32 motor accel-ramp rate (duty/s) -- see main.cpp's MOTOR_SLEW_DEFAULT.
             "/motor_accel": (pub(Float32, "motor_accel", 5), self._mk_motor_accel),
+            # ESP32 straight-line wheel trim (-0.3..0.3): negative = boost left / cut right
+            # (robot veers left), positive = the opposite. Live-tunes the open-loop trim that
+            # rebalances the mismatched gearmotors in main.cpp's applyMotors(); persisted to NVS.
+            "/motor_trim": (pub(Float32, "motor_trim", 5), self._mk_motor_trim),
             # NOTE: the ROS topic string here is bare ("go_home", not "slam_nav/go_home")
             # -- nav_node subscribes to the same bare name with no namespace of its own
             # (neither the systemd unit_exec.sh path nor bringup.launch.py sets one), so
@@ -382,7 +388,8 @@ class TelemetryHub:
                     "temp": esp_temp, "temp_age": round(now - esp_temp_at, 2),
                     "hall": self._hall, "ticks": self._ticks,
                     "stray": self._stray,
-                    "tick_hz": round(self._tick_hz, 1)},
+                    "tick_hz": round(self._tick_hz, 1),
+                    "wheel_trim": self._wheel_trim},
             "lds": self._lds,
             "oled": self._oled,
         }
@@ -481,6 +488,7 @@ class TelemetryHub:
         s(sub(Int32, "esp32_heartbeat", self._on_hb, 2))
         s(sub(Float32, "esp32_temp", self._on_esp_temp, 2))
         s(sub(Int32, "esp32_hall", self._on_hall, 2))
+        s(sub(Float32, "wheel_trim", self._on_wheel_trim, 2))
         s(sub(Float32, "lds_rpm", self._mk_lds("rpm"), 2))
         s(sub(Float32, "lds_hz", self._mk_lds("hz"), 2))
         s(sub(Float32, "lds_duty", self._mk_lds("duty"), 2))
@@ -555,6 +563,9 @@ class TelemetryHub:
     def _on_hall(self, msg):
         self._hall = msg.data
 
+    def _on_wheel_trim(self, msg):
+        self._wheel_trim = round(float(msg.data), 3)
+
     def _mk_lds(self, key):
         def cb(msg):
             self._lds[key] = round(msg.data, 3)
@@ -621,6 +632,13 @@ class TelemetryHub:
     @staticmethod
     def _mk_motor_accel(v):
         return Float32(data=min(MOTOR_ACCEL_MAX, max(MOTOR_ACCEL_MIN, float(v))))
+
+    @staticmethod
+    def _mk_motor_trim(v):
+        t = float(v)
+        if not (-TRIM_MAX <= t <= TRIM_MAX):
+            return None          # out of the rebalance range; ignore rather than clamp silently
+        return Float32(data=t)
 
     @staticmethod
     def _mk_pickup(v):

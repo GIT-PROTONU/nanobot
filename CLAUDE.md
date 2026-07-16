@@ -191,10 +191,12 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   Publishes
   `/wheel_ticks` (Int64MultiArray `[L,R]`) from **single-channel** rising-edge GPIO-
   interrupt counts (**signed by commanded direction** — the encoders have no 2nd channel,
-  so the ISR signs each tick by the last `/cmd_vel` wheel direction), `/left_wheel_suspended` +
+  so the ISR signs each tick by the last `/cmd_vel` wheel direction),   `/left_wheel_suspended` +
   `/right_wheel_suspended` (Bool per-wheel off-ground microswitch, **published on change**
-  for low latency + a 1 Hz heartbeat republish; the SBC consumers — slam_nav pickup
-  freeze, mood_node pickup reflex, web_control snapshot — all honor a **latched
+  for low latency + a 1 Hz heartbeat republish; **`true` = the wheel is UP / lifted, the
+  robot is suspended — `SUSPEND_ACTIVE_HIGH` is `true` (2026-07-16 flip): the switch reads
+  HIGH (INPUT_PULLUP) while lifted, LOW while on the ground.** The SBC consumers — slam_nav
+  pickup freeze, mood_node pickup reflex, web_control snapshot — all honor a **latched
   `/pickup_override` test hook** (Int8: -1 auto, 0 force-grounded, 1 force-lifted; ESP32
   1 Hz heartbeat makes overriding at the source impossible), set from the web
   Coprocessor card, auto-cleared on page reload), `/esp32_temp` (Float32) + `/esp32_hall`
@@ -215,14 +217,17 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   both `/wheel_ticks` and `/wheel_stray_ticks` on the ESP32; `wheel_odometry` also watches
   `/reset_ticks` and re-seeds its prev-tick baseline (`_have_ticks=False`) so `/odom`
   doesn't see a fake huge jump when the raw counters reset.
-- **Straight-line trim autocal**: the mismatched gearmotors are rebalanced by a single
-  trim factor in `applyMotors` (`l*=(1-t)`, `r*=(1+t)`; positive = robot was pulling
-  right). While a straight drive is commanded (equal duties, wheels on the ground, enough
-  ticks) the encoder L/R tick-rate imbalance is folded into the trim each 200 ms window —
-  **calibration = drive straight ahead for ~5 s**. Persisted to ESP32 NVS (survives
-  reboot/reflash; written only while stopped, rate-limited). Manual set/reset via
-  `/motor_trim` (Float32, 0 = reset); live value on `/wheel_trim` @1 Hz + the debug
-  status line. Tunables `TRIM_*` in `main.cpp`; compiled out if `WHEEL_PID_ENABLED`.
+- **Straight-line trim (open-loop rebalance)**: the mismatched gearmotors are rebalanced
+  by a single trim factor in `applyMotors` (`l*=(1-t)`, `r*=(1+t)`; **negative = robot was
+  pulling left** — boost left / cut right — because the robot currently veers LEFT). A
+  fixed **`TRIM_DEFAULT = -0.10`** (main.cpp, 2026-07-16) is the NVS fallback; the old
+  **`TRIM_AUTOCAL` is DISABLED** (`TRIM_AUTOCAL 0`) because on this board its encoder-signed
+  imbalance converged the WRONG way (pushed trim positive = more left veer). Persisted to
+  ESP32 NVS (survives reboot/reflash; written only while stopped, rate-limited). Manual
+  set/reset live via **`/motor_trim`** (Float32, 0 = reset) — the web Coprocessor card has
+  a **Wheel trim** slider (`±0.30`) that POSTs it and re-seeds from the live `/wheel_trim`
+  @1 Hz value; the slider's "Reset trim to 0" button clears it. Tunables `TRIM_*` in
+  `main.cpp`; compiled out if `WHEEL_PID_ENABLED`.
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,
@@ -485,7 +490,7 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   tick and fanned out; the underlying subscriptions are **lazy** (created on the
   first client — on the executor thread via the tick timer — dropped `SUB_LINGER`
   after the last), so idle cost is ~zero. Writes: `POST /publish {topic,value}`
-  (whitelisted + clamped per topic: goal_pose, lds_target_rpm, pickup_override,
+  (whitelisted + clamped per topic: goal_pose, lds_target_rpm, motor_trim, pickup_override,
   reset_ticks, imu_calibrate, schedule_edit,
   selftest, go_home/save_map, oled_*) and `POST /param {node,name,value}`
   (whitelisted nodes/params via `/<node>/set_parameters`, fire-and-forget). The

@@ -12,6 +12,19 @@ First real on-robot SLAM+drive shakedown. Three linked problems fixed, one left
 as an accepted workaround. All changes deployed to the board (`./scripts/deploy.sh
 slam_nav` + an ESP32 reflash).
 
+> **SUPERSEDED by a later 2026-07-16 session — read this first.** Problems 3 & 4 below
+> were revisited the SAME day in a follow-up session and the conclusions changed:
+> - The "inconsistent per-wheel polarity" finding (problem 4) was wrong — the global
+>   flag was simply **inverted**; `SUSPEND_ACTIVE_HIGH` flipped `false`→`true` and now
+>   `suspended==true` correctly means the wheel is LIFTED. See [[esp32-coprocessor]].
+> - The straight-line trim: the robot actually veers **LEFT** (not right), so the manual
+>   `wheel_trim=+0.22` was wrong-way. Autocal was converging the wrong direction, so it's
+>   now **DISABLED** and `TRIM_DEFAULT=-0.10` (boost left / cut right) is the new starting
+>   point. Tune live via the web Coprocessor card slider or `POST /motor_trim`. The old
+>   `pickup_pause: false` workaround may be safe to revert once the flipped switches are
+>   verified on hardware.
+> Keep the map-rotation fix (problem 1) — that one still holds.
+
 ## 1. Map-rotation drift bug (FIXED, hw-verified)
 **Symptom:** as the robot drove, the lidar map did NOT track the robot — the scan
 rotated relative to the map (slam_pose showed a ~60° skew vs odom), so the map
@@ -41,56 +54,58 @@ All temporary debug logging (PREDICT/MATCH lines) was removed after verification
 live). SLAM no longer freezes. **Keep `pickup_pause` OFF until the suspension
 switches read truthfully** (see problem 4) — re-enabling it now would re-break SLAM.
 
-## 3. Encoder straight-line trim — HAND-CALIBRATED (works, autocal blocked)
-The mismatched gearmotors made the robot veer right. The firmware trim autocal
-(`applyMotors`: `l*=(1-t) r*=(1+t)`, positive t = was pulling right; NVS-persisted)
-**could not run** because its gate requires both wheels grounded
-(`!g_susp_l && !g_susp_r`) and the switches lie (problem 4).
+## 3. Encoder straight-line trim — ROBOT VEERS LEFT (autocal disabled, fixed TRIM_DEFAULT)
+The mismatched gearmotors make the robot veer **LEFT** (corrected from the earlier
+"+0.22 right-veer" note — that diagnosis was backwards). In a later same-day session the
+trim **autocal was DISABLED** (`TRIM_AUTOCAL 1→0`) because it was converging the WRONG
+way: its encoder-signed imbalance pushed trim positive, which *increased* the left veer.
 
-**Workaround that works:** set the trim MANUALLY via the `/motor_trim` topic
-(Float32) — landed on **`wheel_trim = +0.22`**. This dropped the L/R tick imbalance
-from ~13.4% to ~2.8% and the robot now drives "way more straight" (measured 3.7°
-yaw over 0.07 m — good for a one-wheel-lifted drive). The value is persisted in
-ESP32 NVS, so it survives reboot/reflash. `/wheel_trim` @1 Hz reports the live value.
+**Current fix:** a fixed starting offset **`TRIM_DEFAULT = -0.10`** (boost left / cut
+right) is now the NVS fallback in `applyMotors` (`l*=(1-t) r*=(1+t)`, negative t = was
+pulling left; NVS-persisted). Tune live via the web Coprocessor card **Wheel trim** slider
+or `POST /motor_trim` (Float32, 0 = reset) — the new value persists to NVS once driven
+straight. `/wheel_trim` @1 Hz reports the live value. If it still veers left after -0.10,
+push the slider further negative (toward -0.30); if it now veers right, move toward 0/+.
 
-> To manually set: publish Float32 to `/motor_trim` (0 = reset). Confirm on
-> `/wheel_trim`. This is the go-to until autocal is unblocked.
+> The earlier manual `wheel_trim=+0.22` is **superseded** — the robot veers left, not
+> right, so a positive trim was wrong-way. NVS may still hold +0.22 from that session until
+> a new `/motor_trim` value is written; set it via the slider/POST to overwrite.
 
-## 4. Suspension switch polarity is INCONSISTENT (OPEN, blocks autocal)
-The two off-ground microswitches do **not** agree with a single
-`SUSPEND_ACTIVE_HIGH` setting — they behave *oppositely*:
-- Flashed `SUSPEND_ACTIVE_HIGH = false` (firmware/nanobot_coprocessor/src/main.cpp
-  ~line 70). Observed: **L reads False while physically lifted**, **R reads True
-  while physically grounded** — both wrong, in opposite directions.
-- The earlier `true` setting also produced a wrong reading (L=True on ground).
-- So neither global polarity is correct → one switch is always wrong regardless.
+## 4. Suspension switch polarity — FLIPPED to `true` (correct), was misdiagnosed
+The earlier conclusion here ("switches read inconsistent polarity, no single flag can
+be right") was WRONG. The global flag was simply **inverted**. On direct user instruction
+("down should be up, up should be down") `SUSPEND_ACTIVE_HIGH` was flipped `false`→`true`
+(firmware/nanobot_coprocessor/src/main.cpp ~L70, **built + flashed**).
 
-**Consequences:**
-- Trim autocal stays blocked (gate needs `!L && !R`; R always reads suspended).
-  Even with both wheels DOWN, R would report suspended → autocal never runs.
-- `pickup_pause` must stay off (problem 2).
+- **`true` is now correct:** the switch reads HIGH (INPUT_PULLUP) while the wheel is
+  LIFTED, LOW while on the ground. So `left/right_wheel_suspended == true` MEANS the
+  wheel is **UP / lifted** (robot suspended) — the natural reading.
+- This removes the autocal blocker premise (the old gate `!g_susp_l && !g_susp_r` is now
+  meaningful). Autocal is still DISABLED for the separate reason in problem 3 (it was
+  converging the wrong way).
+- `pickup_pause` can be reconsidered: with truthful switches, re-enabling
+  `pickup_pause: true` in robot.yaml should be safe — but **verify on hardware** before
+  flipping it back (the false-trigger that forced it off is now expected to be gone).
+- If a switch still misreads after this flip, THEN it's a genuine per-wheel wiring fault
+  (fix options 1/3 above), but that was not the actual cause this time.
 
-**Why unresolved:** the true per-switch wiring is unknown and guessing the global
-flag is unreliable. Real fixes (need the physical robot / firmware reflash):
-1. Read the raw `digitalRead` state per switch (via firmware serial debug line) to
-   learn the true idle level of EACH switch, then set correct polarity **per wheel**
-   (a per-wheel flag, not the single `SUSPEND_ACTIVE_HIGH`), OR
-2. Relax the autocal gate to key off "straight command + enough ticks" instead of
-   requiring both-grounded (removes the dependency on the flaky switches entirely),
-   OR
-3. Physically inspect/fix the switch wiring/mounting.
-
-Note the robot currently drives with the **left wheel genuinely lifted** (chassis
-unbalanced) and the user is OK driving like that — so "both grounded" may rarely be
-true in practice anyway, which argues for fix #2.
-
-## Current accepted state (end of session)
+## Current accepted state (end of ORIGINAL session)
 - Map tracks the robot ✓ (rotation fix + map->odom TF, deployed).
-- Robot drives acceptably straight ✓ (manual `wheel_trim=0.22`, NVS-persisted).
+- Robot drives acceptably straight ✓ (manual `wheel_trim=0.22`, NVS-persisted) — *see
+  the superseded note above; current trim is `TRIM_DEFAULT=-0.10` and robot veers left*.
 - SLAM doesn't freeze ✓ (`pickup_pause: false`).
 - Autocal self-tuning ✗ (blocked on switch polarity — accepted for now).
 
-## Files touched
+## UPDATED state (later same-day session — see top supersede note)
+- Map tracks the robot ✓ (unchanged).
+- Off-ground switches now truthful ✓ (`SUSPEND_ACTIVE_HIGH true` — `suspended==true`
+  means wheel UP/lifted; built + flashed).
+- Straight-line drive: autocal DISABLED, `TRIM_DEFAULT=-0.10` (boost left/cut right for
+  the left veer); tune live via web Coprocessor card slider or `POST /motor_trim`.
+- SLAM freeze + autocal: `pickup_pause` re-enable + autocal re-enable are now *plausible*
+  again (switches truthful) but NOT yet done — verify on hardware before flipping.
+
+## Files touched (original session)
 - `src/slam_nav/slam_nav/nav_node.py` — `_predict` (seed-yaw align + `pth-oth`
   rotation), `_publish_pose` (map->odom TF), seed path in `_on_scan`, `clear_map`.
 - `src/robot_bringup/config/robot.yaml` — `pickup_pause: false`.
@@ -100,5 +115,16 @@ true in practice anyway, which argues for fix #2.
   `firmware/nanobot_coprocessor` (~/pio-venv). Diagnostic scripts lived in
   robot `/tmp/*.py` (trace/trim/heading/settrim2) — transient, gone after reboot.
 
+## Files touched (later session: suspend flip + trim autocal off + web trim slider)
+- `firmware/nanobot_coprocessor/src/main.cpp` — `SUSPEND_ACTIVE_HIGH true`; `TRIM_AUTOCAL 0`
+  + `TRIM_DEFAULT -0.10`; NVS load falls back to `TRIM_DEFAULT`.
+- `src/web_control/web_control/telemetry.py` — `/motor_trim` added to `/publish` whitelist
+  (`_mk_motor_trim`, clamps to `TRIM_MAX=0.30`); subscribes `/wheel_trim`, surfaces live
+  value in the `esp` frame.
+- `src/web_control/web/index.html` + `app.js` — Coprocessor card **Wheel trim** slider
+  (±0.30) + live readout + reset button; slider re-seeds from the telemetry `wheel_trim`.
+- Deploy: `./scripts/deploy.sh` (all pkgs) + `pio run -t upload` — both done this session.
+
 See also [[slam-nav]], [[esp32-coprocessor]], [[slam-autonomy-pickup-relocalize]],
-[[esp32-pid-velocity-pending]] (the trim autocal origin).
+[[esp32-pid-velocity-pending]] (the trim autocal origin),
+[[web-publish-topic-namespace-gotcha]] (the /motor_trim whitelist + web slider).

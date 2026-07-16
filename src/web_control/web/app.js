@@ -123,6 +123,13 @@ $("espResetTicks").addEventListener("click",()=>{ pub("/reset_ticks",true); $("e
 // page reload shows the slider's default rather than the ESP32's actual live value.
 $("motorAccel").oninput=()=>$("motorAccelV").textContent=$("motorAccel").value;
 $("motorAccel").onchange=()=>pub("/motor_accel",Number($("motorAccel").value));
+// ESP32 straight-line wheel trim: negative = boost left / cut right (robot veers left),
+// positive = the opposite. The slider only sends; the live value comes back from the
+// telemetry frame (f.esp.wheel_trim) and is shown in the readout + re-syncs the slider
+// once on first arrival so the page matches the persisted NVS value.
+$("motorTrim").oninput=()=>$("motorTrimV").textContent=Number($("motorTrim").value).toFixed(2);
+$("motorTrim").onchange=()=>pub("/motor_trim",Number($("motorTrim").value));
+$("motorTrimReset").addEventListener("click",()=>{ $("motorTrim").value="0"; $("motorTrimV").textContent="0.00"; pub("/motor_trim",0); });
 // Fan override -> sys_monitor fan_override param.
 // v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
 const setFanOverride=v=>setParam("sys_monitor","fan_override",v);
@@ -981,6 +988,17 @@ function onEsp(e, susp){
     $("espTemp").textContent=e.temp.toFixed(1)+"°C"; OLED.tel({espTemp:e.temp});
   }
   if(e.hall!=null) $("espHall").textContent=e.hall;
+  if(e.wheel_trim!=null){
+    const t=e.wheel_trim;
+    $("motorTrimLive").textContent=`(live ${t>=0?"+":""}${t.toFixed(2)})`;
+    // Re-seed the slider once from the live value so the page matches the ESP32's
+    // persisted NVS trim instead of the slider's default 0.
+    if(!motorTrimSynced){
+      motorTrimSynced=true;
+      $("motorTrim").value=String(t);
+      $("motorTrimV").textContent=t.toFixed(2);
+    }
+  }
 }
 function onLds(l){
   if(l.rpm!=null) $("espLdsRpm").textContent=l.rpm.toFixed(0)+" rpm";
@@ -1628,6 +1646,7 @@ function onOdom(o){
 // 10 Hz keepalive + dead-man on the board, so browser jank can't outlast the ESP32's
 // 500 ms /cmd_vel watchdog and stutter the drive. The dev harness accepts it as a no-op.
 let curV=0, curW=0, driveBusy=false;
+let motorTrimSynced=false;   // whether the wheel-trim slider has been seeded from live ESP state
 function setCmd(v,w){ curV=v; curW=w; }
 function publishCmd(){
   const v=curV*Number($("lin").value), w=curW*Number($("ang").value);
@@ -1659,6 +1678,10 @@ addEventListener("keydown",e=>{
   keys[e.key.toLowerCase()]=true; updateKeys();
 });
 addEventListener("keyup",e=>{ if(typing(e)) return; keys[e.key.toLowerCase()]=false; updateKeys(); });
+// If the window/tab loses focus mid-drive (alt-tab, devtools, click away), keyup events
+// may never arrive — leaving a direction stuck "held". Clear all keys on blur so the
+// robot stops instead of turning forever.
+addEventListener("blur",()=>{ for(const k in keys) keys[k]=false; setCmd(0,0); publishCmd(); });
 function updateKeys(){
   let v=0,w=0;
   if(keys["w"]||keys["arrowup"])v+=1;
