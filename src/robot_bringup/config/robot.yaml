@@ -137,7 +137,7 @@ slam_nav:
     #     reason to expect fresh scans soon -- stationary, no goal, not exploring, not
     #     picked up/relocalizing. Wakes instantly the moment any of those change. ---
     lds_idle_enable: true          # master on/off for the spin-down behaviour. Live-tunable.
-    lds_idle_timeout: 60.0         # s of no motion/goal/exploring before spin-down; 0 = off.
+    lds_idle_timeout: 10.0         # s of no motion/goal/exploring before spin-down; 0 = off.
                                    # Live-tunable.
     lds_idle_rpm: 0.0              # target rpm while parked (0 = fully stop). Live-tunable.
     lds_active_rpm: 300.0          # target rpm to resume; match firmware LDS_TARGET_RPM.
