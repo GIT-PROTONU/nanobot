@@ -10,7 +10,9 @@ There are three kinds of file here, and the distinction is load-bearing —
 without clobbering evolved state:
 
 - **Seed** (git-tracked, under `memory/`) — the starting point / hand-editable
-  override. Pushed to the board by `deploy.sh` (`DEPLOY_SOUL=1` by default).
+  override. Pushed to the board by `deploy.sh` only when you opt in with
+  `DEPLOY_SOUL=1` (**off by default** — the robot keeps the personality it has
+  evolved on its own).
 - **State** (gitignored, `~/.local/state/nanobot/` on the board, `memory/` on
   the dev harness) — runtime-persisted, drifts over time, survives reboots.
   This is what `DEPLOY_SOUL=1` overwrites.
@@ -37,6 +39,7 @@ override any of them per-deployment without touching code.
 |---|---|---|---|---|
 | `memory/presence_chart.yaml` | seed (optional) | hand-edited | `presence.load_chart_yaml` (`chart_path`) | the Sismic statechart itself — overrides the bundled Python default |
 | `memory/beats.json` | seed (optional) | hand-edited, or `personality_creator.py` | `presence.merge_beats` (`beats_path`) | per-beat face/camera/audio/prompt templates, layered onto `BEATS` in `presence.py` |
+| `memory/schedule.json` → `~/.local/state/nanobot/schedule.json` | seed+state | hand-edited, or the web Schedule card via `/schedule_edit` (`mood_node` persists) | `behavior.brain.Schedule` (`schedule_path`) | daily routines — `[{"time":"09:00","skill":"patrol"}, …]`, echoed normalized on the latched `/schedule` topic |
 
 ## LLM / voice config
 
@@ -61,6 +64,8 @@ override any of them per-deployment without touching code.
 |---|---|---|---|---|
 | `~/.local/state/nanobot/cognition.log` | state (append-only) | `CognitionCore` every generation (`cognition_log_path`) | `GET /llm/log`, seeded into the ring buffer on boot | one line per say/chat/observe/look/beat/skill call — trigger, model, status, latency |
 | `~/.local/state/nanobot/phrases.json` | state | `phrasebank.py` (`phrasebank_path`) | `CognitionCore.bank_say` (offline-first idle lines) | pre-generated in-character lines per situation, regenerated on persona drift |
+| `~/.local/state/nanobot/vision_diary.json` | state | `cognition.record_vision_snapshot` (`vision_diary_path`) | `vision_trend_text` (folded into reflect/consolidate prompts), `GET /llm/vision_diary` | slow log of scene scalars — sensory continuity for the self-narrative |
+| `~/.local/state/nanobot/vision_targets.json` | state (not soul — camera calibration) | `web_server` on calibrate/tune (`vision_targets_path`) | re-applied on boot; `GET /vision/targets` | named colour-target calibrations for blob tracking |
 
 ## Dev-only
 

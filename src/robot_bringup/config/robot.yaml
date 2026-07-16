@@ -6,13 +6,14 @@
 # Bus reminders from the pinmap:
 #   I2C0 -> /dev/i2c-0 (PA11/PA12)   I2C1 -> /dev/i2c-1 (PA18/PA19)
 #   I2C2 -> /dev/i2c-2 (PE12/PE13)   UART2 -> /dev/ttyS2 (PA0/PA1)
-#   UART1 -> /dev/ttyS1 (PG6/PG7) -- normally on-board Bluetooth; freed for the
-#            LDS via the `uart1` overlay (Bluetooth is therefore disabled).
+#   UART1 -> /dev/ttyS1 (PG6/PG7) -- normally on-board Bluetooth; freed via the
+#            `uart1` overlay (Bluetooth disabled) for the ESP32 zenoh-pico link.
 #   GPIO main PIO = /dev/gpiochip0, global# = bank*32 + pin (PA0=0, PG=192, ...)
 # Enable the buses first via armbianEnv.txt overlays (see README + pinmap).
 # =============================================================================
 
-# ---- Rust LDS node (sensor_msgs/LaserScan on /scan) -------------------------
+# ---- LDS02RR lidar driver (lds_driver_py; node name "lds_driver") -----------
+# Publishes sensor_msgs/LaserScan on /scan + the /dev/shm scan blob for the web UI.
 lds_driver:
   ros__parameters:
     port: "/dev/ttyS2"        # LDS02RR data UART on UART2/PA0-PA1 (@115200). ttyS1 is the
@@ -28,11 +29,13 @@ lds_driver:
 # ---- Wheel encoders -> odometry (nav_msgs/Odometry on /odom + TF) -----------
 # Wheel ticks are counted on the ESP32 coprocessor and streamed as
 # std_msgs/Int64MultiArray on /wheel_ticks; this node only integrates. Wire/
-# direction fixes live in firmware/nanobot_coprocessor/include/config.h.
+# direction fixes are #defines at the top of firmware/nanobot_coprocessor/src/main.cpp.
 wheel_odometry:
   ros__parameters:
     ticks_topic: "wheel_ticks"  # from the ESP32 zenoh-pico coprocessor
-    ticks_per_rev: 1440       # encoder counts per wheel revolution (x4 quadrature)
+    ticks_per_rev: 1440       # encoder counts per wheel revolution (single-channel
+                              # rising edges; NOT quadrature — needs an on-hardware
+                              # check against measured travel, see docs/TODO.md)
     wheel_radius: 0.0335      # metres
     wheel_separation: 0.16    # metres between wheel contact points
     invert_left: false        # SBC-side fallback (normally inverted on the ESP32)
@@ -462,7 +465,7 @@ web_control:
     # this web server (see web_control/stress.py). Auto-stops regardless of the caller.
     stress_max_duration: 300.0   # s hard cap on any run, however long the UI asks for
     stress_temp_abort_c: 82.0    # abort early if CPU temp reaches this (0 = disable)
-    # Text-to-speech (English + German only). The web page POSTs /tts; the server
+    # Text-to-speech (English en-gb voices only). The web page POSTs /tts; the server
     # synthesises with espeak-ng (install via deploy/install-espeakng.sh; NOT on conda-forge), plays it
     # through aplay, and streams the words to the OLED (/oled_word) as they're said.
     tts_enabled: true

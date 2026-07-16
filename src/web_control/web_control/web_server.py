@@ -2076,8 +2076,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def _serve_scan(self):
         # The lidar driver writes each scan as a compact blob to /dev/shm (JSON header +
-        # raw float32 ranges); the page polls it here instead of bridging the heavy
-        # /scan LaserScan over rosbridge. Same idea as the map — keeps rosbridge light.
+        # raw float32 ranges); the page polls it here instead of receiving the heavy
+        # /scan LaserScan over the telemetry stream. Same idea as the map — heavy data
+        # stays off the SSE frame.
         self._serve_shm("/dev/shm/nano_scan.bin", "no scan yet")
 
     def _serve_shm(self, path, missing_msg):

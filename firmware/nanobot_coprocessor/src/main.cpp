@@ -53,7 +53,8 @@
 
 // ============================ pin / tunable config ============================
 // Reassigned vs the micro-ROS build: GPIO16/17 are now the zenoh UART2 link, so the
-// LDS data RX moves 16->35 (input-only, RX-only).
+// LDS data RX moved off 16 (briefly to 35, now GPIO14 via the UART1 matrix — see
+// LDS_RX_PIN below).
 // DRV8871 x2 (one per motor), verified against the actual harness 2026-07-04:
 // LEFT motor = GPIO 26+27, RIGHT motor = GPIO 25+33. fwd/rev within each pair is a
 // best guess — if a wheel runs backwards, flip that side's INVERT_* below.

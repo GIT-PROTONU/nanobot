@@ -20,9 +20,11 @@ DASHBOARD (pinned) — a compact status panel:
 
 FACE — cute animated robot eyes that blink and glance around, used to express a
 mood. Enabled from the web UI by publishing a mood name on /oled_face (empty
-string returns to the dashboard). Moods: "happy" (upward ^_^ crescents), "angry"
-(slanted scowling brows) and "focused" (narrowed eyes with a staring pupil);
-more can be added later by extending _face_tick.
+string returns to the dashboard). Moods (KNOWN_MOODS): "happy" (upward ^_^
+crescents), "angry" (slanted scowling brows), "focused" (narrowed eyes with a
+staring pupil), "stress" (jittery alarm), "sleepy" (closed eyes + drifting z z z,
+the AI-offline mood) and "looking" (wide scanning eyes). A face can also be a
+compound "shape:emotion" accent, e.g. "looking:happy" — see _face_tick.
 
 Efficiency (the face must be near-free on a 1 GB / quad-A53 board):
   * The face has its own timer that is **cancelled** while in dashboard mode, so

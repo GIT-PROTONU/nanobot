@@ -46,7 +46,19 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - `motor_control` — **retired** (PCA9685 path). The ESP32 owns `/cmd_vel`→motors;
   not launched by the systemd units/`bringup.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
+- `slam_nav` — super-light 2D SLAM (correlative scan-match on odom+IMU prior) +
+  click-to-go nav (planner + pure pursuit, gated by `enable_motion`), pick-up freeze +
+  lost-robot relocalization, LDS idle spin-down, the scripted **self-test** drive
+  (IMU-vs-encoder cross-check), the clamped `trait_motion` caution mapping, and
+  **pan-only vision target tracking** (2026-07-16, not hw-verified: `track_*` params,
+  turns in place to center the GPU-vision colour blob from `/vision/state`; wins over
+  goal-follow/explore while on, still yields to pick-up/self-test/relocalize).
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
+  `imu_driver` also wires the **WitMotion accel/mag calibration** (2026-07-16, not
+  hw-verified: `/imu_calibrate` String cmds `accel|mag_start|mag_stop|save` executed
+  in the reader thread → latched `/imu_calibrate_status`; web IMU card buttons + live
+  mag xyz readout — no protocol readback exists, so verification is eyeballing
+  |accel|≈9.8 + a smooth mag sweep).
 - `sim_hardware` — **dev-PC-only**, not built/launched on the board (linux-aarch64). Two
   nodes used only by `bringup.launch.py sim:=true`: `sim_bridge_node` re-publishes
   Gazebo's bridged `/joint_states_sim` + `/imu` + `/scan` as the exact contracts the real
@@ -361,10 +373,13 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   and calibrated colour-blob tracking (`_THRESHOLD_FS` + largest-blob selection) →
   `target` (bearing/confidence), with live-tunable match tolerance + min/max blob-size
   gating. **Tier-B**: kinetic-intercept alert (blob-area growth rate), flashlight/dark
-  reflex (opt-in, auto-`/led`), the optical virtual bumper (commanded-but-not-moving →
-  possible stall, in `telemetry.py`), and a **manual mode** (`POST /vision/manual`)
-  that fully stops `GpuVision` and swaps in the zero-cost direct `CameraStream`
-  passthrough live, no restart. Two on-demand debug MJPEG views mirror this same
+  reflex (opt-in, auto-`/led`), and the optical virtual bumper
+  (commanded-but-not-moving → possible stall, in `telemetry.py`). (The old **manual
+  mode** — `POST /vision/manual`, a live swap to the direct `CameraStream`
+  passthrough — was REMOVED 2026-07-14 (01e64f9): the passthrough now engages only
+  as the automatic fallback when GPU vision is off/unavailable. The same commit
+  compensates the **upside-down camera mount** once at the YUYV→RGB source pass
+  (`_VFLIP_VS`), so every consumer sees an upright frame.) Two on-demand debug MJPEG views mirror this same
   reduction machinery for human eyes: `/stream_mask.mjpg` (the colour-threshold hit
   mask) and `/stream_motion_mask.mjpg` (the PIR diff mask, reusing the same
   `_MASK_VIEW_FS` shader unmodified against a different source texture) — both
@@ -377,9 +392,10 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   never collides with the user's calibrated colour), and `motion_target_match` (pure
   CPU distance between the motion and blob centroids). All threshold/alert logic lives
   in `telemetry.py`'s `_vision_alerts` (NOT `gpu_vision.py`), mirroring the optical
-  bumper's "read live ROS params, not fixed constants" pattern — 9 alerts total
+  bumper's "read live ROS params, not fixed constants" pattern — **12 alerts total**
   (`obstructed`/`clutter`/`overhead_alert`/`focus_blur`/`backlit`/`shiny`/`looming`/
-  `colorcast`/`motion_matches_target`), each with its own `vision_*` param, live
+  `colorcast`/`motion_matches_target`, plus the 2026-07-13 batch's `novelty`/
+  `camera_freeze`/`vibration`), each with its own `vision_*` param, live
   sliders under the Camera card's "▸ Vision alerts tuning". `vision_obstruction_var_max`
   was retuned from a wrong-by-~100x guess (15) to 400 after a live reading showed an
   ordinary scene reads `luma_variance` ~2700 — a reminder that these thresholds are
@@ -394,8 +410,7 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   information — both pulled from the UI; `gpu_duty` was kept since it's a different,
   demonstrably-useful number. A **master camera switch** (`POST /vision/camera_enable`,
   the Camera tab's "📷 Camera enabled") fully stops BOTH `GpuVision` and the direct
-  passthrough (distinct from manual mode, which still runs the direct feed) — for
-  when the fuller pass set's cost isn't wanted. While off, the live-view `<img>` shows
+  passthrough — for when the fuller pass set's cost isn't wanted. While off, the live-view `<img>` shows
   a real `#camWait` overlay message ("Camera disabled…") instead of a broken-image
   icon, and `app.js`'s `onVision` diffs `camera_enabled` tick-to-tick so re-enabling
   auto-resets the stream `src` itself — no manual page refresh needed to get the feed
@@ -425,7 +440,7 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
     `/dev/shm/nano_oled_mask.bin`): gpu_vision rides the thresh chain to 160×120 then
     one more pass to exactly 128×64, re-binarizes (bytes.translate), writes the blob;
     `oled_display` renders it as a "mask" owner (below reflecting/words/shutdown,
-    above the face). Auto-dropped when manual mode / the camera switch stops capture.
+    above the face). Auto-dropped when the camera master switch stops capture.
   - **Vision→behaviour plumbing**: web_control publishes a compact `/vision/state`
     JSON @2 Hz (approach/looming/clutter/novelty/warmth/motion, only while the
     pipeline is live — staleness IS the stand-down signal). mood_node consumes it:
@@ -471,6 +486,7 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   first client — on the executor thread via the tick timer — dropped `SUB_LINGER`
   after the last), so idle cost is ~zero. Writes: `POST /publish {topic,value}`
   (whitelisted + clamped per topic: goal_pose, lds_target_rpm, pickup_override,
+  reset_ticks, imu_calibrate, schedule_edit,
   selftest, go_home/save_map, oled_*) and `POST /param {node,name,value}`
   (whitelisted nodes/params via `/<node>/set_parameters`, fire-and-forget). The
   power buttons only POST `/system/*`; the server itself publishes `/oled_system`.

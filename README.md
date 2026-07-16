@@ -15,7 +15,7 @@ Hardware:
 | Wheel **encoders** (single-channel ×2) + **motors** | ESP32 GPIO (see firmware pinout) | `wheel_odometry` (`/wheel_ticks`→`/odom`) | `/odom`, TF |
 | **SSD1306** OLED | I2C0 (`/dev/i2c-0`, PA11/PA12 @400 kHz) | `oled_display` | sub `/oled_face`, `/oled_word` |
 | **Speaker** (text-to-speech) | USB/analog audio out (`aplay`) | `web_control` (`espeak-ng`) | `POST /tts`; pub `/oled_word` |
-| **BWT901CL** IMU | USB-serial (`/dev/imu`, CH340) | `imu_driver` | `/imu/data`, `/imu/web` |
+| **BWT901CL** IMU (+ web-UI accel/mag calibration) | USB-serial (`/dev/imu`, CH340) | `imu_driver` | `/imu/data`, `/imu/web` |
 | **Logitech C270** webcam + mic | USB | `web_control` | `/stream.mjpg`, `/audio.pcm` |
 | **PCA9685** PWM | I2C1 (`/dev/i2c-1`, 0x40) | — (retired; ESP32 owns motors) | — |
 | Web control + map | — | `web_control` (HTTP + SSE gateway) | browser |
@@ -43,7 +43,8 @@ lds_driver_py     serial LDS02RR -> /scan + /dev/shm scan blob            [rclpy
 imu_driver        BWT901CL IMU -> /imu/data, /imu/euler, /imu/web         [rclpy]
 wheel_odometry    /wheel_ticks (from ESP32) -> /odom + TF                 [rclpy]
 sys_monitor       /diagnostics + fan curve + health log + vitals blob     [rclpy]
-slam_nav          scan-matching SLAM, planner, pure-pursuit control       [rclpy]
+slam_nav          scan-matching SLAM, planner, pure-pursuit control,
+                  pickup/relocalize, self-test, vision target tracking    [rclpy]
 oled_display      SSD1306 dashboard + animated-eyes faces                 [rclpy]
 behavior          Sismic presence statechart + purpose/A-B "brain"        [rclpy]
 web_control       static control page + the browser's telemetry/control
@@ -164,13 +165,19 @@ backlit, colour-cast, overhead-structure, focus/blur, motion-vs-target correlati
 all computed as GLES2 fragment shaders and reduced on-GPU so almost nothing crosses
 back to the CPU. Needs the `lima` kernel driver loaded (`lsmod | grep lima`;
 `deploy/sbc-setup.sh` handles this) — if missing, vision silently falls back to a
-*software* GL rasterizer (a clear warning in the logs, not a crash) or the page's
-📷 **Camera** tab has a **Manual mode** switch for a zero-cost raw passthrough, plus a
-master **Camera enabled** switch to turn the whole thing off. Everything is
-live-viewable and live-tunable from the web UI's **Sensors → Camera (GPU vision)**
-card — hover any reading or slider there for an explanation (toggle off with
-**💡 Show hints** if you don't want them). All of it is informational only today;
-nothing in the robot's autonomous behavior acts on these signals yet.
+*software* GL rasterizer (a clear warning in the logs, not a crash), and with GPU
+vision off/unavailable the camera automatically drops back to the plain hardware-MJPEG
+passthrough. The page's 📷 **Camera** tab has a master **Camera enabled** switch to
+turn capture off entirely. Everything is live-viewable and live-tunable from the web
+UI's **Sensors → Camera (GPU vision)** card — hover any reading or slider there for an
+explanation (toggle off with **💡 Show hints** if you don't want them). The 12 alert
+signals (obstructed/clutter/looming/vibration/…) are informational, but some vision
+signals now *do* feed behaviour: the personality layer greets someone walking up,
+gets cautious around visual clutter or something looming (which throttles speed when
+`trait_motion` is on), tints its idle mood with the room's colour warmth — and
+`slam_nav` can **turn in place to follow the calibrated colour target**
+(`track_enable`, the map panel's 🎯 Track toggle; pan-only, gated by the same
+`enable_motion` safety switch as navigation).
 
 ## 4. Run
 
@@ -221,10 +228,11 @@ at the top of `firmware/nanobot_coprocessor/src/main.cpp` and flashed from a dev
 scripts/deploy.sh [pkgs…]    # push src+scripts, colcon build on the board, restart
 ```
 
-Credentials come from the environment / `.nano-deploy.env` (never committed). By
-default it also pushes the dev-made "soul" (`memory/personality.json` + phrase bank)
-over the robot's — set `DEPLOY_SOUL=0` to keep the robot's evolved personality. Run
-`pixi run smoke` before deploying.
+Auth is the passwordless `ssh nano` key alias (`~/.ssh/config`; override the target
+with `NANO_HOST`) — no credentials in the environment. By default the robot **keeps**
+the personality it has evolved on its own; set `DEPLOY_SOUL=1` to overwrite the
+board's persisted soul (`personality.json` + phrase bank + learned skills) with the
+dev-made `memory/` seed. Run `pixi run smoke` before deploying.
 
 ## Notes / gotchas
 

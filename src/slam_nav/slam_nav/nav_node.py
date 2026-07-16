@@ -1,4 +1,4 @@
-"""Super-light 2D SLAM for the Nano robot (Stage 1 of 3).
+"""Super-light 2D SLAM + navigation for the Nano robot.
 
 Estimates the robot pose by fusing wheel-odometry translation (/odom) with IMU yaw
 (/imu/euler) as the motion prior, then refines it each scan with a correlative
@@ -6,8 +6,10 @@ scan-to-map matcher (see occupancy.py). Builds an occupancy grid from /scan and 
 it — plus the live pose — to a RAM file (/dev/shm/nano_map.bin) that web_control serves
 to the browser map panel. Also republishes the corrected pose on /slam_pose for debug.
 
-No motion is commanded here. Stage 2 adds the planner + click-to-goal; Stage 3 adds the
-pure-pursuit controller (gated behind enable_motion).
+On top of the SLAM core: click-to-goal planning + pure-pursuit control (ALL motion
+gated behind enable_motion), auto-explore, pick-up freeze + lost-robot relocalization,
+LDS idle spin-down, the scripted self-test drive, the clamped trait_motion caution
+mapping, and pan-only vision target tracking (track_*).
 
 Map file format (atomic via os.replace): one JSON metadata line, '\n', then the raw
 int8 occupancy bytes (row-major, row 0 = origin_y). The browser parses the header and

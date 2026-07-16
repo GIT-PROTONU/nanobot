@@ -296,6 +296,31 @@ steerable by the same `evolve` event (same guardrails: clamped, smoothed, revert
 `0.5` is the neutral "off" point: at the defaults none of the new states ever fire, so
 behaviour is unchanged until reflection pushes a drive above it.
 
+## Vision reflexes — the camera feeds the personality
+
+While GPU vision is live, `web_control` publishes a compact `/vision/state` JSON at
+2 Hz (approach/looming/clutter/novelty/warmth/motion — staleness IS the stand-down
+signal). `mood_node` consumes it as **fast rules and expression, never a new motor
+path**:
+
+- **Anticipatory greeting** — motion growing + centred = someone walking up →
+  greet-face + a `greeting` beat (rate-limited, idle-only).
+- **Looming / clutter → caution** — something closing on the lens startles caution up
+  (edge-triggered); a visually busy floor *holds* caution at `clutter_caution` and
+  releases to the remembered pre-clutter value after. With slam_nav's `trait_motion`
+  opt-in this doubles as the **clutter velocity throttle**, through the one existing
+  clamped caution→max_lin mapping.
+- **Ambient colour mood** — scene warmth (R−B) tints the chart's `feeling` face; the
+  LLM's `drives.mood` always wins.
+- **Novelty boost** — a transient lottery-weight multiplier on the `looking` beat
+  (distinct from the LLM-evolvable registry priority).
+- **Visual diary** — scene scalars sampled every 10 min; the trend ("the room has got
+  darker and calmer") is folded into the reflection prompts like the trait trajectory.
+
+(Separately — and *not* part of the brain — `slam_nav` can visually servo on the
+calibrated colour target: `track_enable` turns the robot in place to keep the blob
+centered, pan-only, gated by `enable_motion` like all motion.)
+
 ## Purpose & goals (the "why" layer)
 
 `behavior/brain.py` (ROS-free, shared verbatim with the dev harness) adds a slow goal layer
@@ -359,11 +384,15 @@ OpenRouter models and only falls back to a **paid DeepSeek** model when *all* th
 are over their (shared, ~daily / upstream) rate limit. So routine chatter costs nothing —
 you only pay when the free quota is exhausted.
 
-| Tier | Free primary (default, tried first) | Paid fallback | Used for |
-|---|---|---|---|
-| cheap text | `nemotron-3-nano-30b:free`, then `llama-3.3-70b:free` | `deepseek-v4-flash` | musing, observe, say, beats |
-| smart text | `nemotron-3-super-120b:free`, then `gpt-oss-120b:free` | `deepseek-v4-pro` | chat + reflection |
-| vision | `nemotron-nano-12b-v2-vl:free` | *(none — DeepSeek can't see; set `llm_vision_fallback_model` for one)* | looking + manual Look |
+| Tier | Config keys (free primary → paid fallback) | Used for |
+|---|---|---|
+| cheap text | `llm_free_model` → `llm_model` | musing, observe, say, beats |
+| smart text | `llm_free_smart_model` → `llm_smart_model` | chat + reflection |
+| vision | `llm_vision_model` → `llm_vision_fallback_model` (`""` = none, stay silent) | looking + manual Look |
+
+(The concrete model slugs live in `robot.yaml` — as of 2026-07 every tier currently
+points at `deepseek/deepseek-v4-flash`; earlier defaults were rotating `:free`
+Nemotron/Llama slugs. Check the yaml, not this table, for what actually runs.)
 
 `_candidates(smart, image)` builds the ordered `(model, is_paid)` list (free fields are
 comma-separated lists, tried in order); `_chat()` tries each, **falling through to the next

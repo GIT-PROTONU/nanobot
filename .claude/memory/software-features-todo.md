@@ -125,3 +125,7 @@ play/character ideas:
 Explicitly out (hardware or excluded): wheel velocity PID (single-channel encoders), overhead
 camera-geometry check (needs the robot), docking/cliff (user-excluded), on-device STT / face
 recognition (too heavy for 1 GB H5).
+
+2026-07-16: a separate CODE-IMPROVEMENT list (review findings, not features) now lives
+in-repo at `docs/TODO.md` — pending flashes/deploys, the tracking-latched-goal fix, the
+brain_timeout code-default guard, ticks_per_rev verification. Check both lists.
