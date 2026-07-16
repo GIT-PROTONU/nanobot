@@ -1048,6 +1048,37 @@ class GpuVision:
         if self._thread:
             self._thread.join(timeout=2.0)
 
+    def _open_camera_with_retries(self):
+        """(Re)acquire the camera. Used both for the initial open and to reconnect
+        after a mid-session drop (see the read-error handler in `_loop`) -- always
+        re-runs `find_camera()` rather than trusting a cached path, since a physical
+        USB disconnect/reconnect can shift which /dev/videoN the camera lands on
+        (confirmed on hardware 2026-07-16: 0 -> 1 after a USB re-enumeration). Also
+        retries a handful of times on open failure: the direct CameraStream backend
+        (the fallback used when GPU vision is off/unavailable) releases the V4L2
+        device ASYNCHRONOUSLY in its own thread (a viewer's remove_viewer() just sets
+        a flag; the actual close() happens once that thread notices) -- confirmed on
+        hardware this can create a real, reproducible "[Errno 16] Device or resource
+        busy" race if the two backends' ownership windows ever overlap. The busy
+        condition is transient (clears within a few hundred ms once the other
+        backend's thread catches up), so retry instead of giving up on the very first
+        attempt. Returns (cam, dev) with cam=None on failure (logged either way)."""
+        dev = self._dev or mjpeg_camera.find_camera()
+        if not dev:
+            self._log("gpu_vision: no camera found")
+            return None, dev
+        last_exc = None
+        for attempt in range(6):
+            try:
+                return mjpeg_camera.MjpegCamera(dev, fourcc=mjpeg_camera.FOURCC_YUYV, **self._cfg), dev
+            except Exception as exc:
+                last_exc = exc
+                if not self._run:
+                    break     # stop() was called while we were retrying -- give up cleanly
+                time.sleep(0.3)
+        self._log(f"gpu_vision: camera open (YUYV) failed after retries: {last_exc}")
+        return None, dev
+
     def _loop(self):
         try:
             gl = GLContext()
@@ -1068,33 +1099,8 @@ class GpuVision:
             self._run = False    # so running() doesn't lie -- the thread is exiting
             return
 
-        dev = self._dev or mjpeg_camera.find_camera()
-        if not dev:
-            self._log("gpu_vision: no camera found")
-            gl.close()
-            self._run = False
-            return
-        # Retry a handful of times: the direct CameraStream backend (the fallback used
-        # when GPU vision is off/unavailable) releases the V4L2 device ASYNCHRONOUSLY
-        # in its own thread (a viewer's remove_viewer() just sets a flag; the actual
-        # close() happens once that thread notices) -- confirmed on hardware this can
-        # create a real, reproducible "[Errno 16] Device or resource busy" race if the
-        # two backends' ownership windows ever overlap. The busy condition is
-        # transient (clears within a few hundred ms once the other backend's thread
-        # catches up), so retry instead of giving up on the very first attempt.
-        cam = None
-        last_exc = None
-        for attempt in range(6):
-            try:
-                cam = mjpeg_camera.MjpegCamera(dev, fourcc=mjpeg_camera.FOURCC_YUYV, **self._cfg)
-                break
-            except Exception as exc:
-                last_exc = exc
-                if not self._run:
-                    break     # stop() was called while we were retrying -- give up cleanly
-                time.sleep(0.3)
+        cam, dev = self._open_camera_with_retries()
         if cam is None:
-            self._log(f"gpu_vision: camera open (YUYV) failed after retries: {last_exc}")
             gl.close()
             self._run = False
             return
@@ -1217,9 +1223,34 @@ class GpuVision:
                         break
                     buf = extra
             except Exception as exc:
-                self._log(f"gpu_vision: capture read error: {exc}")
-                self._run = False    # so running() doesn't lie -- the loop is exiting
-                break
+                # Usually the camera dropping off USB (a transient power/cable blip --
+                # confirmed on hardware 2026-07-16, ENODEV mid-session that needed a
+                # manual nano-app restart to recover) rather than something fatal, so
+                # try to reconnect instead of stopping the vision loop for the rest of
+                # the process's life. frame_age growing stale (see `running()`'s
+                # docstring) already tells consumers vision is degraded meanwhile.
+                self._log(f"gpu_vision: capture read error: {exc} -- reconnecting")
+                try:
+                    cam.close()
+                except Exception:
+                    pass
+                cam = None
+                while self._run and cam is None:
+                    time.sleep(2.0)
+                    cam, dev = self._open_camera_with_retries()
+                if cam is None:
+                    break   # stop() was called while reconnecting
+                if (cam.width, cam.height) != (W, H):
+                    # Same physical camera should always renegotiate the same mode;
+                    # if it doesn't, the pre-built textures/FBOs above are the wrong
+                    # size -- bail cleanly rather than corrupt the pipeline. Whatever
+                    # supervises this process (systemd) will restart it fresh.
+                    self._log(f"gpu_vision: reconnected camera resolution changed "
+                              f"({cam.width}x{cam.height} vs {W}x{H}) -- stopping")
+                    self._run = False
+                    break
+                self._log(f"gpu_vision: reconnected to {dev} YUYV {cam.width}x{cam.height}")
+                continue
 
             gl_start = time.monotonic()   # gpu_duty: excludes the camera-read wait above
             with self._lock:
@@ -1687,7 +1718,8 @@ class GpuVision:
             else:
                 next_t = time.monotonic()
 
-        cam.close()
+        if cam is not None:     # None if stop() landed mid-reconnect, above
+            cam.close()
         if jpeg_enc is not None:
             jpeg_enc.close()    # free the turbojpeg compressor -- see JpegEncoder.close()
         gl.close()              # release the EGL context's ~70MB, not just the camera fd
