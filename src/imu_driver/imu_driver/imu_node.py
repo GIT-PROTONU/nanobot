@@ -21,14 +21,42 @@ z up, mm from base_link) lets the web UI record where the sensor actually sits;
 `lever_arm_correction` subtracts that lever-arm term every cycle so /imu/data
 and /imu/web report the acceleration an IMU AT the centre would have seen. Gyro
 needs no correction -- angular velocity is the same everywhere on a rigid body.
+
+Mounting ROTATION: a separate problem from the offset above -- the sensor board
+itself can be glued down at an angle to the chassis (e.g. its silkscreen "forward"
+ends up facing the robot's side, or it's mounted standing on an edge rather than
+flat). `mount_roll_deg`/`mount_pitch_deg`/`mount_yaw_deg` describe that FIXED
+misalignment as a full 3-axis rotation (a one-time mechanical fact, nothing to do
+with the robot's own live motion): `MOUNT_M` (rebuilt whenever any of the three
+change) is the rotation matrix that turns a vector's SENSOR-frame components into
+ROBOT-frame components; `rotate_mount` applies it to the raw accel/gyro/mag every
+cycle, and `_correct_orientation` reconstructs the sensor's OWN reported
+roll/pitch/yaw as a rotation matrix, composes it with `MOUNT_M`, and re-extracts
+robot-frame roll/pitch/yaw from the product -- proper matrix composition, not an
+algebraic shortcut on the three angles (a shortcut only happens to be exact for a
+PURE yaw-only mount; a roll/pitch component genuinely couples all three angles
+together, which is exactly the "twisting it changes the reported pitch" symptom a
+yaw-only correction can't fix). Applied at parse time (in `_handle`, before
+`lever_arm_correction` runs) so gyro is already robot-frame when the lever-arm
+cross products use it.
+
+Mounting offset/rotation are ROS params, so a live web-UI tweak wouldn't survive
+a restart on its own -- `mount_settings_path` (default ~/.local/state/nanobot/
+imu_mount.json, same convention as tts.py's settings file) persists the last
+values set from the web and reloads them on start, taking priority over
+whatever's in robot.yaml (which stays the fallback for a fresh install).
 """
+import json
 import math
+import os
 import struct
+import tempfile
 import threading
 import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Imu, MagneticField
@@ -85,6 +113,106 @@ def _cross(u, v):
     return (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
 
 
+# ---- small pure-Python 3x3 rotation-matrix helpers (no numpy dependency for a
+# handful of multiplies at ~100 Hz) -- all matrices are row-major 3-tuples-of-3-tuples.
+def _rx(a):
+    c, s = math.cos(a), math.sin(a)
+    return ((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c))
+
+
+def _ry(a):
+    c, s = math.cos(a), math.sin(a)
+    return ((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c))
+
+
+def _rz(a):
+    c, s = math.cos(a), math.sin(a)
+    return ((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0))
+
+
+def _matmul3(a, b):
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
+                 for i in range(3))
+
+
+def _transpose3(a):
+    return tuple(tuple(a[j][i] for j in range(3)) for i in range(3))
+
+
+def _matvec3(a, v):
+    return tuple(sum(a[i][k] * v[k] for k in range(3)) for i in range(3))
+
+
+def euler_to_matrix(roll, pitch, yaw):
+    """ZYX (yaw-pitch-roll) Euler angles (radians) -> 3x3 rotation matrix, matching
+    `euler_to_quat`'s convention. Represents a body-frame vector's rotation into the
+    frame the angles are relative to (e.g. world, for the sensor's own fused output)."""
+    return _matmul3(_matmul3(_rz(yaw), _ry(pitch)), _rx(roll))
+
+
+def matrix_to_euler(m):
+    """Inverse of `euler_to_matrix` -- standard ZYX extraction."""
+    pitch = math.atan2(-m[2][0], math.hypot(m[2][1], m[2][2]))
+    yaw = math.atan2(m[1][0], m[0][0])
+    roll = math.atan2(m[2][1], m[2][2])
+    return roll, pitch, yaw
+
+
+def mount_matrix(roll_deg, pitch_deg, yaw_deg):
+    """Build MOUNT_M: the fixed rotation from the sensor's own frame into the
+    robot's frame, given how the sensor board is physically twisted on the
+    chassis (roll/pitch/yaw, degrees, same ZYX convention as above)."""
+    return euler_to_matrix(math.radians(roll_deg), math.radians(pitch_deg), math.radians(yaw_deg))
+
+
+def rotate_mount(v, mount_m):
+    """Rotate a vector's (x, y, z) from the sensor's own frame into the robot's
+    frame using the fixed `mount_m` (see `mount_matrix`)."""
+    return _matvec3(mount_m, v)
+
+
+def correct_orientation(roll_s_deg, pitch_s_deg, yaw_s_deg, mount_m, mount_m_t):
+    """Reconstruct the robot-frame roll/pitch/yaw (degrees) from the sensor's own
+    reported orientation and the fixed mount rotation: compose the sensor's
+    reported attitude (as a matrix) with the mount, then re-extract Euler angles --
+    NOT a per-angle shortcut, which is only exact for a pure-yaw-only mount."""
+    r_s = euler_to_matrix(math.radians(roll_s_deg), math.radians(pitch_s_deg), math.radians(yaw_s_deg))
+    r_r = _matmul3(r_s, mount_m_t)
+    roll_r, pitch_r, yaw_r = matrix_to_euler(r_r)
+    return math.degrees(roll_r), math.degrees(pitch_r), math.degrees(yaw_r)
+
+
+# Tiny persisted-JSON helpers, mirroring web_control.jsonio (kept local -- imu_driver
+# and web_control are separate ROS packages that can't import each other). Same
+# atomic-write recipe: unique temp file in the target dir, then os.replace.
+def _read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, obj):
+    try:
+        d = os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(obj, f, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        return True
+    except Exception:
+        return False
+
+
 def lever_arm_correction(acc, gyro, alpha, offset_m):
     """Subtract the lever-arm acceleration an IMU at `offset_m` (metres, from the
     rotation centre) picks up from the body's own rotation, returning the
@@ -127,6 +255,15 @@ class ImuNode(Node):
             ("offset_x_mm", 0.0),       # IMU mounting offset from base_link centre
             ("offset_y_mm", 0.0),       # (REP-103: x fwd, y left, z up), mm --
             ("offset_z_mm", 0.0),       # see lever_arm_correction above
+            ("mount_roll_deg", 0.0),    # fixed sensor-vs-chassis mounting rotation
+            ("mount_pitch_deg", 0.0),   # (degrees, ZYX convention) -- see mount_matrix
+            ("mount_yaw_deg", 0.0),     # above. All three together handle a sensor
+                                        # tipped/twisted in any direction, not just a
+                                        # flat spin.
+            ("mount_settings_path", ""),  # "" -> ~/.local/state/nanobot/imu_mount.json;
+                                           # persists offset_{x,y,z}_mm + mount_{roll,
+                                           # pitch,yaw}_deg across restarts once set
+                                           # from the web UI
         ])
         g = self.get_parameter
         self.frame_id = g("frame_id").value
@@ -148,9 +285,47 @@ class ImuNode(Node):
         # deserializing the full 50 Hz Imu (covariances and all) just for two numbers.
         self.web_rate = max(0.0, float(g("web_rate").value))
         self._web_period = (1.0 / self.web_rate) if self.web_rate > 0 else None
-        self._offset_m = (g("offset_x_mm").value / 1000.0,
-                           g("offset_y_mm").value / 1000.0,
-                           g("offset_z_mm").value / 1000.0)
+        # Mount offset/rotation: robot.yaml supplies the fallback default, but a
+        # persisted file (if present) wins -- same "web UI setting outlives a
+        # restart" contract as tts.py's settings file.
+        mount_path = g("mount_settings_path").value
+        self._mount_path = mount_path or os.path.expanduser("~/.local/state/nanobot/imu_mount.json")
+        saved = _read_json(self._mount_path, {})
+        saved = saved if isinstance(saved, dict) else {}
+        off_x = float(saved.get("offset_x_mm", g("offset_x_mm").value))
+        off_y = float(saved.get("offset_y_mm", g("offset_y_mm").value))
+        off_z = float(saved.get("offset_z_mm", g("offset_z_mm").value))
+        self._offset_m = (off_x / 1000.0, off_y / 1000.0, off_z / 1000.0)
+        self._mount_roll_deg = float(saved.get("mount_roll_deg", g("mount_roll_deg").value))
+        self._mount_pitch_deg = float(saved.get("mount_pitch_deg", g("mount_pitch_deg").value))
+        self._mount_yaw_deg = float(saved.get("mount_yaw_deg", g("mount_yaw_deg").value))
+        self._mount_m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg, self._mount_yaw_deg)
+        self._mount_m_t = _transpose3(self._mount_m)
+        # Reflect the effective (possibly persisted-overridden) values back into the
+        # actual ROS parameters -- not just internal state -- so `ros2 param get` and
+        # anything else reading these back (a future web-UI refresh, etc.) sees the
+        # truth instead of robot.yaml's stale default. Safe here: this runs BEFORE
+        # add_on_set_parameters_callback is registered below, so it can't recurse
+        # into _on_params / re-trigger a redundant file write.
+        self.set_parameters([
+            Parameter("offset_x_mm", value=off_x),
+            Parameter("offset_y_mm", value=off_y),
+            Parameter("offset_z_mm", value=off_z),
+            Parameter("mount_roll_deg", value=self._mount_roll_deg),
+            Parameter("mount_pitch_deg", value=self._mount_pitch_deg),
+            Parameter("mount_yaw_deg", value=self._mount_yaw_deg),
+        ])
+        if saved:
+            self.get_logger().info(f"loaded persisted IMU mount settings from {self._mount_path}")
+        # Latched status so the web UI can populate the offset/mount-rotation fields
+        # with the TRUE effective values on page load (they're plain <input>s with a
+        # static "0" in the HTML -- nothing else tells the browser what's actually
+        # active). Mirrors imu_calibrate_status below. Published once here (startup)
+        # and again on every change in _save_mount_settings.
+        self.pub_mount_settings = self.create_publisher(
+            String, "imu_mount_settings",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._save_mount_settings()
         self._prev_gyro = None          # for finite-differencing angular acceleration
         self._prev_gyro_t = None        # (only exercised while an offset is set)
         self._alpha = (0.0, 0.0, 0.0)   # last angular acceleration, rad/s^2
@@ -350,7 +525,31 @@ class ImuNode(Node):
                 else:
                     z = float(p.value) / 1000.0
                 self._offset_m = (x, y, z)
+                self._save_mount_settings()
+            elif p.name in ("mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg"):
+                if p.name == "mount_roll_deg":
+                    self._mount_roll_deg = float(p.value)
+                elif p.name == "mount_pitch_deg":
+                    self._mount_pitch_deg = float(p.value)
+                else:
+                    self._mount_yaw_deg = float(p.value)
+                self._mount_m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg,
+                                              self._mount_yaw_deg)
+                self._mount_m_t = _transpose3(self._mount_m)
+                self._save_mount_settings()
         return SetParametersResult(successful=True)
+
+    def _save_mount_settings(self):
+        """Best-effort persist of the mount offset/rotation so a web-UI tweak
+        outlives a restart -- same contract as tts.py's settings file. Also
+        republishes the latched status topic so the web UI's fields stay in sync."""
+        x, y, z = self._offset_m
+        settings = {"offset_x_mm": x * 1000.0, "offset_y_mm": y * 1000.0,
+                    "offset_z_mm": z * 1000.0, "mount_roll_deg": self._mount_roll_deg,
+                    "mount_pitch_deg": self._mount_pitch_deg, "mount_yaw_deg": self._mount_yaw_deg}
+        if not _write_json(self._mount_path, settings):
+            self.get_logger().warning("IMU mount settings: could not persist")
+        self.pub_mount_settings.publish(String(data=json.dumps(settings)))
 
     def _reader(self):
         """Open (with retry) and read the port; reconnect if it goes away."""
@@ -433,9 +632,9 @@ class ImuNode(Node):
             return
         a, b, c, _ = _UNPACK_FROM(buf, off)     # decode straight from the buffer
         if t == T_ACC:
-            self.acc = (a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE)
+            self.acc = rotate_mount((a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE), self._mount_m)
         elif t == T_GYRO:
-            gyro = (a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE)
+            gyro = rotate_mount((a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE), self._mount_m)
             if self._offset_m != (0.0, 0.0, 0.0):
                 now = time.monotonic()
                 if self._prev_gyro is not None:
@@ -445,9 +644,11 @@ class ImuNode(Node):
                 self._prev_gyro, self._prev_gyro_t = gyro, now
             self.gyro = gyro
         elif t == T_MAG:
-            self.mag = (float(a), float(b), float(c))
+            self.mag = rotate_mount((float(a), float(b), float(c)), self._mount_m)
         elif t == T_ANGLE:
-            self.euler_deg = (a * ANG_SCALE, b * ANG_SCALE, c * ANG_SCALE)
+            roll_s, pitch_s, yaw_s = a * ANG_SCALE, b * ANG_SCALE, c * ANG_SCALE
+            self.euler_deg = correct_orientation(roll_s, pitch_s, yaw_s,
+                                                  self._mount_m, self._mount_m_t)
             # angle is the cycle's anchor frame -> publish a coherent set. The device
             # stream auto-follows publish_rate, so when it's already at/below our target
             # we publish EVERY angle frame. The wall-clock gate is only for the in-between

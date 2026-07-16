@@ -229,6 +229,25 @@ imu_driver:
     offset_x_mm: 0.0
     offset_y_mm: 0.0
     offset_z_mm: 0.0
+    # Mounting ROTATION (separate from the translation offset above): the sensor
+    # board's fixed orientation on the chassis, as a full roll/pitch/yaw rotation
+    # (degrees, ZYX convention) — not just a flat spin. Covers a board glued down
+    # twisted sideways (yaw) AND/OR tipped up on an edge (roll/pitch). Corrects
+    # accel/gyro/mag (all 3 axes) and reconstructs roll/pitch/yaw via proper
+    # rotation-matrix composition — see mount_matrix()/rotate_mount()/
+    # correct_orientation() in imu_node.py. All left at 0 (unconfirmed) —
+    # determine the real values empirically: rest the robot flat and note
+    # roll/pitch/yaw, then prop up ONLY the front (isolated pitch) and note which
+    # reported angle actually moves, then flat again and prop up ONLY one side
+    # (isolated roll) and note which reported angle moves. Whichever angle
+    # responds to which physical tilt reveals the axis mapping directly.
+    mount_roll_deg: 0.0
+    mount_pitch_deg: 0.0
+    mount_yaw_deg: 0.0
+    # A web-UI change to either the offset or rotation above persists here (default
+    # ~/.local/state/nanobot/imu_mount.json) and wins over the values above on the
+    # next start, same "outlives a restart" contract as tts_settings_path.
+    mount_settings_path: ""
 
 # ---- Dev-PC-only: Gazebo hardware stand-in (see bringup.launch.py sim:=true) ------------
 # Not launched on the board. Replaces lds_driver/imu_driver's hardware reads with Gazebo
