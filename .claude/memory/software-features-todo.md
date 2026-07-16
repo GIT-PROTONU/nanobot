@@ -126,6 +126,12 @@ Explicitly out (hardware or excluded): wheel velocity PID (single-channel encode
 camera-geometry check (needs the robot), docking/cliff (user-excluded), on-device STT / face
 recognition (too heavy for 1 GB H5).
 
-2026-07-16: a separate CODE-IMPROVEMENT list (review findings, not features) now lives
-in-repo at `docs/TODO.md` — pending flashes/deploys, the tracking-latched-goal fix, the
-brain_timeout code-default guard, ticks_per_rev verification. Check both lists.
+2026-07-16: a separate CODE-IMPROVEMENT list (review findings, not features) lives
+in-repo at `docs/TODO.md`. All its code-side items were implemented same-day (tracking-
+latched-goal fix in `_on_goal`/`_on_go_home`, `brain_timeout` code-default raised to
+1800 + a runtime clamp to >=2x `purpose_period`, `_mk_goal` coordinate clamp, slam_nav
+self-test constants promoted to live params, narrative-skill phrase-bank fallback in
+`CognitionCore._invoke_skill`) — 198 unit tests + `pixi run smoke` pass, not yet
+deployed (board unreachable that session). What's left in `docs/TODO.md` is
+hardware-only: flash the ESP32 stray-tick firmware, deploy the pending fixes,
+hardware-verify IMU calibration/vision tracking/`ticks_per_rev`. Check both lists.

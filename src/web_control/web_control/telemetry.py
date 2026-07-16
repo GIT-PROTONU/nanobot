@@ -52,6 +52,9 @@ SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the la
 # informational only so far; nothing autonomous acts on them yet.
 PLAN_MAX_PTS = 64        # planned-path polyline is downsampled to at most this many points
 LDS_RPM_MAX = 400.0      # clamp on the /lds_target_rpm setpoint a browser may publish
+GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- half of slam_nav's default
+                         # map_size_m (24m); a goal outside the map would otherwise sit
+                         # latched until goal_no_path_timeout reaps it ~20s later
 SCHEDULE_MAX_ENTRIES = 20  # cap on the scheduled-routines list a browser may set
 STALE = -1e9
 
@@ -65,7 +68,8 @@ PARAM_WHITELIST = {
                  "pickup_pause",
                  "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm",
                  "track_enable", "track_kp", "track_max_ang", "track_deadband",
-                 "track_conf_min", "track_timeout"},
+                 "track_conf_min", "track_timeout",
+                 "test_lin", "test_ang", "test_dist", "test_turns", "test_settle"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
                     "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",
@@ -522,8 +526,8 @@ class TelemetryHub:
     def _mk_goal(v):
         m = PoseStamped()
         m.header.frame_id = "map"
-        m.pose.position.x = float(v["x"])
-        m.pose.position.y = float(v["y"])
+        m.pose.position.x = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, float(v["x"])))
+        m.pose.position.y = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, float(v["y"])))
         m.pose.orientation.w = 1.0
         return m
 

@@ -35,13 +35,6 @@ from .occupancy import GridMap
 
 MAP_FILE = "/dev/shm/nano_map.bin"
 
-# --- self-test / calibration sequence (drives known motions to check IMU + encoders) ---
-TEST_LIN = 0.12      # m/s forward/back speed (capped by max_lin)
-TEST_ANG = 0.6       # rad/s in-place spin speed (capped by max_ang)
-TEST_DIST = 0.35     # m to drive forward, then back
-TEST_TURNS = 1.0     # full in-place rotations for the IMU-vs-odom cross-check
-TEST_SETTLE = 1.2    # s to settle between motion legs
-
 
 def _wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
@@ -145,6 +138,12 @@ class NavNode(Node):
             ("track_deadband", 0.04),      # normalized x-error within this = centered, don't turn
             ("track_conf_min", 0.02),      # ignore target reports below this confidence
             ("track_timeout", 0.6),        # s: no fresh vision-state past this -> stop turning
+            # --- self-test / calibration (scripted drive, IMU-vs-encoder cross-check) ---
+            ("test_lin", 0.12),            # m/s forward/back speed (capped by max_lin)
+            ("test_ang", 0.6),             # rad/s in-place spin speed (capped by max_ang)
+            ("test_dist", 0.35),           # m to drive forward, then back
+            ("test_turns", 1.0),           # full in-place rotations for the IMU-vs-odom check
+            ("test_settle", 1.2),          # s to settle between motion legs
         ])
         g = self.get_parameter
         self.grid = GridMap(
@@ -187,6 +186,11 @@ class NavNode(Node):
         self.track_deadband = float(g("track_deadband").value)
         self.track_conf_min = float(g("track_conf_min").value)
         self.track_timeout = float(g("track_timeout").value)
+        self.test_lin = float(g("test_lin").value)
+        self.test_ang = float(g("test_ang").value)
+        self.test_dist = float(g("test_dist").value)
+        self.test_turns = float(g("test_turns").value)
+        self.test_settle = float(g("test_settle").value)
         self._target = None      # (x, y, confidence) from /vision/state, or None
         self._target_t = 0.0     # monotonic time of the last /vision/state message
 
@@ -386,6 +390,16 @@ class NavNode(Node):
                 self.track_conf_min = float(p.value)
             elif p.name == "track_timeout":
                 self.track_timeout = float(p.value)
+            elif p.name == "test_lin":
+                self.test_lin = float(p.value)
+            elif p.name == "test_ang":
+                self.test_ang = float(p.value)
+            elif p.name == "test_dist":
+                self.test_dist = float(p.value)
+            elif p.name == "test_turns":
+                self.test_turns = float(p.value)
+            elif p.name == "test_settle":
+                self.test_settle = float(p.value)
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
@@ -604,6 +618,11 @@ class NavNode(Node):
 
     # --- navigation (Stages 2/3) --------------------------------------------
     def _on_goal(self, msg):
+        if self.track_enable:
+            # tracking wins over goal-follow while on -- latching a goal here would
+            # otherwise sit stale and fire the instant tracking is turned off
+            self.get_logger().warning("goal_pose ignored: vision tracking is active")
+            return
         self._goal = (msg.pose.position.x, msg.pose.position.y)
         self._goal_is_frontier = False           # a human/explicit goal wins over exploring
         self._next_replan = 0.0                  # plan immediately on the next tick
@@ -612,6 +631,9 @@ class NavNode(Node):
 
     def _on_go_home(self, _msg):
         """Return-to-origin: target the pose the robot booted at (map (0,0))."""
+        if self.track_enable:
+            self.get_logger().warning("go_home ignored: vision tracking is active")
+            return
         self._goal = self.home
         self._goal_is_frontier = False
         self._next_replan = 0.0
@@ -814,18 +836,19 @@ class NavNode(Node):
             self._publish_test("self-test aborted: enable motion first (safety)")
             self.get_logger().warning("self-test: enable motion first")
             return
-        lin = min(TEST_LIN, self.max_lin)
-        ang = min(TEST_ANG, self.max_ang)
-        fwd = TEST_DIST / lin if lin > 0 else 2.0
-        rot = TEST_TURNS * 2.0 * math.pi / ang if ang > 0 else 6.0
+        lin = min(self.test_lin, self.max_lin)
+        ang = min(self.test_ang, self.max_ang)
+        fwd = self.test_dist / lin if lin > 0 else 2.0
+        rot = self.test_turns * 2.0 * math.pi / ang if ang > 0 else 6.0
+        settle = self.test_settle
         self._test_seq = [
-            ("still",   TEST_SETTLE, 0.0,  0.0),   # IMU at rest: gravity + zero-gyro check
-            ("forward", fwd,         lin,  0.0),   # encoders: both count +, balanced; odom dist
-            ("settle",  TEST_SETTLE, 0.0,  0.0),
-            ("back",    fwd,        -lin,  0.0),   # encoders: signs go negative on reverse
-            ("settle",  TEST_SETTLE, 0.0,  0.0),
-            ("rotate",  rot,         0.0,  ang),   # IMU yaw vs odom yaw vs commanded
-            ("done",    0.4,         0.0,  0.0),
+            ("still",   settle, 0.0,  0.0),   # IMU at rest: gravity + zero-gyro check
+            ("forward", fwd,    lin,  0.0),   # encoders: both count +, balanced; odom dist
+            ("settle",  settle, 0.0,  0.0),
+            ("back",    fwd,   -lin,  0.0),   # encoders: signs go negative on reverse
+            ("settle",  settle, 0.0,  0.0),
+            ("rotate",  rot,    0.0,  ang),   # IMU yaw vs odom yaw vs commanded
+            ("done",    0.4,    0.0,  0.0),
         ]
         self._test_ang, self._test_rot_dur = ang, rot
         self._test_phase, self._test_entered = 0, False
@@ -907,7 +930,7 @@ class NavNode(Node):
             dist = math.hypot(cur["x"] - s["x"], cur["y"] - s["y"])
             dL, dR = cur["L"] - s["L"], cur["R"] - s["R"]
             self._m_fwd = (dL, dR)
-            line = f"FWD: odom {dist:.2f} m (cmd ~{TEST_DIST:.2f}); ticks L={dL:+d} R={dR:+d}"
+            line = f"FWD: odom {dist:.2f} m (cmd ~{self.test_dist:.2f}); ticks L={dL:+d} R={dR:+d}"
             if dL == 0 or dR == 0:
                 line += " -> ENCODER DEAD / no tick data"; self._test_fail += 1
             elif dL < 0 or dR < 0:

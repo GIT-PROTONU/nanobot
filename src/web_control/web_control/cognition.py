@@ -1049,6 +1049,20 @@ class CognitionCore:
             if skill.kind == "offline":                   # grow the LLM-free fallback pool
                 return self._do_offline_skill(skill, trigger, state, prelude)
             return self._do_workshop_skill(skill, trigger, state, prelude)
+        if not skill.camera and not self.available() and self._bank_enable:
+            # Narrative skills have no per-skill offline content of their own (unlike the
+            # generic musing beat, which already tries the phrase bank first) -- so a named
+            # say/observe skill invoked while the LLM is down would otherwise go silent. Fall
+            # back to the same sensor-classified phrase bank, bypassing its live-ratio "go
+            # live occasionally" skip since there's no live option right now anyway.
+            reply = self._bank.pick(self._sensor_signals())
+            if reply:
+                self.express(reply["mood"], reply["say"])
+                self.log_decision(trigger, state, False, status="bank-fallback",
+                                  model="phrasebank", say=reply["say"], mood=reply["mood"],
+                                  detail=f"{skill.name}:{reply['category']}")
+                self._note_trial_run(skill.name, ok=True)
+                return reply
         frame = None
         if skill.camera:
             if not self.llm.can_call(image=True):

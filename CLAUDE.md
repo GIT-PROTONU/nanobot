@@ -683,8 +683,11 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
     falls back to a **plain random pick among the currently offered `topic` (action) skills**
     (the only tier that needs zero model calls to execute) — a `blink-led`/`cool-down`-style
     reflex still fires instead of the beat going silent. Narrative (`say`/`observe`/`look`)
-    skills still require the LLM (no cached-line fallback for named skills yet — unlike the
-    generic idle "musing" beat, which already tries the phrase bank first via `bank_say`).
+    skills (2026-07-16) now fall back too: `CognitionCore._invoke_skill` tries the generic
+    sensor-classified phrase bank (`_bank.pick`, bypassing `bank_say`'s live-ratio "go live
+    occasionally" skip since there's no live option right now) before requiring the LLM — so
+    a named skill still says *something*, just not the skill-specific line, matching the
+    generic idle "musing" beat's existing bank-first fallback.
   - **A fourth meta skill grows that offline-only fallback pool: `skills/expand-offline.md`**
     (`action.kind: offline`, `CognitionCore.expand_offline_skills`/`_do_offline_skill`). It reuses
     the exact same workshop pipeline (`run_skill_workshop(offline=True)` → `_suggest_skill

@@ -178,6 +178,15 @@ slam_nav:
     track_conf_min: 0.02           # ignore target reports below this confidence (too small/noisy)
     track_timeout: 0.6             # s: no fresh target/vision-state past this -> stop turning
 
+    # --- self-test / calibration (scripted forward/back/spin drive that cross-checks
+    # IMU vs encoders). Was module constants; now params so the SPIN-check investigation
+    # (see selftest-spin-imu-mismatch memory) can retune live instead of by edit.
+    test_lin: 0.12                 # m/s forward/back speed (capped by max_lin)
+    test_ang: 0.6                  # rad/s in-place spin speed (capped by max_ang)
+    test_dist: 0.35                # m to drive forward, then back
+    test_turns: 1.0                # full in-place rotations for the IMU-vs-odom cross-check
+    test_settle: 1.2               # s to settle between motion legs
+
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:
   ros__parameters:

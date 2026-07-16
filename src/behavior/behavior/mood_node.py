@@ -84,7 +84,9 @@ class MoodNode(Node):
             ("chart_path", ""),             # "" -> ~/.local/state/nanobot/presence_chart.yaml
             ("beats_path", ""),             # "" -> ~/.local/state/nanobot/beats.json
             ("smoothing_alpha", 0.1),       # exponential-smoothing rate for `evolve` (0..1)
-            ("brain_timeout", 90.0),        # s without an evolve before reverting to baseline
+            ("brain_timeout", 1800.0),      # s without an evolve before reverting to baseline
+                                             # (MUST stay well above purpose_period -- see the
+                                             # clamp below; this default matches robot.yaml's)
             ("nudge_pickup_caution", 0.92), # fast rule: being picked up eases caution toward this
             ("nudge_pickup_playful", 0.3),  #            and playfulness toward this (startled)
             # --- vision-driven reflexes (fed by web_control's /vision/state feed; all
@@ -224,9 +226,24 @@ class MoodNode(Node):
         self._beats = merge_beats(load_json(
             _state_path(g("beats_path").value, "beats.json"), logger=self.get_logger().warning))
 
+        # INVARIANT: brain_timeout MUST stay well above reflect_period (purpose_period) --
+        # it's a process-death failsafe, and if it's shorter than the gap between
+        # reflections the chart reverts accumulated drift during normal quiet, so the
+        # robot can never "become its own" (this bit us once: 90 < 600). Clamp rather
+        # than trust a param-less launch (dev harness, future configs) to get it right.
+        reflect_period = float(g("purpose_period").value)
+        brain_timeout = float(g("brain_timeout").value)
+        _min_timeout = 2.0 * reflect_period
+        if brain_timeout < _min_timeout:
+            self.get_logger().warning(
+                f"brain_timeout ({brain_timeout:.0f}s) is not >= 2x purpose_period "
+                f"({reflect_period:.0f}s) -- clamping to {_min_timeout:.0f}s to avoid "
+                "reverting personality drift on every quiet reflection gap")
+            brain_timeout = _min_timeout
+
         self._personality = Personality(
             path=g("personality_path").value, logger=self.get_logger().warning,
-            heartbeat_enable=self.enrich_enable, brain_timeout=float(g("brain_timeout").value),
+            heartbeat_enable=self.enrich_enable, brain_timeout=brain_timeout,
             nudge_pickup_caution=float(g("nudge_pickup_caution").value),
             nudge_pickup_playful=float(g("nudge_pickup_playful").value),
             nudge_looming_caution=float(g("nudge_looming_caution").value),
@@ -237,7 +254,7 @@ class MoodNode(Node):
             name=self._personality.name, enable=bool(g("purpose_enable").value),
             rng=random.Random(), epsilon=float(g("ab_epsilon").value),
             pursue_min_interval=float(g("pursue_min_interval").value),
-            reflect_period=float(g("purpose_period").value),
+            reflect_period=reflect_period,
             skills_enable=bool(g("skills_enable").value),
             skill_every=max(1, int(g("skill_every").value)),
             purpose_path=g("purpose_path").value, experiments_path=g("experiments_path").value,
