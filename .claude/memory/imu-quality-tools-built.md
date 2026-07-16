@@ -1,11 +1,38 @@
 ---
 name: imu-quality-tools-built
-description: "2026-07-16: 6-axis mode toggle, automated interference self-test, mag-cal scatter view, bandwidth filter all built same-day as the backlog request; smoke/unit/manual-tested, NOT hardware-verified/deployed"
+description: "2026-07-16: 6-axis mode toggle, automated interference self-test, mag-cal scatter view, bandwidth filter all built same-day as the backlog request; smoke/unit/manual-tested, NOT hardware-verified/deployed. Follow-up same day: mag scatter view REMOVED, replaced by mount offset/rotation 3D indicator + spin check — see [[imu-mount-rotation-fixed]]"
 metadata: 
   node_type: memory
   type: project
   originSessionId: 86e220b7-6c44-4d8e-9467-f21fce9a03e4
 ---
+
+**Follow-up, same day, later session — superseded/extended:**
+- **Mag-cal scatter view (item 3 below) was REMOVED** at the user's request (decluttering
+  the IMU card) once the actual mount problem was found and fixed — see
+  [[imu-mount-rotation-fixed]]. The mag xyz/magnitude/noise numeric readouts stay; only
+  the canvas scatter plot + its buttons/JS are gone.
+- **New: a 3D mount-offset axis triad** in the existing CSS-3D attitude view (`imu3d-*` in
+  `style.css`/`app.js`) — a small red/green/blue gizmo (X-forward/Y-left/Z-up) that sits
+  on the body's centre dot at offset `0,0,0` and slides out live as the `offset_x/y/z_mm`
+  fields change, so the numbers can be visually matched to where the sensor actually sits.
+  Verified with matrix algebra against the rig's own documented rest pose before shipping
+  (forward=+Z, right=+X, up=-Y).
+- **New: a front/back arrow (▼) drawn on the 3D model's roof**, always visible from the
+  fixed camera angle (unlike the coloured front face, which can rotate out of view) —
+  added because the coloured-face-only indicator wasn't unambiguous enough on its own.
+- **New: a "spin check"** — client-side-only, reuses the existing `|accel|`/`|gyro|`
+  stream: while the robot is actually rotating (`|gyro|` > ~15°/s), a CORRECT mount
+  offset should keep `|accel|` pinned near 9.81 (lever-arm correction cancels the
+  rotation-induced term) just like when parked; this grades the residual live plus a
+  peak-hold "worst spin residual" (mirrors the existing mag-noise worst-seen idiom).
+  This tooling is what actually led to finding + fixing the real mount problem — see
+  [[imu-mount-rotation-fixed]] for the resolution and the mount-ROTATION correction
+  (`mount_roll/pitch/yaw_deg`) that came out of using it.
+- **New: a "Clear map" button** (Map card) — unrelated to the IMU work but built same
+  session: wipes `slam_nav`'s occupancy grid and re-seeds from the current pose, like a
+  fresh boot. Surfaced a real pre-existing bug in the process — see
+  [[web-publish-topic-namespace-gotcha]].
 
 Built same session as [[software-features-todo]]'s "IMU quality tools" entry (user said
 "add all to todo" then "execute these" in the same conversation). All four target the

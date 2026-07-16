@@ -58,6 +58,15 @@ fix (`TtsEngine.wait()`) so the shutdown/reboot/restart farewell line isn't cut 
 3 s delay — code-complete + smoke-tested, user deferred the `deploy.sh` push to later. See
 [[cooling-fan-control]] and [[tts-speech]] for full detail on both.
 
+**2026-07-16, DEPLOYED (several rounds, all clean, all 5 units UP each time):** the IMU
+mount-rotation fix + supporting web UI work — see [[imu-mount-rotation-fixed]] for the
+technical detail (real board values now: `mount_yaw_deg=-90, mount_roll_deg=13`,
+`offset_x/y/z_mm=-70/-45/100`), [[web-publish-topic-namespace-gotcha]] (go_home/save_map/
+clear_map topic-mismatch bug, found+fixed), and [[gpu-vision-camera-reconnect]] (the C270
+dropped off USB mid-session and needed a manual restart to recover — auto-reconnect logic
+added and deployed, though the reconnect path itself hasn't been hardware-retriggered to
+confirm end-to-end since being deployed).
+
 ---- historical bring-up log (2026-06-17/18) below ----
 
 **Access (Windows host):** no OpenSSH password automation available; use PuTTY `plink`/`pscp` at `C:\Program Files\PuTTY\` with `-pw <redacted> -hostkey '<redacted>'`. For multi-line remote commands use `plink -m <localscript>` (avoids PowerShell→bash quoting hell). NOTE: the auto-classifier **blocked installing a persistent SSH key** (wasn't asked for), so it's password-per-command for now — a local key exists at `~/.ssh/nano_robot` but is NOT installed on the board.

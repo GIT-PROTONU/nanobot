@@ -1,11 +1,20 @@
 ---
 name: selftest-spin-imu-mismatch
-description: "2026-07-15: robot's first live drive — self-test SPIN check fails erratically (IMU yaw vs odom vs commanded all inconsistent run-to-run); open question, not yet resolved"
+description: "2026-07-15: robot's first live drive — self-test SPIN check fails erratically (IMU yaw vs odom vs commanded all inconsistent run-to-run); RESOLVED 2026-07-16, see [[imu-mount-rotation-fixed]]"
 metadata: 
   node_type: memory
   type: project
   originSessionId: 45be2e8a-ac2f-4486-96cb-ab8b2dfd0218
 ---
+
+**RESOLVED 2026-07-16 — see [[imu-mount-rotation-fixed]] for the fix.** Root cause was
+neither of the two hypotheses below: the IMU was physically mounted with roll and pitch
+swapped relative to the chassis (~90° rotated about the vertical axis), so every yaw
+turn was partly landing in the reported PITCH channel — which explains exactly this
+kind of run-to-run-inconsistent, "sometimes IMU way over, sometimes way under" noise
+depending on how much of a given spin's energy leaked into the swapped channel. Fixed
+with a mount-rotation correction (`mount_yaw_deg=-90`, `mount_roll_deg=13` on the real
+robot). Kept the investigation below for the record.
 
 **2026-07-15: robot drove under its own power for the first time** (after the
 `INVERT_RIGHT` harness-pin fix, see [[esp32-coprocessor]]). Live testing surfaced two
