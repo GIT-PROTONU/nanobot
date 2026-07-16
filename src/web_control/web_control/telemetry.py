@@ -34,6 +34,7 @@ from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int64MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path
+from sensor_msgs.msg import MagneticField
 from diagnostic_msgs.msg import DiagnosticArray
 
 SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the last client
@@ -105,6 +106,8 @@ class TelemetryHub:
         self._lds = {}                # rpm / hz / duty
         self._fan = None
         self._selftest = ""
+        self._mag = None              # (x, y, z) raw counts, for eyeballing IMU cal quality
+        self._imu_cal_status = ""     # latched, from imu_driver's calibration routine
         self._purpose = self._task = self._experiments = self._schedule = ""  # latched JSON
         self._oled = {"face": "", "word": "", "brand": "", "system": ""}
         self._cmd_vel = (0.0, 0.0)     # (linear.x, angular.z), for the optical bumper
@@ -133,6 +136,9 @@ class TelemetryHub:
             "/oled_text": (pub(String, "oled_text", 5), self._mk_text),
             "/oled_dashboard": (pub(Bool, "oled_dashboard", 5), self._mk_bool),
             "/oled_show_words": (pub(Bool, "oled_show_words", 5), self._mk_bool),
+            # WitMotion 5-byte hex calibration protocol, executed in imu_driver's
+            # reader thread — see ImuNode._do_calibrate.
+            "/imu_calibrate": (pub(String, "imu_calibrate", 5), self._mk_calibrate),
             # Scheduled routines: replace the whole schedule (mood_node validates/parses the
             # HH:MM + skill entries, persists them, and echoes the normalized result back on
             # the latched /schedule topic below — see behavior.brain.Schedule).
@@ -326,6 +332,10 @@ class TelemetryHub:
             f["fan"] = self._fan
         if self._selftest:
             f["selftest"] = self._selftest
+        if self._mag is not None:
+            f["imuMag"] = list(self._mag)
+        if self._imu_cal_status:
+            f["imuCalStatus"] = self._imu_cal_status
         gv = getattr(n, "_gpu_vision", None)
         camera_enabled = not bool(getattr(n, "_camera_disabled", False))
         if gv is not None:
@@ -397,6 +407,8 @@ class TelemetryHub:
         s(sub(Float32, "lds_duty", self._mk_lds("duty"), 2))
         s(sub(Float32, "fan_pwm", self._on_fan, 2))
         s(sub(String, "selftest_result", self._on_selftest, 2))
+        s(sub(MagneticField, "imu/mag", self._on_mag, 2))
+        s(sub(String, "imu_calibrate_status", self._mk_str("_imu_cal_status"), self._latched_qos))
         s(sub(Twist, "cmd_vel", self._on_cmd_vel, 5))   # optical virtual bumper correlation
         # OLED mirror inputs (the page renders a client-side copy of the panel)
         s(sub(String, "oled_face", self._mk_oled("face"), 5))
@@ -469,6 +481,10 @@ class TelemetryHub:
     def _on_selftest(self, msg):
         self._selftest = msg.data
 
+    def _on_mag(self, msg):
+        m = msg.magnetic_field
+        self._mag = (round(m.x, 1), round(m.y, 1), round(m.z, 1))
+
     def _on_cmd_vel(self, msg):
         self._cmd_vel = (msg.linear.x, msg.angular.z)
 
@@ -530,6 +546,13 @@ class TelemetryHub:
     @staticmethod
     def _mk_text(v):
         return String(data=str(v or "")[:32])
+
+    @staticmethod
+    def _mk_calibrate(v):
+        v = str(v or "").strip()
+        if v not in ("accel", "mag_start", "mag_stop", "save"):
+            raise ValueError(f"unknown imu calibrate command: {v}")
+        return String(data=v)
 
     @staticmethod
     def _mk_schedule(v):

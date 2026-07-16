@@ -32,6 +32,19 @@ function pub(topic,value){
 const setNodeRate=(node,hz)=>setParam(node,"publish_rate",hz);
 $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
 $("imuRate").onchange=()=>setNodeRate("imu_driver",Number($("imuRate").value));
+// IMU calibration (WitMotion 5-byte hex protocol, see imu_driver._do_calibrate) — the
+// four steps are separate button presses since accel cal needs the robot held still
+// and mag cal needs it physically rotated; status comes back async via imuCalStatus.
+$("imuCalAccel").onclick=()=>{
+  if(!confirm("Set the robot on a flat, level, still surface, then calibrate the accelerometer?")) return;
+  pub("/imu_calibrate","accel");
+};
+$("imuCalMagStart").onclick=()=>pub("/imu_calibrate","mag_start");
+$("imuCalMagStop").onclick=()=>pub("/imu_calibrate","mag_stop");
+$("imuCalSave").onclick=()=>{
+  if(!confirm("Save IMU calibration to flash?")) return;
+  pub("/imu_calibrate","save");
+};
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
 $("ldsRate").onchange=()=>setNodeRate("lds_driver",Number($("ldsRate").value));
 $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
@@ -416,7 +429,7 @@ function setConn(ok){
 }
 
 // ---- telemetry frame fan-out: one frame updates every readout ----------------
-let rawPurpose="", rawTask="", rawExp="", rawSelftest="", rawSchedule="";
+let rawPurpose="", rawTask="", rawExp="", rawSelftest="", rawSchedule="", rawImuCal="";
 function onFrame(f){
   if(f.odom) onOdom(f.odom);
   if(f.imu) onImu(f.imu);
@@ -429,6 +442,11 @@ function onFrame(f){
   onVision(f.vision);
   if(f.selftest && f.selftest!==rawSelftest){ rawSelftest=f.selftest;
     const el=$("mapTestOut"); el.style.display="block"; el.textContent=f.selftest; }
+  // IMU mag readout for eyeballing calibration quality (see the IMU card's hint) +
+  // the async status line from imu_driver._publish_cal_status.
+  if(f.imuMag) $("imuMag").textContent=f.imuMag.map(v=>v.toFixed(1)).join(", ");
+  if(f.imuCalStatus && f.imuCalStatus!==rawImuCal){ rawImuCal=f.imuCalStatus;
+    const el=$("imuCalOut"); el.style.display="block"; el.textContent=f.imuCalStatus; }
   // Brain readouts arrive as the same latched JSON strings the behaviour node
   // publishes; only re-render when they actually change (frames tick ~5 Hz).
   if(f.purpose && f.purpose!==rawPurpose){ rawPurpose=f.purpose; renderPurpose(f.purpose); }

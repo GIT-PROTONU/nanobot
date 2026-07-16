@@ -20,9 +20,11 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Imu, MagneticField
 from geometry_msgs.msg import Vector3Stamped
+from std_msgs.msg import String
 
 try:
     import serial
@@ -114,6 +116,16 @@ class ImuNode(Node):
         self._need_reconfig = threading.Event()
         # let the web UI slider retune the rate live via /imu_driver/set_parameters
         self.add_on_set_parameters_callback(self._on_params)
+        # One-off calibration trigger from the web UI (WitMotion 5-byte hex protocol,
+        # see _do_calibrate). Mirrors _need_reconfig: the callback (executor thread)
+        # only sets a flag + the pending command; the actual serial write happens in
+        # the reader thread, since self.ser must only ever be touched there.
+        self._cal_pending = threading.Event()
+        self._cal_cmd = None
+        self.create_subscription(String, "imu_calibrate", self._on_calibrate_cmd, 5)
+        self.pub_cal_status = self.create_publisher(
+            String, "imu_calibrate_status",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         self.pub_imu = self.create_publisher(Imu, "imu/data", 10)
         self.pub_mag = self.create_publisher(MagneticField, "imu/mag", 10)
@@ -183,6 +195,55 @@ class ImuNode(Node):
         except Exception as exc:
             self.get_logger().warning(f"IMU rate config failed: {exc}")
 
+    _CAL_CMDS = ("accel", "mag_start", "mag_stop", "save")
+
+    def _on_calibrate_cmd(self, msg):
+        cmd = str(msg.data or "").strip().lower()
+        if cmd not in self._CAL_CMDS:
+            self._publish_cal_status(f"unknown command: {cmd}")
+            return
+        if not HAVE_SERIAL or self.ser is None:
+            self._publish_cal_status("IMU port not connected — try again once it's up")
+            return
+        self._cal_cmd = cmd
+        self._cal_pending.set()
+
+    def _publish_cal_status(self, text):
+        try:
+            self.pub_cal_status.publish(String(data=text[:120]))
+        except Exception:
+            pass
+
+    def _do_calibrate(self, cmd):
+        """WitMotion 5-byte hex calibration commands. Runs in the reader thread (the
+        only place self.ser is touched) since _reader() dispatches it. Accel cal is a
+        blocking ~3s ("keep the sensor still and level" per the datasheet); mag cal is
+        a start/stop pair around the user physically rotating the robot, so those two
+        return immediately and rely on a follow-up button press."""
+        try:
+            self.ser.write(b"\xff\xaa\x69\x88\xb5")               # unlock registers
+            time.sleep(0.05)
+            if cmd == "accel":
+                self._publish_cal_status("accel: keep the robot still & level — calibrating (3s)...")
+                self.ser.write(bytes((0xff, 0xaa, 0x01, 0x01, 0x00)))
+                time.sleep(3.0)
+                self.ser.write(bytes((0xff, 0xaa, 0x01, 0x00, 0x00)))  # stop
+                self._publish_cal_status("accel: done — press Save to keep it")
+            elif cmd == "mag_start":
+                self.ser.write(bytes((0xff, 0xaa, 0x01, 0x02, 0x00)))
+                self._publish_cal_status(
+                    "mag: rotating — slowly turn the robot through all orientations, then press Stop")
+            elif cmd == "mag_stop":
+                self.ser.write(bytes((0xff, 0xaa, 0x01, 0x00, 0x00)))
+                self._publish_cal_status("mag: stopped — press Save to keep it")
+            elif cmd == "save":
+                self.ser.write(bytes((0xff, 0xaa, 0x00, 0x00, 0x00)))
+                self._publish_cal_status("calibration saved to flash")
+            self.ser.reset_input_buffer()
+        except Exception as exc:
+            self._publish_cal_status(f"error: {exc}")
+            self.get_logger().warning(f"IMU calibration '{cmd}' failed: {exc}")
+
     def _on_params(self, params):
         for p in params:
             if p.name == "publish_rate":
@@ -240,6 +301,9 @@ class ImuNode(Node):
             if self._need_reconfig.is_set():
                 self._need_reconfig.clear()
                 self._configure_device()
+            if self._cal_pending.is_set():
+                self._cal_pending.clear()
+                self._do_calibrate(self._cal_cmd)
             try:
                 # Read in batches (blocks until 64 bytes or the 0.2 s timeout)
                 # instead of draining to 1 byte at a time — that per-byte spin was

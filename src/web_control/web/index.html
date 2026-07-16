@@ -411,11 +411,23 @@
               <span>|accel|</span><b id="imuA">–</b>
               <span>|gyro|</span><b id="imuG">–</b>
               <span>rate</span><b id="imuHz">–</b>
+              <span>mag xyz</span><b id="imuMag">–</b>
             </div>
             <div class="field"><label>Publish rate <span id="imuRateV">1</span> Hz</label>
               <input id="imuRate" type="range" min="1" max="200" step="1" value="1"></div>
+            <div class="chiprow">
+              <button id="imuCalAccel" class="btn">🎯 Calibrate accel</button>
+              <button id="imuCalMagStart" class="btn">🧭 Start mag cal</button>
+              <button id="imuCalMagStop" class="btn">■ Stop mag cal</button>
+              <button id="imuCalSave" class="btn">💾 Save calibration</button>
+            </div>
+            <pre id="imuCalOut" style="display:none"></pre>
             <p class="hint">BWT901CL via <b>/imu/web</b> + <b>/imu/euler</b>. Slider retunes the
-              <b>/imu/data</b> rate live (device stream auto-follows). Angles °, accel m/s², gyro °/s.</p>
+              <b>/imu/data</b> rate live (device stream auto-follows). Angles °, accel m/s², gyro °/s.
+              <b>Calibrate accel</b> with the robot flat &amp; still (~3s) — check <b>|accel|</b> reads
+              ~9.8 afterwards. <b>Start/Stop mag cal</b> while slowly rotating the robot through all
+              orientations — check <b>mag xyz</b> sweeps smoothly, not stuck at one value. Always
+              <b>Save</b> to persist to flash, else it resets on power-cycle.</p>
           </div>
           <div class="card">
             <h2>Odometry</h2>

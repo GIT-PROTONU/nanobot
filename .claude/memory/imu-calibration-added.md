@@ -9,8 +9,8 @@ metadata:
 
 Built 2026-07-16, motivated by the open [[selftest-spin-imu-mismatch]] investigation
 (magnetometer interference is one of the two live hypotheses for the erratic self-test
-SPIN yaw). **Code-complete on the dev PC (smoke-tested), NOT yet run against the real
-BWT901CL hardware** — the actual calibration quality/behavior is unverified.
+SPIN yaw). **Committed + smoke-tested on the dev PC, NOT yet deployed/run against the
+real BWT901CL hardware** — the actual calibration quality/behavior is unverified.
 
 **Protocol**: WitMotion's documented 5-byte hex commands over the same UART the driver
 already uses (`imu_driver/imu_node.py` already sent the unlock frame for RSW/RRATE
