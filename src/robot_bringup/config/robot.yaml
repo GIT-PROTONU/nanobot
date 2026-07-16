@@ -162,6 +162,18 @@ slam_nav:
     trait_motion: false            # let `caution` nudge the reactive motion thresholds
     stop_distance_max: 0.45        # m: stop_distance at caution=1 (stops earlier when wary)
     max_lin_min: 0.08              # m/s: max_lin at caution=1 (drives slower when wary)
+    # --- vision target tracking (pan-only: turn in place to keep a calibrated
+    # colour-blob centered in the camera frame). Reads /vision/state (web_control's
+    # GPU-vision feed) for the target's normalized x position + confidence. OFF by
+    # default; when on it WINS over goal-follow/auto-explore (the whole point of
+    # turning it on is "look at this now") but is still gated by enable_motion and
+    # still yields to pick-up/self-test/relocalization like everything else here.
+    track_enable: false            # master toggle. Live-tunable (web "🎯 Track target").
+    track_kp: 2.0                  # angular gain: rad/s commanded per unit of x-error (-0.5..0.5)
+    track_max_ang: 0.8             # rad/s cap for tracking turns (independent of nav's max_ang)
+    track_deadband: 0.04           # normalized x-error within this = already centered, don't turn
+    track_conf_min: 0.02           # ignore target reports below this confidence (too small/noisy)
+    track_timeout: 0.6             # s: no fresh target/vision-state past this -> stop turning
 
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:

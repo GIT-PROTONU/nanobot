@@ -534,6 +534,11 @@ const HINTS = {
   visTargetSel: "The persistent calibration palette -- pick a stored colour target and press Track to make it live.",
   visTargetUse: "Make the selected stored target the live tracked colour (also restores its saved tuning).",
   visTargetDel: "Forget the selected stored target. Deleting the active one stops tracking.",
+  navTrackEnable: "Turns the robot in place to keep the calibrated colour target centered in the camera frame (pan only, never drives forward/back). Wins over any active nav goal/auto-explore while on; still respects enable_motion, pick-up freeze, and self-test.",
+  trackKp: "Turn gain -- rad/s commanded per unit of horizontal off-center error. Higher = snappier, but can overshoot/oscillate.",
+  trackMaxAng: "Cap on the turn rate while tracking.",
+  trackDeadband: "How close to dead-center counts as \"close enough\" -- no turning inside this band.",
+  trackConfMin: "Minimum blob-lock confidence to trust before turning -- rejects noise/flicker locks too small to act on.",
   visGlare: "Glare rejection: derates the blob lock confidence by the frame's specular-highlight fraction, so a shiny reflection matching the tracked hue can't hold a false lock. 0 = off.",
   visNoveltyAlert: "Novelty score above which the \"scene changed\" alert fires.",
   visCamStall: "Seconds without a new frame (or with an exactly-zero diff) before the camera counts as frozen.",
@@ -716,6 +721,23 @@ $("visDarkOn").oninput=()=>$("visDarkOnV").textContent=$("visDarkOn").value;
 $("visDarkOff").oninput=()=>$("visDarkOffV").textContent=$("visDarkOff").value;
 $("visDarkOn").onchange=syncDarkReflex;
 $("visDarkOff").onchange=syncDarkReflex;
+
+// Vision target tracking (pan-only visual servoing, owned by slam_nav — see
+// track_* params/robot.yaml). Turning it on WINS over any active goal/auto-explore.
+$("navTrackEnable").onchange=e=>setParam("slam_nav","track_enable",e.target.checked);
+$("trackTuneToggle").onclick=()=>{
+  const box=$("trackTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("trackTuneToggle").textContent=(open?"▾":"▸")+" Tracking tuning";
+};
+$("trackKp").oninput=()=>$("trackKpV").textContent=$("trackKp").value;
+$("trackKp").onchange=()=>setParam("slam_nav","track_kp",Number($("trackKp").value));
+$("trackMaxAng").oninput=()=>$("trackMaxAngV").textContent=$("trackMaxAng").value;
+$("trackMaxAng").onchange=()=>setParam("slam_nav","track_max_ang",Number($("trackMaxAng").value));
+$("trackDeadband").oninput=()=>$("trackDeadbandV").textContent=$("trackDeadband").value;
+$("trackDeadband").onchange=()=>setParam("slam_nav","track_deadband",Number($("trackDeadband").value)/100);
+$("trackConfMin").oninput=()=>$("trackConfMinV").textContent=$("trackConfMin").value;
+$("trackConfMin").onchange=()=>setParam("slam_nav","track_conf_min",Number($("trackConfMin").value)/100);
 
 $("visionAlertsToggle").onclick=()=>{
   const box=$("visionAlertsTune"), open=box.style.display!=="block";

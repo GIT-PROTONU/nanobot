@@ -136,6 +136,13 @@ class NavNode(Node):
             ("trait_motion", False),       # opt-in: let `caution` nudge stop_distance/max_lin
             ("stop_distance_max", 0.45),   # m: the cautious extreme of stop_distance (caution=1)
             ("max_lin_min", 0.08),         # m/s: the cautious extreme of max_lin (caution=1)
+            # --- vision target tracking (pan-only visual servoing; see robot.yaml) ---
+            ("track_enable", False),       # master toggle; WINS over goal-follow/explore while on
+            ("track_kp", 2.0),             # angular gain: rad/s per unit of x-error (-0.5..0.5)
+            ("track_max_ang", 0.8),        # rad/s cap for tracking turns
+            ("track_deadband", 0.04),      # normalized x-error within this = centered, don't turn
+            ("track_conf_min", 0.02),      # ignore target reports below this confidence
+            ("track_timeout", 0.6),        # s: no fresh vision-state past this -> stop turning
         ])
         g = self.get_parameter
         self.grid = GridMap(
@@ -170,6 +177,16 @@ class NavNode(Node):
         self._base_max_lin = self.max_lin
         self._stop_max = float(g("stop_distance_max").value)
         self._max_lin_min = float(g("max_lin_min").value)
+
+        # vision target tracking
+        self.track_enable = bool(g("track_enable").value)
+        self.track_kp = float(g("track_kp").value)
+        self.track_max_ang = float(g("track_max_ang").value)
+        self.track_deadband = float(g("track_deadband").value)
+        self.track_conf_min = float(g("track_conf_min").value)
+        self.track_timeout = float(g("track_timeout").value)
+        self._target = None      # (x, y, confidence) from /vision/state, or None
+        self._target_t = 0.0     # monotonic time of the last /vision/state message
 
         # extras
         self.map_store = str(g("map_store").value)
@@ -272,6 +289,7 @@ class NavNode(Node):
         self.create_subscription(PoseStamped, "goal_pose", self._on_goal, 5)
         self.create_subscription(Bool, "go_home", self._on_go_home, 5)
         self.create_subscription(Bool, "save_map", self._on_save_map, 5)
+        self.create_subscription(String, "vision/state", self._on_vision_state, 5)
         # per-wheel off-ground switches from the ESP32 (pick-up detection)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
         self.create_subscription(Bool, "right_wheel_suspended", self._on_susp_r, 10)
@@ -346,6 +364,26 @@ class NavNode(Node):
                     # currently spinning -> apply the new setpoint now, not just at the
                     # next idle<->active transition, so the web slider feels live
                     self.lds_rpm_pub.publish(Float32(data=self.lds_active_rpm))
+            elif p.name == "track_enable":
+                self.track_enable = bool(p.value)
+                if self.track_enable:
+                    # tracking wins over goal-follow/explore -- drop any stale plan so
+                    # the map view doesn't keep showing a path that will never resume
+                    self._goal, self._path, self._goal_is_frontier = None, [], False
+                    self._no_path_since = None
+                    self._publish_path()
+                else:
+                    self._send(0.0, 0.0)     # drop to a stop the moment it's disabled
+            elif p.name == "track_kp":
+                self.track_kp = float(p.value)
+            elif p.name == "track_max_ang":
+                self.track_max_ang = float(p.value)
+            elif p.name == "track_deadband":
+                self.track_deadband = float(p.value)
+            elif p.name == "track_conf_min":
+                self.track_conf_min = float(p.value)
+            elif p.name == "track_timeout":
+                self.track_timeout = float(p.value)
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
@@ -377,6 +415,18 @@ class NavNode(Node):
         if self._susp_override == 1:
             return True, True
         return self._susp_l, self._susp_r
+
+    def _on_vision_state(self, msg):
+        """web_control's /vision/state feed (only published while GPU vision is live —
+        see gpu-vision docs). Only the `target` field matters here: [x, y, confidence]
+        normalized image coords, or None. Recorded even when None so track_timeout can
+        tell 'no lock right now' apart from 'the vision pipeline stopped talking'."""
+        self._target_t = time.monotonic()
+        try:
+            t = json.loads(msg.data).get("target")
+        except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            return
+        self._target = tuple(t) if isinstance(t, list) and len(t) == 3 else None
 
     def _on_traits(self, msg):
         """Map the behaviour layer's `caution` trait (0..1) onto the reactive motion
@@ -610,6 +660,12 @@ class NavNode(Node):
                 self._send(0.0, self.recover_spin)     # slow in-place spin (only if motion on)
             return
 
+        # Vision target tracking wins over goal-follow/explore while enabled -- see
+        # track_step's docstring. (Also gated by enable_motion, inside _send.)
+        if self.track_enable:
+            self._track_step(now)
+            return
+
         # auto-explore: when there's no goal, periodically adopt the nearest reachable
         # frontier as one (only drives if enable_motion; otherwise just shows the plan).
         if self._goal is None:
@@ -715,6 +771,28 @@ class NavNode(Node):
         self.lds_rpm_pub.publish(Float32(data=rpm))
         self.get_logger().info(
             f"LDS {'spinning up' if want_active else 'idle spin-down'} ({rpm:.0f} rpm)")
+
+    def _track_step(self, now):
+        """Pan-only visual servoing: turn in place to keep the calibrated colour-blob
+        target (from /vision/state) centered in the camera frame. x is normalized
+        image coords, 0=left edge .. 1=right edge; target off to the right (x > 0.5)
+        needs a negative angular.z (turn right) to re-center it. Stops the moment the
+        target is missing, stale (no /vision/state for track_timeout -- covers both
+        'lost the lock' and 'the vision pipeline stopped'), or too low-confidence to
+        trust. Never drives forward/back (see the tracking design note)."""
+        if self._target is None or now - self._target_t > self.track_timeout:
+            self._send(0.0, 0.0)
+            return
+        x, _y, conf = self._target
+        if conf < self.track_conf_min:
+            self._send(0.0, 0.0)
+            return
+        err = x - 0.5
+        if abs(err) < self.track_deadband:
+            self._send(0.0, 0.0)
+            return
+        w = max(-self.track_max_ang, min(self.track_max_ang, -self.track_kp * err))
+        self._send(0.0, w)
 
     def _set_face(self, mood):
         """Drive the OLED face (an alert stare while carried). Skipped entirely when

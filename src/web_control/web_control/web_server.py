@@ -1333,6 +1333,9 @@ class WebServerNode(Node):
             # lamps), negative = cool (daylight/fluorescent). The ambient-mood input.
             "warmth": round(cast[0] - cast[2], 3) if cast else 0.0,
             "motion": round(gv.motion_score, 3),
+            # calibrated colour-blob target, for slam_nav's optional pan-tracking:
+            # [x, y, confidence] normalized 0..1 image coords, or None if no lock.
+            "target": list(gv.target) if gv.target is not None else None,
         }
         self._vision_state_pub.publish(String(data=json.dumps(payload)))
 
