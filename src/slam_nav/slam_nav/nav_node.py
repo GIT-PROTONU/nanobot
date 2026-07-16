@@ -134,7 +134,27 @@ class NavNode(Node):
             # --- vision target tracking (pan-only visual servoing; see robot.yaml) ---
             ("track_enable", False),       # master toggle; WINS over goal-follow/explore while on
             ("track_kp", 2.0),             # angular gain: rad/s per unit of x-error (-0.5..0.5)
-            ("track_max_ang", 0.8),        # rad/s cap for tracking turns
+            ("track_kd", 0.5),             # damping: rad/s commanded per rad/s of the robot's
+                                            # OWN measured yaw rate (IMU), opposing it -- brakes
+                                            # against real turning momentum near the setpoint
+                                            # instead of relying on P-gain alone (see track_step)
+            ("track_max_ang", 2.0),        # rad/s cap for tracking turns -- raised 2026-07-16
+                                            # from 0.8: the ESP32's stiction/deadzone remap
+                                            # (MOTOR_MIN_DUTY) means duty barely rises across
+                                            # this whole range (0.16 rad/s -> 56% duty, 3.0 rad/s
+                                            # -> only 72%), so a higher cap costs little and lets
+                                            # the robot actually slew fast enough to catch a
+                                            # quick-moving target; MAX_ANGULAR_SPEED (firmware) is
+                                            # the true ceiling at 3.0
+            ("track_min_eff_ang", 0.2),     # rad/s: the smallest turn rate that reliably moves
+                                            # the wheels at all, given the ESP32's stiction
+                                            # compensation (main.cpp MOTOR_DEADZONE/MOTOR_MIN_DUTY
+                                            # -- anything commanded below ~0.16 rad/s produces
+                                            # literally zero motion, not a slow crawl). Below this,
+                                            # track_step time-dithers full-floor pulses instead of
+                                            # asking for a continuous rate the hardware can't
+                                            # produce -- this, not P/D gain, is what fixes fine
+                                            # centering/overshoot right at the setpoint.
             ("track_deadband", 0.04),      # normalized x-error within this = centered, don't turn
             ("track_conf_min", 0.02),      # ignore target reports below this confidence
             ("track_timeout", 0.6),        # s: no fresh vision-state past this -> stop turning
@@ -182,7 +202,9 @@ class NavNode(Node):
         # vision target tracking
         self.track_enable = bool(g("track_enable").value)
         self.track_kp = float(g("track_kp").value)
+        self.track_kd = float(g("track_kd").value)
         self.track_max_ang = float(g("track_max_ang").value)
+        self.track_min_eff_ang = float(g("track_min_eff_ang").value)
         self.track_deadband = float(g("track_deadband").value)
         self.track_conf_min = float(g("track_conf_min").value)
         self.track_timeout = float(g("track_timeout").value)
@@ -193,6 +215,9 @@ class NavNode(Node):
         self.test_settle = float(g("test_settle").value)
         self._target = None      # (x, y, confidence) from /vision/state, or None
         self._target_t = 0.0     # monotonic time of the last /vision/state message
+        self._track_prev_yaw = None    # last _imu_yaw sampled by _track_step, for the
+        self._track_prev_yaw_t = 0.0   # yaw-rate damping term (see track_kd)
+        self._track_pulse_acc = 0.0    # sub-floor time-dither accumulator (see track_min_eff_ang)
 
         # extras
         self.map_store = str(g("map_store").value)
@@ -383,8 +408,12 @@ class NavNode(Node):
                     self._send(0.0, 0.0)     # drop to a stop the moment it's disabled
             elif p.name == "track_kp":
                 self.track_kp = float(p.value)
+            elif p.name == "track_kd":
+                self.track_kd = float(p.value)
             elif p.name == "track_max_ang":
                 self.track_max_ang = float(p.value)
+            elif p.name == "track_min_eff_ang":
+                self.track_min_eff_ang = float(p.value)
             elif p.name == "track_deadband":
                 self.track_deadband = float(p.value)
             elif p.name == "track_conf_min":
@@ -822,19 +851,100 @@ class NavNode(Node):
         needs a negative angular.z (turn right) to re-center it. Stops the moment the
         target is missing, stale (no /vision/state for track_timeout -- covers both
         'lost the lock' and 'the vision pipeline stopped'), or too low-confidence to
-        trust. Never drives forward/back (see the tracking design note)."""
-        if self._target is None or now - self._target_t > self.track_timeout:
+        trust. Never drives forward/back (see the tracking design note).
+
+        2026-07-16: briefly "fixed" as a vision-mirroring bug (err = 0.5 - x) on an
+        imprecise first report, then DISPROVEN on hardware -- with that flip live,
+        a target held at the robot's physical right made it turn LEFT (away), so the
+        flip had it backwards. Reverted to the formula below, which a controlled
+        target-on-the-right test confirmed turns the robot right (toward). gpu_vision's
+        x is NOT mirrored after all; whatever was originally observed was a bad read of
+        left/right, not a real bug here.
+
+        2026-07-16 (2nd finding): direction fixed, but hardware still overshoot/
+        oscillated even with track_kp lowered to its UI floor -- ruling out "gain too
+        high". Root cause: /vision/state only refreshes @2 Hz (web_control's fixed 0.5s
+        tick) while this control loop runs @control_rate (10 Hz default), so most ticks
+        recompute w from an already-stale reading and keep commanding the SAME turn rate
+        for up to ~0.5s blind, well past where the robot had actually re-centered by the
+        time the next fresh sample arrived -- no amount of P-gain reduction fixes a
+        stale-data problem. Taper |w| by sample age instead of holding it at full
+        strength for the whole gap between vision frames.
+
+        2026-07-16 (3rd finding): bumped /vision/state to 10 Hz (matches this loop),
+        which helped but hardware STILL overshot, and only a slow-moving target could be
+        followed at all -- both point at the robot's own turning momentum, not sample
+        staleness: a pure P-on-vision-error law commands a velocity proportional to
+        (visual) error alone, with nothing accounting for how fast the robot is ALREADY
+        physically spinning, so it keeps commanding a turn well past center whenever
+        momentum (no motor accel ramp is flashed yet either) carries it past where the
+        P term alone would've throttled back. Added a real damping term (track_kd) on
+        the robot's OWN measured yaw rate (numeric derivative of /imu/euler) that
+        actively brakes against its current spin instead of only reacting to visual
+        error -- a standard PD-on-measurement design, and orthogonal to track_kp, so it
+        should let kp go back up (faster tracking) without the extra overshoot kp alone
+        used to cost.
+
+        2026-07-16 (4th finding): still overshooting near the setpoint. Worked out WHY
+        gain/damping alone could never fully fix it: the ESP32's stiction compensation
+        (main.cpp MOTOR_MIN_DUTY/MOTOR_DEADZONE) means any |angular.z| below ~0.16 rad/s
+        produces literally zero wheel motion, and anything above that floor jumps
+        straight to ~55% duty -- across this ENTIRE control loop's practical command
+        range (0.16 up to the old 0.8 rad/s cap), the real motor duty only spans
+        ~56-60%. The actuator is close to a relay (off / ~fixed-speed-on), not a
+        smoothly variable one, so a continuous small "gentle nudge" command near the
+        setpoint either does nothing or overshoots with a much bigger kick than
+        intended -- no amount of P/D tuning changes that floor. Fix: below
+        track_min_eff_ang, don't ask for a rate the hardware can't produce continuously
+        -- TIME-dither instead, firing a full-floor pulse only as often as needed to
+        average out to the desired slow rate (a delta-sigma / PWM-style modulator).
+        Also raised track_max_ang's default+ceiling: since duty barely rises across the
+        whole range, a much higher cap costs little and lets the robot slew far faster
+        toward a quick-moving target instead of being capped at 0.8 rad/s for free."""
+        # Yaw-rate estimate for the damping term below -- computed every call (even on
+        # early-return paths) so the derivative stays continuous across gaps instead of
+        # spiking after target loss / a disable-then-reenable.
+        yaw = self._imu_yaw
+        yaw_rate = 0.0
+        if self._track_prev_yaw is not None:
+            dt = now - self._track_prev_yaw_t
+            if dt > 0:
+                yaw_rate = _wrap(yaw - self._track_prev_yaw) / dt
+        self._track_prev_yaw, self._track_prev_yaw_t = yaw, now
+
+        if self._target is None:
+            self._track_pulse_acc = 0.0
+            self._send(0.0, 0.0)
+            return
+        age = now - self._target_t
+        if age > self.track_timeout:
+            self._track_pulse_acc = 0.0
             self._send(0.0, 0.0)
             return
         x, _y, conf = self._target
         if conf < self.track_conf_min:
+            self._track_pulse_acc = 0.0
             self._send(0.0, 0.0)
             return
         err = x - 0.5
         if abs(err) < self.track_deadband:
+            self._track_pulse_acc = 0.0
             self._send(0.0, 0.0)
             return
-        w = max(-self.track_max_ang, min(self.track_max_ang, -self.track_kp * err))
+        fresh = max(0.0, 1.0 - age / self.track_timeout)   # 1 on a brand-new sample -> 0 at track_timeout
+        w_raw = -self.track_kp * err - self.track_kd * yaw_rate   # P on vision error, D braking on actual spin
+        w = fresh * max(-self.track_max_ang, min(self.track_max_ang, w_raw))
+        if 0.0 < abs(w) < self.track_min_eff_ang:
+            # Below the hardware's reliable-motion floor -- fire a fixed-magnitude pulse
+            # only often enough (in time) to average out to the desired slow rate.
+            self._track_pulse_acc += abs(w) / self.track_min_eff_ang
+            if self._track_pulse_acc >= 1.0:
+                self._track_pulse_acc -= 1.0
+                w = math.copysign(self.track_min_eff_ang, w)
+            else:
+                w = 0.0
+        else:
+            self._track_pulse_acc = 0.0
         self._send(0.0, w)
 
     def _set_face(self, mood):

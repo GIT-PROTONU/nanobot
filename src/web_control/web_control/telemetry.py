@@ -52,6 +52,8 @@ SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the la
 # informational only so far; nothing autonomous acts on them yet.
 PLAN_MAX_PTS = 64        # planned-path polyline is downsampled to at most this many points
 LDS_RPM_MAX = 400.0      # clamp on the /lds_target_rpm setpoint a browser may publish
+MOTOR_ACCEL_MIN = 0.3    # clamp on the /motor_accel ramp rate (duty/s) -- matches the
+MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.cpp)
 GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- half of slam_nav's default
                          # map_size_m (24m); a goal outside the map would otherwise sit
                          # latched until goal_no_path_timeout reaps it ~20s later
@@ -68,8 +70,8 @@ PARAM_WHITELIST = {
                  "robot_radius", "stuck_timeout", "goal_no_path_timeout", "relocalize",
                  "pickup_pause",
                  "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm",
-                 "track_enable", "track_kp", "track_max_ang", "track_deadband",
-                 "track_conf_min", "track_timeout",
+                 "track_enable", "track_kp", "track_kd", "track_max_ang", "track_min_eff_ang",
+                 "track_deadband", "track_conf_min", "track_timeout",
                  "test_lin", "test_ang", "test_dist", "test_turns", "test_settle"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
@@ -143,6 +145,8 @@ class TelemetryHub:
             "/pickup_override": (pub(Int8, "pickup_override", latched), self._mk_pickup),
             "/selftest": (pub(Bool, "selftest", 5), self._mk_bool),
             "/reset_ticks": (pub(Bool, "reset_ticks", 5), self._mk_bool),
+            # ESP32 motor accel-ramp rate (duty/s) -- see main.cpp's MOTOR_SLEW_DEFAULT.
+            "/motor_accel": (pub(Float32, "motor_accel", 5), self._mk_motor_accel),
             # NOTE: the ROS topic string here is bare ("go_home", not "slam_nav/go_home")
             # -- nav_node subscribes to the same bare name with no namespace of its own
             # (neither the systemd unit_exec.sh path nor bringup.launch.py sets one), so
@@ -613,6 +617,10 @@ class TelemetryHub:
     @staticmethod
     def _mk_lds_rpm(v):
         return Float32(data=min(LDS_RPM_MAX, max(0.0, float(v))))
+
+    @staticmethod
+    def _mk_motor_accel(v):
+        return Float32(data=min(MOTOR_ACCEL_MAX, max(MOTOR_ACCEL_MIN, float(v))))
 
     @staticmethod
     def _mk_pickup(v):

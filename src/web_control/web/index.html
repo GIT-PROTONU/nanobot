@@ -675,8 +675,12 @@
             <div id="trackTune" style="display:none">
               <div class="field"><label>Turn gain <span id="trackKpV">2.0</span></label>
                 <input id="trackKp" type="range" min="0.5" max="6" step="0.1" value="2.0"></div>
-              <div class="field"><label>Max turn rate <span id="trackMaxAngV">0.8</span> rad/s</label>
-                <input id="trackMaxAng" type="range" min="0.2" max="2" step="0.1" value="0.8"></div>
+              <div class="field"><label>Braking <span id="trackKdV">0.5</span></label>
+                <input id="trackKd" type="range" min="0" max="2" step="0.05" value="0.5"></div>
+              <div class="field"><label>Max turn rate <span id="trackMaxAngV">2.0</span> rad/s</label>
+                <input id="trackMaxAng" type="range" min="0.2" max="3" step="0.1" value="2.0"></div>
+              <div class="field"><label>Min effective turn rate <span id="trackMinEffAngV">0.2</span> rad/s</label>
+                <input id="trackMinEffAng" type="range" min="0.1" max="0.5" step="0.01" value="0.2"></div>
               <div class="field"><label>Center deadband <span id="trackDeadbandV">4</span>%</label>
                 <input id="trackDeadband" type="range" min="0" max="20" step="1" value="4"></div>
               <div class="field"><label>Min confidence to trust <span id="trackConfMinV">2</span>%</label>
@@ -841,6 +845,8 @@
               <span>stray ticks L/R</span><b id="espStray">–</b>
             </div>
             <button id="espResetTicks" class="btn">🔁 Reset ticks</button>
+            <div class="field"><label>Accel ramp <span id="motorAccelV">3.0</span> duty/s</label>
+              <input id="motorAccel" type="range" min="0.3" max="8" step="0.1" value="3.0"></div>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>
@@ -856,7 +862,11 @@
               a rising count with the robot motionless means encoder-line noise
               (ground bounce, a loose signal wire), not real rotation. <b>Reset ticks</b>
               zeros both counters (and the stray counters) for a clean baseline —
-              odometry re-seeds automatically so /odom doesn't jump.</p>
+              odometry re-seeds automatically so /odom doesn't jump. <b>Accel ramp</b>
+              caps how fast the applied motor duty may follow a commanded change (duty
+              units/sec) instead of stepping straight to it — lower is smoother/gentler
+              but laggier, higher is snappier but jerkier. A dead-man stop (lost link/cmd)
+              always cuts power immediately, ignoring this ramp.</p>
           </div>
           <div class="card">
             <h2>Navigation (slam_nav)</h2>

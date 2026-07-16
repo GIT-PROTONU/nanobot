@@ -117,6 +117,12 @@ function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value));
 // count after fixing a wiring issue); wheel_odometry re-seeds itself off the same topic
 // so /odom doesn't jump.
 $("espResetTicks").addEventListener("click",()=>{ pub("/reset_ticks",true); $("espStray").style.color=""; });
+// ESP32 motor accel-ramp rate (duty/s, see main.cpp's MOTOR_SLEW_DEFAULT) -- how fast
+// applied motor duty may follow a commanded change; lower = smoother/gentler & laggier,
+// higher = snappier & jerkier. Fire-and-forget like reset_ticks -- not read back, so a
+// page reload shows the slider's default rather than the ESP32's actual live value.
+$("motorAccel").oninput=()=>$("motorAccelV").textContent=$("motorAccel").value;
+$("motorAccel").onchange=()=>pub("/motor_accel",Number($("motorAccel").value));
 // Fan override -> sys_monitor fan_override param.
 // v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
 const setFanOverride=v=>setParam("sys_monitor","fan_override",v);
@@ -640,7 +646,9 @@ const HINTS = {
   visTargetDel: "Forget the selected stored target. Deleting the active one stops tracking.",
   navTrackEnable: "Turns the robot in place to keep the calibrated colour target centered in the camera frame (pan only, never drives forward/back). Wins over any active nav goal/auto-explore while on; still respects enable_motion, pick-up freeze, and self-test.",
   trackKp: "Turn gain -- rad/s commanded per unit of horizontal off-center error. Higher = snappier, but can overshoot/oscillate.",
-  trackMaxAng: "Cap on the turn rate while tracking.",
+  trackKd: "Braking -- opposes the robot's OWN measured turning speed (from the IMU), damping overshoot from momentum near the setpoint. Higher = brakes harder, but too high can make it feel sluggish/hesitant.",
+  trackMaxAng: "Cap on the turn rate while tracking. Raised well above the old 0.8 default -- the ESP32's stiction compensation means real motor duty barely changes across this whole range, so a higher cap is nearly free extra tracking speed.",
+  trackMinEffAng: "Smallest turn rate that reliably moves the wheels at all (below this the ESP32's stiction compensation means the command does nothing). Fine corrections below this are time-dithered -- short pulses at this rate -- instead of asking for a rate the hardware can't produce, which is what actually fixes overshoot right at the setpoint. Shouldn't normally need tuning.",
   trackDeadband: "How close to dead-center counts as \"close enough\" -- no turning inside this band.",
   trackConfMin: "Minimum blob-lock confidence to trust before turning -- rejects noise/flicker locks too small to act on.",
   visGlare: "Glare rejection: derates the blob lock confidence by the frame's specular-highlight fraction, so a shiny reflection matching the tracked hue can't hold a false lock. 0 = off.",
@@ -855,8 +863,12 @@ $("trackTuneToggle").onclick=()=>{
 };
 $("trackKp").oninput=()=>$("trackKpV").textContent=$("trackKp").value;
 $("trackKp").onchange=()=>setParam("slam_nav","track_kp",Number($("trackKp").value));
+$("trackKd").oninput=()=>$("trackKdV").textContent=$("trackKd").value;
+$("trackKd").onchange=()=>setParam("slam_nav","track_kd",Number($("trackKd").value));
 $("trackMaxAng").oninput=()=>$("trackMaxAngV").textContent=$("trackMaxAng").value;
 $("trackMaxAng").onchange=()=>setParam("slam_nav","track_max_ang",Number($("trackMaxAng").value));
+$("trackMinEffAng").oninput=()=>$("trackMinEffAngV").textContent=$("trackMinEffAng").value;
+$("trackMinEffAng").onchange=()=>setParam("slam_nav","track_min_eff_ang",Number($("trackMinEffAng").value));
 $("trackDeadband").oninput=()=>$("trackDeadbandV").textContent=$("trackDeadband").value;
 $("trackDeadband").onchange=()=>setParam("slam_nav","track_deadband",Number($("trackDeadband").value)/100);
 $("trackConfMin").oninput=()=>$("trackConfMinV").textContent=$("trackConfMin").value;

@@ -173,7 +173,21 @@ slam_nav:
     # still yields to pick-up/self-test/relocalization like everything else here.
     track_enable: false            # master toggle. Live-tunable (web "🎯 Track target").
     track_kp: 2.0                  # angular gain: rad/s commanded per unit of x-error (-0.5..0.5)
-    track_max_ang: 0.8             # rad/s cap for tracking turns (independent of nav's max_ang)
+    track_kd: 0.5                  # damping: rad/s commanded per rad/s of the robot's OWN
+                                    # measured yaw rate (IMU), opposing it -- brakes against
+                                    # real turning momentum near the setpoint (see nav_node's
+                                    # track_step docstring, 2026-07-16 3rd finding)
+    track_max_ang: 2.0             # rad/s cap for tracking turns (independent of nav's max_ang).
+                                    # Raised 2026-07-16 from 0.8: the ESP32's stiction/deadzone
+                                    # remap means real motor duty barely rises across this whole
+                                    # range, so a higher cap is nearly free extra tracking speed
+                                    # (MAX_ANGULAR_SPEED, firmware, is the true ceiling at 3.0)
+    track_min_eff_ang: 0.2         # rad/s: smallest turn rate that reliably moves the wheels at
+                                    # all (the ESP32's stiction compensation means anything
+                                    # commanded below ~0.16 rad/s produces zero motion, not a
+                                    # slow crawl) -- below this, track_step time-dithers full-
+                                    # floor pulses instead of asking for a rate the hardware
+                                    # can't produce (2026-07-16 4th finding)
     track_deadband: 0.04           # normalized x-error within this = already centered, don't turn
     track_conf_min: 0.02           # ignore target reports below this confidence (too small/noisy)
     track_timeout: 0.6             # s: no fresh target/vision-state past this -> stop turning

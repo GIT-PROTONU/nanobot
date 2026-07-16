@@ -8,6 +8,7 @@
 //   sub  lds_target_rpm        std_msgs/Float32          -> LDS spin-speed PID setpoint
 //   sub  fan_pwm               std_msgs/Float32 (0..1)   -> SBC cooling fan PWM duty
 //   sub  motor_trim            std_msgs/Float32 (-0.3..0.3) -> manual L/R trim set/reset
+//   sub  motor_accel           std_msgs/Float32 (0.3..8.0)  -> accel-ramp rate (duty/s)
 //   sub  reset_ticks           std_msgs/Bool (true)      -> zero wheel_ticks + wheel_stray_ticks
 //   pub  wheel_ticks           std_msgs/Int64MultiArray  [L,R] raw cumulative counts
 //   pub  wheel_stray_ticks     std_msgs/Int64MultiArray  [L,R] cumulative ticks seen while the
@@ -108,6 +109,19 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // Tune MOTOR_MIN_DUTY down to just below where the wheels reliably start on the ground.
 #define MOTOR_MIN_DUTY 0.55f
 #define MOTOR_DEADZONE 0.02f   // |duty| below this = intended stop, not a crawl
+// Acceleration control: duty (a step function of the latest /cmd_vel) used to be applied
+// to the motors instantly, so any joystick flick or direction reversal was a hard jolt.
+// MOTOR_SLEW_DEFAULT caps how fast the APPLIED duty may follow the commanded duty (duty
+// units/sec; duty spans -1..1, so 3.0 crosses the full range in ~0.67s) — a simple ramp,
+// not a closed-loop accel controller. Live-tunable via /motor_accel (Float32, see
+// motor_slew_cb below / the web UI's Coprocessor card "Accel ramp" slider), clamped to
+// [MOTOR_SLEW_MIN..MOTOR_SLEW_MAX]; NOT persisted, so a reboot/reflash always starts from
+// this safe default. Lower = gentler/laggier, higher = snappier/jerkier. Bypassed on a
+// stale cmd (CMD_TIMEOUT_MS) so the dead-man stop still cuts power immediately instead of
+// coasting down a ramp.
+#define MOTOR_SLEW_DEFAULT 3.0f
+#define MOTOR_SLEW_MIN     0.3f
+#define MOTOR_SLEW_MAX     8.0f
 
 // ---- straight-line trim (motor matching) --------------------------------------
 // The two gearmotors don't run the same speed at the same duty, so open-loop straight
@@ -234,6 +248,7 @@ static volatile float    g_fan_duty = FAN_BOOT_DUTY;   // /fan_pwm 0..1 (Core0 w
 // Straight-line trim: loaded from NVS in setup(), adapted on Core 1 (autocal), manually
 // set from the zenoh RX task (/motor_trim cb). Aligned-32-bit volatile = atomic enough.
 static volatile float    g_trim = 0;
+static volatile float    g_motor_slew = MOTOR_SLEW_DEFAULT;   // live /motor_accel setpoint
 static Preferences       g_prefs;          // NVS handle (namespace "nano", key "trim")
 static float             g_trim_saved = 0; // last value written to NVS (Core 1 only)
 static volatile float    g_temp = 0;
@@ -439,6 +454,17 @@ static void trim_cb(z_loaned_sample_t* sm, void*){
     if (!isnan(f)){ g_trim = clampf(f,-TRIM_MAX,TRIM_MAX); Serial.printf("[nano] manual trim=%.3f\n", (double)g_trim); }
   }
 }
+// /motor_accel (Float32, duty/s): live acceleration-ramp rate — see MOTOR_SLEW_DEFAULT
+// above / the web UI's Coprocessor card "Accel ramp" slider. Not persisted.
+static void motor_slew_cb(z_loaned_sample_t* sm, void*){
+  uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){
+    float f; memcpy(&f,b+4,4);
+    if (!isnan(f)){
+      g_motor_slew = clampf(f, MOTOR_SLEW_MIN, MOTOR_SLEW_MAX);
+      Serial.printf("[nano] motor accel ramp=%.2f duty/s\n", (double)g_motor_slew);
+    }
+  }
+}
 #if LINK_RX_TIMEOUT_MS
 // /esp32_ping (Int32) from the SBC web_control node — payload ignored; arrival = link alive.
 static void ping_cb(z_loaned_sample_t*, void*){
@@ -463,7 +489,7 @@ static bool zenohConnect(){
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
-  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset;   // kept alive (static)
+  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset, sub_accel;   // kept alive (static)
   z_owned_closure_sample_t cl;
   z_view_keyexpr_t ke;
   z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
@@ -481,6 +507,9 @@ static bool zenohConnect(){
   z_view_keyexpr_from_str_unchecked(&ke, KE("reset_ticks",T_BOOL));
   z_closure_sample(&cl, reset_ticks_cb, NULL, NULL);
   z_declare_subscriber(z_session_loan(&s), &sub_reset, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_accel",T_F32));
+  z_closure_sample(&cl, motor_slew_cb, NULL, NULL);
+  z_declare_subscriber(z_session_loan(&s), &sub_accel, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
 #if LINK_RX_TIMEOUT_MS
   static z_owned_subscriber_t sub_ping;
   z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
@@ -563,6 +592,11 @@ static void writeSide(int chf, int chr, float duty){
   m = (m < MOTOR_DEADZONE) ? 0.0f : MOTOR_MIN_DUTY + m*(1.0f - MOTOR_MIN_DUTY);
   if (duty>=0){ ledcWrite(chr,0); ledcWrite(chf,(uint32_t)(m*PWM_MAX)); }
   else        { ledcWrite(chf,0); ledcWrite(chr,(uint32_t)(m*PWM_MAX)); }
+}
+static inline float slewTo(float cur, float target, float maxDelta){
+  float diff = target - cur;
+  if (diff > maxDelta) diff = maxDelta; else if (diff < -maxDelta) diff = -maxDelta;
+  return cur + diff;
 }
 static void applyMotors(float l, float r){
   // Straight-line trim: positive trim boosts RIGHT / cuts LEFT (robot was pulling right).
@@ -793,16 +827,32 @@ void loop(){   // Core 1: real-time control
 #endif
 
   if (now-last_ctl >= 10){                                  // motors + watchdog @100 Hz
+    uint32_t ctl_dt_ms = now-last_ctl;
     last_ctl=now;
-    if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){ g_left_duty=0; g_right_duty=0; }
-    applyMotors(g_left_duty, g_right_duty);
-    // Stray-tick gating: a wheel counts as "stopped" STRAY_SETTLE_MS after its commanded
-    // duty last went to exactly 0 (coast-down grace period), and un-stops the instant a
-    // nonzero duty is commanded again.
+    bool cmd_stale = (now-g_last_cmd_ms > CMD_TIMEOUT_MS);
+    if (cmd_stale){ g_left_duty=0; g_right_duty=0; }
+    // Ramp the applied duty toward the commanded duty (see MOTOR_SLEW_PER_S) instead of
+    // stepping straight to it — smooths starts, stops, and direction reversals. Skipped on
+    // a stale cmd so the dead-man stop is instant, not a ramped coast-down.
+    static float l_ramped=0, r_ramped=0;
+    if (cmd_stale){ l_ramped=0; r_ramped=0; }
+    else {
+      float maxDelta = g_motor_slew * (ctl_dt_ms/1000.0f);
+      l_ramped = slewTo(l_ramped, g_left_duty, maxDelta);
+      r_ramped = slewTo(r_ramped, g_right_duty, maxDelta);
+    }
+    applyMotors(l_ramped, r_ramped);
+    // Stray-tick gating: a wheel counts as "stopped" STRAY_SETTLE_MS after its APPLIED
+    // (ramped) duty last went to exactly 0 (coast-down grace period), and un-stops the
+    // instant nonzero power is applied again. MUST key off the ramped duty (l_ramped/
+    // r_ramped), not the commanded duty (g_*_duty): the ramp can still be driving the
+    // motor for tens-to-hundreds of ms after a stop command zeroes the commanded duty,
+    // and any real rotation during that window is genuine, not encoder noise — flagging
+    // it as stray under-counts /odom and false-positives a flaky-encoder.
     static uint32_t l_zero_since=0, r_zero_since=0;
-    if (g_left_duty  != 0.0f){ l_zero_since=0; g_left_stopped=false; }
+    if (fabsf(l_ramped) > MOTOR_DEADZONE){ l_zero_since=0; g_left_stopped=false; }
     else { if (!l_zero_since) l_zero_since=now; g_left_stopped = (now-l_zero_since) >= STRAY_SETTLE_MS; }
-    if (g_right_duty != 0.0f){ r_zero_since=0; g_right_stopped=false; }
+    if (fabsf(r_ramped) > MOTOR_DEADZONE){ r_zero_since=0; g_right_stopped=false; }
     else { if (!r_zero_since) r_zero_since=now; g_right_stopped = (now-r_zero_since) >= STRAY_SETTLE_MS; }
     // Fan tracks true SBC presence (like the LDS park above), not a /cmd_vel-style command
     // watchdog: park it whenever the link isn't alive (boot race, drop, or the SBC genuinely

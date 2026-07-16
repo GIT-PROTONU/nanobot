@@ -330,13 +330,24 @@ class WebServerNode(Node):
             # booleans + scalars its reflexes consume (approach greeting, looming/
             # clutter caution, ambient colour mood, novelty-boosted curiosity). Only
             # published while the pipeline is actually live, so a stale message can't
-            # drive a reflex (mood_node also applies its own freshness window). The
-            # same tick pushes the live vision_glare_derate param into the GL thread.
+            # drive a reflex (mood_node also applies its own freshness window, several
+            # seconds -- unaffected by the faster rate below). The same tick pushes the
+            # live vision_glare_derate param into the GL thread.
             self._vision_state_pub = self.create_publisher(String, "vision/state", 5)
             self._oled_mask_pub = self.create_publisher(
                 Bool, "oled_mask",
                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-            self.create_timer(0.5, self._vision_state_tick)
+            # Was 0.5s (2 Hz): slam_nav's pan-tracking control loop runs @10 Hz
+            # (control_rate) and only turns on a FRESH /vision/state sample, tapering its
+            # commanded rate to ~0 as a sample ages (see nav_node._track_step) -- at 2 Hz
+            # that meant coasting on stale data for up to ~0.5s per update, which hardware
+            # testing showed as overshoot no P-gain reduction could fix, and a hard
+            # ceiling on how fast a target could be followed. 10 Hz matches the control
+            # loop 1:1 (worst-case staleness ~0.1s) at a cost that's just re-reading a
+            # handful of already-computed GpuVision scalars + a small JSON dump -- cheap
+            # next to the GPU capture/shader pipeline itself, which runs independently of
+            # this tick's rate.
+            self.create_timer(0.1, self._vision_state_tick)
 
         self._mic = AudioStream(
             device=g("mic_device").value or None,
