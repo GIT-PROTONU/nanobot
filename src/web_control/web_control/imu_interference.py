@@ -6,12 +6,16 @@ one disturbs the magnetometer (and, for the motor phase, the reported yaw) again
 a quiet baseline. Mag *magnitude* is rotation-invariant, so even the motor-wiggle
 phase attributes cleanly without needing the robot to hold still during it.
 
-Reuses the exact publishers web_control already gates behind `skills_allow_actions`
-(the project's one flag for "web_control physically actuates something") rather
-than opening a second, unguarded actuation path -- see WebServerNode.
-_publish_skill_action. The fan phase goes through sys_monitor's `fan_override`
-PARAM (not a raw /fan_pwm publish), since sys_monitor is /fan_pwm's continuous
-owner and a competing publish would just be overwritten on its next tick.
+Owns its OWN publishers rather than reusing the skill-action tier's -- this test
+is meant to run regardless of `skills_allow_actions` (a deliberate exception,
+requested by the user: leave that flag off so autonomous skills stay unable to
+act, while this deliberately human-triggered diagnostic still can). Safety here
+comes from the test's own preconditions + live re-checks instead: it only starts
+while provably parked, re-checks every ~0.1s during each phase, and the web UI
+makes the caller confirm before it starts (worded differently if the motor-wiggle
+phase is included). The fan phase goes through sys_monitor's `fan_override` PARAM
+(not a raw /fan_pwm publish), since sys_monitor is /fan_pwm's continuous owner and
+a competing publish would just be overwritten on its next tick.
 
 Single-flight; aborts (and restores every touched actuator) if the robot stops
 being provably stationary mid-run -- picked up, or driven.
@@ -39,15 +43,18 @@ def _clamp_secs(v, default):
 
 
 class IMUInterferenceTest:
-    """One run at a time. Needs `node` for its gated skill-action publishers
-    (`node._skill_pubs`) and its telemetry hub (`node.telemetry`) for live mag/
-    euler samples, the stationary check, and the fan_override param call."""
+    """One run at a time. Creates its own LED/LDS/cmd_vel publishers (independent
+    of `skills_allow_actions`) and needs `node.telemetry` for live mag/euler
+    samples, the stationary check, and the fan_override param call."""
 
     def __init__(self, node, logger=None, lds_rpm=300.0, motor_ang=0.35):
         self._node = node
         self._log = logger or (lambda *a, **k: None)
         self.lds_rpm = float(lds_rpm)
         self.motor_ang = float(motor_ang)
+        self._led_pub = node.create_publisher(Bool, "led", 5)
+        self._lds_pub = node.create_publisher(Float32, "lds_target_rpm", 5)
+        self._cmd_pub = node.create_publisher(Twist, "cmd_vel", 5)
         self._lock = threading.Lock()
         self._active = False
         self._phase = ""
@@ -63,9 +70,6 @@ class IMUInterferenceTest:
             if self._active:
                 return {"error": "interference test already running"}
             n = self._node
-            if not getattr(n, "_skills_allow_actions", False):
-                return {"error": "requires skills_allow_actions (Skills card) — "
-                                  "needed to actuate the LDS/fan/LED/motors"}
             if n.telemetry._mag is None or n.telemetry._eul is None:
                 return {"error": "IMU mag/euler not streaming yet"}
             if any(n._susp_eff()):
@@ -145,30 +149,26 @@ class IMUInterferenceTest:
 
     def _run(self, include_motor, base_secs, lds_secs, fan_secs, led_secs, motor_secs):
         n = self._node
-        pubs = n._skill_pubs
-        led_pub = pubs.get("/led")
-        lds_pub = pubs.get("/lds_target_rpm")
-        cmd_pub = pubs.get("/cmd_vel")
         # (name, on, off, duration, check_cmd) -- `off` is None where the actuator is
         # deliberately left as-is afterward (the LDS spin-down is slam_nav's own idle-
         # park logic's job, not this test's).
         phases = [
             ("baseline", None, None, base_secs, True),
-            ("lds", (lambda: lds_pub.publish(Float32(data=self.lds_rpm))) if lds_pub else None,
+            ("lds", lambda: self._lds_pub.publish(Float32(data=self.lds_rpm)),
              None, lds_secs, True),
             ("fan", lambda: n.telemetry.set_param_json(
                 {"node": "sys_monitor", "name": "fan_override", "value": 1.0}),
              None, fan_secs, True),
-            ("led", (lambda: led_pub.publish(Bool(data=True))) if led_pub else None,
-             (lambda: led_pub.publish(Bool(data=False))) if led_pub else None, led_secs, True),
+            ("led", lambda: self._led_pub.publish(Bool(data=True)),
+             lambda: self._led_pub.publish(Bool(data=False)), led_secs, True),
         ]
-        if include_motor and cmd_pub is not None:
+        if include_motor:
             def _motor_on():
                 tw = Twist()
                 tw.angular.z = self.motor_ang
-                cmd_pub.publish(tw)
+                self._cmd_pub.publish(tw)
 
-            phases.append(("motor", _motor_on, lambda: cmd_pub.publish(Twist()),
+            phases.append(("motor", _motor_on, lambda: self._cmd_pub.publish(Twist()),
                            motor_secs, False))
         try:
             self._log(f"imu interference test: {len(phases)} phases, motor={include_motor}")
@@ -200,24 +200,20 @@ class IMUInterferenceTest:
                         "yaw_wobble_deg": round(yaw_wobble, 2)})
             self._finish("")
         finally:
-            self._safe_all(pubs)
+            self._safe_all()
 
-    def _safe_all(self, pubs):
+    def _safe_all(self):
         """Best-effort return every touched actuator to its resting state."""
         try:
             self._node.telemetry.set_param_json(
                 {"node": "sys_monitor", "name": "fan_override", "value": -1.0})
         except Exception:
             pass
-        led_pub = pubs.get("/led")
-        cmd_pub = pubs.get("/cmd_vel")
-        if led_pub:
-            try:
-                led_pub.publish(Bool(data=False))
-            except Exception:
-                pass
-        if cmd_pub:
-            try:
-                cmd_pub.publish(Twist())
-            except Exception:
-                pass
+        try:
+            self._led_pub.publish(Bool(data=False))
+        except Exception:
+            pass
+        try:
+            self._cmd_pub.publish(Twist())
+        except Exception:
+            pass

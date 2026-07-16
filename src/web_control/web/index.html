@@ -537,11 +537,12 @@
               no more holding the loose IMU near each part by hand. <b>Include motor wiggle</b> adds
               a brief in-place turn as a 4th phase (uses the yaw-wobble column instead, since a
               motor wiggle intentionally moves — mag magnitude stays rotation-invariant so it still
-              attributes cleanly). Requires <code>skills_allow_actions: true</code> in
-              <code>robot.yaml</code> (a restart-only setting — no live web toggle exists) since
-              it actuates the LDS/fan/LED/motors; you'll be asked to confirm before it starts, and
-              it aborts automatically (restoring every actuator) if the robot is picked up or
-              driven mid-run.</p>
+              attributes cleanly). This test actuates the LDS/fan/LED (and, if checked, the
+              motors) on its own publishers — it runs regardless of <code>skills_allow_actions</code>
+              (that flag stays off unless you want autonomous skills to also act; this button is a
+              deliberate human-triggered action, not a skill). You'll be asked to confirm before it
+              starts, and it aborts automatically (restoring every actuator) if the robot is picked
+              up or driven mid-run.</p>
           </div>
           <div class="card">
             <h2>Odometry</h2>

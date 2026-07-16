@@ -417,9 +417,9 @@ class WebServerNode(Node):
         # ---- IMU mounting-interference self-test (see imu_interference.py) ------------
         # Automates the "walk the loose IMU around by hand" mag-noise hunt from the IMU
         # card's hint: cycles the LDS/fan/LED/motors one at a time while parked and
-        # scores each one's magnetometer disturbance. Reuses the gated skill-action
-        # publishers below (created next), so this is instantiated after them but reads
-        # them lazily at run time -- order here doesn't matter.
+        # scores each one's magnetometer disturbance. Creates its OWN LED/LDS/cmd_vel
+        # publishers -- deliberately independent of skills_allow_actions (below), so a
+        # human clicking this button can run it with autonomous action-skills still off.
         self.declare_parameter("imu_test_lds_rpm", 300.0)   # matches slam_nav's lds_active_rpm
         self.declare_parameter("imu_test_motor_ang", 0.35)  # rad/s, optional motor-wiggle phase
         self._imu_test = IMUInterferenceTest(

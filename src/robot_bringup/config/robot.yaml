@@ -492,9 +492,10 @@ web_control:
     stress_temp_abort_c: 82.0    # abort early if CPU temp reaches this (0 = disable)
     # IMU mounting-interference self-test (POST /imu/interference/start, see
     # imu_interference.py) -- cycles the LDS/fan/LED/motors one at a time while
-    # parked to find which one disturbs the magnetometer. Requires
-    # skills_allow_actions (below) since it actuates the same publishers as the
-    # skill action tier.
+    # parked to find which one disturbs the magnetometer. Runs on its OWN
+    # publishers, independent of skills_allow_actions below (deliberate: a
+    # human-triggered diagnostic, not an autonomous skill) -- gated instead by
+    # its own stationary preconditions + live re-checks + a web UI confirm().
     imu_test_lds_rpm: 300.0      # target rpm for the LDS phase; matches slam_nav's lds_active_rpm
     imu_test_motor_ang: 0.35     # rad/s for the OPTIONAL motor-wiggle phase (off by default)
     # Text-to-speech (English en-gb voices only). The web page POSTs /tts; the server
