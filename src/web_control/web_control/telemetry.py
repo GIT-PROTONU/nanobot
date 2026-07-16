@@ -61,7 +61,7 @@ STALE = -1e9
 # ---- POST /param whitelist: node -> settable parameter names -------------------
 PARAM_WHITELIST = {
     "imu_driver": {"publish_rate", "euler_rate", "offset_x_mm", "offset_y_mm", "offset_z_mm",
-                   "bandwidth_hz"},
+                   "mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg", "bandwidth_hz"},
     "lds_driver": {"publish_rate"},
     "wheel_odometry": {"publish_rate"},
     "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
@@ -120,6 +120,7 @@ class TelemetryHub:
         self._drift_base = None       # (r0, p0, y0, start monotonic) while stationary, else None
         self._drift_last = ""         # latched summary of the last completed still period
         self._imu_cal_status = ""     # latched, from imu_driver's calibration routine
+        self._imu_mount_settings = ""  # latched JSON, from imu_driver's effective mount offset/rotation
         self._purpose = self._task = self._experiments = self._schedule = ""  # latched JSON
         self._oled = {"face": "", "word": "", "brand": "", "system": ""}
         self._cmd_vel = (0.0, 0.0)     # (linear.x, angular.z), for the optical bumper
@@ -142,8 +143,15 @@ class TelemetryHub:
             "/pickup_override": (pub(Int8, "pickup_override", latched), self._mk_pickup),
             "/selftest": (pub(Bool, "selftest", 5), self._mk_bool),
             "/reset_ticks": (pub(Bool, "reset_ticks", 5), self._mk_bool),
-            "/slam_nav/go_home": (pub(Bool, "slam_nav/go_home", 5), self._mk_bool),
-            "/slam_nav/save_map": (pub(Bool, "slam_nav/save_map", 5), self._mk_bool),
+            # NOTE: the ROS topic string here is bare ("go_home", not "slam_nav/go_home")
+            # -- nav_node subscribes to the same bare name with no namespace of its own
+            # (neither the systemd unit_exec.sh path nor bringup.launch.py sets one), so
+            # a "slam_nav/"-prefixed publisher topic here would silently talk to nobody.
+            # The "/slam_nav/..." string is only the whitelist KEY (what the browser
+            # POSTs as `topic`) -- kept as-is so map.js doesn't need to change.
+            "/slam_nav/go_home": (pub(Bool, "go_home", 5), self._mk_bool),
+            "/slam_nav/save_map": (pub(Bool, "save_map", 5), self._mk_bool),
+            "/slam_nav/clear_map": (pub(Bool, "clear_map", 5), self._mk_bool),
             "/oled_face": (node._face_pub, self._mk_face),
             "/oled_text": (pub(String, "oled_text", 5), self._mk_text),
             "/oled_dashboard": (pub(Bool, "oled_dashboard", 5), self._mk_bool),
@@ -401,6 +409,8 @@ class TelemetryHub:
             f["imuMag"] = list(self._mag)
         if self._imu_cal_status:
             f["imuCalStatus"] = self._imu_cal_status
+        if self._imu_mount_settings:
+            f["imuMountSettings"] = self._imu_mount_settings
         gv = getattr(n, "_gpu_vision", None)
         camera_enabled = not bool(getattr(n, "_camera_disabled", False))
         if gv is not None:
@@ -479,6 +489,7 @@ class TelemetryHub:
         # ~1 Hz updates no matter how fast imu_driver itself published.
         s(sub(Vector3Stamped, "imu/euler", self._on_eul, 5))
         s(sub(String, "imu_calibrate_status", self._mk_str("_imu_cal_status"), self._latched_qos))
+        s(sub(String, "imu_mount_settings", self._mk_str("_imu_mount_settings"), self._latched_qos))
         s(sub(Twist, "cmd_vel", self._on_cmd_vel, 5))   # optical virtual bumper correlation
         # OLED mirror inputs (the page renders a client-side copy of the panel)
         s(sub(String, "oled_face", self._mk_oled("face"), 5))

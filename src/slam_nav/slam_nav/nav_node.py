@@ -295,6 +295,7 @@ class NavNode(Node):
         self.create_subscription(PoseStamped, "goal_pose", self._on_goal, 5)
         self.create_subscription(Bool, "go_home", self._on_go_home, 5)
         self.create_subscription(Bool, "save_map", self._on_save_map, 5)
+        self.create_subscription(Bool, "clear_map", self._on_clear_map, 5)
         self.create_subscription(String, "vision/state", self._on_vision_state, 5)
         # per-wheel off-ground switches from the ESP32 (pick-up detection)
         self.create_subscription(Bool, "left_wheel_suspended", self._on_susp_l, 10)
@@ -642,6 +643,24 @@ class NavNode(Node):
 
     def _on_save_map(self, _msg):
         self._save_map_file()
+
+    def _on_clear_map(self, _msg):
+        """Wipe the occupancy grid and start fresh from right here, like the very
+        first scan after boot (_on_scan's seed path). Manual recovery from a
+        corrupted/smeared map without restarting the node."""
+        self.grid = GridMap(size_m=self.grid.n * self.grid.res, res=self.grid.res,
+                             rmin=self.grid.rmin, rmax=self.grid.rmax)
+        self.px = self.py = self.pth = 0.0
+        self.home = (0.0, 0.0)
+        self._have_map = False
+        self._recovering = False
+        self._lost_count = 0
+        self._last_score = 0.0
+        if self._trail is not None:
+            self._trail.clear()
+        self._occ_rev = -1     # force _write_map to recompute against the new grid
+        self.get_logger().info("map cleared by user request")
+        self._write_map()
 
     def _save_map_file(self, quiet=False):
         if not self.map_store:

@@ -91,6 +91,7 @@
             <button id="mapStop" class="btn danger">■ Stop</button>
             <button id="mapHome" class="btn">⌂ Go home</button>
             <button id="mapSave" class="btn">💾 Save map</button>
+            <button id="mapClear" class="btn danger">🗑 Clear map</button>
             <button id="mapTest" class="btn">🔧 Self-test</button>
           </div>
           <div id="mapStats"></div>
@@ -100,7 +101,10 @@
             pan, <b>⤢ Fit</b> recentres. <b>Tap the map to set a goal</b> —
             the green line is the plan. It only drives when <b>Motion</b> is on (else it just
             plans). Red = robot, yellow = goal, cyan = trail, ⌂ = home. <b>Auto-explore</b>
-            drives to unmapped frontiers; <b>Save map</b> persists it.</p>
+            drives to unmapped frontiers; <b>Save map</b> persists it. <b>Clear map</b> wipes
+            the current grid and starts fresh from wherever the robot is standing right now
+            (like a reboot) — use it to recover from a corrupted/smeared map without
+            restarting anything. Cannot be undone.</p>
         </div>
         <div id="ctlCam">
           <!-- hidden checkbox driven by the view switcher; keeps the old camera handler -->
@@ -440,10 +444,23 @@
               </div>
               <div class="imu3d-wheel left"></div>
               <div class="imu3d-wheel right"></div>
+              <div class="imu3d-axes" id="imu3dAxes">
+                <div class="origin"></div>
+                <div class="axis x"></div>
+                <div class="axis y"></div>
+                <div class="axis z"></div>
+              </div>
             </div></div></div>
             <p class="hint imu3d-hint">Live attitude, rendered client-side (CSS 3D, no
-              extra network/CPU load) from the same <b>roll/pitch/yaw</b> above — blue face is
-              front. Tilt/turn the robot and check the model follows.</p>
+              extra network/CPU load) from the same <b>roll/pitch/yaw</b> above — the
+              coloured face AND the white ▼ arrow on the roof both mark the front (the
+              arrow stays visible even when the coloured face rotates out of view). Tilt/turn
+              the robot and check the model follows. The small <b><span
+              style="color:#e5484d">red</span>/<span style="color:#30a46c">green</span>/<span
+              style="color:#0091ff">blue</span></b> axis triad marks where the IMU itself sits —
+              it's driven by the <b>mount offset</b> fields below, so it sits exactly on the
+              body's centre dot at 0,0,0 and slides out from there as you dial in the real
+              mounting position. Red = IMU X (forward), green = Y (left), blue = Z (up).</p>
             <div class="field"><label>Publish rate <span id="imuRateV">1</span> Hz</label>
               <input id="imuRate" type="range" min="1" max="200" step="1" value="1"></div>
             <div class="chiprow">
@@ -459,15 +476,6 @@
               ~9.8 afterwards. <b>Start/Stop mag cal</b> while slowly rotating the robot through all
               orientations — check <b>mag xyz</b> sweeps smoothly, not stuck at one value. Always
               <b>Save</b> to persist to flash, else it resets on power-cycle.</p>
-            <canvas id="imuMagScatter" width="160" height="160"></canvas>
-            <div class="chiprow">
-              <button id="imuMagScatterClear" class="btn">↺ Clear plot</button>
-            </div>
-            <p class="hint">Mag cal quality (client-side, no protocol readback exists to check
-              this any other way): plots mag X/Y live while <b>Start/Stop mag cal</b> is
-              recording. A good hard-iron calibration traces a <b>circle centred on the
-              crosshair</b> as you rotate the robot through all orientations — an off-centre or
-              egg-shaped loop means redo the cal (or re-check the mount for nearby interference).</p>
             <div class="chiprow">
               <button id="imuAxis6" class="btn">🧭 6-axis mode</button>
               <button id="imuAxis9" class="btn">🧲 9-axis mode</button>
@@ -522,7 +530,47 @@
               (x forward, y left, z up). If it's not at the centre, turning the robot makes the
               accelerometer see extra lever-arm acceleration on top of the real motion — set this
               and the driver subtracts it before publishing, so <b>|accel|</b> stays correct
-              during rotation. Leave at 0,0,0 if the IMU is centred.</p>
+              during rotation. Leave at 0,0,0 if the IMU is centred. Drag/adjust these and watch
+              the axis triad above move — line it up against where the sensor physically sits on
+              the chassis, then verify with the spin check below. Persists across restarts once
+              changed here.</p>
+            <div class="field inline">mount rotation (deg) roll <input id="imuMountRoll" type="number" value="0" step="1">
+              pitch <input id="imuMountPitch" type="number" value="0" step="1">
+              yaw <input id="imuMountYaw" type="number" value="0" step="1"></div>
+            <p class="hint">A DIFFERENT problem from the offset above: the sensor board itself
+              glued down at an angle on the chassis (its own "forward"/"up" not lined up with
+              the robot's), not moved off-centre. This is the sensor's full fixed orientation —
+              a flat sideways twist is <b>yaw</b> only, but a board mounted tipped up on an edge
+              needs <b>roll</b> and/or <b>pitch</b> too; the driver properly rotates
+              accel/gyro/mag and reconstructs roll/pitch/yaw through the combination, not just a
+              yaw shift. <b>To find the right values:</b> rest the robot flat and note the
+              roll/pitch/yaw reading above, then prop up ONLY the front (no turning, no
+              sideways lean) and see which reported angle actually changes — that tells you
+              which of these three fields corresponds to a nose-up tilt; repeat propping up
+              ONLY one side to find the other. Whichever reported angle moves for a given
+              physical tilt is the one to set (typically 90/-90/180). Leave all at 0 if unsure;
+              they default off. Persists across restarts once changed here.</p>
+            <div class="kv">
+              <span>spin check</span><b id="imuSpinCheck">–</b>
+              <span>worst spin residual</span><b id="imuSpinWorst">0.0</b>
+            </div>
+            <div class="chiprow">
+              <button id="imuSpinResetWorst" class="btn">↺ Reset worst-seen</button>
+            </div>
+            <p class="hint">Tests whether the offsets above are actually right (no extra
+              hardware or backend needed — reuses the same <b>|accel|</b>/<b>|gyro|</b> stream).
+              <b>Spin the robot in place</b> (joystick twist with no forward stick, or run the
+              self-test's SPIN leg) with nothing else moving: if the offset is correct, the
+              lever-arm correction cancels the extra centripetal/tangential acceleration a
+              rotating, off-centre IMU would otherwise feel, so <b>|accel|</b> should stay
+              pinned near 9.81 through the whole spin, same as parked. This reading only
+              updates while <b>|gyro|</b> is above ~15°/s (i.e. actually spinning) and reports
+              how far |accel| wandered from 9.81 during that time — <b>worst spin residual</b>
+              peak-holds the biggest wander since the last reset so you don't have to watch it
+              mid-spin. Green ≤0.5, amber ≤1.5, red above: nudge the x/y/z offsets (bigger radius
+              from the true mount point, or a wrong sign) and spin again until it's green. Only
+              meaningful for a pure in-place turn — driving forward while turning will show a
+              real residual that has nothing to do with the offset.</p>
             <div class="chiprow">
               <button id="imuInterferenceStart" class="btn primary">▶ Run interference self-test</button>
               <button id="imuInterferenceStop" class="btn">■ Stop</button>

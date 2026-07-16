@@ -150,6 +150,10 @@
   $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));
   $("mapHome").addEventListener("click",()=>pub("/slam_nav/go_home",true));
   $("mapSave").addEventListener("click",()=>pub("/slam_nav/save_map",true));
+  $("mapClear").addEventListener("click",()=>{
+    if(!confirm("Clear the map? This wipes the current SLAM grid and cannot be undone.")) return;
+    pub("/slam_nav/clear_map",true);
+  });
   $("mapTest").addEventListener("click",()=>{
     if(!$("mapMotion").checked){ alert("Enable Motion first — the self-test drives the robot."); return; }
     if(!confirm("Run the calibration self-test?\nThe robot will drive forward, back, then spin in place.")) return;

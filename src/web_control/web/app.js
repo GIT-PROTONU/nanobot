@@ -45,6 +45,12 @@ $("imuRate").onchange=()=>{
 [["imuOffX","offset_x_mm"],["imuOffY","offset_y_mm"],["imuOffZ","offset_z_mm"]].forEach(([id,param])=>{
   $(id).onchange=()=>setParam("imu_driver",param,Number($(id).value));
 });
+// IMU mount ROTATION (separate from the translation offset above) -> imu_driver's
+// mount_{roll,pitch,yaw}_deg, a full 3-axis fixed rotation that maps raw accel/gyro/mag
+// and roll/pitch/yaw from the sensor's own tilted/twisted frame into the robot's frame
+// (imu_node.py's mount_matrix/rotate_mount/correct_orientation).
+[["imuMountRoll","mount_roll_deg"],["imuMountPitch","mount_pitch_deg"],["imuMountYaw","mount_yaw_deg"]]
+  .forEach(([id,param])=>{ $(id).onchange=()=>setParam("imu_driver",param,Number($(id).value)); });
 // IMU calibration (WitMotion 5-byte hex protocol, see imu_driver._do_calibrate) — the
 // four steps are separate button presses since accel cal needs the robot held still
 // and mag cal needs it physically rotated; status comes back async via imuCalStatus.
@@ -52,11 +58,8 @@ $("imuCalAccel").onclick=()=>{
   if(!confirm("Set the robot on a flat, level, still surface, then calibrate the accelerometer?")) return;
   pub("/imu_calibrate","accel");
 };
-$("imuCalMagStart").onclick=()=>{
-  pub("/imu_calibrate","mag_start");
-  magScatterPts=[]; magScatterOn=true; drawMagScatter();
-};
-$("imuCalMagStop").onclick=()=>{ pub("/imu_calibrate","mag_stop"); magScatterOn=false; };
+$("imuCalMagStart").onclick=()=>pub("/imu_calibrate","mag_start");
+$("imuCalMagStop").onclick=()=>pub("/imu_calibrate","mag_stop");
 $("imuCalSave").onclick=()=>{
   if(!confirm("Save IMU calibration to flash?")) return;
   pub("/imu_calibrate","save");
@@ -513,7 +516,7 @@ function setConn(ok){
 }
 
 // ---- telemetry frame fan-out: one frame updates every readout ----------------
-let rawPurpose="", rawTask="", rawExp="", rawSelftest="", rawSchedule="", rawImuCal="";
+let rawPurpose="", rawTask="", rawExp="", rawSelftest="", rawSchedule="", rawImuCal="", rawMountSettings="";
 function onFrame(f){
   if(f.odom) onOdom(f.odom);
   if(f.imu) onImu(f.imu);
@@ -531,6 +534,22 @@ function onFrame(f){
   if(f.imuMag) onImuMag(f.imuMag);
   if(f.imuCalStatus && f.imuCalStatus!==rawImuCal){ rawImuCal=f.imuCalStatus;
     const el=$("imuCalOut"); el.style.display="block"; el.textContent=f.imuCalStatus; }
+  // Populate the offset/mount-rotation fields with the TRUE effective values (they're
+  // plain inputs with a static "0" in the HTML -- nothing else tells the browser what
+  // imu_driver actually loaded from its persisted settings file). Latched + only
+  // re-applied on an actual change, so it won't fight with the user mid-edit (a saved
+  // value only republishes after the SAME onchange that set it, echoing back what was
+  // just typed).
+  if(f.imuMountSettings && f.imuMountSettings!==rawMountSettings){
+    rawMountSettings=f.imuMountSettings;
+    try{
+      const s=JSON.parse(f.imuMountSettings);
+      $("imuOffX").value=s.offset_x_mm; $("imuOffY").value=s.offset_y_mm; $("imuOffZ").value=s.offset_z_mm;
+      $("imuMountRoll").value=s.mount_roll_deg; $("imuMountPitch").value=s.mount_pitch_deg;
+      $("imuMountYaw").value=s.mount_yaw_deg;
+      updateImu3dOffset();
+    }catch(e){}
+  }
   if(f.imu_drift) onImuDrift(f.imu_drift);
   // Brain readouts arrive as the same latched JSON strings the behaviour node
   // publishes; only re-render when they actually change (frames tick ~5 Hz).
@@ -645,8 +664,6 @@ const HINTS = {
   driftPitch: "Pitch change while parked. Same margins as roll: ≤0.3° green, ≤1° amber, above red.",
   driftYaw: "Total yaw change this still period. Graded against the scan matcher's ±6.9°/scan correction budget: ≤1° green, ≤3.5° (half window) amber, above red. Slow drift is auto-corrected (SLAM re-matches after ~0.3°); a sudden JUMP past ~7° between scans is what actually loses localization.",
   driftRate: "Yaw drift normalized to °/min -- the IMU heading-health number. ≤1°/min green (a real gyro-bias level); 1-6 amber (SLAM still corrects it, but run the mag cal / check mounting); ≥6 red -- that's magnetometer interference territory, the prime suspect for the erratic self-test SPIN check and map corruption.",
-  imuMagScatter: "Live mag X/Y scatter while a mag cal is recording (Start/Stop mag cal above). A good hard-iron cal traces a circle centred on the crosshair as you rotate through all orientations -- offset or egg-shaped means redo it.",
-  imuMagScatterClear: "Clear the scatter plot and start a fresh trace.",
   imuAxis6: "Switch the BWT901CL to 6-axis fusion: yaw becomes gyro-only, no magnetometer. Trades mag interference JUMPS (which the scan matcher can't absorb) for slow gyro DRIFT (which it's built to absorb). Try this if the mag-noise/drift-rate numbers above keep reading red. Save (above) to persist to flash.",
   imuAxis9: "Switch back to the BWT901CL's default 9-axis fusion (magnetometer fused into yaw). Save (above) to persist to flash.",
   imuZeroYaw: "Reset the currently-reported heading to 0°. Only meaningful in 6-axis mode -- in 9-axis mode the magnetometer re-asserts its own heading on the next update.",
@@ -988,6 +1005,7 @@ function slamGrade(el, v, warn, bad){
 }
 let driftStillS=0;   // >0 while provably stationary (gates the |accel|/|gyro| grading)
 let lastImuT=0;
+let spinWorst=0;      // worst |accel-9.81| seen while spinning, since last reset
 function onImu(m){
   // frame imu: {a:|accel| m/s^2, g:|gyro| rad/s, hz:actual /imu/data Hz, age:s}.
   // Sourced from sys_monitor's 1 Hz vitals blob, so a healthy age can reach ~2 s.
@@ -1001,9 +1019,22 @@ function onImu(m){
     slamGrade($("imuA"), Math.abs(m.a-9.81), 0.3, 1.0);
     slamGrade($("imuG"), m.g*180/Math.PI, 1.0, 3.0);
   } else { $("imuA").style.color=""; $("imuG").style.color=""; }
+  // Mount-offset spin check: while actually rotating (|gyro| above ~15 deg/s) a
+  // CORRECT offset keeps |accel| pinned near 9.81 same as parked, since
+  // lever_arm_correction (imu_node.py) cancels the rotation-induced centripetal/
+  // tangential term -- any residual here is the offset being wrong/mis-signed, not
+  // a real acceleration. Independent of the stationary grading above.
+  const gDeg=m.g*180/Math.PI, spinEl=$("imuSpinCheck");
+  if(gDeg>15){
+    const dev=Math.abs(m.a-9.81);
+    spinEl.textContent=dev.toFixed(2);
+    slamGrade(spinEl, dev, 0.5, 1.5);
+    if(dev>spinWorst){ spinWorst=dev; $("imuSpinWorst").textContent=spinWorst.toFixed(2); }
+  } else { spinEl.textContent="–"; spinEl.style.color=""; }
   const el=$("imuHz"); el.textContent=m.hz.toFixed(0)+" Hz"; el.style.color="";
   OLED.tel({imuHz:m.hz});
 }
+$("imuSpinResetWorst").onclick=()=>{ spinWorst=0; $("imuSpinWorst").textContent="0.0"; };
 // IMU connectivity: if the IMU stream stops (USB unplugged, or the driver lost the
 // port) the rate readout goes red "lost" — so even with the sensor nodes merged into
 // one process you can still see the IMU drop out.
@@ -1039,41 +1070,10 @@ function onImuDrift(d){
 // adding any backend/ROS computation). See the IMU card's hint for how to use it.
 let magHist=[];             // [[performance.now() ms, magnitude], ...] trailing ~2s
 let magWorst=0;             // peak-to-peak noise seen since the last reset
-// Mag-cal quality scatter (client-side, no protocol readback exists to check cal
-// quality any other way): plots raw mag X/Y while recording is on (toggled by the
-// Start/Stop mag cal buttons below). A good hard-iron cal traces a circle centred
-// on the crosshair as the robot rotates through all orientations.
-let magScatterOn=false, magScatterPts=[];
-const magScatterCv=$("imuMagScatter"), magScatterCtx=magScatterCv&&magScatterCv.getContext("2d");
-function drawMagScatter(){
-  if(!magScatterCtx) return;
-  const w=magScatterCv.width, h=magScatterCv.height;
-  magScatterCtx.clearRect(0,0,w,h);
-  magScatterCtx.strokeStyle="rgba(128,128,128,.4)";
-  magScatterCtx.beginPath();
-  magScatterCtx.moveTo(w/2,0); magScatterCtx.lineTo(w/2,h);
-  magScatterCtx.moveTo(0,h/2); magScatterCtx.lineTo(w,h/2);
-  magScatterCtx.stroke();
-  if(!magScatterPts.length) return;
-  const mx=Math.max(...magScatterPts.map(p=>Math.abs(p[0]))),
-        my=Math.max(...magScatterPts.map(p=>Math.abs(p[1]))),
-        span=Math.max(mx,my,1)*1.15, s=Math.min(w,h)/2/span;
-  magScatterCtx.fillStyle="var(--accent, #5cf)";
-  for(const [x,y] of magScatterPts){
-    magScatterCtx.beginPath();
-    magScatterCtx.arc(w/2+x*s, h/2-y*s, 1.6, 0, 7);
-    magScatterCtx.fill();
-  }
-}
 function onImuMag(xyz){
   $("imuMag").textContent=xyz.map(v=>v.toFixed(1)).join(", ");
   const mag=Math.hypot(xyz[0], xyz[1], xyz[2]);
   $("imuMagMag").textContent=mag.toFixed(1);
-  if(magScatterOn){
-    magScatterPts.push([xyz[0], xyz[1]]);
-    if(magScatterPts.length>1500) magScatterPts.shift();
-    drawMagScatter();
-  }
   const now=performance.now();
   magHist.push([now, mag]);
   while(magHist.length && now-magHist[0][0]>2000) magHist.shift();
@@ -1090,7 +1090,6 @@ function onImuMag(xyz){
   if(noise>magWorst){ magWorst=noise; $("imuMagWorst").textContent=magWorst.toFixed(1); }
 }
 $("imuMagResetWorst").onclick=()=>{ magWorst=0; magHist=[]; $("imuMagWorst").textContent="0.0"; };
-$("imuMagScatterClear").onclick=()=>{ magScatterPts=[]; drawMagScatter(); };
 function onEul(m){
   if(m.age>=4 || m.r==null) return;
   $("imuR").textContent=m.r.toFixed(1)+"°";
@@ -1109,6 +1108,23 @@ function updateImu3d(rollDeg, pitchDeg, yawDeg){
   if(!rig) return;
   rig.style.transform=`rotateY(${-yawDeg}deg) rotateX(${-pitchDeg}deg) rotateZ(${rollDeg}deg)`;
 }
+// IMU offset gizmo: RGB axis triad (red=X fwd, green=Y left, blue=Z up) inside the
+// same rotating rig as the body, translated to the mm offset entered below -- sits
+// on the body's centre dot at 0,0,0 and slides out to visually match the real mount.
+// PX_PER_MM is illustrative (the body box isn't drawn to a real scale); clamped so
+// an unrealistic entry can't fly the marker out of the scene.
+const IMU3D_PX_PER_MM=0.5, IMU3D_MAX_PX=70;
+function updateImu3dOffset(){
+  const el=$("imu3dAxes"); if(!el) return;
+  const clamp=v=>Math.max(-IMU3D_MAX_PX, Math.min(IMU3D_MAX_PX, v));
+  const ox=Number($("imuOffX").value)||0, oy=Number($("imuOffY").value)||0, oz=Number($("imuOffZ").value)||0;
+  // rig rest pose: forward=+Z, right=+X, up=-Y -- REP-103 x/y/z (fwd/left/up) map
+  // onto that as (+z, -x, -y).
+  const lx=clamp(-oy*IMU3D_PX_PER_MM), ly=clamp(-oz*IMU3D_PX_PER_MM), lz=clamp(ox*IMU3D_PX_PER_MM);
+  el.style.transform=`translate3d(${lx}px,${ly}px,${lz}px)`;
+}
+["imuOffX","imuOffY","imuOffZ"].forEach(id=>$(id).addEventListener("input", updateImu3dOffset));
+updateImu3dOffset();
 
 function fmtUptime(s){
   const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
