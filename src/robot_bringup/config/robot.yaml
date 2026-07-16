@@ -143,8 +143,12 @@ slam_nav:
     lds_active_rpm: 300.0          # target rpm to resume; match firmware LDS_TARGET_RPM.
                                    # Live-tunable.
     # --- pick-up awareness + lost-robot relocalization (autonomy) ---
-    pickup_pause: true             # both off-ground switches -> halt + freeze SLAM while carried.
-                                   # Live-tunable.
+    pickup_pause: false            # both off-ground switches -> halt + freeze SLAM while carried.
+                                    # Default OFF: the off-ground microswitches currently false-trigger
+                                    # (suspension polarity inverted in firmware), which would freeze
+                                    # SLAM and block trim autocal during normal driving. Re-enable via
+                                    # the web UI / set true here once SUSPEND_ACTIVE_HIGH is corrected.
+                                    # Live-tunable.
     pickup_face: "focused"         # OLED mood shown while lifted ("" = leave the OLED alone)
     relocalize: true               # auto-recover the pose when scans stop matching the map.
                                    # Live-tunable.

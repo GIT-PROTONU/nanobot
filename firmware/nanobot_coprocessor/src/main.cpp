@@ -67,7 +67,11 @@
 #define RIGHT_ENC      5
 #define LEFT_SUSPEND_PIN   4
 #define RIGHT_SUSPEND_PIN 21
-#define SUSPEND_ACTIVE_HIGH true
+#define SUSPEND_ACTIVE_HIGH false  // switch reads HIGH (INPUT_PULLUP) while the wheel is ON the
+                                    // ground (switch open); lifted = pin pulled LOW. The previous
+                                    // `true` inverted this, so the robot reported "suspended" while
+                                    // driving — which froze SLAM (pickup_pause) and blocked the
+                                    // straight-line trim autocal.
 #define LED_PIN        2
 // LDS data link = UART1 (Serial1). UART1's default pins (9/10) are the SPI flash, but the
 // peripheral routes through the GPIO matrix, so RX is remapped to GPIO14 (TX=GPIO13 stays

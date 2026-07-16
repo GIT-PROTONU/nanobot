@@ -24,9 +24,26 @@ left needs the physical robot and can't be closed from a dev host.
       comment already correctly says single-channel rising-edge (not quadrature); the
       true counts/rev can only be confirmed by driving a measured distance on the
       robot (ties into the odom-autocal backlog item).
+- [ ] **Unblock the encoder trim autocal** (2026-07-16, see
+      `.claude/memory/slam-map-rotation-encoder-trim.md`). The off-ground microswitches
+      read INCONSISTENT polarity (one wheel always reports "suspended"), so the autocal
+      gate `!g_susp_l && !g_susp_r` never passes — straight-line trim is running on a
+      MANUAL `wheel_trim=0.22` (NVS) instead. Fix options: (a) read raw per-switch
+      `digitalRead` idle levels via firmware serial → set correct polarity PER WHEEL
+      (not the single `SUSPEND_ACTIVE_HIGH`); or (b) relax the autocal gate to key off
+      "straight command + enough ticks" and drop the switch dependency entirely; then
+      re-flash and let autocal converge from a reset trim. Needs the physical robot.
+- [ ] **Re-enable `pickup_pause: true`** (currently `false` in robot.yaml) only AFTER
+      the suspension switches read truthfully — until then it false-freezes SLAM.
 
 ## Done (2026-07-16)
 
+- [x] **slam_nav: map-rotation drift FIXED (HW-verified).** `_predict` now aligns the
+      seed yaw to current odom/IMU yaw and rotates the odom delta by the live `pth-oth`
+      offset (was a drifting `pth-poth`); added a `map->odom` TF broadcaster. The map now
+      tracks the robot (was ~60° skew). See `.claude/memory/slam-map-rotation-encoder-trim.md`.
+- [x] **Straight-line drive fixed on hardware** via manual `wheel_trim=0.22` (imbalance
+      ~13% → ~3%). Autocal remains blocked — moved to the physical-robot list above.
 - [x] **slam_nav: a goal set while tracking is active stays latched.** `_on_goal` /
       `_on_go_home` now reject goals while `track_enable` is on (log + drop) instead
       of silently latching a stale `_goal`.

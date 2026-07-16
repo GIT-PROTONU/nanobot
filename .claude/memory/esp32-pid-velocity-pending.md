@@ -60,3 +60,11 @@ persisted in ESP32 NVS, manual set/reset via `/motor_trim` (Float32), telemetry 
 Flashed + boot-verified 2026-07-04. Trim is compiled out under `WHEEL_PID_ENABLED` (a velocity
 PID equalizes wheels itself). The wheel PID remains pending only for true speed-holding (slopes,
 carpet, slow crawl below the stiction remap).
+
+**UPDATE (2026-07-16): the trim autocal is currently BLOCKED on hardware** — its
+"wheels grounded" gate (`!g_susp_l && !g_susp_r`) never passes because the off-ground
+microswitches read inconsistent polarity (one wheel always reports suspended). So the
+straight-line trim was set **manually** to `0.22` via `/motor_trim` (drops L/R imbalance
+~13% → ~3%, drives acceptably straight; NVS-persisted). Autocal self-tuning is deferred
+until the switch polarity is fixed per-wheel or the gate is relaxed to key off the
+straight command instead of the switches. Full detail → [[slam-map-rotation-encoder-trim]].

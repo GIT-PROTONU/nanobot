@@ -26,10 +26,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
-from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped, TransformStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String, Int8, Int64MultiArray, Float32
+from tf2_ros import TransformBroadcaster
 
 from .occupancy import GridMap
 
@@ -307,6 +308,11 @@ class NavNode(Node):
             self.get_logger().info(f"loaded saved map from {self.map_store}")
 
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
+        # Publish the SLAM-corrected map->odom transform so the ROS graph (RViz remote
+        # view, any node expecting /odom in the map frame) sees the corrected pose. The
+        # /odom publisher (wheel_odometry) gives base_link in odom; this transform closes
+        # the loop by placing odom correctly inside map.
+        self.tf_bc = TransformBroadcaster(node=self)
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.lds_rpm_pub = self.create_publisher(Float32, "lds_target_rpm", 10)
         self.path_pub = self.create_publisher(Path, "plan", 5)
@@ -513,7 +519,15 @@ class NavNode(Node):
 
         if not self._have_map:
             # Seed: drop the first scan straight in at the origin and prime trackers.
-            self.grid.integrate((0.0, 0.0, 0.0), angles, ranges)
+            # Align the map frame's yaw with the *current* odometry (or IMU) yaw so the
+            # map starts oriented the same as the odom frame — otherwise a non-zero seed
+            # yaw leaves a constant (pth - oth) rotation that flings every subsequent
+            # scan sideways the moment the robot moves.
+            if self.use_imu and self._imu_yaw is not None:
+                self.pth = self._imu_yaw
+            elif self._odom is not None:
+                self.pth = self._odom[2]
+            self.grid.integrate((0.0, 0.0, self.pth), angles, ranges)
             self._have_map = True
             self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
             self._write_map()
@@ -625,15 +639,27 @@ class NavNode(Node):
             return px, py, pth
         ox, oy, oth = self._odom
         pox, poy, poth = self._prev_odom
-        # forward distance travelled in the odom frame (projected on its heading)
-        ds = (ox - pox) * math.cos(poth) + (oy - poy) * math.sin(poth)
+        # Rotation since the last scan: prefer the IMU yaw delta (less slip-prone than
+        # wheel odom) when available.
         if self.use_imu and self._imu_yaw is not None and self._prev_imu is not None:
             dth = _wrap(self._imu_yaw - self._prev_imu)
         else:
             dth = _wrap(oth - poth)
         self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
         pth = _wrap(pth + dth)
-        return px + ds * math.cos(pth), py + ds * math.sin(pth), pth
+        # Express the odom-frame displacement in the map frame. The map frame is rotated
+        # relative to the odom frame by (pth - oth): pth is the robot's *map* yaw (after
+        # this update) and oth is its *odom* yaw. Rotating the full (dx,dy) delta by that
+        # offset — rather than re-projecting it onto pth, which dropped the cross-track
+        # component — keeps scans aligned through turns. Using the CURRENT odom yaw (oth),
+        # not the previous one (poth), is what matters: if IMU and wheel-odom disagree on
+        # a small extra bit of yaw, (pth - oth) stays the true live map-vs-odom offset
+        # instead of accumulating drift scan-over-scan (which used to fling the map
+        # sideways into a constant y offset).
+        dx, dy = (ox - pox), (oy - poy)
+        c, s = math.cos(pth - oth), math.sin(pth - oth)
+        wx, wy = c * dx - s * dy, s * dx + c * dy
+        return px + wx, py + wy, pth
 
     # --- outputs -------------------------------------------------------------
     def _publish_pose(self):
@@ -645,6 +671,26 @@ class NavNode(Node):
         ps.pose.orientation.z = math.sin(self.pth * 0.5)
         ps.pose.orientation.w = math.cos(self.pth * 0.5)
         self.pose_pub.publish(ps)
+
+        # map -> odom correction transform: the robot's pose in the map frame is
+        # (px, py, pth); in the odom frame it's the latest wheel-odometry pose
+        # (ox, oy, oth). Composing the map pose with the inverse of the odom pose gives
+        # the offset that places the odom frame inside the map. Only meaningful once we
+        # have an odometry sample.
+        if self._odom is not None:
+            ox, oy, oth = self._odom
+            c, s = math.cos(self.pth), math.sin(self.pth)
+            tx = self.px - (c * ox - s * oy)
+            ty = self.py - (s * ox + c * oy)
+            t = TransformStamped()
+            t.header.stamp = ps.header.stamp
+            t.header.frame_id = "map"
+            t.child_frame_id = "odom"
+            t.transform.translation.x = tx
+            t.transform.translation.y = ty
+            t.transform.rotation.z = math.sin((self.pth - oth) * 0.5)
+            t.transform.rotation.w = math.cos((self.pth - oth) * 0.5)
+            self.tf_bc.sendTransform(t)
 
     # --- navigation (Stages 2/3) --------------------------------------------
     def _on_goal(self, msg):
@@ -685,6 +731,10 @@ class NavNode(Node):
         self._recovering = False
         self._lost_count = 0
         self._last_score = 0.0
+        # re-seed the yaw on the next scan so the fresh map aligns with odom/IMU again
+        self.pth = 0.0
+        self._prev_odom = None
+        self._prev_imu = None
         if self._trail is not None:
             self._trail.clear()
         self._occ_rev = -1     # force _write_map to recompute against the new grid

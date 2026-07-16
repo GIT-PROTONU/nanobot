@@ -61,6 +61,10 @@ loop = heaviest CPU spot. Still needs the on-board run (deploy → show map → 
 
 Chosen knobs (user picked): scan-matching tier, whole-floor coverage, plan+pursuit+replan.
 SLAM quality depends on the signed-tick firmware fix (now applied) — see [[esp32-coprocessor]].
+**2026-07-16 (first real HW SLAM+drive run):** the map-rotation drift bug in `_predict`
+(map didn't track the robot, ~60° skew) is FIXED + a `map->odom` TF was added; `pickup_pause`
+turned OFF (switches false-trigger); straight-line drive hand-fixed via manual `wheel_trim=0.22`.
+Full writeup + the still-OPEN suspension-polarity/autocal blocker → [[slam-map-rotation-encoder-trim]].
 I cannot build/flash from the Windows dev host (colcon runs in the board's pixi env; pio in
 ~/pio-venv). (The "deferred big RAM wins" noted here — node consolidation and replacing
 rosbridge — were BOTH done since: sensor_hub/app_hub + the SSE gateway, see
