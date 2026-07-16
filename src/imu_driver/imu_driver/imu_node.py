@@ -59,6 +59,11 @@ _UNPACK_FROM = struct.Struct("<hhhh").unpack_from
 # down from its 200 Hz default so the node has far fewer frames to parse.
 RATE_CODES = {1: 0x03, 2: 0x04, 5: 0x05, 10: 0x06, 20: 0x07,
               50: 0x08, 100: 0x09, 200: 0x0b}
+# WitMotion internal analog low-pass BANDWIDTH register (0x1F) -- NOT the output
+# rate above. This is the sensor's own anti-vibration filter on accel/gyro; lower =
+# more filtering (rejects motor/chassis vibration noise at the source) at the cost
+# of response lag. Per WitMotion's documented register table.
+BANDWIDTH_CODES = {256: 0x00, 188: 0x01, 98: 0x02, 42: 0x03, 20: 0x04, 10: 0x05, 5: 0x06}
 
 
 def _dev_rate_for(hz):
@@ -67,6 +72,11 @@ def _dev_rate_for(hz):
         if r >= hz:
             return r
     return 200
+
+
+def _bandwidth_code_for(hz):
+    """Nearest supported BANDWIDTH register value to the requested Hz."""
+    return min(BANDWIDTH_CODES.items(), key=lambda kv: abs(kv[0] - hz))[1]
 
 
 def _cross(u, v):
@@ -113,6 +123,7 @@ class ImuNode(Node):
             ("mag_rate", 10.0),         # /imu/mag is slow-moving + unused by the UI
             ("web_rate", 15.0),         # /imu/web (accel|/|gyro| summary for the UI)
             ("output_rate_hz", 0),      # device stream rate; 0 = auto-follow publish
+            ("bandwidth_hz", 0),        # internal low-pass filter; 0 = leave device default
             ("offset_x_mm", 0.0),       # IMU mounting offset from base_link centre
             ("offset_y_mm", 0.0),       # (REP-103: x fwd, y left, z up), mm --
             ("offset_z_mm", 0.0),       # see lever_arm_correction above
@@ -123,6 +134,7 @@ class ImuNode(Node):
         # cheapest lever for CPU is to make the device stream no faster than we
         # publish. `output_rate_hz` > 0 pins the device rate; 0 = auto-follow.
         self.force_rate = int(g("output_rate_hz").value)
+        self.bandwidth_hz = int(g("bandwidth_hz").value)   # 0 = leave device default
         self.publish_rate = max(1.0, g("publish_rate").value)
         self._pub_period = 1.0 / self.publish_rate
         # /imu/euler + /imu/mag have no high-rate consumer (the standard /imu/data
@@ -228,11 +240,15 @@ class ImuNode(Node):
             time.sleep(0.05)
             self.ser.write(bytes((0xff, 0xaa, 0x03, code, 0x00)))  # set RRATE (rate)
             time.sleep(0.05)
+            if self.bandwidth_hz > 0:
+                bw = _bandwidth_code_for(self.bandwidth_hz)
+                self.ser.write(bytes((0xff, 0xaa, 0x1f, bw, 0x00)))  # set BANDWIDTH
+                time.sleep(0.05)
             self.ser.reset_input_buffer()
         except Exception as exc:
             self.get_logger().warning(f"IMU rate config failed: {exc}")
 
-    _CAL_CMDS = ("accel", "mag_start", "mag_stop", "save")
+    _CAL_CMDS = ("accel", "mag_start", "mag_stop", "save", "axis6", "axis9", "zero_yaw")
 
     def _on_calibrate_cmd(self, msg):
         cmd = str(msg.data or "").strip().lower()
@@ -276,6 +292,29 @@ class ImuNode(Node):
             elif cmd == "save":
                 self.ser.write(bytes((0xff, 0xaa, 0x00, 0x00, 0x00)))
                 self._publish_cal_status("calibration saved to flash")
+            elif cmd == "axis6":
+                # ALG register (0x24) = 1: 6-axis algorithm (gyro+accel only) -- the
+                # fused yaw this driver reports no longer incorporates the magnetometer,
+                # so a mag disturbance can no longer step the heading. Trades that for
+                # slow gyro bias drift instead, which slam_nav's scan matcher is built
+                # to absorb continuously (see the IMU card's "margins for good SLAM"
+                # hint) -- likely a net win near motors/LDS/wiring. Per WitMotion's
+                # documented register table; not verified against this specific unit.
+                self.ser.write(bytes((0xff, 0xaa, 0x24, 0x01, 0x00)))
+                self._publish_cal_status(
+                    "6-axis mode set (magnetometer no longer fused into yaw) — press Save to keep it")
+            elif cmd == "axis9":
+                self.ser.write(bytes((0xff, 0xaa, 0x24, 0x00, 0x00)))
+                self._publish_cal_status(
+                    "9-axis mode set (magnetometer fused into yaw) — press Save to keep it")
+            elif cmd == "zero_yaw":
+                # CALSW (0x01) = 4: reset the currently-reported heading to zero. Only
+                # meaningful in 6-axis mode -- in 9-axis mode the magnetometer just
+                # re-asserts its own heading on the next update.
+                self.ser.write(bytes((0xff, 0xaa, 0x01, 0x04, 0x00)))
+                time.sleep(0.1)
+                self.ser.write(bytes((0xff, 0xaa, 0x01, 0x00, 0x00)))  # exit cal mode
+                self._publish_cal_status("yaw zeroed")
             self.ser.reset_input_buffer()
         except Exception as exc:
             self._publish_cal_status(f"error: {exc}")
@@ -298,6 +337,9 @@ class ImuNode(Node):
                 self._web_period = (1.0 / self.web_rate) if self.web_rate > 0 else None
             elif p.name == "output_rate_hz":
                 self.force_rate = int(p.value)
+                self._need_reconfig.set()
+            elif p.name == "bandwidth_hz":
+                self.bandwidth_hz = int(p.value)
                 self._need_reconfig.set()
             elif p.name in ("offset_x_mm", "offset_y_mm", "offset_z_mm"):
                 x, y, z = self._offset_m

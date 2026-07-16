@@ -52,12 +52,28 @@ $("imuCalAccel").onclick=()=>{
   if(!confirm("Set the robot on a flat, level, still surface, then calibrate the accelerometer?")) return;
   pub("/imu_calibrate","accel");
 };
-$("imuCalMagStart").onclick=()=>pub("/imu_calibrate","mag_start");
-$("imuCalMagStop").onclick=()=>pub("/imu_calibrate","mag_stop");
+$("imuCalMagStart").onclick=()=>{
+  pub("/imu_calibrate","mag_start");
+  magScatterPts=[]; magScatterOn=true; drawMagScatter();
+};
+$("imuCalMagStop").onclick=()=>{ pub("/imu_calibrate","mag_stop"); magScatterOn=false; };
 $("imuCalSave").onclick=()=>{
   if(!confirm("Save IMU calibration to flash?")) return;
   pub("/imu_calibrate","save");
 };
+// 6-axis/9-axis toggle (drop/restore the magnetometer from the fused yaw) + zero-yaw
+// -- same WitMotion command channel as the cal buttons above.
+$("imuAxis6").onclick=()=>{
+  if(!confirm("Switch to 6-axis mode? Yaw becomes gyro-only (no magnetometer). Remember to Save.")) return;
+  pub("/imu_calibrate","axis6");
+};
+$("imuAxis9").onclick=()=>{
+  if(!confirm("Switch back to 9-axis mode (magnetometer fused into yaw)? Remember to Save.")) return;
+  pub("/imu_calibrate","axis9");
+};
+$("imuZeroYaw").onclick=()=>pub("/imu_calibrate","zero_yaw");
+// Internal analog low-pass bandwidth (register 0x1F) -- device default vs 20/10/5 Hz.
+$("imuBandwidth").onchange=()=>setParam("imu_driver","bandwidth_hz",Number($("imuBandwidth").value));
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
 $("ldsRate").onchange=()=>setNodeRate("lds_driver",Number($("ldsRate").value));
 $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
@@ -355,6 +371,54 @@ $("stressStop").onclick=()=>fetch("/stress/stop",{method:"POST"})
   .then(r=>r.json()).then(stressRender).catch(()=>{});
 stressPoll();
 
+// ---- IMU mounting-interference self-test ---- automates the "walk the loose IMU
+// around by hand" mag-noise hunt (see imu_interference.py): cycles LDS/fan/LED/
+// motors one at a time while parked, server-side, and scores each phase's mag
+// disturbance. Same poll-while-active pattern as the stress test above.
+let imuTestTimer=null;
+const IMU_PHASE_LABEL={baseline:"baseline (quiet)", lds:"LDS spin", fan:"cooling fan",
+  led:"LED", motor:"motor wiggle"};
+function imuTestRender(d){
+  const st=$("imuInterferenceStatus"), rowsEl=$("imuInterferenceResults");
+  if(!d){ return; }
+  if(d.error && !d.active){
+    st.textContent="error: "+d.error;
+  } else if(d.active){
+    st.textContent=`running — phase ${d.phase_i+1}/${d.phase_n}: ${IMU_PHASE_LABEL[d.phase]||d.phase}`;
+  } else if(d.results && d.results.length){
+    st.textContent="done";
+  } else {
+    st.textContent="";
+  }
+  if(!d.active && imuTestTimer){ clearInterval(imuTestTimer); imuTestTimer=null; }
+  if(d.active && !imuTestTimer) imuTestTimer=setInterval(imuTestPoll,500);
+  const rows=(d.results||[]).slice().sort((a,b)=>b.mag_noise_pct-a.mag_noise_pct);
+  rowsEl.innerHTML="";
+  const baselinePct=(d.results||[]).find(r=>r.phase==="baseline");
+  for(const r of rows){
+    const div=document.createElement("div");
+    div.className="row";
+    const over=baselinePct && r.phase!=="baseline" ? r.mag_noise_pct-baselinePct.mag_noise_pct : null;
+    div.style.color = r.mag_noise_pct>=6 ? "var(--red)" : r.mag_noise_pct>=2 ? "var(--amber)" : "var(--green)";
+    div.textContent=`${IMU_PHASE_LABEL[r.phase]||r.phase}: mag noise ${r.mag_noise} (${r.mag_noise_pct}% of field`
+      +(over!==null ? `, +${over.toFixed(1)} over baseline` : "")+`)`
+      +(r.yaw_wobble_deg ? `, yaw wobble ${r.yaw_wobble_deg}°` : "");
+    rowsEl.appendChild(div);
+  }
+}
+function imuTestPoll(){
+  fetch("/imu/interference/status").then(r=>r.ok?r.json():null).then(imuTestRender).catch(()=>{});
+}
+$("imuInterferenceStart").onclick=()=>{
+  fetch("/imu/interference/start",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({include_motor:$("imuInterferenceMotor").checked})})
+    .then(r=>r.json()).then(d=>{ if(d&&d.error){ alert(d.error); return; } imuTestRender(d); })
+    .catch(()=>{});
+};
+$("imuInterferenceStop").onclick=()=>fetch("/imu/interference/stop",{method:"POST"})
+  .then(r=>r.json()).then(imuTestRender).catch(()=>{});
+imuTestPoll();
+
 // Camera snapshot: one still JPEG in a new tab (the server ref-counts the camera,
 // so this works with the live stream off). Cache-busted so each click is a new grab.
 $("camShot").onclick=()=>window.open("/snapshot.jpg?t="+Date.now(),"_blank");
@@ -574,6 +638,15 @@ const HINTS = {
   driftPitch: "Pitch change while parked. Same margins as roll: ≤0.3° green, ≤1° amber, above red.",
   driftYaw: "Total yaw change this still period. Graded against the scan matcher's ±6.9°/scan correction budget: ≤1° green, ≤3.5° (half window) amber, above red. Slow drift is auto-corrected (SLAM re-matches after ~0.3°); a sudden JUMP past ~7° between scans is what actually loses localization.",
   driftRate: "Yaw drift normalized to °/min -- the IMU heading-health number. ≤1°/min green (a real gyro-bias level); 1-6 amber (SLAM still corrects it, but run the mag cal / check mounting); ≥6 red -- that's magnetometer interference territory, the prime suspect for the erratic self-test SPIN check and map corruption.",
+  imuMagScatter: "Live mag X/Y scatter while a mag cal is recording (Start/Stop mag cal above). A good hard-iron cal traces a circle centred on the crosshair as you rotate through all orientations -- offset or egg-shaped means redo it.",
+  imuMagScatterClear: "Clear the scatter plot and start a fresh trace.",
+  imuAxis6: "Switch the BWT901CL to 6-axis fusion: yaw becomes gyro-only, no magnetometer. Trades mag interference JUMPS (which the scan matcher can't absorb) for slow gyro DRIFT (which it's built to absorb). Try this if the mag-noise/drift-rate numbers above keep reading red. Save (above) to persist to flash.",
+  imuAxis9: "Switch back to the BWT901CL's default 9-axis fusion (magnetometer fused into yaw). Save (above) to persist to flash.",
+  imuZeroYaw: "Reset the currently-reported heading to 0°. Only meaningful in 6-axis mode -- in 9-axis mode the magnetometer re-asserts its own heading on the next update.",
+  imuBandwidth: "The BWT901CL's own internal analog low-pass filter on accel/gyro (separate from the publish-rate slider above). Lower rejects more motor/chassis vibration noise at the source, at the cost of response lag. Try 10 Hz if readings are noisy even while genuinely stationary.",
+  imuInterferenceStart: "Automates the mounting-interference hunt: while parked, cycles the LDS spin / cooling fan / LED (and optionally a brief motor wiggle) one at a time and scores each one's magnetometer disturbance, worst first -- no more holding the loose IMU near each part by hand. Requires skills_allow_actions (Skills card).",
+  imuInterferenceStop: "Cancel a running interference self-test and restore every actuator (fan/LED/motors) to its resting state.",
+  imuInterferenceMotor: "Add a brief in-place turn as a 4th test phase. Mag magnitude is rotation-invariant so it still attributes cleanly; this phase is scored on yaw wobble instead of the stationary-only mag-noise numbers the other phases use.",
 };
 function applyHints(on){
   for(const [id,text] of Object.entries(HINTS)){
@@ -959,10 +1032,41 @@ function onImuDrift(d){
 // adding any backend/ROS computation). See the IMU card's hint for how to use it.
 let magHist=[];             // [[performance.now() ms, magnitude], ...] trailing ~2s
 let magWorst=0;             // peak-to-peak noise seen since the last reset
+// Mag-cal quality scatter (client-side, no protocol readback exists to check cal
+// quality any other way): plots raw mag X/Y while recording is on (toggled by the
+// Start/Stop mag cal buttons below). A good hard-iron cal traces a circle centred
+// on the crosshair as the robot rotates through all orientations.
+let magScatterOn=false, magScatterPts=[];
+const magScatterCv=$("imuMagScatter"), magScatterCtx=magScatterCv&&magScatterCv.getContext("2d");
+function drawMagScatter(){
+  if(!magScatterCtx) return;
+  const w=magScatterCv.width, h=magScatterCv.height;
+  magScatterCtx.clearRect(0,0,w,h);
+  magScatterCtx.strokeStyle="rgba(128,128,128,.4)";
+  magScatterCtx.beginPath();
+  magScatterCtx.moveTo(w/2,0); magScatterCtx.lineTo(w/2,h);
+  magScatterCtx.moveTo(0,h/2); magScatterCtx.lineTo(w,h/2);
+  magScatterCtx.stroke();
+  if(!magScatterPts.length) return;
+  const mx=Math.max(...magScatterPts.map(p=>Math.abs(p[0]))),
+        my=Math.max(...magScatterPts.map(p=>Math.abs(p[1]))),
+        span=Math.max(mx,my,1)*1.15, s=Math.min(w,h)/2/span;
+  magScatterCtx.fillStyle="var(--accent, #5cf)";
+  for(const [x,y] of magScatterPts){
+    magScatterCtx.beginPath();
+    magScatterCtx.arc(w/2+x*s, h/2-y*s, 1.6, 0, 7);
+    magScatterCtx.fill();
+  }
+}
 function onImuMag(xyz){
   $("imuMag").textContent=xyz.map(v=>v.toFixed(1)).join(", ");
   const mag=Math.hypot(xyz[0], xyz[1], xyz[2]);
   $("imuMagMag").textContent=mag.toFixed(1);
+  if(magScatterOn){
+    magScatterPts.push([xyz[0], xyz[1]]);
+    if(magScatterPts.length>1500) magScatterPts.shift();
+    drawMagScatter();
+  }
   const now=performance.now();
   magHist.push([now, mag]);
   while(magHist.length && now-magHist[0][0]>2000) magHist.shift();
@@ -979,6 +1083,7 @@ function onImuMag(xyz){
   if(noise>magWorst){ magWorst=noise; $("imuMagWorst").textContent=magWorst.toFixed(1); }
 }
 $("imuMagResetWorst").onclick=()=>{ magWorst=0; magHist=[]; $("imuMagWorst").textContent="0.0"; };
+$("imuMagScatterClear").onclick=()=>{ magScatterPts=[]; drawMagScatter(); };
 function onEul(m){
   if(m.age>=4 || m.r==null) return;
   $("imuR").textContent=m.r.toFixed(1)+"°";

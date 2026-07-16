@@ -14,7 +14,8 @@ left needs the physical robot and can't be closed from a dev host.
       built 2026-07-15, not flashed).
 - [ ] **Deploy to the board**: `goal_no_path_timeout` LDS-idle fix + the TTS
       shutdown-cutoff fix (`TtsEngine.wait`) — both committed 2026-07-15, not deployed.
-- [ ] **Hardware-verify the IMU accel/mag calibration** (2026-07-16) — then re-run the
+- [ ] **Hardware-verify the IMU accel/mag calibration + the new 6-axis mode /
+      bandwidth filter / interference self-test** (2026-07-16) — then re-run the
       self-test SPIN check to test the magnetometer-interference hypothesis
       (`selftest-spin-imu-mismatch` memory, still OPEN).
 - [ ] **Hardware-verify vision target tracking** (2026-07-16, pan-only) — needs a

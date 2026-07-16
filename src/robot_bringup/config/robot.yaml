@@ -218,6 +218,10 @@ imu_driver:
     web_rate: 5.0             # Hz; /imu/web (|accel|,|gyro|,rate) summary — same story as
                               # euler_rate above, sys_monitor-only, no raw-topic UI reader
     output_rate_hz: 0         # 0 = device streams at publish_rate; >0 pins it
+    bandwidth_hz: 0           # internal analog low-pass filter (register 0x1F); 0 = leave
+                              # device default. Lower (e.g. 10 or 5) rejects motor/chassis
+                              # vibration noise at the source, at the cost of response lag.
+                              # Nearest of 256/188/98/42/20/10/5 Hz is programmed.
     # Mounting offset from base_link's centre (REP-103: x=fwd, y=left, z=up), mm.
     # Web-editable (IMU card). If nonzero, accel is corrected for the lever-arm
     # (centripetal + tangential) effect of rotating off-centre before publish —
@@ -486,6 +490,13 @@ web_control:
     # this web server (see web_control/stress.py). Auto-stops regardless of the caller.
     stress_max_duration: 300.0   # s hard cap on any run, however long the UI asks for
     stress_temp_abort_c: 82.0    # abort early if CPU temp reaches this (0 = disable)
+    # IMU mounting-interference self-test (POST /imu/interference/start, see
+    # imu_interference.py) -- cycles the LDS/fan/LED/motors one at a time while
+    # parked to find which one disturbs the magnetometer. Requires
+    # skills_allow_actions (below) since it actuates the same publishers as the
+    # skill action tier.
+    imu_test_lds_rpm: 300.0      # target rpm for the LDS phase; matches slam_nav's lds_active_rpm
+    imu_test_motor_ang: 0.35     # rad/s for the OPTIONAL motor-wiggle phase (off by default)
     # Text-to-speech (English en-gb voices only). The web page POSTs /tts; the server
     # synthesises with espeak-ng (install via deploy/install-espeakng.sh; NOT on conda-forge), plays it
     # through aplay, and streams the words to the OLED (/oled_word) as they're said.

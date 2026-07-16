@@ -60,7 +60,8 @@ STALE = -1e9
 
 # ---- POST /param whitelist: node -> settable parameter names -------------------
 PARAM_WHITELIST = {
-    "imu_driver": {"publish_rate", "euler_rate", "offset_x_mm", "offset_y_mm", "offset_z_mm"},
+    "imu_driver": {"publish_rate", "euler_rate", "offset_x_mm", "offset_y_mm", "offset_z_mm",
+                   "bandwidth_hz"},
     "lds_driver": {"publish_rate"},
     "wheel_odometry": {"publish_rate"},
     "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
@@ -623,7 +624,7 @@ class TelemetryHub:
     @staticmethod
     def _mk_calibrate(v):
         v = str(v or "").strip()
-        if v not in ("accel", "mag_start", "mag_stop", "save"):
+        if v not in ("accel", "mag_start", "mag_stop", "save", "axis6", "axis9", "zero_yaw"):
             raise ValueError(f"unknown imu calibrate command: {v}")
         return String(data=v)
 

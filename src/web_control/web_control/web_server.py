@@ -52,6 +52,7 @@ from .llm import LlmClient
 from .skills import resolve_skills_dir
 from .cognition import CognitionCore, sanitize_personality_patch
 from .stress import StressTest
+from .imu_interference import IMUInterferenceTest
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
@@ -413,6 +414,19 @@ class WebServerNode(Node):
             abort_temp_c=float(g("stress_temp_abort_c").value),
             read_temp=procstats.cpu_temp)
 
+        # ---- IMU mounting-interference self-test (see imu_interference.py) ------------
+        # Automates the "walk the loose IMU around by hand" mag-noise hunt from the IMU
+        # card's hint: cycles the LDS/fan/LED/motors one at a time while parked and
+        # scores each one's magnetometer disturbance. Reuses the gated skill-action
+        # publishers below (created next), so this is instantiated after them but reads
+        # them lazily at run time -- order here doesn't matter.
+        self.declare_parameter("imu_test_lds_rpm", 300.0)   # matches slam_nav's lds_active_rpm
+        self.declare_parameter("imu_test_motor_ang", 0.35)  # rad/s, optional motor-wiggle phase
+        self._imu_test = IMUInterferenceTest(
+            self, logger=self.get_logger().info,
+            lds_rpm=float(g("imu_test_lds_rpm").value),
+            motor_ang=float(g("imu_test_motor_ang").value))
+
         # ---- Cognition core (shared, ROS-free) ----------------------------------
         # ALL the LLM-personality logic lives in web_control.cognition.CognitionCore, shared
         # verbatim with the dev harness (scripts/dev_webui.py) — one base to maintain. We build
@@ -672,6 +686,17 @@ class WebServerNode(Node):
 
     def stress_status(self):
         return self._stress.status()
+
+    # ---- IMU mounting-interference self-test (see imu_interference.py) --------
+    def imu_interference_start(self, data):
+        data = data or {}
+        return self._imu_test.start(include_motor=bool(data.get("include_motor", False)))
+
+    def imu_interference_stop(self):
+        return self._imu_test.stop()
+
+    def imu_interference_status(self):
+        return self._imu_test.status()
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -1592,6 +1617,10 @@ class WebServerNode(Node):
             self._stress.stop()
         except Exception:
             pass
+        try:
+            self._imu_test.stop()
+        except Exception:
+            pass
         if self._gpu_vision is not None:
             try:
                 self._gpu_vision.stop()
@@ -1675,6 +1704,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/health/log": lambda n: n.get_health_log(),
         "/logs": lambda n: n.get_merged_log(),
         "/stress/status": lambda n: n.stress_status(),
+        "/imu/interference/status": lambda n: n.imu_interference_status(),
         "/vision/targets": lambda n: n.get_vision_targets(),
         "/llm/vision_diary": lambda n: n.get_vision_diary(),
     }
@@ -1684,6 +1714,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/param": lambda n, d: n.telemetry.set_param_json(d),   # whitelisted live-tune params
         "/stress/start": lambda n, d: n.stress_start(d),
         "/stress/stop": lambda n, d: n.stress_stop(),
+        "/imu/interference/start": lambda n, d: n.imu_interference_start(d),
+        "/imu/interference/stop": lambda n, d: n.imu_interference_stop(),
         "/tts/config": lambda n, d: n.update_settings(d),
         "/llm/config": lambda n, d: n.update_llm_settings(d),
         "/personality": lambda n, d: n.set_personality(d),

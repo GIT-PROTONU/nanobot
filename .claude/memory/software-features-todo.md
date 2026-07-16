@@ -1,6 +1,6 @@
 ---
 name: software-features-todo
-description: "Software-only feature backlog (no new hardware), started 2026-07-13. TODO (approved): named locations + go-to skill, IMU-fused odometry, odom auto-calibration, wheel-slip cross-check; +2026-07-16 IMU quality tools: 6-axis mode toggle, automated interference self-test, mag-cal scatter view, bandwidth filter. NICE-TO-HAVE (all user-endorsed, no priority): follow-me, voice, roam, sentry, no-go zones, history graphs, path replay, conversation memory, audio emotes, map-change detection, push notifications, coverage map, odometer stats, TTS prosody, stuck-escape, global relocalization, tap gestures, terrain-from-effort, WiFi fingerprint, chirp self-test, mirror detection, courier mode, alarm clock, rhythm learning, diary page, dream journal, games, expressive fan"
+description: "Software-only feature backlog (no new hardware), started 2026-07-13. TODO (approved): named locations + go-to skill, IMU-fused odometry, odom auto-calibration, wheel-slip cross-check. DONE 2026-07-16: IMU quality tools (6-axis toggle, interference self-test, mag-cal scatter, bandwidth filter) -- see imu-quality-tools-built. NICE-TO-HAVE (all user-endorsed, no priority): follow-me, voice, roam, sentry, no-go zones, history graphs, path replay, conversation memory, audio emotes, map-change detection, push notifications, coverage map, odometer stats, TTS prosody, stuck-escape, global relocalization, tap gestures, terrain-from-effort, WiFi fingerprint, chirp self-test, mirror detection, courier mode, alarm clock, rhythm learning, diary page, dream journal, games, expressive fan"
 metadata: 
   node_type: memory
   type: project
@@ -42,40 +42,12 @@ slipping/dragged/stuck. Complements the optical bumper (which needs the camera o
 near-free once item 2 exists. Consumers: caution fast-rule + a diagnostics alert; later the
 stuck-escape reflex.
 
-## TODO — IMU quality tools (user-approved 2026-07-16 "add all to todo", not yet built)
+## DONE (2026-07-16, same day) — IMU quality tools
 
-Follow-on from the IMU calibration + SLAM-margin work ([[imu-calibration-added]]); all
-target the open [[selftest-spin-imu-mismatch]] mag-interference suspicion. Ranked:
-
-**5. 6-axis mode toggle (take the magnetometer out of yaw) — likely the biggest SLAM win.**
-The BWT901CL's on-board 9-axis fusion mag-corrects the yaw slam_nav consumes, so every mag
-disturbance becomes a yaw step before software sees it. WitMotion ALG register `0x24`
-(0 = 9-axis, 1 = 6-axis) switches to pure gyro-integrated yaw: trades mag *jumps* (which the
-scan matcher can't absorb) for slow gyro *drift* (which it's built to absorb — ±6.9°/scan,
-parked re-match at 0.3°). Same unlock/write/save wire pattern as the existing cal commands in
-`imu_node._do_calibrate` + a web toggle. Pair with CALSW = 4 ("zero yaw", works only in
-6-axis) as a re-zero-heading button. A/B instruments already exist: drift check + self-test
-SPIN. Note for item 2 (IMU-fused odometry): fuse *delta* yaw regardless, so 6-axis drift
-doesn't matter there either.
-
-**6. Automated interference self-test.** Replace walking the loose IMU around by hand: robot
-parked, cycle each actuator over existing topics — LDS spin up/down (`/lds_target_rpm`), fan
-0→100% (`/fan_pwm`), `/led`, brief in-place motor wiggle — while recording mag noise + yaw
-wobble; report a per-actuator interference score ("motors: +9% ← culprit"). Mag *magnitude*
-is rotation-invariant, so the motor wiggle still attributes cleanly.
-
-**7. Mag-cal quality view.** No protocol readback exists, but quality is visible: client-side
-canvas scatter of mag X vs Y during the cal rotation — a circle centred on origin = good
-hard-iron cal; offset/egg-shaped = redo. Mag xyz already streams every frame; zero robot cost.
-
-**8. On-device bandwidth filter (WitMotion register `0x1F`).** Default internal low-pass is
-20 Hz; dropping to 10/5 Hz rejects motor/chassis vibration noise at the source (fits the
-already-reduced publish rates). Same wire pattern as the cal commands.
-
-Setup notes (no code, matter as much as the tools): the mag cal is only valid *for the spot
-and orientation the IMU is mounted in* — redo it after any move, in final position, with the
-robot's electronics powered on so the cal absorbs the static field. Gyro bias shifts with
-temperature — a cold-boot drift check reads worse than after a few minutes of warm-up.
+User-approved 2026-07-16 ("add all to todo"), then built same session. All four
+implemented + smoke/unit/manual-endpoint tested on the dev host; NOT yet
+hardware-verified or deployed. See [[imu-quality-tools-built]] for the full writeup
+(files touched, register values used, safety gating).
 
 ## Nice to have (user-endorsed 2026-07-13 — wanted, no deadline/priority; pick up when convenient)
 

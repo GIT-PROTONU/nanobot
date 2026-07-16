@@ -459,6 +459,36 @@
               ~9.8 afterwards. <b>Start/Stop mag cal</b> while slowly rotating the robot through all
               orientations — check <b>mag xyz</b> sweeps smoothly, not stuck at one value. Always
               <b>Save</b> to persist to flash, else it resets on power-cycle.</p>
+            <canvas id="imuMagScatter" width="160" height="160"></canvas>
+            <div class="chiprow">
+              <button id="imuMagScatterClear" class="btn">↺ Clear plot</button>
+            </div>
+            <p class="hint">Mag cal quality (client-side, no protocol readback exists to check
+              this any other way): plots mag X/Y live while <b>Start/Stop mag cal</b> is
+              recording. A good hard-iron calibration traces a <b>circle centred on the
+              crosshair</b> as you rotate the robot through all orientations — an off-centre or
+              egg-shaped loop means redo the cal (or re-check the mount for nearby interference).</p>
+            <div class="chiprow">
+              <button id="imuAxis6" class="btn">🧭 6-axis mode</button>
+              <button id="imuAxis9" class="btn">🧲 9-axis mode</button>
+              <button id="imuZeroYaw" class="btn">↺ Zero yaw</button>
+              <label>Bandwidth <select id="imuBandwidth">
+                <option value="0">device default</option>
+                <option value="20">20 Hz</option>
+                <option value="10">10 Hz</option>
+                <option value="5">5 Hz</option>
+              </select></label>
+            </div>
+            <p class="hint">The BWT901CL's default <b>9-axis</b> fusion mixes the magnetometer
+              into the reported yaw, so a mag disturbance near motors/LDS/wiring becomes a yaw
+              JUMP the scan matcher can't absorb (see the margins above). <b>6-axis mode</b> drops
+              the magnetometer from yaw entirely — heading is gyro-only, trading mag jumps for
+              slow gyro drift (which SLAM IS built to absorb). Try it if the mag-noise/drift
+              numbers above keep reading red near the chassis. <b>Zero yaw</b> resets the current
+              heading to 0° (only meaningful in 6-axis mode). <b>Bandwidth</b> is the sensor's own
+              internal vibration filter — lower rejects more motor/chassis noise at the cost of
+              response lag; try 10 Hz if numbers are noisy even while genuinely stationary. Always
+              <b>Save</b> (above) to persist axis mode to flash.</p>
             <div class="kv">
               <span>stationary for</span><b id="driftStill">–</b>
               <span>roll drift</span><b id="driftRoll">–</b>
@@ -493,6 +523,23 @@
               accelerometer see extra lever-arm acceleration on top of the real motion — set this
               and the driver subtracts it before publishing, so <b>|accel|</b> stays correct
               during rotation. Leave at 0,0,0 if the IMU is centred.</p>
+            <div class="chiprow">
+              <button id="imuInterferenceStart" class="btn primary">▶ Run interference self-test</button>
+              <button id="imuInterferenceStop" class="btn">■ Stop</button>
+              <label class="switch"><input id="imuInterferenceMotor" type="checkbox">
+                <span class="track"></span> include motor wiggle</label>
+            </div>
+            <p class="hint" id="imuInterferenceStatus"></p>
+            <div id="imuInterferenceResults"></div>
+            <p class="hint">Automates the mounting-interference check above: while the robot sits
+              parked, cycles the <b>LDS spin</b>, <b>cooling fan</b> (full duty), and <b>LED</b> one
+              at a time (~13s total) and reports each one's magnetometer disturbance, worst first —
+              no more holding the loose IMU near each part by hand. <b>Include motor wiggle</b> adds
+              a brief in-place turn as a 4th phase (uses the yaw-wobble column instead, since a
+              motor wiggle intentionally moves — mag magnitude stays rotation-invariant so it still
+              attributes cleanly). Requires <b>skills_allow_actions</b> (Skills card) since it
+              actuates the LDS/fan/LED/motors; aborts automatically if the robot is picked up or
+              driven mid-run.</p>
           </div>
           <div class="card">
             <h2>Odometry</h2>
