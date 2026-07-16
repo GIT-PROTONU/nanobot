@@ -410,8 +410,15 @@ function imuTestPoll(){
   fetch("/imu/interference/status").then(r=>r.ok?r.json():null).then(imuTestRender).catch(()=>{});
 }
 $("imuInterferenceStart").onclick=()=>{
+  const motor=$("imuInterferenceMotor").checked;
+  const warn=motor
+    ? "Run the IMU interference self-test? The robot will spin the LDS, blip the fan/LED, "
+      +"and briefly TURN IN PLACE (motor wiggle) -- make sure the area around it is clear."
+    : "Run the IMU interference self-test? The robot will spin the LDS and blip the fan/LED "
+      +"while parked -- it will NOT drive (motor wiggle is unchecked).";
+  if(!confirm(warn)) return;
   fetch("/imu/interference/start",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({include_motor:$("imuInterferenceMotor").checked})})
+    body:JSON.stringify({include_motor:motor})})
     .then(r=>r.json()).then(d=>{ if(d&&d.error){ alert(d.error); return; } imuTestRender(d); })
     .catch(()=>{});
 };
@@ -644,7 +651,7 @@ const HINTS = {
   imuAxis9: "Switch back to the BWT901CL's default 9-axis fusion (magnetometer fused into yaw). Save (above) to persist to flash.",
   imuZeroYaw: "Reset the currently-reported heading to 0°. Only meaningful in 6-axis mode -- in 9-axis mode the magnetometer re-asserts its own heading on the next update.",
   imuBandwidth: "The BWT901CL's own internal analog low-pass filter on accel/gyro (separate from the publish-rate slider above). Lower rejects more motor/chassis vibration noise at the source, at the cost of response lag. Try 10 Hz if readings are noisy even while genuinely stationary.",
-  imuInterferenceStart: "Automates the mounting-interference hunt: while parked, cycles the LDS spin / cooling fan / LED (and optionally a brief motor wiggle) one at a time and scores each one's magnetometer disturbance, worst first -- no more holding the loose IMU near each part by hand. Requires skills_allow_actions (Skills card).",
+  imuInterferenceStart: "Automates the mounting-interference hunt: while parked, cycles the LDS spin / cooling fan / LED (and optionally a brief motor wiggle) one at a time and scores each one's magnetometer disturbance, worst first -- no more holding the loose IMU near each part by hand. Requires skills_allow_actions: true in robot.yaml (a restart-only setting, no live toggle) -- it WILL actuate the LDS/fan/LED and, if checked, briefly turn the robot.",
   imuInterferenceStop: "Cancel a running interference self-test and restore every actuator (fan/LED/motors) to its resting state.",
   imuInterferenceMotor: "Add a brief in-place turn as a 4th test phase. Mag magnitude is rotation-invariant so it still attributes cleanly; this phase is scored on yaw wobble instead of the stationary-only mag-noise numbers the other phases use.",
 };
