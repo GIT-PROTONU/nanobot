@@ -10,6 +10,7 @@ Memory: one float32 grid + one bool 'seen' mask. At 24 m / 5 cm that's 480x480 =
 ~0.9 MB + 0.23 MB. CPU: integration is O(hit cells); matching is a small coarse-to-fine
 search over a subsampled scan (caller decimates), vectorised per candidate angle.
 """
+import math
 import os
 
 import numpy as np
@@ -126,6 +127,35 @@ class GridMap:
             self.seen[fr[mf], fc[mf]] = True
 
         np.clip(self.log, -L_CLAMP, L_CLAMP, out=self.log)
+        self.rev += 1
+
+    # --- loop closure: rigid map transform ----------------------------------
+    def transform(self, dx, dy, dth):
+        """Rigidly shift/rotate the whole grid by (dx, dy, dth) in world metres/rad.
+        Used by loop closure to bleed off accumulated global drift: the correction
+        found against a far-away re-visited area is applied as a small rotation +
+        translation of the accumulated map. Pure-numpy, no scipy. Only called on a
+        loop event (rare), so the temporary copy cost (~1.1 MB) is irrelevant."""
+        c, s = math.cos(dth), math.sin(dth)
+        # world centre of every cell (row r, col c) -> source world point before the
+        # transform, then sample the OLD grids there. Inverse of the forward motion:
+        # a point that ends up at (wx, wy) came from (R^{-1} ((wx-dx, wy-dy))).
+        ys, xs = np.mgrid[0:self.n, 0:self.n].astype(np.float64)
+        wy = self.origin + (ys + 0.5) * self.res
+        wx = self.origin + (xs + 0.5) * self.res
+        sx = c * (wx - dx) + s * (wy - dy)
+        sy = -s * (wx - dx) + c * (wy - dy)
+        sc, sr = self.w2g(sx, sy)
+        m = (sc >= 0) & (sc < self.n) & (sr >= 0) & (sr < self.n)
+        sic = sc[m].astype(np.int64)
+        sir = sr[m].astype(np.int64)
+        tic = xs[m].astype(np.int64)
+        tir = ys[m].astype(np.int64)
+        new_log = self.log.copy()
+        new_seen = self.seen.copy()
+        new_log[tir, tic] = self.log[sir, sic]
+        new_seen[tir, tic] = self.seen[sir, sic]
+        self.log, self.seen = new_log, new_seen
         self.rev += 1
 
     # --- export --------------------------------------------------------------

@@ -195,6 +195,22 @@ slam_nav:
     track_deadband: 0.04           # normalized x-error within this = already centered, don't turn
     track_conf_min: 0.02           # ignore target reports below this confidence (too small/noisy)
     track_timeout: 0.6             # s: no fresh target/vision-state past this -> stop turning
+    # --- true loop closure (drift correction; lowest-impact variant) ---
+    # The accumulated map IS the keyframe store (no separate pose graph). Every
+    # loop_probe_every scans the current scan is re-matched against the map centered on
+    # the odometry-predicted (drifted) pose with a WIDE window; a strong match that lands
+    # far from where we think we are = a far re-visit = the accumulated global offset,
+    # which is bled off smoothly (loop_alpha) into the live pose + (rarely) the grid.
+    # Cost: one extra match() every loop_probe_every scans (~few ms every ~10s at 300rpm)
+    # + a few float ops otherwise; steady-state RAM ~48 bytes. ON by default.
+    loop_closure: true              # master on/off
+    loop_probe_every: 50            # run the wide re-match every Nth scan
+    loop_lin: 0.5                   # wide search half-window (m) for the probe
+    loop_ang: 1.0                   # wide search half-window (rad) for the probe
+    loop_score: 4.0                 # probe match must score at least this to count
+    loop_min_shift: 0.3             # m: correction bigger than this = a real loop (else noise)
+    loop_alpha: 0.1                 # smoothing fraction applied per loop detection
+    loop_apply_thresh: 0.05         # m: warp the grid only once shift per-event exceeds this
 
     # --- self-test / calibration (scripted forward/back/spin drive that cross-checks
     # IMU vs encoders). Was module constants; now params so the SPIN-check investigation

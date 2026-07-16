@@ -158,7 +158,24 @@ class NavNode(Node):
                                             # centering/overshoot right at the setpoint.
             ("track_deadband", 0.04),      # normalized x-error within this = centered, don't turn
             ("track_conf_min", 0.02),      # ignore target reports below this confidence
-            ("track_timeout", 0.6),        # s: no fresh vision-state past this -> stop turning
+            ("track_timeout", 0.6),      # s: no fresh vision-state past this -> stop turning
+            # --- true loop closure (drift correction, lowest-impact variant) ---
+            # The accumulated map IS the keyframe store, so no separate pose graph is
+            # kept. Every `loop_probe_every` scans we re-match the current scan against
+            # the map centered on the *odometry-predicted* (drifted) pose with a WIDE
+            # window; a strong match that lands far from the corrected pose reveals the
+            # accumulated global offset, which we bleed off smoothly (exponential) into
+            # the live pose + (rarely) the grid. Cost: one extra match() every
+            # loop_probe_every scans (~few ms every ~10s at 300rpm) + a few float ops
+            # otherwise. Steady-state RAM ~48 bytes. On by default.
+            ("loop_closure", True),       # master on/off
+            ("loop_probe_every", 50),     # run the wide re-match every Nth scan
+            ("loop_lin", 0.5),            # wide search half-window (m) for the probe
+            ("loop_ang", 1.0),            # wide search half-window (rad) for the probe
+            ("loop_score", 4.0),          # probe match must score at least this to count
+            ("loop_min_shift", 0.3),      # m: correction bigger than this = a real loop
+            ("loop_alpha", 0.1),          # smoothing fraction applied per loop detection
+            ("loop_apply_thresh", 0.05),  # m: warp the grid only once shift exceeds this
             # --- self-test / calibration (scripted drive, IMU-vs-encoder cross-check) ---
             ("test_lin", 0.12),            # m/s forward/back speed (capped by max_lin)
             ("test_ang", 0.6),             # rad/s in-place spin speed (capped by max_ang)
@@ -209,6 +226,15 @@ class NavNode(Node):
         self.track_deadband = float(g("track_deadband").value)
         self.track_conf_min = float(g("track_conf_min").value)
         self.track_timeout = float(g("track_timeout").value)
+        # loop closure (drift correction)
+        self.loop_closure = bool(g("loop_closure").value)
+        self.loop_probe_every = int(max(1, g("loop_probe_every").value))
+        self.loop_lin = float(g("loop_lin").value)
+        self.loop_ang = float(g("loop_ang").value)
+        self.loop_score = float(g("loop_score").value)
+        self.loop_min_shift = float(g("loop_min_shift").value)
+        self.loop_alpha = max(0.0, min(1.0, float(g("loop_alpha").value)))
+        self.loop_apply_thresh = float(g("loop_apply_thresh").value)
         self.test_lin = float(g("test_lin").value)
         self.test_ang = float(g("test_ang").value)
         self.test_dist = float(g("test_dist").value)
@@ -292,6 +318,11 @@ class NavNode(Node):
         self._recovering = False     # actively re-searching for the pose (lost / set down)
         self._recover_until = 0.0
         self._lost_count = 0         # consecutive scans the match has failed
+        # loop closure (drift correction): accumulated global offset (dx, dy, dth) that
+        # the odometry/IMU chain has drifted relative to the map. Blended into the live
+        # pose + (rarely) the grid. Only meaningful once we have a map + have moved.
+        self._loop_off = (0.0, 0.0, 0.0)
+        self._scan_count = 0         # counts scans since boot, for the probe cadence
         # self-test / calibration state
         self._test_active = False
         self._test_seq = []
@@ -426,6 +457,22 @@ class NavNode(Node):
                 self.track_conf_min = float(p.value)
             elif p.name == "track_timeout":
                 self.track_timeout = float(p.value)
+            elif p.name == "loop_closure":
+                self.loop_closure = bool(p.value)
+            elif p.name == "loop_probe_every":
+                self.loop_probe_every = int(max(1, p.value))
+            elif p.name == "loop_lin":
+                self.loop_lin = float(p.value)
+            elif p.name == "loop_ang":
+                self.loop_ang = float(p.value)
+            elif p.name == "loop_score":
+                self.loop_score = float(p.value)
+            elif p.name == "loop_min_shift":
+                self.loop_min_shift = float(p.value)
+            elif p.name == "loop_alpha":
+                self.loop_alpha = max(0.0, min(1.0, float(p.value)))
+            elif p.name == "loop_apply_thresh":
+                self.loop_apply_thresh = float(p.value)
             elif p.name == "test_lin":
                 self.test_lin = float(p.value)
             elif p.name == "test_ang":
@@ -616,6 +663,17 @@ class NavNode(Node):
         if not self._recovering:
             self.grid.integrate((self.px, self.py, self.pth), angles, ranges)
         self._publish_pose()
+        # True loop closure: periodically re-match the scan against the map centered on
+        # the odometry-predicted (possibly drifted) pose with a WIDE window. A strong
+        # match that lands far from where we think we are = a far re-visit = the
+        # accumulated global offset, which we bleed off smoothly. Skipped while seeding,
+        # recovering (pose uncertain), or self-testing.
+        if (self.loop_closure and not self._recovering and not self._test_active
+                and len(vr) > 10):
+            self._scan_count += 1
+            if self._scan_count >= self.loop_probe_every:
+                self._scan_count = 0
+                self._maybe_loop_close(va, vr)
 
         # breadcrumb trail: append only when the robot has actually moved a bit (keeps the
         # ring buffer meaningful and the JSON header small).
@@ -632,7 +690,7 @@ class NavNode(Node):
             self._next_autosave = now + self._autosave_period
             self._save_map_file(quiet=True)
 
-    def _predict(self, px, py, pth):
+    def _predict(self, px, py, pth, off=None):
         """Apply the odom/IMU motion since the last scan as the scan-match prior."""
         if self._odom is None or self._prev_odom is None:
             self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
@@ -659,7 +717,60 @@ class NavNode(Node):
         dx, dy = (ox - pox), (oy - poy)
         c, s = math.cos(pth - oth), math.sin(pth - oth)
         wx, wy = c * dx - s * dy, s * dx + c * dy
+        # Fold in the accumulated loop-closure offset (drift the odom/IMU chain has
+        # accumulated vs the map). This re-anchors the whole pose chain onto the corrected
+        # map so subsequent scans localize against the un-drifted frame. The offset is
+        # updated smoothly by _maybe_loop_close() when a far re-visit is detected. `off`
+        # lets the probe re-run the prediction WITHOUT the current offset (to measure the
+        # raw drift against the map).
+        ox_off, oy_off, oth_off = self._loop_off if off is None else off
+        if ox_off or oy_off or oth_off:
+            c2, s2 = math.cos(oth_off), math.sin(oth_off)
+            wx, wy = c2 * wx - s2 * wy, s2 * wx + c2 * wy
+            px, py, pth = px + ox_off, py + oy_off, _wrap(pth + oth_off)
         return px + wx, py + wy, pth
+
+    def _maybe_loop_close(self, va, vr):
+        """Detect a far re-visit and bleed off the accumulated global drift.
+
+        Re-matches the current scan against the map centered on the *offset-free*
+        odometry-predicted pose with a wide window. If that match is strong AND lands far
+        from where our (offset-corrected) chain currently thinks we are, the gap is the
+        accumulated drift: we nudge the persistent `_loop_off` toward it by `loop_alpha`
+        (so the correction is smooth, never a jarring map jump) and, once the per-event
+        shift passes `loop_apply_thresh`, warp the grid itself by the same small step so
+        the map un-drifts in lock-step. Measuring against the offset-free prior each time
+        avoids feedback (the offset can't chase its own tail)."""
+        # Offset-free prior: where the raw odom/IMU chain says we are in the map frame.
+        prior = self._predict(self.px, self.py, self.pth, off=(0.0, 0.0, 0.0))
+        cand = self.grid.match(prior, va, vr, lin=self.loop_lin, ang=self.loop_ang)
+        score = self.grid.score(cand, va, vr)
+        if score < self.loop_score:
+            return
+        # Where the corrected chain currently believes we are (already includes _loop_off).
+        cur = (self.px, self.py, self.pth)
+        dpos = math.hypot(cand[0] - cur[0], cand[1] - cur[1])
+        dth = abs(_wrap(cand[2] - cur[2]))
+        if dpos < self.loop_min_shift and dth < 0.15:
+            return                                      # not a real loop — just local noise
+        # Correction to apply this event (smoothed). The raw drift is cand - prior,
+        # expressed in the map frame (prior is the offset-free chain pose).
+        ddx = cand[0] - prior[0]
+        ddy = cand[1] - prior[1]
+        dda = _wrap(cand[2] - prior[2])
+        a = self.loop_alpha
+        self._loop_off = (self._loop_off[0] + a * ddx,
+                          self._loop_off[1] + a * ddy,
+                          _wrap(self._loop_off[2] + a * dda))
+        # Warp the grid by the small step once it's big enough to matter; otherwise the
+        # live pose alone carries the correction until a few loops accumulate it.
+        if (math.hypot(a * ddx, a * ddy) >= self.loop_apply_thresh
+                or abs(a * dda) >= 0.02):
+            self.grid.transform(a * ddx, a * ddy, a * dda)
+        self.get_logger().info(
+            f"loop closure: drift {dpos:.2f} m / {dth:.1f} rad, "
+            f"offset now ({self._loop_off[0]:.2f}, {self._loop_off[1]:.2f}, "
+            f"{self._loop_off[2]:.2f})")
 
     # --- outputs -------------------------------------------------------------
     def _publish_pose(self):
@@ -735,6 +846,8 @@ class NavNode(Node):
         self.pth = 0.0
         self._prev_odom = None
         self._prev_imu = None
+        self._loop_off = (0.0, 0.0, 0.0)   # fresh map -> no accumulated drift
+        self._scan_count = 0
         if self._trail is not None:
             self._trail.clear()
         self._occ_rev = -1     # force _write_map to recompute against the new grid

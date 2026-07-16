@@ -47,8 +47,9 @@ replaced by a repeat/cumsum ragged-index pass; bit-identical output, ~1.5x faste
 tricks (submaps, 2/4-bit cell packing, pose-graph pruning, static/dynamic split) and chose NOT
 to: our whole grid is ~0.9 MB (480² f32) on a ~970 MB board, so per-node Python overhead — not
 the map array — dominates RAM; bit-packing would *slow* numpy. We already avoid the gmapping
-particle-filter RAM blowup (single-pose correlative scan-to-map matcher). Real remaining gaps if
-ever needed: bounded/sparse grid (only if map grows much larger) + true loop closure (drift).
+ particle-filter RAM blowup (single-pose correlative scan-to-map matcher). Real remaining gaps if
+ever needed: bounded/sparse grid (only if map grows much larger). TRUE LOOP CLOSURE DONE 2026-07-16
+(see [[slam-loop-closure]]) — the correlative match is no longer only a local stand-in.
 
 **Full static review done 2026-06-21 (HEAD `e7cca93`):** no bugs found. Verified package
 wiring (setup.py console_script `nav_node` ↔ stack.sh launch/down/status; robot.yaml keys ↔
@@ -68,4 +69,13 @@ Full writeup + the still-OPEN suspension-polarity/autocal blocker → [[slam-map
 I cannot build/flash from the Windows dev host (colcon runs in the board's pixi env; pio in
 ~/pio-venv). (The "deferred big RAM wins" noted here — node consolidation and replacing
 rosbridge — were BOTH done since: sensor_hub/app_hub + the SSE gateway, see
-[[architecture-two-planes-three-hubs]].)
+[[architecture-two-planes-three-hubs]].
+
+**2026-07-16 (later same day): TRUE LOOP CLOSURE / drift correction added** — see
+[[slam-loop-closure]]. The accumulated map IS the keyframe store (no separate pose graph,
+kept RAM at ~48 B steady-state). Every `loop_probe_every` (50) scans nav_node re-matches the
+current scan against the map centered on the odometry-predicted (drifted) pose with a WIDE
+window; a strong match landing >`loop_min_shift` (0.3 m) from the corrected pose = a far
+re-visit = accumulated global drift, which is SMOOTHED into a persistent `_loop_off` (and the
+grid warped only once the per-event step exceeds `loop_apply_thresh`). On by default. Deployed
++ verified live (params confirmed via `ros2 param get`); HW drift-removal not yet driven.)
