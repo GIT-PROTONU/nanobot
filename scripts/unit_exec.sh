@@ -5,7 +5,7 @@
 # relaunches a crashed node natively, which replaced the old nano-heal.timer polling
 # (and its heal-vs-restart duplicate-node race).
 #
-#   scripts/unit_exec.sh {router|app|sensors|nav|map}
+#   scripts/unit_exec.sh {router|app|sensors|ekf|nav|map}
 #
 # Notes baked in from stack.sh's era:
 #  * Nodes are launched by their INSTALLED EXECUTABLES, not `ros2 run`/`ros2 launch` —
@@ -33,6 +33,7 @@ if [ -f "$NANO/install/setup.bash" ]; then
 fi
 
 PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/robot.yaml"
+EKF_PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/ekf.yaml"
 OWN="$NANO/install"
 LOGDIR="$NANO/.run"; mkdir -p "$LOGDIR"
 
@@ -75,6 +76,12 @@ PY
   sensors)  # imu + sys_monitor + wheel_odometry + lds in ONE process (see sensor_hub)
     exec "$OWN/sensor_hub/lib/sensor_hub/sensor_hub" --ros-args --params-file "$PARAMS"
     ;;
+  ekf)      # robot_localization EKF: fuses /odom (wheel encoders) + /imu/data (IMU)
+            # into a single filtered pose on /odometry/filtered + odom->base_link TF.
+            # Node name must match ekf.yaml's top-level key (ekf_node).
+    exec "$CONDA_PREFIX/lib/robot_localization/ekf_node" \
+      --ros-args -r __node:=ekf_node --params-file "$EKF_PARAMS"
+    ;;
   nav)
     exec "$OWN/slam_nav/lib/slam_nav/nav_node" --ros-args --params-file "$PARAMS"
     ;;
@@ -82,7 +89,7 @@ PY
     exec "$OWN/sim_hardware/bin/map_bridge_node" --ros-args --params-file "$PARAMS"
     ;;
   *)
-    echo "usage: $0 {router|app|sensors|nav|map}" >&2
+    echo "usage: $0 {router|app|sensors|ekf|nav|map}" >&2
     exit 2
     ;;
 esac

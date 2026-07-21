@@ -29,8 +29,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 
 ## Layout (`src/`)
 - `robot_msgs` — custom interfaces (ament_cmake).
-- `robot_bringup` — launch files + **the single config `config/robot.yaml`** (all
-  ports/pins/rates live here). `launch/bringup.launch.py` is the one node graph shared
+- `robot_bringup` — launch files + **the two configs `config/robot.yaml`** (all
+  ports/pins/rates) + **`config/ekf.yaml`** (robot_localization EKF: fuses
+  `/odom` + `/imu/data` → `/odometry/filtered` + `odom→base_link` TF).
+  `launch/bringup.launch.py` is the one node graph shared
   by the real robot and the Gazebo dev-sim (`sim:=true`/`rviz:=true` args) — see
   "Dev/prod ROS parity + Gazebo sim" below. Also holds the URDF (`urdf/nano.urdf.xacro`),
   the Gazebo world (`worlds/nano_room.sdf`), the `ros_gz_bridge` topic map
@@ -42,11 +44,13 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - `lds_driver` — **abandoned** Rust/r2r LDS node; does NOT build against this
   RoboStack. Kept for reference only. **Do not try to build it** (see below).
 - `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32, or from `sim_hardware` in
-  Gazebo dev-sim) into `/odom`+TF; no longer reads GPIO.
+  Gazebo dev-sim) into `/odom`; TF is published by the EKF (`publish_tf: false` here).
+  No longer reads GPIO.
 - `motor_control` — **retired** (PCA9685 path). The ESP32 owns `/cmd_vel`→motors;
   not launched by the systemd units/`bringup.launch.py`. Kept for the optional PCA9685
   LDS-spin/aux channels only.
-- `slam_nav` — super-light 2D SLAM (correlative scan-match on odom+IMU prior) +
+- `slam_nav` — super-light 2D SLAM (correlative scan-match on EKF-filtered odometry
+  `/odometry/filtered` + IMU yaw prior) +
   click-to-go nav (planner + pure pursuit, gated by `enable_motion`), pick-up freeze +
   lost-robot relocalization, LDS idle spin-down, the scripted **self-test** drive
   (IMU-vs-encoder cross-check), the clamped `trait_motion` caution mapping, and
@@ -180,8 +184,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   crash/restart independently.
 - `app_hub` — the same move for the expression/cognition layer: **runs `web_control` +
   `oled_display` + `behavior` (mood_node) in ONE process**. The board now runs exactly
-  **three node hubs matching the three fault domains** — `sensor_hub` (the body),
-  `slam_nav` (spatial), `app_hub` (expression/web/brain) — plus the zenoh router.
+  **four fault domains** — `sensor_hub` (the body), `ekf_node` (sensor fusion,
+  `robot_localization`, standalone C++ process, fuses `/odom` + `/imu/data` →
+  `/odometry/filtered` + `odom→base_link` TF), `slam_nav` (spatial, consumes
+  `/odometry/filtered`), `app_hub` (expression/web/brain) — plus the zenoh router.
   app_hub's main also preserves the OLED SIGTERM end-screen (restart/shutdown glyph).
 
 ## ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
@@ -266,16 +272,19 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   typed-nowhere contract between `telemetry.py` and `app.js`, and this is what catches
   a drift.
 - Run the stack: **`scripts/stack.sh {up|down|restart|status}`** — now a thin wrapper
-  over **systemd**. The stack is five units under **`nano-robot.target`**:
-  `nano-router` (zenohd-serial) → `nano-app` (app_hub = web+oled+behavior) /
-  `nano-sensors` (sensor_hub = imu+sys+odom+lds) / `nano-nav` (slam_nav) /
+  over **systemd**. The stack is six units under **`nano-robot.target`**:
+  `nano-router` (zenohd-serial) → `nano-sensors` (sensor_hub = imu+sys+odom+lds) →
+  `nano-ekf` (robot_localization: /odom+/imu/data→/odometry/filtered) →
+  `nano-nav` (slam_nav) → `nano-app` (app_hub = web+oled+behavior) /
   `nano-map` (map_bridge_node, `/dev/shm/nano_map.bin` → `/map` for a remote RViz).
   Ordering (`After=nano-router.service` + the router unit's ExecStartPost probe that
-  waits for :7447 to actually accept) encodes the rmw_zenoh island gotcha; **crash
-  recovery is `Restart=on-failure`**, and **hang recovery is the systemd watchdog**:
-  app/sensors/nav are `Type=notify` and pet `WATCHDOG=1` every 5 s from an *executor
-  timer* (`_sd_notify` in each main), so an alive-but-wedged executor (a stuck
-  callback) stops petting and gets restarted (`WatchdogSec=90`). Each unit also has a
+  waits for :7447 to actually accept) encodes the rmw_zenoh island gotcha; the EKF
+  starts after sensors (needs /odom + /imu/data); nav starts after the EKF (consumes
+  /odometry/filtered). **Crash recovery is `Restart=on-failure`**, and **hang recovery
+  is the systemd watchdog**: app/sensors/nav are `Type=notify` and pet `WATCHDOG=1`
+  every 5 s from an *executor timer* (`_sd_notify` in each main), so an alive-but-wedged
+  executor (a stuck callback) stops petting and gets restarted (`WatchdogSec=90`). The
+  EKF is `Type=simple` (stock rclcpp binary, no watchdog). Each unit also has a
   `MemoryMax` cap so a leak restarts that hub instead of waking the kernel OOM killer.
   (The old `nano-heal.timer` polling — and its heal-vs-restart duplicate-node race —
   is gone.)
@@ -298,7 +307,9 @@ There are now **two dev paths**, not one, serving different purposes:
 - **`scripts/sim_run.sh`** (Ubuntu/Linux dev PC, real ROS 2 via the SAME `pixi.toml`
   RoboStack env the board uses — `linux-64` is already one of its `platforms`) — runs
   the **exact same node graph** as the robot: `web_control`, `oled_display`,
-  `behavior/mood_node`, `sys_monitor`, `wheel_odometry`, `slam_nav` are all real,
+  `behavior/mood_node`, `sys_monitor`, `wheel_odometry`, `slam_nav`, and the
+  `robot_localization` EKF (config/ekf.yaml, fuses /odom + /imu/data →
+  /odometry/filtered) are all real,
   unmodified rclpy nodes. Only the lowest hardware-transducer layer differs: **Gazebo
   Sim** (`ros_gz_sim`, the modern actively-maintained "Ignition"-lineage simulator —
   `robostack-staging` doesn't cleanly ship classic `gazebo_ros_pkgs` for Humble, but does

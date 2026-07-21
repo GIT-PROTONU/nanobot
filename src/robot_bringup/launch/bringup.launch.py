@@ -58,8 +58,9 @@ def generate_launch_description():
         DeclareLaunchArgument("web", default_value="true",
                               description="Also start the web control page/gateway."),
         DeclareLaunchArgument("ekf", default_value="true",
-                              description="true = robot_localization EKF fuses wheel "
-                                          "odometry + IMU; false = raw wheel odometry only."),
+                               description="true = robot_localization EKF fuses wheel "
+                                           "odometry + IMU (standard, always-on on the robot); "
+                                           "false = raw wheel odometry only (debug)."),
 
         # ---- always: the shared node graph -----------------------------------------
         Node(package="wheel_odometry", executable="encoder_node",

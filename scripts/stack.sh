@@ -3,10 +3,11 @@
 #
 #   bash scripts/stack.sh {up|down|restart|status}     (no pixi env needed)
 #
-# The stack runs as five systemd units (installed by deploy/sbc-setup.sh):
+# The stack runs as six systemd units (installed by deploy/sbc-setup.sh):
 #   nano-router    serial-capable zenohd (rmw_zenoh graph + the ESP32 UART link)
 #   nano-app       app_hub: web_control + oled_display + behavior in ONE process
 #   nano-sensors   sensor_hub: imu + sys_monitor + wheel_odometry + lds in ONE process
+#   nano-ekf       robot_localization EKF: /odom + /imu/data -> /odometry/filtered
 #   nano-nav       slam_nav
 #   nano-map       map_bridge_node (/dev/shm map blob -> /map for remote RViz)
 # grouped under nano-robot.target. What each unit execs lives in ONE place:
@@ -23,7 +24,7 @@
 set -u
 
 TARGET="nano-robot.target"
-UNITS=(nano-router nano-app nano-sensors nano-nav nano-map)
+UNITS=(nano-router nano-app nano-sensors nano-ekf nano-nav nano-map)
 SYSTEMCTL="/usr/bin/systemctl"
 
 installed() { "$SYSTEMCTL" list-unit-files "$TARGET" --no-legend 2>/dev/null | grep -q nano-robot; }

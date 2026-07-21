@@ -26,15 +26,14 @@ lds_driver:
     range_max: 6.0            # metres
     publish_rate: 10.0        # Hz cap on /scan (motor ~5 Hz; lower = decimate)
 
-# ---- Wheel encoders -> odometry (nav_msgs/Odometry on /odom + TF) -----------
+# ---- Wheel encoders -> odometry (nav_msgs/Odometry on /odom) ---------------
 # Wheel ticks are counted on the ESP32 coprocessor and streamed as
 # std_msgs/Int64MultiArray on /wheel_ticks; this node only integrates. Wire/
 # direction fixes are #defines at the top of firmware/nanobot_coprocessor/src/main.cpp.
 #
-# NOTE: When robot_localization (the EKF node in ekf.yaml) is active, publish_tf
-# should be false — the EKF publishes odom -> base_link TF instead. slam_nav's
-# odom_topic should be changed from "odom" to "odometry/filtered" to consume the
-# EKF-fused state (see slam_nav section below).
+# TF is published by the EKF (robot_localization ekf_node, config/ekf.yaml), NOT
+# by this node — publish_tf is false so the EKF owns odom -> base_link. slam_nav
+# consumes the EKF-fused /odometry/filtered (see slam_nav section below).
 wheel_odometry:
   ros__parameters:
     ticks_topic: "wheel_ticks"  # from the ESP32 zenoh-pico coprocessor
@@ -43,23 +42,13 @@ wheel_odometry:
                               # check against measured travel, see docs/TODO.md)
     wheel_radius: 0.0335      # metres
     wheel_separation: 0.16    # metres between wheel contact points
-    invert_left: false        # SBC-side fallback (normally inverted on the ESP32)
+    invert_left: false
     invert_right: false
     publish_rate: 15.0        # Hz, odom publish rate (retunable live via web UI slider;
                                 # matches the ESP32's ~15 Hz /wheel_ticks cadence.
-                                # Raised from 10 Hz for the EKF: at 20 Hz, 15 Hz odom
-                                # gives a position correction on ~75% of filter steps
-                                # instead of only 50%. The EKF needs more corrections
-                                # than the old system since X/Y come from odom alone
-                                # (IMU owns yaw/vyaw). 15 Hz still keeps sensor_hub
-                                # executor wakeups low — one extra publish per 200ms
-                                # vs the old 10 Hz — and this node no longer publishes
-                                # TF (EKF does), so the per-tick cost dropped.)
-    publish_tf: false            # EKF publishes odom -> base_link TF with the fused
-                               # pose (IMU-corrected yaw). WARNING: if running without
-                               # the EKF (ekf:=false), set this to true AND change
-                               # slam_nav.odom_topic back to "odom" — otherwise the TF
-                               # tree is broken (no odom->base_link anywhere).
+                                # 15 Hz gives the EKF a position correction on ~75% of
+                                # filter steps at the default 15 Hz EKF rate.)
+    publish_tf: false           # EKF publishes odom -> base_link TF instead
     odom_frame: "odom"
     base_frame: "base_link"
 
@@ -88,18 +77,17 @@ motor_control:
     lds_motor_duty: 0.55
 
 # ---- 2D occupancy-grid SLAM (slam_nav) --------------------------------------
-# Builds a map from /scan with the pose = EKF-filtered odometry translation
-# (/odometry/filtered when robot_localization is active) + raw IMU yaw for the
-# rotation prior, refined by a correlative scan-to-map matcher.
+# Builds a map from /scan with the pose = EKF-filtered odometry
+# (/odometry/filtered) + raw IMU yaw for the rotation prior, refined by a
+# correlative scan-to-map matcher. The EKF (robot_localization ekf_node,
+# config/ekf.yaml) fuses wheel odometry + IMU into a single filtered state.
 # Writes /dev/shm/nano_map.bin for the web UI map panel.
 # All sizes/RAM scale with map_size_m / map_resolution: 24 m @ 0.05 m = 480x480
 # cells (~0.9 MB grid).
 slam_nav:
   ros__parameters:
     scan_topic: "scan"
-    odom_topic: "odometry/filtered"  # EKF-fused odometry (robot_localization).
-                                     # Change back to "odom" when running without
-                                     # the EKF (wheel_odometry's raw output).
+    odom_topic: "odometry/filtered"  # EKF-fused wheel odometry + IMU
     euler_topic: "imu/euler"         # /imu/euler vector.z = yaw in degrees
     map_size_m: 24.0                 # square map side, metres (whole-floor)
     map_resolution: 0.05           # metres/cell

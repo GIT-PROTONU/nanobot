@@ -1,0 +1,16 @@
+[Unit]
+Description=Nano EKF sensor fusion (robot_localization: /odom + /imu/data -> /odometry/filtered)
+After=nano-router.service nano-sensors.service
+Wants=nano-router.service nano-sensors.service
+PartOf=nano-robot.target
+
+[Service]
+Type=simple
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh ekf
+Restart=on-failure
+RestartSec=3
+MemoryMax=150M
+
+[Install]
+WantedBy=nano-robot.target

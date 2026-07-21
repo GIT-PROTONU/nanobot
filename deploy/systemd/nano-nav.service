@@ -1,7 +1,7 @@
 [Unit]
 Description=Nano SLAM/navigation (slam_nav)
-# After sensors so /scan + /odom are flowing when the matcher starts.
-After=nano-router.service nano-sensors.service
+# After ekf so /odometry/filtered is flowing when the matcher starts.
+After=nano-router.service nano-sensors.service nano-ekf.service
 Wants=nano-router.service
 PartOf=nano-robot.target
 

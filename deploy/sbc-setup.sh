@@ -130,7 +130,7 @@ systemctl disable --now nano-heal.timer nano-heal.service nano-stack.service 2>/
 rm -f /etc/systemd/system/nano-heal.timer /etc/systemd/system/nano-heal.service \
       /etc/systemd/system/nano-stack.service
 for unit in nano-robot.target nano-router.service nano-app.service \
-            nano-sensors.service nano-nav.service nano-map.service; do
+            nano-sensors.service nano-ekf.service nano-nav.service nano-map.service; do
   install -m 0644 "$HERE/systemd/$unit" "/etc/systemd/system/$unit"
   if [ "$USER_NAME" != ibster ]; then
     sed -i "s|ibster|$USER_NAME|g; s|/home/ibster|$(eval echo "~$USER_NAME")|g" \
@@ -139,7 +139,7 @@ for unit in nano-robot.target nano-router.service nano-app.service \
 done
 systemctl daemon-reload
 systemctl enable nano-robot.target nano-router.service nano-app.service \
-                 nano-sensors.service nano-nav.service nano-map.service
+                 nano-sensors.service nano-ekf.service nano-nav.service nano-map.service
 
 echo
 echo "Done. The stack auto-starts on boot; a crashed unit restarts itself (Restart=on-failure)."
