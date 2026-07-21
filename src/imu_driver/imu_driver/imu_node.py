@@ -264,6 +264,18 @@ class ImuNode(Node):
                                            # persists offset_{x,y,z}_mm + mount_{roll,
                                            # pitch,yaw}_deg across restarts once set
                                            # from the web UI
+            ("disable_gyro_autocal", True),  # write 0x0001 to register 0x63 to disable
+                                              # the BWT901CL's gyro auto-calibration.
+                                              # Without this, the gyro bias estimate drifts
+                                              # continuously, which can cause slow yaw
+                                              # wander in the robot_localization EKF.
+            ("axis6_mode", True),            # write 0x01 to register 0x24 to select
+                                              # 6-axis fusion (gyro+accel only, no
+                                              # magnetometer in yaw). The magnetometer
+                                              # near motors/LDS wiring can disturb yaw;
+                                              # 6-axis trades that for slow gyro bias
+                                              # drift instead, which slam_nav's scan
+                                              # matcher absorbs continuously.
         ])
         g = self.get_parameter
         self.frame_id = g("frame_id").value
@@ -329,6 +341,8 @@ class ImuNode(Node):
         self._prev_gyro = None          # for finite-differencing angular acceleration
         self._prev_gyro_t = None        # (only exercised while an offset is set)
         self._alpha = (0.0, 0.0, 0.0)   # last angular acceleration, rad/s^2
+        self._disable_gyro_autocal = bool(g("disable_gyro_autocal").value)
+        self._axis6_mode = bool(g("axis6_mode").value)
         self._next_pub = 0.0
         self._next_eul = 0.0
         self._next_mag = 0.0
@@ -418,6 +432,25 @@ class ImuNode(Node):
             if self.bandwidth_hz > 0:
                 bw = _bandwidth_code_for(self.bandwidth_hz)
                 self.ser.write(bytes((0xff, 0xaa, 0x1f, bw, 0x00)))  # set BANDWIDTH
+                time.sleep(0.05)
+            if self._disable_gyro_autocal:
+                # Disable gyro auto-calibration: write 0x0001 to register 0x63.
+                # The BWT901CL's gyro bias auto-calibration continuously adjusts the
+                # zero-rate offset while the sensor is still, which causes slow yaw
+                # wander during stationary periods — problematic for the
+                # robot_localization EKF (it interprets the drift as real rotation).
+                # This lock disables that adjustment so the gyro bias stays fixed
+                # once the device has settled after power-on.
+                self.ser.write(bytes((0xff, 0xaa, 0x63, 0x01, 0x00)))
+                time.sleep(0.05)
+            if self._axis6_mode:
+                # 6-axis fusion (register 0x24 = 0x01): gyro+accel only, no
+                # magnetometer in the yaw estimate. The BWT901CL's magnetometer
+                # near the LDS motor and wiring picks up magnetic interference
+                # that disturbs the fused heading; 6-axis mode eliminates that
+                # at the cost of slow gyro bias drift instead, which the scan
+                # matcher in slam_nav absorbs continuously.
+                self.ser.write(bytes((0xff, 0xaa, 0x24, 0x01, 0x00)))
                 time.sleep(0.05)
             self.ser.reset_input_buffer()
         except Exception as exc:

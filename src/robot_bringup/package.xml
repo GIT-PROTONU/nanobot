@@ -21,6 +21,8 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>xacro</exec_depend>
+  <!-- robot_localization EKF sensor fusion (wheel odometry + IMU). -->
+  <exec_depend>robot_localization</exec_depend>
   <!-- Dev-PC-only (sim:=true); not installed/available on the board (linux-aarch64);
        see pixi.toml's [target.linux-64.dependencies]. -->
   <exec_depend>sim_hardware</exec_depend>

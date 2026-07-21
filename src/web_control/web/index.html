@@ -685,6 +685,16 @@
                 <input id="trackDeadband" type="range" min="0" max="20" step="1" value="4"></div>
               <div class="field"><label>Min confidence to trust <span id="trackConfMinV">2</span>%</label>
                 <input id="trackConfMin" type="range" min="0" max="30" step="1" value="2"></div>
+              <div class="field"><label>Soft deadband edge <span id="trackDeadbandSoftV">4</span>%</label>
+                <input id="trackDeadbandSoft" type="range" min="0" max="20" step="1" value="4"></div>
+              <div class="field"><label>Full-authority confidence <span id="trackConfScaleV">10</span>%</label>
+                <input id="trackConfScale" type="range" min="0" max="50" step="1" value="10"></div>
+              <div class="field"><label>Coast on loss <span id="trackCoastV">0.20</span> s</label>
+                <input id="trackCoast" type="range" min="0" max="1" step="0.05" value="0.2"></div>
+              <div class="field"><label>Integral gain <span id="trackKiV">0.0</span></label>
+                <input id="trackKi" type="range" min="0" max="2" step="0.05" value="0"></div>
+              <div class="field"><label>Target feedforward <span id="trackKffV">0.5</span></label>
+                <input id="trackKff" type="range" min="0" max="2" step="0.05" value="0.5"></div>
             </div>
             <label class="switch"><input type="checkbox" id="visDarkAuto"><span class="track"></span>
               Dark reflex (auto-LED)</label>

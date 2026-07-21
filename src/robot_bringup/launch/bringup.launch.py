@@ -36,6 +36,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     bringup_share = get_package_share_directory("robot_bringup")
     params = os.path.join(bringup_share, "config", "robot.yaml")
+    ekf_params = os.path.join(bringup_share, "config", "ekf.yaml")
     xacro_path = os.path.join(bringup_share, "urdf", "nano.urdf.xacro")
     world_path = os.path.join(bringup_share, "worlds", "nano_room.sdf")
     bridge_config = os.path.join(bringup_share, "config", "gz_bridge.yaml")
@@ -44,6 +45,7 @@ def generate_launch_description():
     sim = LaunchConfiguration("sim")
     rviz = LaunchConfiguration("rviz")
     web = LaunchConfiguration("web")
+    ekf = LaunchConfiguration("ekf")
 
     robot_description = ParameterValue(Command(["xacro ", xacro_path]), value_type=str)
 
@@ -55,6 +57,9 @@ def generate_launch_description():
                               description="Also start RViz2 with the checked-in config."),
         DeclareLaunchArgument("web", default_value="true",
                               description="Also start the web control page/gateway."),
+        DeclareLaunchArgument("ekf", default_value="true",
+                              description="true = robot_localization EKF fuses wheel "
+                                          "odometry + IMU; false = raw wheel odometry only."),
 
         # ---- always: the shared node graph -----------------------------------------
         Node(package="wheel_odometry", executable="encoder_node",
@@ -74,6 +79,18 @@ def generate_launch_description():
         # (the web UI keeps reading the blob directly) -- useful on the real robot too.
         Node(package="sim_hardware", executable="map_bridge_node",
              name="map_bridge", output="screen"),
+
+        # ---- robot_localization EKF: sensor fusion between wheel odometry and IMU ----
+        # Fuses /odom (wheel encoders) + /imu/data (IMU orientation/gyro/accel) into a
+        # single filtered state on /odometry/filtered. The EKF also publishes the
+        # odom -> base_link TF, replacing wheel_odometry's own TF broadcast
+        # (wheel_odometry.publish_tf is set to false in robot.yaml when EKF is active).
+        # Standalone config in config/ekf.yaml.
+        Node(package="robot_localization", executable="ekf_node",
+             name="ekf_node",
+             parameters=[ekf_params],
+             output="screen",
+             condition=IfCondition(LaunchConfiguration("ekf"))),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([

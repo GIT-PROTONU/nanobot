@@ -23,6 +23,9 @@ CMAKE_GENERATOR = "Ninja"
 # --- ROS 2 Humble core (ros-base = no Rviz/Gazebo/GUI, keeps the footprint small) ---
 ros-humble-ros-base = "*"
 ros-humble-rmw-zenoh-cpp = "*"
+# robot_localization provides the EKF/UKF sensor-fusion filter that fuses wheel
+# odometry + IMU into a single filtered pose on /odometry/filtered.
+ros-humble-robot-localization = "*"
 # NOTE: rosbridge is GONE. The browser talks only to web_control's own HTTP server
 # (SSE /telemetry + POST /publish|/param|/drive) — see web_control/telemetry.py.
 # common_interfaces (sensor_msgs/nav_msgs/geometry_msgs) + tf2 ship with ros-base.

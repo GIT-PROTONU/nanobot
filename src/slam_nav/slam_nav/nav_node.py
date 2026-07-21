@@ -157,8 +157,34 @@ class NavNode(Node):
                                             # produce -- this, not P/D gain, is what fixes fine
                                             # centering/overshoot right at the setpoint.
             ("track_deadband", 0.04),      # normalized x-error within this = centered, don't turn
+            ("track_deadband_soft", 0.04), # normalized x: width of the LINEAR taper just outside
+                                            # track_deadband -- eff_err ramps from 0 at |err|=deadband
+                                            # to err at |err|=deadband+soft, replacing the hard
+                                            # bang-in/out at the deadband edge with a smooth blend.
+                                            # 0 = original hard edge.
             ("track_conf_min", 0.02),      # ignore target reports below this confidence
+            ("track_conf_scale", 0.10),    # confidence at/above which the FULL P/D authority is
+                                            # applied; below it the output scales down linearly
+                                            # (conf/track_conf_scale) so a weak/noisy lock can't
+                                            # yank the robot. 0 = ignore confidence scaling.
             ("track_timeout", 0.6),      # s: no fresh vision-state past this -> stop turning
+            ("track_coast", 0.2),         # s: hold the last commanded w with exponential decay
+                                            # across a transient target loss (a None frame or a
+                                            # sub-conf dip), then stop. Eliminates the stop-start
+                                            # jerk a brief occlusion used to cause with a hard
+                                            # send(0,0) per lost frame. 0 = original hard stop.
+            ("track_ki", 0.0),            # integral gain (OPT-IN): rad/s of steady-state correction
+                                            # per (unit-x * s) of accumulated err. 0 = off (default
+                                            # -- preserves prior PD behaviour); a small value
+                                            # (~0.3) cancels steady-state offset from camera
+                                            # misalignment or stiction bias. Anti-windup: only
+                                            # accumulates outside the deadband + when not saturated,
+                                            # bounded so its max contribution is track_max_ang/2.
+            ("track_kff", 0.5),           # target-velocity feedforward: rad/s commanded per
+                                            # normalized-x/s of target motion. Predictive lead for a
+                                            # moving target -- the robot starts turning before the
+                                            # visual error grows. EMA-smoothed dx/dt over the last
+                                            # few /vision/state samples. 0 = pure reactive.
             # --- true loop closure (drift correction, lowest-impact variant) ---
             # The accumulated map IS the keyframe store, so no separate pose graph is
             # kept. Every `loop_probe_every` scans we re-match the current scan against
@@ -224,8 +250,13 @@ class NavNode(Node):
         self.track_max_ang = float(g("track_max_ang").value)
         self.track_min_eff_ang = float(g("track_min_eff_ang").value)
         self.track_deadband = float(g("track_deadband").value)
+        self.track_deadband_soft = float(g("track_deadband_soft").value)
         self.track_conf_min = float(g("track_conf_min").value)
+        self.track_conf_scale = float(g("track_conf_scale").value)
         self.track_timeout = float(g("track_timeout").value)
+        self.track_coast = float(g("track_coast").value)
+        self.track_ki = float(g("track_ki").value)
+        self.track_kff = float(g("track_kff").value)
         # loop closure (drift correction)
         self.loop_closure = bool(g("loop_closure").value)
         self.loop_probe_every = int(max(1, g("loop_probe_every").value))
@@ -245,6 +276,12 @@ class NavNode(Node):
         self._track_prev_yaw = None    # last _imu_yaw sampled by _track_step, for the
         self._track_prev_yaw_t = 0.0   # yaw-rate damping term (see track_kd)
         self._track_pulse_acc = 0.0    # sub-floor time-dither accumulator (see track_min_eff_ang)
+        self._track_int = 0.0          # integral accumulator (see track_ki)
+        self._track_last_w = 0.0       # last commanded angular rate, for coast-on-loss (track_coast)
+        self._track_prev_x = None      # last valid target x, for the x-rate feedforward estimate
+        self._track_prev_x_t = 0.0
+        self._track_prev_t = 0.0       # last _track_step call time (dt for the integral term)
+        self._track_x_rate = 0.0       # EMA-smoothed target x velocity (norm-x/s, for track_kff)
 
         # extras
         self.map_store = str(g("map_store").value)
@@ -443,6 +480,14 @@ class NavNode(Node):
                     self._publish_path()
                 else:
                     self._send(0.0, 0.0)     # drop to a stop the moment it's disabled
+                    # clear tracking state so a re-enable starts clean (no stale
+                    # coast/integral/feedforward carries over)
+                    self._track_int = 0.0
+                    self._track_last_w = 0.0
+                    self._track_prev_x = None
+                    self._track_prev_x_t = 0.0
+                    self._track_x_rate = 0.0
+                    self._track_pulse_acc = 0.0
             elif p.name == "track_kp":
                 self.track_kp = float(p.value)
             elif p.name == "track_kd":
@@ -453,10 +498,20 @@ class NavNode(Node):
                 self.track_min_eff_ang = float(p.value)
             elif p.name == "track_deadband":
                 self.track_deadband = float(p.value)
+            elif p.name == "track_deadband_soft":
+                self.track_deadband_soft = float(p.value)
             elif p.name == "track_conf_min":
                 self.track_conf_min = float(p.value)
+            elif p.name == "track_conf_scale":
+                self.track_conf_scale = float(p.value)
             elif p.name == "track_timeout":
                 self.track_timeout = float(p.value)
+            elif p.name == "track_coast":
+                self.track_coast = float(p.value)
+            elif p.name == "track_ki":
+                self.track_ki = float(p.value)
+            elif p.name == "track_kff":
+                self.track_kff = float(p.value)
             elif p.name == "loop_closure":
                 self.loop_closure = bool(p.value)
             elif p.name == "loop_probe_every":
@@ -1063,7 +1118,30 @@ class NavNode(Node):
         average out to the desired slow rate (a delta-sigma / PWM-style modulator).
         Also raised track_max_ang's default+ceiling: since duty barely rises across the
         whole range, a much higher cap costs little and lets the robot slew far faster
-        toward a quick-moving target instead of being capped at 0.8 rad/s for free."""
+        toward a quick-moving target instead of being capped at 0.8 rad/s for free.
+
+        2026-07-21 refinement (smoother + more accurate tracking, additive on top of
+        the PD + age-taper + stiction-dither above):
+          * SMOOTH DEADBAND (track_deadband_soft): eff_err linearly ramps from 0 at
+            |err|=deadband to err at |err|=deadband+soft, replacing the hard
+            bang-in/out at the deadband edge (a classic limit cycle: enter -> stop ->
+            drift/jitter out -> snap a turn -> re-enter -> ...) with a smooth blend.
+          * COAST ON LOSS (track_coast): a transient target loss (a None frame, a
+            sub-conf dip) used to fire a hard send(0,0) and jerk the robot to a dead
+            stop every time. Now the last commanded w is held with exponential decay
+            for track_coast seconds before stopping -- a brief occlusion costs a
+            gentle coast, not a stop-start stutter.
+          * INTEGRAL (track_ki, opt-in/default 0): anti-windup (conditional + clamped,
+            max contribution track_max_ang/2) cancels steady-state offset from camera
+            misalignment or stiction bias. Off by default so existing tuned behaviour
+            is unchanged until the user opts in.
+          * TARGET-VELOCITY FEEDFORWARD (track_kff): EMA-smoothed dx/dt of the target's
+            normalized x gives predictive lead -- the robot starts turning BEFORE the
+            visual error grows, so a moving target is followed smoothly instead of
+            always lagging by one P-reactive step.
+          * CONFIDENCE-SCALED AUTHORITY (track_conf_scale): output is scaled by
+            min(1, conf/track_conf_scale) so a weak/noisy lock can't yank the robot
+            at full P-gain; full authority is restored once conf >= track_conf_scale."""
         # Yaw-rate estimate for the damping term below -- computed every call (even on
         # early-return paths) so the derivative stays continuous across gaps instead of
         # spiking after target loss / a disable-then-reenable.
@@ -1074,29 +1152,105 @@ class NavNode(Node):
             if dt > 0:
                 yaw_rate = _wrap(yaw - self._track_prev_yaw) / dt
         self._track_prev_yaw, self._track_prev_yaw_t = yaw, now
-
-        if self._target is None:
-            self._track_pulse_acc = 0.0
-            self._send(0.0, 0.0)
-            return
+    
+        # Loop dt for the integral term (fallback to the nominal control period if the
+        # gap is implausible -- e.g. the first call after a long disable).
+        dt_loop = now - self._track_prev_t
+        self._track_prev_t = now
+        if not (0.0 < dt_loop < 1.0):
+            dt_loop = 0.1
+    
         age = now - self._target_t
-        if age > self.track_timeout:
+        tgt = self._target
+        conf = tgt[2] if tgt is not None else 0.0
+        valid = (tgt is not None) and (age <= self.track_timeout) and (conf >= self.track_conf_min)
+    
+        # --- target-velocity feedforward (EMA-smoothed dx/dt of target x) ---
+        # Only updated from fresh valid samples so a momentary loss can't inject a
+        # spike; decays toward zero while invalid so the FF term doesn't keep shoving
+        # the robot once the lock is actually gone.
+        if valid:
+            if self._track_prev_x is not None and self._track_prev_x_t > 0.0:
+                dtv = now - self._track_prev_x_t
+                if 0.0 < dtv < 0.5:
+                    inst = (tgt[0] - self._track_prev_x) / dtv
+                    a = 0.5
+                    self._track_x_rate = (1.0 - a) * self._track_x_rate + a * inst
+            self._track_prev_x, self._track_prev_x_t = tgt[0], now
+        else:
+            self._track_x_rate *= 0.8
+    
+        # --- target loss / stale / low-conf: coast with exponential decay, then stop ---
+        # (track_coast). A hard send(0,0) on every transient None frame used to stutter
+        # the robot stop-start through brief occlusions.
+        if not valid:
             self._track_pulse_acc = 0.0
+            self._track_int *= 0.7      # bleed the integral so it can't slam on return
+            since = now - self._target_t
+            if self._track_last_w != 0.0 and since < self.track_coast:
+                decay = max(0.0, 1.0 - since / self.track_coast)
+                self._send(0.0, self._track_last_w * decay)
+                return
+            self._track_last_w = 0.0
             self._send(0.0, 0.0)
             return
-        x, _y, conf = self._target
-        if conf < self.track_conf_min:
-            self._track_pulse_acc = 0.0
-            self._send(0.0, 0.0)
-            return
+    
+        x, _y, conf = tgt
         err = x - 0.5
-        if abs(err) < self.track_deadband:
+        aerr = abs(err)
+    
+        # --- smooth deadband: full stop inside deadband, linear taper just outside ---
+        # (track_deadband_soft). Replaces the hard bang-in/out at the deadband edge.
+        db = self.track_deadband
+        dbs = self.track_deadband_soft
+        if aerr < db:
             self._track_pulse_acc = 0.0
+            # bleed the integral while centered so it can't wind up against the
+            # deadband; a partial bleed (not a hard zero) keeps it smooth if the
+            # target oscillates in/out of the deadband.
+            self._track_int *= 0.5
+            self._track_last_w = 0.0
             self._send(0.0, 0.0)
             return
+        if dbs > 0.0 and aerr < db + dbs:
+            eff_err = err * (aerr - db) / dbs
+        else:
+            eff_err = err
+    
         fresh = max(0.0, 1.0 - age / self.track_timeout)   # 1 on a brand-new sample -> 0 at track_timeout
-        w_raw = -self.track_kp * err - self.track_kd * yaw_rate   # P on vision error, D braking on actual spin
-        w = fresh * max(-self.track_max_ang, min(self.track_max_ang, w_raw))
+    
+        # --- integral term with anti-windup (conditional + clamped) ---
+        # Opt-in via track_ki > 0. Bounded so its max contribution is track_max_ang/2
+        # -- never enough to dominate the P term. Cleared/bled on deadband + target loss
+        # (above) so it can't wind up against a constraint.
+        if self.track_ki > 0.0:
+            self._track_int += eff_err * dt_loop
+            int_max = (self.track_max_ang * 0.5) / self.track_ki
+            if self._track_int > int_max:
+                self._track_int = int_max
+            elif self._track_int < -int_max:
+                self._track_int = -int_max
+        else:
+            self._track_int = 0.0
+    
+        # --- control law: P on (smoothed) vision error + I (steady-state offset) +
+        #     D braking on the robot's OWN measured spin + FF on the target's motion ---
+        w_raw = (
+            -self.track_kp * eff_err
+            - self.track_ki * self._track_int
+            - self.track_kd * yaw_rate
+            - self.track_kff * self._track_x_rate
+        )
+    
+        # confidence-scaled authority: weak lock -> cautious output (avoids the robot
+        # yanking hard on a one-pixel/low-conf false lock). At conf >= track_conf_scale
+        # the full P/D authority is restored. track_conf_scale=0 disables scaling.
+        if self.track_conf_scale > 0.0:
+            conf_scale = max(0.0, min(1.0, conf / self.track_conf_scale))
+        else:
+            conf_scale = 1.0
+        w = conf_scale * fresh * max(-self.track_max_ang, min(self.track_max_ang, w_raw))
+    
         if 0.0 < abs(w) < self.track_min_eff_ang:
             # Below the hardware's reliable-motion floor -- fire a fixed-magnitude pulse
             # only often enough (in time) to average out to the desired slow rate.
@@ -1108,6 +1262,7 @@ class NavNode(Node):
                 w = 0.0
         else:
             self._track_pulse_acc = 0.0
+        self._track_last_w = w
         self._send(0.0, w)
 
     def _set_face(self, mood):

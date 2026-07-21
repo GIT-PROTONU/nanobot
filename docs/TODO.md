@@ -18,8 +18,13 @@ left needs the physical robot and can't be closed from a dev host.
       bandwidth filter / interference self-test** (2026-07-16) — then re-run the
       self-test SPIN check to test the magnetometer-interference hypothesis
       (`selftest-spin-imu-mismatch` memory, still OPEN).
-- [ ] **Hardware-verify vision target tracking** (2026-07-16, pan-only) — needs a
-      calibrated colour target + `enable_motion` + `track_enable`.
+- [ ] **Hardware-verify vision target tracking** (2026-07-16 pan-only PD loop +
+      2026-07-21 refinement: smooth deadband / coast-on-loss / integral /
+      feedforward / confidence-scaled authority) — needs a calibrated colour target +
+      `enable_motion` + `track_enable`. Check: turn-direction sign, does the smooth
+      deadband kill the limit cycle, does coast-on-loss feel right vs. hard stop, does
+      `track_kff` follow a moving target without overshoot, does `track_ki` cancel
+      steady offset without windup.
 - [ ] **wheel_odometry: verify `ticks_per_rev: 1440` against measured travel.** The
       comment already correctly says single-channel rising-edge (not quadrature); the
       true counts/rev can only be confirmed by driving a measured distance on the

@@ -880,6 +880,16 @@ $("trackDeadband").oninput=()=>$("trackDeadbandV").textContent=$("trackDeadband"
 $("trackDeadband").onchange=()=>setParam("slam_nav","track_deadband",Number($("trackDeadband").value)/100);
 $("trackConfMin").oninput=()=>$("trackConfMinV").textContent=$("trackConfMin").value;
 $("trackConfMin").onchange=()=>setParam("slam_nav","track_conf_min",Number($("trackConfMin").value)/100);
+$("trackDeadbandSoft").oninput=()=>$("trackDeadbandSoftV").textContent=$("trackDeadbandSoft").value;
+$("trackDeadbandSoft").onchange=()=>setParam("slam_nav","track_deadband_soft",Number($("trackDeadbandSoft").value)/100);
+$("trackConfScale").oninput=()=>$("trackConfScaleV").textContent=$("trackConfScale").value;
+$("trackConfScale").onchange=()=>setParam("slam_nav","track_conf_scale",Number($("trackConfScale").value)/100);
+$("trackCoast").oninput=()=>$("trackCoastV").textContent=Number($("trackCoast").value).toFixed(2);
+$("trackCoast").onchange=()=>setParam("slam_nav","track_coast",Number($("trackCoast").value));
+$("trackKi").oninput=()=>$("trackKiV").textContent=Number($("trackKi").value).toFixed(1);
+$("trackKi").onchange=()=>setParam("slam_nav","track_ki",Number($("trackKi").value));
+$("trackKff").oninput=()=>$("trackKffV").textContent=Number($("trackKff").value).toFixed(2);
+$("trackKff").onchange=()=>setParam("slam_nav","track_kff",Number($("trackKff").value));
 
 $("visionAlertsToggle").onclick=()=>{
   const box=$("visionAlertsTune"), open=box.style.display!=="block";

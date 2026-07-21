@@ -52,7 +52,16 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (IMU-vs-encoder cross-check), the clamped `trait_motion` caution mapping, and
   **pan-only vision target tracking** (2026-07-16, not hw-verified: `track_*` params,
   turns in place to center the GPU-vision colour blob from `/vision/state`; wins over
-  goal-follow/explore while on, still yields to pick-up/self-test/relocalize).
+  goal-follow/explore while on, still yields to pick-up/self-test/relocalize.
+  2026-07-21 refinement for smoother + more accurate tracking: a **smooth deadband**
+  (`track_deadband_soft`, linear taper at the deadband edge — kills limit-cycle
+  bang-in/out), **coast on transient loss** (`track_coast`, holds the last `w` with
+  exponential decay through a None/sub-conf frame instead of a hard stop-start),
+  **integral term** (`track_ki`, opt-in/default 0, anti-windup — cancels steady-state
+  offset), **target-velocity feedforward** (`track_kff`, EMA-smoothed `dx/dt` —
+  predictive lead for a moving target), and **confidence-scaled authority**
+  (`track_conf_scale`, weak lock = cautious output). All five are live-tunable from the
+  Camera tab's "▸ Tracking tuning" expandable.)
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
   `imu_driver` also wires the **WitMotion accel/mag calibration** (2026-07-16, not
   hw-verified: `/imu_calibrate` String cmds `accel|mag_start|mag_stop|save` executed

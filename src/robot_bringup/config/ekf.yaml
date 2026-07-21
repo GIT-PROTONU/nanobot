@@ -1,0 +1,98 @@
+# EKF configuration for robot_localization.
+# Fuses wheel odometry (/odom) + IMU (/imu/data) into a single filtered pose
+# published on /odometry/filtered. Also publishes odom -> base_link TF.
+#
+# The EKF runs in 2D mode (two_d_mode: true): Z, roll, pitch, and their derivatives
+# are constrained to zero. The state vector is the standard 15D:
+#   [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, Vroll, Vpitch, Vyaw, Ax, Ay, Az]
+#
+# Fusion strategy:
+#   Wheel odometry provides X, Y (position from encoder integration) and Vx
+#     (forward velocity). Its yaw/vyaw are deliberately NOT used — the single-channel
+#     encoders sign ticks by commanded direction, so heading drifts from wheel slip,
+#     and feeding that into the filter would fight the IMU.
+#   IMU provides absolute yaw (from orientation quaternion), yaw velocity (gyro Z),
+#     and linear acceleration X, Y (helps the filter predict between odom updates).
+#   IMU's roll/pitch are NOT used (2D mode zeros them); Z, Vz, Az are not used.
+#   Yaw is dominated by the IMU (more reliable than wheel-slip-prone odometry heading).
+#
+# Process noise: X/Y position noise (0.05) is moderate — the encoders are decent
+# over short distances. Yaw noise (0.06) is deliberately higher so the filter
+# weights the IMU's yaw over the prediction model. Velocity/acceleration noise
+# (0.01) is tight; the filter should trust the integrated IMU gyro between updates.
+#
+# Frequency: 15 Hz — matches the wheel odometry rate exactly, so EVERY EKF
+# step gets a wheel-odometry position correction (zero prediction-only steps,
+# the most efficient use of CPU on this 1 GB board). IMU gyro data arrives at
+# ~3 samples per step for smooth yaw prediction between corrections. TF at
+# 15 Hz = 10mm max step at 0.15 m/s, well under the scan-match search window
+# (100mm). Higher EKF rates give negligible quality benefit but cost ~1x
+# extra CPU per +10 Hz. Bump to 20 Hz on a bigger machine.
+#
+# See: http://docs.ros.org/en/humble/Tutorials/Advanced/Using-robot-localization.html
+ekf_node:
+  ros__parameters:
+frequency: 15.0                # Hz. 15 Hz = odom rate -> every EKF step has a
+                                    # full measurement update (zero prediction-only steps).
+                                    # IMU at 50 Hz provides ~3 gyro samples per step.
+    sensor_timeout: 0.1            # s; extrapolate if a sensor is this stale
+    two_d_mode: true               # ground robot: Z, roll, pitch stay zero
+    publish_tf: true               # publish odom -> base_link transform
+    publish_acceleration: false    # don't publish acceleration in /odometry/filtered
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom              # EKF estimates pose in the odom frame
+
+    # ---- Wheel odometry input (/odom from wheel_odometry) --------
+    # Provides: X, Y (encoder position), Vx (forward velocity).
+    # Yaw/yaw-velocity are deliberately excluded: the single-channel encoders sign
+    # ticks by commanded direction, so the heading from wheel odometry drifts with
+    # slip. The IMU provides the absolute yaw (see imu0 below).
+    odom0: /odom
+    odom0_config: [true,  true,  false,   # X, Y, Z
+                   false, false, false,   # roll, pitch, yaw — IMU provides yaw
+                   true,  false, false,   # Vx, Vy, Vz
+                   false, false, false,   # Vroll, Vpitch, Vyaw — IMU gyro provides vyaw
+                   false, false, false]   # Ax, Ay, Az
+    odom0_queue_size: 10
+    odom0_nodelay: true
+    odom0_differential: false       # wheel odom provides absolute pose in odom frame
+    odom0_relative: false
+
+    # ---- IMU input (/imu/data from imu_driver) -------------------
+    # Provides: absolute yaw (from orientation quat), yaw velocity (gyro Z),
+    #           linear acceleration X, Y (for smooth prediction between odom ticks)
+    imu0: /imu/data
+    imu0_config: [false, false, false,   # X, Y, Z
+                  false, false, true,    # roll, pitch, yaw
+                  false, false, false,   # Vx, Vy, Vz
+                  false, false, true,    # Vroll, Vpitch, Vyaw
+                  true,  true,  false]   # Ax, Ay, Az
+    imu0_queue_size: 10
+    imu0_nodelay: true
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: true  # IMU reports total accel; EKF
+                                                   # removes gravity internally
+
+    # ---- Process noise covariance (tuned for this platform) ------
+    # Diagonal of the 15x15 process noise covariance matrix Q.
+    # Higher = more trust in measurements (filter responds faster).
+    # Lower = smoother but laggier output.
+    # Order matches the state vector above.
+    process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                               0,    0.05, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0.06, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0.03, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0.03, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0.06, 0,    0,    0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0.01, 0,    0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,    0.01, 0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,    0,    0.01, 0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,    0,    0,    0.01, 0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0.01, 0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0.01, 0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0.01, 0,    0,
+                               0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0.01, 0,
+                               0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0.01]

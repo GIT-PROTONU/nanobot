@@ -30,6 +30,11 @@ lds_driver:
 # Wheel ticks are counted on the ESP32 coprocessor and streamed as
 # std_msgs/Int64MultiArray on /wheel_ticks; this node only integrates. Wire/
 # direction fixes are #defines at the top of firmware/nanobot_coprocessor/src/main.cpp.
+#
+# NOTE: When robot_localization (the EKF node in ekf.yaml) is active, publish_tf
+# should be false — the EKF publishes odom -> base_link TF instead. slam_nav's
+# odom_topic should be changed from "odom" to "odometry/filtered" to consume the
+# EKF-fused state (see slam_nav section below).
 wheel_odometry:
   ros__parameters:
     ticks_topic: "wheel_ticks"  # from the ESP32 zenoh-pico coprocessor
@@ -40,10 +45,21 @@ wheel_odometry:
     wheel_separation: 0.16    # metres between wheel contact points
     invert_left: false        # SBC-side fallback (normally inverted on the ESP32)
     invert_right: false
-    publish_rate: 10.0        # Hz, odom/TF publish rate (retunable live via web UI slider;
-                               # matches slam_nav's control_rate, was 15 — cuts executor
-                               # wakeups in sensor_hub/slam_nav/app_hub with no functional loss)
-    publish_tf: true
+    publish_rate: 15.0        # Hz, odom publish rate (retunable live via web UI slider;
+                                # matches the ESP32's ~15 Hz /wheel_ticks cadence.
+                                # Raised from 10 Hz for the EKF: at 20 Hz, 15 Hz odom
+                                # gives a position correction on ~75% of filter steps
+                                # instead of only 50%. The EKF needs more corrections
+                                # than the old system since X/Y come from odom alone
+                                # (IMU owns yaw/vyaw). 15 Hz still keeps sensor_hub
+                                # executor wakeups low — one extra publish per 200ms
+                                # vs the old 10 Hz — and this node no longer publishes
+                                # TF (EKF does), so the per-tick cost dropped.)
+    publish_tf: false            # EKF publishes odom -> base_link TF with the fused
+                               # pose (IMU-corrected yaw). WARNING: if running without
+                               # the EKF (ekf:=false), set this to true AND change
+                               # slam_nav.odom_topic back to "odom" — otherwise the TF
+                               # tree is broken (no odom->base_link anywhere).
     odom_frame: "odom"
     base_frame: "base_link"
 
@@ -72,16 +88,20 @@ motor_control:
     lds_motor_duty: 0.55
 
 # ---- 2D occupancy-grid SLAM (slam_nav) --------------------------------------
-# Builds a map from /scan with the pose = wheel odom translation + IMU yaw,
-# refined by a correlative scan-to-map matcher. Writes /dev/shm/nano_map.bin for
-# the web UI map panel. Stage 1 = mapping only (no motion). All sizes/RAM scale
-# with map_size_m / map_resolution: 24 m @ 0.05 m = 480x480 cells (~0.9 MB grid).
+# Builds a map from /scan with the pose = EKF-filtered odometry translation
+# (/odometry/filtered when robot_localization is active) + raw IMU yaw for the
+# rotation prior, refined by a correlative scan-to-map matcher.
+# Writes /dev/shm/nano_map.bin for the web UI map panel.
+# All sizes/RAM scale with map_size_m / map_resolution: 24 m @ 0.05 m = 480x480
+# cells (~0.9 MB grid).
 slam_nav:
   ros__parameters:
     scan_topic: "scan"
-    odom_topic: "odom"
-    euler_topic: "imu/euler"       # /imu/euler vector.z = yaw in degrees
-    map_size_m: 24.0               # square map side, metres (whole-floor)
+    odom_topic: "odometry/filtered"  # EKF-fused odometry (robot_localization).
+                                     # Change back to "odom" when running without
+                                     # the EKF (wheel_odometry's raw output).
+    euler_topic: "imu/euler"         # /imu/euler vector.z = yaw in degrees
+    map_size_m: 24.0                 # square map side, metres (whole-floor)
     map_resolution: 0.05           # metres/cell
     range_min: 0.12
     range_max: 6.0
@@ -89,7 +109,12 @@ slam_nav:
     match_ang: 0.12                # scan-match search half-window (rad)
     match_points: 90               # scan beams used for matching (decimated)
     min_match_score: 1.0           # reject matches with no real map overlap
-    use_imu_yaw: true              # IMU yaw delta for rotation (vs wheel odom)
+    use_imu_yaw: true              # IMU yaw delta for the rotation prior. With the EKF
+                                # providing an IMU-corrected baseline yaw in /odometry/
+                                # filtered, the raw IMU delta from /imu/euler is more
+                                # reliable than ever — the scan matcher's yaw window
+                                # (match_ang: 0.12 rad) could potentially be tightened
+                                # (e.g. 0.08) once yaw tracking is verified on hardware.
     # Parked = skip: when odom AND IMU both say the robot hasn't moved since the last
     # processed scan, skip the scan-match + map-integrate (the bulk of parked idle
     # CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
@@ -193,8 +218,32 @@ slam_nav:
                                     # floor pulses instead of asking for a rate the hardware
                                     # can't produce (2026-07-16 4th finding)
     track_deadband: 0.04           # normalized x-error within this = already centered, don't turn
+    track_deadband_soft: 0.04      # normalized x: width of the LINEAR taper just outside
+                                    # track_deadband. eff_err ramps from 0 at |err|=deadband to err
+                                    # at |err|=deadband+soft -- replaces the hard bang-in/out at the
+                                    # deadband edge (a classic limit cycle: enter -> stop -> drift
+                                    # out -> snap a turn -> re-enter) with a smooth blend. 0 = hard.
     track_conf_min: 0.02           # ignore target reports below this confidence (too small/noisy)
+    track_conf_scale: 0.10         # confidence at/above which the FULL P/D authority is applied;
+                                    # below it the output scales down linearly (conf/track_conf_scale)
+                                    # so a weak/noisy lock can't yank the robot. 0 = ignore scaling.
     track_timeout: 0.6             # s: no fresh target/vision-state past this -> stop turning
+    track_coast: 0.2               # s: hold the last commanded w with exponential decay across a
+                                    # transient target loss (a None frame or a sub-conf dip), then
+                                    # stop. Eliminates the stop-start jerk a brief occlusion used to
+                                    # cause with a hard send(0,0) per lost frame. 0 = hard stop.
+    track_ki: 0.0                  # integral gain (OPT-IN): rad/s of steady-state correction per
+                                    # (unit-x * s) of accumulated err. 0 = off (default -- preserves
+                                    # the prior PD behaviour); a small value (~0.3) cancels steady-
+                                    # state offset from camera misalignment or stiction bias. Anti-
+                                    # windup: only accumulates outside the deadband + when not
+                                    # saturated, bounded so its max contribution is track_max_ang/2.
+    track_kff: 0.5                 # target-velocity feedforward: rad/s commanded per normalized-x/s
+                                    # of target motion. Predictive lead -- the robot starts turning
+                                    # before the visual error grows, so a moving target is followed
+                                    # smoothly instead of always lagging by one P-reactive step.
+                                    # EMA-smoothed dx/dt over the last few /vision/state samples.
+                                    # 0 = pure reactive.
     # --- true loop closure (drift correction; lowest-impact variant) ---
     # The accumulated map IS the keyframe store (no separate pose graph). Every
     # loop_probe_every scans the current scan is re-matched against the map centered on
@@ -241,13 +290,19 @@ imu_driver:
     port: "/dev/imu"          # stable udev symlink (CH340 by VID:PID, any USB port)
     baud: 115200              # BWT901CL is fixed at 115200
     frame_id: "imu_link"
-    publish_rate: 1.0         # Hz; /imu/data rate (slider 1..200; raise live for tuning).
-                              # The device stream rate auto-follows this (1 Hz = minimal
-                              # CPU/serial load; also caps euler/web/mag output below).
-    euler_rate: 5.0           # Hz; /imu/euler only feeds the web angle display (via the
-                              # vitals blob, not the raw topic) — sys_monitor is the only
-                              # subscriber and just wants the freshest sample, so this only
-                              # matters as a cap if publish_rate is ever raised live
+    publish_rate: 50.0        # Hz; /imu/data rate. Raised for the robot_localization
+                              # EKF (20 Hz): at 50 Hz the IMU gyro arrives >2x per EKF
+                              # step, so every prediction gets fresh gyro data for smooth
+                              # yaw integration between wheel odometry ticks (100 ms).
+                              # Cost is negligible (~1.6 KB/s serial, ~200 frame
+                              # parses/sec). Device auto-follows (50 Hz via code 0x08).
+                              # Live-tunable via web UI slider (1..200).
+    euler_rate: 50.0          # Hz; /imu/euler feeds BOTH slam_nav's yaw-delta rotation
+                              # prior (use_imu_yaw: true) AND the web angle display.
+                              # Raised to match publish_rate so every scan-match cycle
+                              # (every ~100ms at 300 RPM LDS) sees a fresh IMU yaw
+                              # instead of a possibly 200ms-stale one. This also keeps
+                              # the EKF's IMU and slam_nav's yaw deltas in lockstep.
     mag_rate: 10.0            # Hz; /imu/mag is slow-moving + unused by the UI
     web_rate: 5.0             # Hz; /imu/web (|accel|,|gyro|,rate) summary — same story as
                               # euler_rate above, sys_monitor-only, no raw-topic UI reader
@@ -282,6 +337,20 @@ imu_driver:
     # ~/.local/state/nanobot/imu_mount.json) and wins over the values above on the
     # next start, same "outlives a restart" contract as tts_settings_path.
     mount_settings_path: ""
+    # Disable gyro auto-calibration (register 0x63 = 0x0001). The BWT901CL's default
+    # gyro bias auto-calibration continuously re-adjusts the zero-rate offset while
+    # still, causing slow yaw wander during stationary periods that the
+    # robot_localization EKF interprets as real rotation. Locking it keeps the bias
+    # fixed after power-on settle. Leave true unless you have a reason to disable it.
+    disable_gyro_autocal: true
+    # 6-axis fusion mode (register 0x24 = 0x01). When true, the IMU's internal
+    # fusion uses only gyro+accel — the magnetometer is excluded from the yaw
+    # estimate. The magnetometer near the LDS motor and wiring picks up magnetic
+    # interference that disturbs the fused heading; 6-axis trades that for slow
+    # gyro bias drift instead, which the scan matcher in slam_nav absorbs
+    # continuously. The manual cal commands (axis6/axis9) can still override this
+    # until the next (re)connect.
+    axis6_mode: true
 
 # ---- Dev-PC-only: Gazebo hardware stand-in (see bringup.launch.py sim:=true) ------------
 # Not launched on the board. Replaces lds_driver/imu_driver's hardware reads with Gazebo

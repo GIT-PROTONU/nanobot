@@ -319,7 +319,11 @@ path**:
 
 (Separately — and *not* part of the brain — `slam_nav` can visually servo on the
 calibrated colour target: `track_enable` turns the robot in place to keep the blob
-centered, pan-only, gated by `enable_motion` like all motion.)
+centered, pan-only, gated by `enable_motion` like all motion. The controller is a
+PD + age-taper + stiction-dither loop refined 2026-07-21 with a smooth deadband,
+coast-on-loss, an opt-in integral, a target-velocity feedforward, and
+confidence-scaled authority — all `track_*` params are live-tunable from the Camera
+tab's "▸ Tracking tuning".)
 
 ## Purpose & goals (the "why" layer)
 

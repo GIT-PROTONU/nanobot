@@ -33,6 +33,10 @@ __pycache__/
 # back-compat fallback the dev scripts still check.
 scripts/.openrouter_key
 
+# asset images (not source)
+*.webp
+*.jpg
+
 # dev web UI runtime state — soul, logs, goal/reward state. The memory/ folder is now
 # tracked in git (with an empty openrouter_key placeholder). Hand-crafted personality
 # and other memory files are versioned.

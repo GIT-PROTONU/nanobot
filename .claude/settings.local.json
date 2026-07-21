@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(git clone *)",
-      "Bash(ssh nano *)"
+      "Bash(ssh nano *)",
+      "Bash(git -C /home/ib/Desktop/nanobot show --stat 8377bc0)"
     ]
   }
 }
