@@ -85,6 +85,8 @@ slam_nav:
     match_points: 90               # scan beams used for matching (decimated)
     min_match_score: 1.0           # reject matches with no real map overlap
     use_imu_yaw: true              # IMU yaw delta for rotation (vs wheel odom)
+    imu_yaw_sign: 1                # +1/-1. IF the robot reports "IMU yaw and wheel yaw rotate
+                                   # OPPOSITE signs", flip this to -1 (IMU mounted rotated).
     map_write_rate: 2.0            # Hz to refresh the /dev/shm map file
     # --- navigation (click-to-go) ---
     enable_motion: false           # SAFETY: false = plan + show path but DON'T drive.

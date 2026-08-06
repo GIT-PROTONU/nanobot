@@ -70,6 +70,7 @@ class NavNode(Node):
             ("match_points", 90),        # scan points used for matching (decimated)
             ("min_match_score", 1.0),    # below this, keep the prior (no good overlap)
             ("use_imu_yaw", True),       # IMU yaw delta for rotation (else wheel odom)
+            ("imu_yaw_sign", 1.0),       # +1/-1: flip if the IMU yaw rotates opposite the wheels
             ("map_write_rate", 2.0),     # Hz to (re)write the /dev/shm map file
             # --- navigation (Stages 2/3) ---
             ("enable_motion", False),    # SAFETY: when false, plan+show path but DON'T drive
@@ -123,6 +124,12 @@ class NavNode(Node):
         self.match_pts = int(g("match_points").value)
         self.min_score = float(g("min_match_score").value)
         self.use_imu = bool(g("use_imu_yaw").value)
+        self.imu_sign = -1.0 if float(g("imu_yaw_sign").value) < 0 else 1.0
+        # Motion-prior freshness: if /odom or /imu/euler goes silent longer than this while
+        # the robot behaves, _predict must not keep trusting the stale value (it would smear
+        # the map / spurious "lost"). Odom = 15 Hz, euler = 25 Hz, so 0.35 s ~ 4-8 periods.
+        self._src_stale = 0.35
+        self._check_turn = 0.35          # rad of wheel-yaw accumulated before re-checking sign
         self._write_period = 1.0 / max(0.2, float(g("map_write_rate").value))
 
         # navigation params
@@ -180,6 +187,13 @@ class NavNode(Node):
         self._imu_yaw = None
         self._prev_odom = None
         self._prev_imu = None
+        # monotonic last-seen times of the motion-prior feeds (freshness guard)
+        self._odom_stamp = None
+        self._imu_stamp = None
+        # runtime IMU-vs-odom rotation-sign monitor (soft, WARN-only, see _predict)
+        self._sig_abs = 0.0
+        self._sig_imu = 0.0
+        self._sig_odo = 0.0
         self._last_write = 0.0
 
         # navigation state (all callbacks + the control timer run on the one spin
@@ -284,9 +298,11 @@ class NavNode(Node):
         q = msg.pose.pose.orientation
         th = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
         self._odom = (msg.pose.pose.position.x, msg.pose.pose.position.y, th)
+        self._odom_stamp = time.monotonic()
 
     def _on_euler(self, msg):
         self._imu_yaw = math.radians(msg.vector.z)   # /imu/euler vector.z = yaw (deg)
+        self._imu_stamp = time.monotonic()
 
     def _on_susp_l(self, msg):
         self._susp_l = bool(msg.data)
@@ -439,19 +455,56 @@ class NavNode(Node):
             self._save_map_file(quiet=True)
 
     def _predict(self, px, py, pth):
-        """Apply the odom/IMU motion since the last scan as the scan-match prior."""
+        """Apply the odom/IMU motion since the last scan as the scan-match prior.
+
+        Freshness guard: if /odom or /imu/euler has gone silent (stale feed), a stale value
+        would move the prior wrongly and smear the map or set off false "lost" storms, so the
+        stale component is dropped and (for rotation) we fall back to the other source. Also
+        runs a soft monitor comparing the IMU and wheel-odom rotation sign; if they rotate
+        opposite ways it warns to set `imu_yaw_sign: -1`.
+        """
         if self._odom is None or self._prev_odom is None:
             self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
             return px, py, pth
+        now = time.monotonic()
+        odom_fresh = self._odom_stamp is not None and now - self._odom_stamp <= self._src_stale
+        imu_fresh = self._imu_stamp is not None and now - self._imu_stamp <= self._src_stale
+
         ox, oy, oth = self._odom
         pox, poy, poth = self._prev_odom
-        # forward distance travelled in the odom frame (projected on its heading)
-        ds = (ox - pox) * math.cos(poth) + (oy - poy) * math.sin(poth)
-        if self.use_imu and self._imu_yaw is not None and self._prev_imu is not None:
-            dth = _wrap(self._imu_yaw - self._prev_imu)
+        if odom_fresh:
+            # forward distance travelled in the odom frame (projected on its heading)
+            ds = (ox - pox) * math.cos(poth) + (oy - poy) * math.sin(poth)
         else:
-            dth = _wrap(oth - poth)
+            self.get_logger().warning("odom motion stale; not advancing the prior",
+                                      throttle_duration_sec=5.0)
+            ds = 0.0
+
+        dth_odom = _wrap(oth - poth)
+        if self.use_imu and self._imu_yaw is not None and self._prev_imu is not None:
+            if imu_fresh:
+                dth = self.imu_sign * _wrap(self._imu_yaw - self._prev_imu)
+            else:
+                self.get_logger().warning("imu/euler stale; using wheel-odom yaw",
+                                          throttle_duration_sec=5.0)
+                dth = dth_odom
+        else:
+            dth = dth_odom
         self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
+
+        # Runtime IMU-vs-odom rotation-sign check (soft; only warns, never auto-flips).
+        self._sig_abs += abs(dth_odom)
+        self._sig_imu += dth
+        self._sig_odo += dth_odom
+        if self._sig_abs >= self._check_turn:
+            self._sig_abs = 0.0
+            si, so = self._sig_imu, self._sig_odo
+            self._sig_imu = self._sig_odo = 0.0
+            if abs(so) > 0.05 and si * so < 0.0:
+                self.get_logger().warning(
+                    "IMU yaw and wheel yaw rotate OPPOSITE signs — set imu_yaw_sign: -1",
+                    throttle_duration_sec=10.0)
+
         pth = _wrap(pth + dth)
         return px + ds * math.cos(pth), py + ds * math.sin(pth), pth
 
@@ -658,7 +711,7 @@ class NavNode(Node):
             self._rot_prev = (iy, oy)
             return
         piy, poy = self._rot_prev
-        self._rot_imu += _wrap(iy - piy)
+        self._rot_imu += self.imu_sign * _wrap(iy - piy)
         self._rot_odom += _wrap(oy - poy)
         self._rot_prev = (iy, oy)
 
