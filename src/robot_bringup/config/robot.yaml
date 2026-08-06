@@ -127,6 +127,10 @@ slam_nav:
     recover_refine: 3              # recovery coarse-to-fine passes
     recover_spin: 0.6              # rad/s in-place spin while relocalizing (needs enable_motion)
     recover_timeout: 12.0          # s before giving up the active relocalize search
+    recover_global: true           # also run a FULL-GRID relocalize search while lost (kidnap:
+                                   # being carried to a far spot beats the local window above)
+    recover_global_step: 4         # grid-cell step of the global search (4 = 20 cm cells)
+    recover_global_period: 2.0     # min s between full-grid searches while recovering
     # --- personality -> motion (the behaviour layer's `caution` trait) ---
     # OFF by default (it touches motion). When on, slam_nav subscribes /cognition/traits and
     # eases stop_distance up + max_lin down with `caution`, CLAMPED here to safe bounds — the

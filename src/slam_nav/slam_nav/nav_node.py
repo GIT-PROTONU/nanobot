@@ -96,6 +96,9 @@ class NavNode(Node):
             ("recover_refine", 3),        # recovery coarse-to-fine passes
             ("recover_spin", 0.6),        # rad/s in-place spin while relocalizing (needs motion)
             ("recover_timeout", 12.0),    # s before giving up the active relocalize search
+            ("recover_global", True),     # also run a full-grid relocalize search while lost
+            ("recover_global_step", 4),   # grid-cell step of the global search (4 = 20 cm)
+            ("recover_global_period", 2.0),  # min s between global searches while recovering
             # --- personality -> motion (the behaviour layer's `caution` trait, clamped
             #     REFLEXIVELY here so the cognitive layer can never push motion unsafe) ---
             ("trait_motion", False),       # opt-in: let `caution` nudge stop_distance/max_lin
@@ -155,6 +158,9 @@ class NavNode(Node):
         self.recover_refine = int(g("recover_refine").value)
         self.recover_spin = float(g("recover_spin").value)
         self.recover_timeout = float(g("recover_timeout").value)
+        self.recover_global = bool(g("recover_global").value)
+        self.recover_global_step = int(g("recover_global_step").value)
+        self.recover_global_period = float(g("recover_global_period").value)
 
         # SLAM pose in the map frame.
         self.px = self.py = self.pth = 0.0
@@ -188,6 +194,7 @@ class NavNode(Node):
         self._recovering = False     # actively re-searching for the pose (lost / set down)
         self._recover_until = 0.0
         self._lost_count = 0         # consecutive scans the match has failed
+        self._next_global_scan = 0.0 # monotonic time for the next full-grid relocalize
         # self-test / calibration state
         self._test_active = False
         self._test_seq = []
@@ -304,8 +311,8 @@ class NavNode(Node):
     def _on_scan(self, msg):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
         n = len(ranges)
-        if n == 0:
-            return
+        if n == 0 or msg.angle_increment <= 0.0:
+            return  # nothing usable (degenerate / unconfigured lidar)
         angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
         self._last_scan = (angles, ranges)        # for the reactive front-stop layer
 
@@ -336,9 +343,16 @@ class NavNode(Node):
             idx = np.linspace(0, len(vr) - 1, self.match_pts).astype(int)
             va, vr = va[idx], vr[idx]
 
+        # A scan may only be folded into the map when the pose is TRUSTED — i.e. the
+        # scan actually matched the existing map. Integrating an unmatched pose (during
+        # the lost-countdown, or after a relocalize timeout) smears obstacles around a
+        # wrong pose and permanently corrupts the map.
+        trusted = False
+
         if self._recovering:
-            # Lost / kidnapped: search a much WIDER window around the prior (and the control
-            # loop spins us in place to vary the geometry) until a strong match snaps back.
+            # Local wide window every scan (cheap — keeps snapping as the spin varies
+            # geometry); a full-grid search periodically (handles being dropped far away,
+            # which a window search around a wrong pose can never recover).
             if len(vr) > 10:
                 cand = self.grid.match((px, py, pth), va, vr, lin=self.recover_lin,
                                        ang=self.recover_ang, half=self.recover_half,
@@ -346,11 +360,28 @@ class NavNode(Node):
                 score = self.grid.score(cand, va, vr)
                 self._last_score = score
                 if score >= self.min_score:
-                    px, py, pth = cand                 # keep snapping toward the map
+                    px, py, pth = cand
                 if score >= self.recover_exit_score:
                     self._recovering = False
                     self._lost_count = 0
+                    self._next_global_scan = 0.0
+                    trusted = True
                     self.get_logger().info(f"relocalized (score {score:.1f})")
+                elif self.recover_global and time.monotonic() >= self._next_global_scan:
+                    self._next_global_scan = time.monotonic() + self.recover_global_period
+                    g = self.grid.relocalize(va, vr, step=self.recover_global_step)
+                    if g is not None:
+                        gx, gy, gth, gscore = g
+                        self._last_score = gscore
+                        if gscore >= self.min_score:
+                            px, py, pth = gx, gy, gth   # better prior; keep spinning
+                        if gscore >= self.recover_exit_score:
+                            self._recovering = False
+                            self._lost_count = 0
+                            self._next_global_scan = 0.0
+                            trusted = True
+                            self.get_logger().info(
+                                f"relocalized globally (score {gscore:.1f})")
         elif len(vr) > 10:
             cand = self.grid.match((px, py, pth), va, vr,
                                    lin=self.match_lin, ang=self.match_ang)
@@ -359,6 +390,7 @@ class NavNode(Node):
             self._last_score = score
             if score >= self.min_score:
                 px, py, pth = cand
+                trusted = True
                 self._lost_count = 0
             elif (self.relocalize and not self._test_active
                   and len(vr) >= self.recover_min_beams):
@@ -367,13 +399,12 @@ class NavNode(Node):
                 if self._lost_count >= self.recover_patience:
                     self._recovering = True
                     self._recover_until = time.monotonic() + self.recover_timeout
+                    self._next_global_scan = 0.0   # global search fires this first scan
                     self.get_logger().warning(
                         f"localization lost (score {score:.1f}) — relocalizing")
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
-        # Don't fold the scan into the map while the pose is uncertain (recovering) — a
-        # wrong pose would smear obstacles across the map.
-        if not self._recovering:
+        if trusted:
             self.grid.integrate((self.px, self.py, self.pth), angles, ranges)
         self._publish_pose()
 
@@ -537,6 +568,7 @@ class NavNode(Node):
                 self._recovering = True
                 self._recover_until = now + self.recover_timeout
                 self._lost_count = 0
+                self._next_global_scan = 0.0
             self.get_logger().info("set down — relocalizing")
 
     def _set_face(self, mood):
@@ -772,9 +804,18 @@ class NavNode(Node):
     def _pursuit(self):
         if not self._path:
             return 0.0, 0.0
-        # lookahead target = first waypoint at least `lookahead` away (else the last)
+        # Start from the NEAREST waypoint so a point we've already driven past isn't
+        # chased (chasing it throws the robot into a U-turn loop around a passed corner).
+        dmin, imin = math.inf, 0
+        for i, (x, y) in enumerate(self._path):
+            d = math.hypot(x - self.px, y - self.py)
+            if d < dmin:
+                dmin, imin = d, i
+        # lookahead target = first waypoint at least `lookahead` away from the robot,
+        # scanned forward from the nearest one (else the final goal).
         tx, ty = self._path[-1]
-        for (x, y) in self._path:
+        for i in range(imin, len(self._path)):
+            x, y = self._path[i]
             if math.hypot(x - self.px, y - self.py) >= self.lookahead:
                 tx, ty = x, y
                 break

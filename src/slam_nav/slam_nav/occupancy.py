@@ -10,6 +10,7 @@ Memory: one float32 grid + one bool 'seen' mask. At 24 m / 5 cm that's 480x480 =
 ~0.9 MB + 0.23 MB. CPU: integration is O(hit cells); matching is a small coarse-to-fine
 search over a subsampled scan (caller decimates), vectorised per candidate angle.
 """
+import math
 import os
 
 import numpy as np
@@ -89,6 +90,63 @@ class GridMap:
             bx, by, bth = best
         return bx, by, bth
 
+    def relocalize(self, angles, ranges, step=4, n_headings=16, npts=90, keep=6):
+        """Global scan-to-map search (kidnap recovery). Scores a decimated scan against
+        EVERY grid candidate at `step`-cell spacing across `n_headings` yaw steps, then
+        coarse-to-fine refines the top `keep` candidates with the local matcher and keeps
+        the best-scoring one. Keeping several hypotheses matters: at a slightly-wrong
+        coarse heading even the true location scores poorly, so the true pose can rank
+        below a spurious rotated one — refining the top K rescues it. Unlike match(),
+        which only hunts around the current pose, this can snap back after the robot is
+        carried far away (or boots inside an already-loaded map). Returns
+        (x, y, theta, score) or None when the map has little structure and no pose scored
+        above the free-space floor. Compatible with the caller's min_score / exit check."""
+        if len(ranges) > npts:                       # decimate: keeps the big lookup small
+            idx = np.linspace(0, len(ranges) - 1, npts).astype(int)
+            angles, ranges = angles[idx], ranges[idx]
+        xs = self.origin + (np.arange(0, self.n, step) + 0.5) * self.res
+        ys = self.origin + (np.arange(0, self.n, step) + 0.5) * self.res
+        ths = np.linspace(-np.pi, np.pi, n_headings, endpoint=False)
+
+        cands = []                                   # (coarse_score, th, x, y)
+        for th in ths:                               # per-heading (Nx, Ny, npts) broadcast
+            a = angles + th
+            hx = ranges * np.cos(a)                  # hit offsets for this heading
+            hy = ranges * np.sin(a)
+            cx = np.floor((xs[:, None] + hx[None, :] - self.origin) / self.res).astype(np.int32)
+            ry = np.floor((ys[:, None] + hy[None, :] - self.origin) / self.res).astype(np.int32)
+            inx = (cx >= 0) & (cx < self.n)
+            iny = (ry >= 0) & (ry < self.n)
+            cxc = np.clip(cx, 0, self.n - 1)
+            ryc = np.clip(ry, 0, self.n - 1)
+            vals = self.log[ryc[None, :, :], cxc[:, None, :]]     # (Nx, Ny, npts)
+            mask = inx[:, None, :] & iny[None, :, :]
+            s = np.where(mask, vals, 0.0).sum(axis=2)             # (Nx, Ny)
+            # keep the top-2 (x, y) per heading too, so a spurious peak at the true
+            # heading doesn't mask the right location for this heading. (Guard the
+            # argpartition kth bound: it must stay < size, else tiny maps crash.)
+            k2 = min(2, s.size)
+            if k2 >= 1:
+                for fi in np.argpartition(s.ravel(), -k2)[-k2:]:
+                    i, j = np.unravel_index(int(fi), s.shape)
+                    cands.append((float(s[i, j]), float(th), float(xs[i]), float(ys[j])))
+        cands.sort(key=lambda c: -c[0])
+
+        best = None
+        for _, th, x, y in cands[:keep]:
+            # 3 refine passes: a 2-pass climb can trap in a neighbouring basin when the
+            # coarse heading is a few degrees off, leaving the true peak unreached.
+            cand = self.match((x, y, th), angles, ranges,
+                              lin=2 * step * self.res, ang=0.35, half=4, refine=3)
+            sc = self.score(cand, angles, ranges)
+            if best is None or sc > best[3]:
+                best = (cand[0], cand[1], cand[2], sc)
+        if best is None or best[3] <= 0.0:
+            # Free-space cells carry negative log-odds, so a pose that actually hits
+            # occupied structure scores positive; anything at/below zero found no match.
+            return None
+        return best
+
     # --- map update ----------------------------------------------------------
     def integrate(self, pose, angles, ranges):
         """Ray-cast every valid beam: decrement free cells along it, bump the endpoint."""
@@ -126,10 +184,14 @@ class GridMap:
     # --- export --------------------------------------------------------------
     def occupancy_int8(self):
         """ROS-style occupancy: -1 unknown, 0 free .. 100 occupied. Row 0 = origin_y
-        (bottom). Returned row-major as int8, ready to dump to the web map file."""
-        p = 1.0 - 1.0 / (1.0 + np.exp(self.log))      # P(occupied)
-        out = (p * 100.0).astype(np.int8)
-        out[~self.seen] = -1
+        (bottom). Returned row-major as int8, ready to dump to the web map file. Only
+        cells that have been seen get a probability (exp over the ~mostly-unmapped grid
+        dominates the map-write cost early on); unseen cells are -1 directly."""
+        out = np.full(self.log.shape, -1, dtype=np.int8)
+        s = self.seen
+        if s.any():
+            p = 1.0 - 1.0 / (1.0 + np.exp(self.log[s]))      # P(occupied) on seen cells
+            out[s] = (p * 100.0).astype(np.int8)
         return out
 
     def coverage(self):
@@ -237,8 +299,8 @@ class GridMap:
         fr[:, :-1] |= free[:, :-1] & unknown[:, 1:]
         if not fr.any():
             return []
-        sc = int((start[0] - self.origin) / res_c)
-        sr = int((start[1] - self.origin) / res_c)
+        sc = int(math.floor((start[0] - self.origin) / res_c))
+        sr = int(math.floor((start[1] - self.origin) / res_c))
         rs, cs = np.nonzero(fr)
         order = np.argsort((rs - sr) ** 2 + (cs - sc) ** 2)[:max(1, int(k))]
         return [(self.origin + (cs[i] + 0.5) * res_c, self.origin + (rs[i] + 0.5) * res_c)
@@ -254,7 +316,10 @@ class GridMap:
         blocked, seen_c, m, res_c = self._coarse(downsample, radius_m, allow_unknown)
 
         def w2c(x, y):
-            return (int((x - self.origin) / res_c), int((y - self.origin) / res_c))
+            # floor() (not int()) so negative coordinates map like w2g — int() truncates
+            # toward zero and would snap a point just below the origin onto cell 0.
+            return (int(math.floor((x - self.origin) / res_c)),
+                    int(math.floor((y - self.origin) / res_c)))
 
         sc, sr = w2c(*start)
         gc, gr = w2c(*goal)
