@@ -87,6 +87,11 @@ STAT_PATH = "/proc/stat"
 MEMINFO_PATH = "/proc/meminfo"
 SCAN_FILE = "/dev/shm/nano_scan.bin"          # compact lidar blob (for the read-lidar skill)
 
+# Web map-editor handoff to slam_nav: write no-go paint/erase requests here (atomic
+# os.replace). slam_nav polls this file on its control tick and applies them to the grid;
+# a rising "t" token makes each request idempotent (so the file may persist between writes).
+NGO_MAP_EDIT_FILE = "/dev/shm/nano_map_edit.json"
+
 # The GATED "action tier" for topic-skills: the ONLY ROS topics a skill may publish, each
 # with a hard clamp. Anything else is refused. Motion is ALSO clamped reflexively by
 # slam_nav downstream, so a skill can never push the robot into an unsafe state. Builders
@@ -1070,6 +1075,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._stream_audio()
         if path == "/map":
             return self._serve_map()
+        if path == "/map/nogo":
+            # The no-go overlay blob slam_nav writes (/dev/shm/nano_nogo.bin) so the map
+            # canvas can shade restricted zones. Same header+raw layout, rewritten only
+            # when the forbidden mask changes.
+            return self._serve_shm("/dev/shm/nano_nogo.bin", "no no-go zones yet")
         if path == "/scan.bin":
             return self._serve_scan()
         return super().do_GET()
@@ -1202,6 +1212,19 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._respond(503, "no node")
             else:
                 self._respond_json(self._node.brain_reflect(self._read_json()))
+        elif path == "/map/nogo/stroke":
+            # Paint/erase a no-go zone on the live map: {"x0","y0","x1","y1","brush",
+            # "erase"} in world metres. Forwards to slam_nav (atomic file handoff, token'd).
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._write_map_edit(self._read_json()))
+        elif path == "/map/nogo/clear":
+            # Wipe ALL no-go zones from the live map.
+            if self._node is None:
+                self._respond(503, "no node")
+            else:
+                self._respond_json(self._write_map_edit({"action": "clear"}))
         elif path == "/system/restart":
             # Restart the whole ROS stack. Detached + new session so it survives
             # do_down killing this very web server, then do_up brings it back.
@@ -1228,6 +1251,22 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._respond(200, "shutting down")
         else:
             self.send_error(404)
+
+    @staticmethod
+    def _write_map_edit(edit):
+        """Forward a map-edit request to slam_nav via the atomic /dev/shm handoff file.
+        Injects a monotonic `t` token so slam_nav can apply each request exactly once even
+        if the file persists. Returns a small status dict."""
+        req = dict(edit or {})
+        req["t"] = int(time.time() * 1000)
+        tmp = NGO_MAP_EDIT_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(req, f)
+            os.replace(tmp, NGO_MAP_EDIT_FILE)
+            return {"ok": True, "action": req.get("action"), "t": req["t"]}
+        except OSError as exc:
+            return {"error": str(exc)}
 
     @staticmethod
     def _set_oled_action(action):

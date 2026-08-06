@@ -36,6 +36,14 @@ if [ -f "$NANO/install/setup.bash" ]; then
 fi
 cd "$NANO" || exit 1
 
+# --- Resolve the OpenRouter key (env first, then memory/openrouter_key, then the old
+#     scripts/.openrouter_key location for back-compat) --------------------------------
+if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$NANO/memory/openrouter_key" ]; then
+  export OPENROUTER_API_KEY="$(tr -d '[:space:]' < "$NANO/memory/openrouter_key")"
+elif [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$NANO/scripts/.openrouter_key" ]; then
+  export OPENROUTER_API_KEY="$(tr -d '[:space:]' < "$NANO/scripts/.openrouter_key")"
+fi
+
 # launch NAME "command…"  — detached, own session, logged to .run/NAME.log
 launch() {
   setsid bash -c "exec $2" >"$LOG/$1.log" 2>&1 </dev/null &

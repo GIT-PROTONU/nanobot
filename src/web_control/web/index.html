@@ -196,6 +196,9 @@
   #simEdit{width:100%;height:100%;display:block;cursor:crosshair;touch-action:none;
     image-rendering:pixelated}
   #simTools .tool.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+  #mapToolBar .tool.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+  #mapToolBar{flex-wrap:wrap}
+  #mapStats{min-height:18px}
   #panel-sim .row .btn,#panel-sim .row label.btn{flex:1}
   /* AI decision log */
   .logbox{margin-top:8px}
@@ -271,6 +274,18 @@
             <button id="mapHome" class="btn">⌂ Go home</button>
             <button id="mapSave" class="btn">💾 Save map</button>
             <button id="mapTest" class="btn">🔧 Self-test</button>
+          </div>
+          <div id="mapToolBar" class="row" style="flex-wrap:wrap">
+            <button class="btn tool active" data-edit="goal" title="Tap the map to set a goal">◎ Goal</button>
+            <button class="btn tool" data-edit="nogo" title="Drag to forbid a zone — the robot will never route through it">⊘ No-go</button>
+            <button class="btn tool" data-edit="erase" title="Drag to remove a no-go zone">🧽 No-go erase</button>
+            <button class="btn danger" id="mapNogoClear" title="Remove every no-go zone">⌫ Clear zones</button>
+            <label class="row" style="flex:1;min-width:0;gap:8px">
+              <span style="color:var(--muted);font-size:11px;flex:none">brush</span>
+              <input id="mapBrush" type="range" min="1" max="15" step="1" value="4"
+                style="flex:1" title="No-go brush size (map cells)">
+              <b id="mapBrushV" style="color:var(--muted);font-family:var(--mono);flex:none">4</b>
+            </label>
           </div>
           <div id="mapStats"></div>
           <pre id="mapTestOut" style="display:none"></pre>
@@ -1536,6 +1551,8 @@ connect();   // auto-connect on load
   const cv=$("mapcv"), ctx=cv.getContext("2d");
   const dec=new TextDecoder();
   let timer=null, img=null, lastMeta=null;
+  // no-go overlay (fetched separately from the map blob) + the map-edit tool state.
+  let nogo={dims:0, data:null}, editMode="goal";
 
   async function poll(){
     try{
@@ -1546,7 +1563,22 @@ connect();   // auto-connect on load
       if(nl<0) return;
       const meta=JSON.parse(dec.decode(buf.subarray(0,nl)));
       draw(meta, buf.subarray(nl+1));
+      if(editMode!=="goal") pollNogo();
     }catch(e){ /* transient: keep polling */ }
+  }
+
+  async function pollNogo(){
+    if(editMode==="goal") return;              // only worth fetching while editing
+    try{
+      const r=await fetch("/map/nogo?t="+Date.now());
+      if(!r.ok) return;
+      const buf=new Uint8Array(await r.arrayBuffer());
+      const nl=buf.indexOf(10); if(nl<0) return;
+      const h=JSON.parse(dec.decode(buf.subarray(0,nl)));
+      if(!nogo.dims || nogo.dims[0]!==h.w || nogo.dims[1]!==h.h)
+        nogo.dims=[h.w,h.h];
+      nogo.data=buf.subarray(nl+1);
+    }catch(e){ /* keep last overlay */ }
   }
 
   function draw(m, grid){
@@ -1565,7 +1597,16 @@ connect();   // auto-connect on load
     ctx.putImageData(img,0,0);
     lastMeta=m;
     $("mapWait").style.display="none";    // got a real frame: drop the placeholder
-    cv.style.cursor="crosshair";          // ...and arm click-to-go only now
+    cv.style.cursor = editMode==="goal" ? "crosshair" : "cell";
+    // no-go overlay: shade forbidden zones translucent amber (drawn first, under the
+    // overlays below so markers/path stay legible on top).
+    if(nogo.data && nogo.dims){
+      for(let oi=0; oi<nogo.data.length; oi++) if(nogo.data[oi]){
+        const row=(oi/w)|0, col=oi%w, cy=h-1-row, o=(cy*w+col)*4;
+        d[o]=Math.min(255,d[o]+70); d[o+1]=Math.min(255,d[o+1]+40); d[o+2]=Math.max(0,d[o+2]-40);
+      }
+      ctx.putImageData(img,0,0);
+    }
     const W2P=(x,y)=>[(x-m.ox)/m.res, h-1-(y-m.oy)/m.res];  // world -> canvas px
     // breadcrumb trail (cyan polyline) — where the robot has been
     if(m.trail && m.trail.length>1){
@@ -1617,15 +1658,70 @@ connect();   // auto-connect on load
     } else { clearInterval(timer); timer=null; }
   });
 
-  // click the map -> goal in world metres (account for CSS scaling + the y-flip)
-  cv.addEventListener("click",e=>{
-    if(!lastMeta) return;
+  // point -> world metres (account for CSS scaling + the y-flip)
+  function evtWorld(e){
+    const m=lastMeta; if(!m) return null;
     const rect=cv.getBoundingClientRect();
     const cx=(e.clientX-rect.left)*cv.width/rect.width;
     const cy=(e.clientY-rect.top)*cv.height/rect.height;
-    const m=lastMeta;
-    mapSetGoal(m.ox+cx*m.res, m.oy+(cv.height-1-cy)*m.res);
+    return [m.ox+cx*m.res, m.oy+(cv.height-1-cy)*m.res];
+  }
+  // click the map -> goal in world metres (goal mode only)
+  cv.addEventListener("click",e=>{
+    if(editMode!=="goal") return;
+    const w=evtWorld(e); if(w) mapSetGoal(w[0],w[1]);
   });
+
+  // no-go painting: collect a drag stroke in world coords and commit ONE request on
+  // pointerup (a stroke = one /map/nogo/stroke POST, regardless of length) so we don't
+  // hammer the server mid-drag. slam_nav fills the line with the brush on its side.
+  const brush=()=>Number($("mapBrush").value)||4;
+  let stroke=null;
+  cv.addEventListener("pointerdown",e=>{
+    if(editMode==="goal") return;
+    if(stroke){ /* a previous stroke never committed (pointercancel) */ }
+    const w=evtWorld(e); if(!w) return;
+    stroke={x0:w[0],y0:w[1],x1:w[0],y1:w[1]};
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener("pointermove",e=>{
+    if(!stroke) return;
+    const w=evtWorld(e); if(!w) return;
+    stroke.x1=w[0]; stroke.y1=w[1];
+  });
+  function commitStroke(){
+    if(!stroke) return;
+    const s=stroke; stroke=null;
+    fetch("/map/nogo/stroke",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({action:"stroke", x0:s.x0,y0:s.y0,x1:s.x1,y1:s.y1,
+        brush:brush(), erase:(editMode==="erase")})})
+      .then(r=>r.ok?r.json():null)
+      .then(res=>{ if(res && res.ok) poll(); })
+      .catch(()=>{});
+  }
+  cv.addEventListener("pointerup",commitStroke);
+  cv.addEventListener("pointercancel",commitStroke);
+
+  // map-edit toolbar: goal / no-go / erase + the clear-all button + brush slider
+  document.querySelectorAll("#mapToolBar .tool").forEach(b=>b.onclick=()=>{
+    editMode=b.dataset.edit;
+    updateToolbar();
+  });
+  function updateToolbar(){
+    document.querySelectorAll("#mapToolBar .tool").forEach(b=>
+      b.classList.toggle("active",b.dataset.edit===editMode));
+    cv.style.cursor=editMode==="goal"?"crosshair":"cell";
+    if(editMode!=="goal") pollNogo(); else poll();   // refresh overlay visibility
+  }
+  $("mapBrush").oninput=()=>$("mapBrushV").textContent=$("mapBrush").value;
+  $("mapNogoClear").onclick=()=>{
+    if(!confirm("Remove ALL no-go zones from the map?")) return;
+    fetch("/map/nogo/clear",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:"{}"}).then(r=>r.ok?r.json():null)
+      .then(()=>poll()).catch(()=>{});
+  };
+
   $("mapMotion").addEventListener("change",e=>setNavMotion(e.target.checked));
   $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));
   $("mapHome").addEventListener("click",()=>{ if(homeTopic) homeTopic.publish(new ROSLIB.Message({data:true})); });

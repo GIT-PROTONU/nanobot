@@ -35,7 +35,7 @@ if [ "${DEPLOY_SOUL:-0}" = "1" ]; then
   echo ">> pushing memory/ soul + phrase bank to $HOST:$STATE_DIR (DEPLOY_SOUL=1)"
   "$PLINK" -batch -pw "$PW" -hostkey "$HK" "$HOST" "mkdir -p $STATE_DIR"
   pushed=0
-  for f in personality.json phrases.json workshop.json trait_history.json self_model.json \
+  for f in llm.json personality.json phrases.json workshop.json trait_history.json self_model.json \
            skill_likes.json presence_chart.yaml beats.json; do
     if [ -f "memory/$f" ]; then
       "$PSCP" -batch -pw "$PW" -hostkey "$HK" "memory/$f" "$HOST:$STATE_DIR/$f"

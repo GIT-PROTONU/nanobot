@@ -32,6 +32,15 @@ from std_msgs.msg import Bool, String, Int64MultiArray
 from .occupancy import GridMap
 
 MAP_FILE = "/dev/shm/nano_map.bin"
+# Web map-editor handoff: web_control writes a small JSON "edit request" here (atomic
+# os.replace) when the user paints/erases a no-go zone; slav_nav consumes it here and
+# folds the result into the grid. A monotonically-rising "t" token makes it idempotent
+# (the file may persist; we never re-apply an already-seen token), so no file race.
+NGO_EDIT_FILE = "/dev/shm/nano_map_edit.json"
+# The no-go overlay blob the web map panel polls to shade forbidden zones on the canvas:
+# one JSON header line ('\n') then the raw bool mask (1 = no-go), row 0 = origin_y. Only
+# rewritten when the mask changes (it doesn't move like the live occupancy does).
+NGO_BLOB_FILE = "/dev/shm/nano_nogo.bin"
 
 # --- self-test / calibration sequence (drives known motions to check IMU + encoders) ---
 TEST_LIN = 0.12      # m/s forward/back speed (capped by max_lin)
@@ -188,6 +197,9 @@ class NavNode(Node):
         # stuck detector
         self._stuck_ref = None       # (x, y) pose when the current move started
         self._stuck_since = 0.0
+        # map editing (no-go zones from the web UI)
+        self._edit_last_t = -1        # last applied edit token (idempotency)
+        self._nogo_dirty = True       # rebuild the no-go blob on the next map frame
         # pick-up + relocalization state
         self._susp_l = self._susp_r = False   # per-wheel off-ground switches (from the ESP)
         self._picked_up = False
@@ -206,9 +218,12 @@ class NavNode(Node):
         self._ticks_sub = self._imuweb_sub = None
 
         # Optionally reload a previously-saved map (relocalize into it from the origin).
-        if self.map_store and self.grid.load(self.map_store):
-            self._have_map = True
-            self.get_logger().info(f"loaded saved map from {self.map_store}")
+        if self.map_store:
+            self.map_store = os.path.expanduser(self.map_store)
+            if self.grid.load(self.map_store):
+                self._have_map = True
+                self._nogo_dirty = True
+                self.get_logger().info(f"loaded saved map from {self.map_store}")
 
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
@@ -474,6 +489,9 @@ class NavNode(Node):
                 self.get_logger().warning("save_map ignored: map_store param is empty")
             return
         try:
+            d = os.path.dirname(self.map_store)
+            if d:
+                os.makedirs(d, exist_ok=True)          # persist into a fresh dir on boot
             self.grid.save(self.map_store)
             if not quiet:
                 self.get_logger().info(f"map saved to {self.map_store}")
@@ -484,6 +502,11 @@ class NavNode(Node):
         if not self._have_map:
             return
         now = time.monotonic()
+
+        # Apply any pending web map edit (no-go strokes) BEFORE the nav decision, and
+        # rewrite the map + (once) the no-go blob so the UI reflects the edit this tick.
+        if self._check_edits():
+            self._write_map()
 
         # Pick-up + self-test + relocalization take priority over navigation.
         self._update_pickup(now)
@@ -865,6 +888,7 @@ class NavNode(Node):
             "free_m2": round(free_m2, 1),                    # mapped free area
             "score": round(self._last_score, 1),             # scan-match quality
             "mode": mode, "loc": loc, "motion": self.enable_motion,
+            "nogo": self.grid.nogo_count(),                  # no-go zones marked
             "trail": list(self._trail) if self._trail else [],
         }
         header = (json.dumps(meta) + "\n").encode()
@@ -876,6 +900,54 @@ class NavNode(Node):
             os.replace(tmp, MAP_FILE)        # atomic: the server never reads a torn file
         except OSError as exc:
             self.get_logger().warning(f"map write failed: {exc}", throttle_duration_sec=10.0)
+        if self._nogo_dirty:
+            self._write_nogo()
+            self._nogo_dirty = False
+
+    def _write_nogo(self):
+        """Publish the current no-go mask blob (only when it changed). Same header+raw
+        layout as the map; the browser decodes `w*h` bytes as a 1-bits-per-cell overlay."""
+        header = json.dumps({
+            "w": self.grid.n, "h": self.grid.n, "res": self.grid.res,
+            "ox": self.grid.origin, "oy": self.grid.origin,
+            "count": self.grid.nogo_count(),
+        }).encode()
+        tmp = NGO_BLOB_FILE + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(header + b"\n")
+                f.write(self.grid.forbidden.tobytes())
+            os.replace(tmp, NGO_BLOB_FILE)
+        except OSError as exc:
+            self.get_logger().warning(f"no-go write failed: {exc}",
+                                      throttle_duration_sec=10.0)
+
+    def _check_edits(self):
+        """Apply any pending web map-editor request (idempotent via its `t` token). The
+        file may persist; we only act on a token we haven't seen, so no delete/rename
+        race. Returns True if a no-go blob rewrite is needed."""
+        try:
+            with open(NGO_EDIT_FILE, "r") as f:
+                req = json.load(f)
+        except (OSError, ValueError):
+            return False
+        try:
+            t = int(req.get("t", 0))
+        except (TypeError, ValueError):
+            t = 0
+        if t <= self._edit_last_t:
+            return False                      # already applied (or older/duplicate)
+        self._edit_last_t = t
+        try:
+            res = self.grid.apply_action(req)   # never raises on bad input
+        except Exception as exc:
+            self.get_logger().warning(f"map edit failed: {exc}")
+            return False
+        self._nogo_dirty = True
+        if self.map_store:
+            self._save_map_file(quiet=True)   # persist the zone edit immediately
+        self.get_logger().info(f"map edit applied: {res}", throttle_duration_sec=2.0)
+        return True
 
 
 def main():

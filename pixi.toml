@@ -89,18 +89,18 @@ zenohd = "ros2 run rmw_zenoh_cpp rmw_zenohd"
 
 # Bring up the full robot (real hardware; ros2-launch debug alternative to stack.sh,
 # which is what actually runs in production — see robot_bringup/launch/bringup.launch.py).
-bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup bringup.launch.py'", depends-on = ["build"] }
+bringup = { cmd = "bash -c 'if [ -z \"${OPENROUTER_API_KEY:-}\" ] && [ -f memory/openrouter_key ]; then export OPENROUTER_API_KEY=\"$(tr -d \"[:space:]\" < memory/openrouter_key)\"; fi && source install/setup.bash && ros2 launch robot_bringup bringup.launch.py'", depends-on = ["build"] }
 
 # Dev-PC-only: the same node graph as `bringup`, but with lds_driver_py/imu_driver/the
 # ESP32 replaced by Gazebo Sim + sim_hardware, plus RViz. See scripts/sim_run.sh.
-sim = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup bringup.launch.py sim:=true rviz:=true'", depends-on = ["build"] }
+sim = { cmd = "bash -c 'if [ -z \"${OPENROUTER_API_KEY:-}\" ] && [ -f memory/openrouter_key ]; then export OPENROUTER_API_KEY=\"$(tr -d \"[:space:]\" < memory/openrouter_key)\"; fi && source install/setup.bash && ros2 launch robot_bringup bringup.launch.py sim:=true rviz:=true'", depends-on = ["build"] }
 
 # Dev-PC-only: RViz watching the REAL robot live over the shared zenoh graph (robot runs
 # its own stack.sh unchanged) -- NOT a simulation. See scripts/rviz_remote.sh.
-visualize = { cmd = "bash -c 'source install/setup.bash && ros2 launch robot_bringup visualize.launch.py'", depends-on = ["build"] }
+visualize = { cmd = "bash -c 'if [ -z \"${OPENROUTER_API_KEY:-}\" ] && [ -f memory/openrouter_key ]; then export OPENROUTER_API_KEY=\"$(tr -d \"[:space:]\" < memory/openrouter_key)\"; fi && source install/setup.bash && ros2 launch robot_bringup visualize.launch.py'", depends-on = ["build"] }
 
 # Web control page + rosbridge only (handy for UI dev). Web UI on :8080, ws on :9090.
-web = { cmd = "bash -c 'source install/setup.bash && ros2 launch web_control web.launch.py'", depends-on = ["build"] }
+web = { cmd = "bash -c 'if [ -z \"${OPENROUTER_API_KEY:-}\" ] && [ -f memory/openrouter_key ]; then export OPENROUTER_API_KEY=\"$(tr -d \"[:space:]\" < memory/openrouter_key)\"; fi && source install/setup.bash && ros2 launch web_control web.launch.py'", depends-on = ["build"] }
 
 # Convenience: open a shell with everything sourced.
 shell = "bash -c 'source install/setup.bash 2>/dev/null; exec bash'"

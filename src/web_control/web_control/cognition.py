@@ -1311,7 +1311,7 @@ class CognitionCore:
         s = dict(self.settings)
         s["available"] = self.llm.available()           # enabled AND a key is configured
         s["configured"] = self.llm.available()
-        s["model_effective"] = self.llm.model
+        s["model_effective"] = self.llm.model_for()
         s["smart_model"] = self.llm.smart_model
         s["vision_model"] = self.llm.vision_model
         s["vision_fallback_model"] = self.llm.vision_fallback_model  # optional paid vision fallback
