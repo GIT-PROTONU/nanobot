@@ -50,7 +50,7 @@ class EncoderNode(Node):
             ("wheel_radius", 0.0335),
             ("wheel_separation", 0.16),
             ("invert_left", False), ("invert_right", False),
-            ("publish_rate", 30.0),
+            ("publish_rate", 15.0),
             ("publish_tf", True),
             ("odom_frame", "odom"),
             ("base_frame", "base_link"),

@@ -97,12 +97,14 @@ slam_nav:
     match_ang: 0.12                # scan-match search half-window (rad)
     match_points: 90               # scan beams used for matching (decimated)
     min_match_score: 1.0           # reject matches with no real map overlap
-    use_imu_yaw: true              # IMU yaw delta for the rotation prior. With the EKF
+use_imu_yaw: true              # IMU yaw delta for the rotation prior. With the EKF
                                 # providing an IMU-corrected baseline yaw in /odometry/
                                 # filtered, the raw IMU delta from /imu/euler is more
                                 # reliable than ever — the scan matcher's yaw window
                                 # (match_ang: 0.12 rad) could potentially be tightened
                                 # (e.g. 0.08) once yaw tracking is verified on hardware.
+    imu_yaw_sign: 1                   # +1/-1. IF "IMU yaw and wheel yaw rotate OPPOSITE
+                                      # signs", flip to -1 (IMU mounted rotated).
     # Parked = skip: when odom AND IMU both say the robot hasn't moved since the last
     # processed scan, skip the scan-match + map-integrate (the bulk of parked idle
     # CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
@@ -128,11 +130,16 @@ slam_nav:
     front_angle: 0.6               # rad: half-width of the reactive front cone
     # --- extras (each independently toggleable; behaviour-changers default OFF for
     #     easy/safe testing — flip them on one at a time) ---
-    map_store: ""                  # persist the map here (.npz). "" = disabled. To enable,
-                                   # set an absolute path e.g. "/home/ibster/nano_map.npz";
-                                   # it auto-loads on boot + saves on the /slam_nav/save_map
-                                   # button. (Don't use /dev/shm — that's RAM, lost on reboot.)
-    autosave_period: 0.0           # s between background map autosaves; 0 = off (manual only)
+    # No-go zones: paint them on the web Map view (No-go brush/erase). They're stored
+    # with the map, rendered as a shaded overlay, and the planner NEVER routes through
+    # them — even across un-mapped cells (allow_unknown won't let it). Survives reboot
+    # via map_store. See web_control + /dev/shm/nano_map_edit.json handoff.
+    map_store: ~/nanobot/maps/nano_map.npz   # persist the map (grid + no-go zones) here.
+                                             # Auto-loads on boot, saved on /slam_nav/save_map
+                                             # + every `autosave_period`s. Tilde is expanded;
+                                             # the parent dir is created automatically. Leave
+                                             # "" to disable persistence.
+    autosave_period: 30.0            # s between background map autosaves (0 = manual only)
     auto_explore: false            # autonomously drive to map frontiers when idle.
                                    # Still needs enable_motion to actually move; with motion
                                    # off it just shows where it *would* explore.
@@ -174,6 +181,10 @@ slam_nav:
     recover_refine: 3              # recovery coarse-to-fine passes
     recover_spin: 0.6              # rad/s in-place spin while relocalizing (needs enable_motion)
     recover_timeout: 12.0          # s before giving up the active relocalize search
+    recover_global: true           # also run a FULL-GRID relocalize search while lost (kidnap:
+                                   # being carried to a far spot beats the local window above)
+    recover_global_step: 4         # grid-cell step of the global search (4 = 20 cm cells)
+    recover_global_period: 2.0     # min s between full-grid searches while recovering
     # --- personality -> motion (the behaviour layer's `caution` trait) ---
     # OFF by default (it touches motion). When on, slam_nav subscribes /cognition/traits and
     # eases stop_distance up + max_lin down with `caution`, CLAMPED here to safe bounds — the

@@ -35,6 +35,15 @@ from tf2_ros import TransformBroadcaster
 from .occupancy import GridMap
 
 MAP_FILE = "/dev/shm/nano_map.bin"
+# Web map-editor handoff: web_control writes a small JSON "edit request" here (atomic
+# os.replace) when the user paints/erases a no-go zone; slav_nav consumes it here and
+# folds the result into the grid. A monotonically-rising "t" token makes it idempotent
+# (the file may persist; we never re-apply an already-seen token), so no file race.
+NGO_EDIT_FILE = "/dev/shm/nano_map_edit.json"
+# The no-go overlay blob the web map panel polls to shade forbidden zones on the canvas:
+# one JSON header line ('\n') then the raw bool mask (1 = no-go), row 0 = origin_y. Only
+# rewritten when the mask changes (it doesn't move like the live occupancy does).
+NGO_BLOB_FILE = "/dev/shm/nano_nogo.bin"
 
 
 def _wrap(a):
@@ -80,6 +89,7 @@ class NavNode(Node):
             ("still_skip", True),        # parked (odom+IMU unchanged) -> skip match+integrate
             ("still_lin", 0.005),        # m translation since last processed scan = "moved"
             ("still_ang", 0.005),        # rad (~0.3 deg) yaw delta = "moved" (fires on pure rotation)
+            ("imu_yaw_sign", 1.0),       # +1/-1: flip if the IMU yaw rotates opposite the wheels
             ("map_write_rate", 2.0),     # Hz to (re)write the /dev/shm map file
             # --- navigation (Stages 2/3) ---
             ("enable_motion", False),    # SAFETY: when false, plan+show path but DON'T drive
@@ -127,6 +137,9 @@ class NavNode(Node):
             ("recover_refine", 3),        # recovery coarse-to-fine passes
             ("recover_spin", 0.6),        # rad/s in-place spin while relocalizing (needs motion)
             ("recover_timeout", 12.0),    # s before giving up the active relocalize search
+            ("recover_global", True),     # also run a full-grid relocalize search while lost
+            ("recover_global_step", 4),   # grid-cell step of the global search (4 = 20 cm)
+            ("recover_global_period", 2.0),  # min s between global searches while recovering
             # --- personality -> motion (the behaviour layer's `caution` trait, clamped
             #     REFLEXIVELY here so the cognitive layer can never push motion unsafe) ---
             ("trait_motion", False),       # opt-in: let `caution` nudge stop_distance/max_lin
@@ -221,6 +234,12 @@ class NavNode(Node):
         self.still_skip = bool(g("still_skip").value)
         self.still_lin = float(g("still_lin").value)
         self.still_ang = float(g("still_ang").value)
+        self.imu_sign = -1.0 if float(g("imu_yaw_sign").value) < 0 else 1.0
+        # Motion-prior freshness: if /odom or /imu/euler goes silent longer than this while
+        # the robot behaves, _predict must not keep trusting the stale value (it would smear
+        # the map / spurious "lost"). Odom = 15 Hz, euler = 25 Hz, so 0.35 s ~ 4-8 periods.
+        self._src_stale = 0.35
+        self._check_turn = 0.35          # rad of wheel-yaw accumulated before re-checking sign
         self._write_period = 1.0 / max(0.2, float(g("map_write_rate").value))
 
         # navigation params
@@ -311,6 +330,9 @@ class NavNode(Node):
         self.recover_refine = int(g("recover_refine").value)
         self.recover_spin = float(g("recover_spin").value)
         self.recover_timeout = float(g("recover_timeout").value)
+        self.recover_global = bool(g("recover_global").value)
+        self.recover_global_step = int(g("recover_global_step").value)
+        self.recover_global_period = float(g("recover_global_period").value)
 
         # SLAM pose in the map frame.
         self.px = self.py = self.pth = 0.0
@@ -321,6 +343,13 @@ class NavNode(Node):
         self._imu_yaw = None
         self._prev_odom = None
         self._prev_imu = None
+        # monotonic last-seen times of the motion-prior feeds (freshness guard)
+        self._odom_stamp = None
+        self._imu_stamp = None
+        # runtime IMU-vs-odom rotation-sign monitor (soft, WARN-only, see _predict)
+        self._sig_abs = 0.0
+        self._sig_imu = 0.0
+        self._sig_odo = 0.0
         self._last_write = 0.0
         # _write_map export cache: recomputing occupancy_int8 (a full-grid np.exp) +
         # coverage at the write rate cost ~40% of a core even while SLAM was paused.
@@ -348,6 +377,9 @@ class NavNode(Node):
         self._lds_idle_ref = None    # (x, y); None until the first tick seeds it
         self._lds_idle_since = 0.0
         self._lds_active = True      # current commanded state; only republish on change
+        # map editing (no-go zones from the web UI)
+        self._edit_last_t = -1        # last applied edit token (idempotency)
+        self._nogo_dirty = True       # rebuild the no-go blob on the next map frame
         # pick-up + relocalization state
         self._susp_l = self._susp_r = False   # per-wheel off-ground switches (from the ESP)
         self._susp_override = -1              # /pickup_override: -1 auto, 0 grounded, 1 lifted
@@ -360,6 +392,7 @@ class NavNode(Node):
         # pose + (rarely) the grid. Only meaningful once we have a map + have moved.
         self._loop_off = (0.0, 0.0, 0.0)
         self._scan_count = 0         # counts scans since boot, for the probe cadence
+        self._next_global_scan = 0.0 # monotonic time for the next full-grid relocalize
         # self-test / calibration state
         self._test_active = False
         self._test_seq = []
@@ -371,9 +404,12 @@ class NavNode(Node):
         self._ticks_sub = self._imuweb_sub = None
 
         # Optionally reload a previously-saved map (relocalize into it from the origin).
-        if self.map_store and self.grid.load(self.map_store):
-            self._have_map = True
-            self.get_logger().info(f"loaded saved map from {self.map_store}")
+        if self.map_store:
+            self.map_store = os.path.expanduser(self.map_store)
+            if self.grid.load(self.map_store):
+                self._have_map = True
+                self._nogo_dirty = True
+                self.get_logger().info(f"loaded saved map from {self.map_store}")
 
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
         # Publish the SLAM-corrected map->odom transform so the ROS graph (RViz remote
@@ -545,9 +581,11 @@ class NavNode(Node):
         q = msg.pose.pose.orientation
         th = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
         self._odom = (msg.pose.pose.position.x, msg.pose.pose.position.y, th)
+        self._odom_stamp = time.monotonic()
 
     def _on_euler(self, msg):
         self._imu_yaw = math.radians(msg.vector.z)   # /imu/euler vector.z = yaw (deg)
+        self._imu_stamp = time.monotonic()
 
     def _on_susp_l(self, msg):
         self._susp_l = bool(msg.data)
@@ -614,8 +652,8 @@ class NavNode(Node):
     def _on_scan(self, msg):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
         n = len(ranges)
-        if n == 0:
-            return
+        if n == 0 or msg.angle_increment <= 0.0:
+            return  # nothing usable (degenerate / unconfigured lidar)
         angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
         self._last_scan = (angles, ranges)        # for the reactive front-stop layer
 
@@ -678,9 +716,16 @@ class NavNode(Node):
             idx = np.linspace(0, len(vr) - 1, self.match_pts).astype(int)
             va, vr = va[idx], vr[idx]
 
+        # A scan may only be folded into the map when the pose is TRUSTED — i.e. the
+        # scan actually matched the existing map. Integrating an unmatched pose (during
+        # the lost-countdown, or after a relocalize timeout) smears obstacles around a
+        # wrong pose and permanently corrupts the map.
+        trusted = False
+
         if self._recovering:
-            # Lost / kidnapped: search a much WIDER window around the prior (and the control
-            # loop spins us in place to vary the geometry) until a strong match snaps back.
+            # Local wide window every scan (cheap — keeps snapping as the spin varies
+            # geometry); a full-grid search periodically (handles being dropped far away,
+            # which a window search around a wrong pose can never recover).
             if len(vr) > 10:
                 cand = self.grid.match((px, py, pth), va, vr, lin=self.recover_lin,
                                        ang=self.recover_ang, half=self.recover_half,
@@ -688,11 +733,28 @@ class NavNode(Node):
                 score = self.grid.score(cand, va, vr)
                 self._last_score = score
                 if score >= self.min_score:
-                    px, py, pth = cand                 # keep snapping toward the map
+                    px, py, pth = cand
                 if score >= self.recover_exit_score:
                     self._recovering = False
                     self._lost_count = 0
+                    self._next_global_scan = 0.0
+                    trusted = True
                     self.get_logger().info(f"relocalized (score {score:.1f})")
+                elif self.recover_global and time.monotonic() >= self._next_global_scan:
+                    self._next_global_scan = time.monotonic() + self.recover_global_period
+                    g = self.grid.relocalize(va, vr, step=self.recover_global_step)
+                    if g is not None:
+                        gx, gy, gth, gscore = g
+                        self._last_score = gscore
+                        if gscore >= self.min_score:
+                            px, py, pth = gx, gy, gth   # better prior; keep spinning
+                        if gscore >= self.recover_exit_score:
+                            self._recovering = False
+                            self._lost_count = 0
+                            self._next_global_scan = 0.0
+                            trusted = True
+                            self.get_logger().info(
+                                f"relocalized globally (score {gscore:.1f})")
         elif len(vr) > 10:
             cand = self.grid.match((px, py, pth), va, vr,
                                    lin=self.match_lin, ang=self.match_ang)
@@ -701,6 +763,7 @@ class NavNode(Node):
             self._last_score = score
             if score >= self.min_score:
                 px, py, pth = cand
+                trusted = True
                 self._lost_count = 0
             elif (self.relocalize and not self._test_active
                   and len(vr) >= self.recover_min_beams):
@@ -709,13 +772,12 @@ class NavNode(Node):
                 if self._lost_count >= self.recover_patience:
                     self._recovering = True
                     self._recover_until = time.monotonic() + self.recover_timeout
+                    self._next_global_scan = 0.0   # global search fires this first scan
                     self.get_logger().warning(
                         f"localization lost (score {score:.1f}) — relocalizing")
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
-        # Don't fold the scan into the map while the pose is uncertain (recovering) — a
-        # wrong pose would smear obstacles across the map.
-        if not self._recovering:
+        if trusted:
             self.grid.integrate((self.px, self.py, self.pth), angles, ranges)
         self._publish_pose()
         # True loop closure: periodically re-match the scan against the map centered on
@@ -746,19 +808,56 @@ class NavNode(Node):
             self._save_map_file(quiet=True)
 
     def _predict(self, px, py, pth, off=None):
-        """Apply the odom/IMU motion since the last scan as the scan-match prior."""
+        """Apply the odom/IMU motion since the last scan as the scan-match prior.
+
+        Freshness guard: if /odom or /imu/euler has gone silent (stale feed), a stale value
+        would move the prior wrongly and smear the map or set off false "lost" storms, so the
+        stale component is dropped and (for rotation) we fall back to the other source. Also
+        runs a soft monitor comparing the IMU and wheel-odom rotation sign; if they rotate
+        opposite ways it warns to set `imu_yaw_sign: -1`.
+        """
         if self._odom is None or self._prev_odom is None:
             self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
             return px, py, pth
+        now = time.monotonic()
+        odom_fresh = self._odom_stamp is not None and now - self._odom_stamp <= self._src_stale
+        imu_fresh = self._imu_stamp is not None and now - self._imu_stamp <= self._src_stale
+
         ox, oy, oth = self._odom
         pox, poy, poth = self._prev_odom
+        if not odom_fresh:
+            self.get_logger().warning("odom motion stale; not advancing the prior",
+                                      throttle_duration_sec=5.0)
+            self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
+            return px, py, pth
+
         # Rotation since the last scan: prefer the IMU yaw delta (less slip-prone than
-        # wheel odom) when available.
+        # wheel odom) when available; fall back to wheel odom if the IMU feed went stale.
+        dth_odom = _wrap(oth - poth)
         if self.use_imu and self._imu_yaw is not None and self._prev_imu is not None:
-            dth = _wrap(self._imu_yaw - self._prev_imu)
+            if imu_fresh:
+                dth = self.imu_sign * _wrap(self._imu_yaw - self._prev_imu)
+            else:
+                self.get_logger().warning("imu/euler stale; using wheel-odom yaw",
+                                          throttle_duration_sec=5.0)
+                dth = dth_odom
         else:
-            dth = _wrap(oth - poth)
+            dth = dth_odom
         self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
+
+        # Runtime IMU-vs-odom rotation-sign check (soft; only warns, never auto-flips).
+        self._sig_abs += abs(dth_odom)
+        self._sig_imu += dth
+        self._sig_odo += dth_odom
+        if self._sig_abs >= self._check_turn:
+            self._sig_abs = 0.0
+            si, so = self._sig_imu, self._sig_odo
+            self._sig_imu = self._sig_odo = 0.0
+            if abs(so) > 0.05 and si * so < 0.0:
+                self.get_logger().warning(
+                    "IMU yaw and wheel yaw rotate OPPOSITE signs — set imu_yaw_sign: -1",
+                    throttle_duration_sec=10.0)
+
         pth = _wrap(pth + dth)
         # Express the odom-frame displacement in the map frame. The map frame is rotated
         # relative to the odom frame by (pth - oth): pth is the robot's *map* yaw (after
@@ -915,6 +1014,9 @@ class NavNode(Node):
                 self.get_logger().warning("save_map ignored: map_store param is empty")
             return
         try:
+            d = os.path.dirname(self.map_store)
+            if d:
+                os.makedirs(d, exist_ok=True)          # persist into a fresh dir on boot
             self.grid.save(self.map_store)
             if not quiet:
                 self.get_logger().info(f"map saved to {self.map_store}")
@@ -925,6 +1027,11 @@ class NavNode(Node):
         if not self._have_map:
             return
         now = time.monotonic()
+
+        # Apply any pending web map edit (no-go strokes) BEFORE the nav decision, and
+        # rewrite the map + (once) the no-go blob so the UI reflects the edit this tick.
+        if self._check_edits():
+            self._write_map()
 
         # Pick-up + self-test + relocalization take priority over navigation.
         self._update_pickup(now)
@@ -1033,6 +1140,7 @@ class NavNode(Node):
                 self._recovering = True
                 self._recover_until = now + self.recover_timeout
                 self._lost_count = 0
+                self._next_global_scan = 0.0
             self.get_logger().info("set down — relocalizing")
 
     def _update_lds_idle(self, now):
@@ -1330,7 +1438,7 @@ class NavNode(Node):
             self._rot_prev = (iy, oy)
             return
         piy, poy = self._rot_prev
-        self._rot_imu += _wrap(iy - piy)
+        self._rot_imu += self.imu_sign * _wrap(iy - piy)
         self._rot_odom += _wrap(oy - poy)
         self._rot_prev = (iy, oy)
 
@@ -1499,9 +1607,18 @@ class NavNode(Node):
     def _pursuit(self):
         if not self._path:
             return 0.0, 0.0
-        # lookahead target = first waypoint at least `lookahead` away (else the last)
+        # Start from the NEAREST waypoint so a point we've already driven past isn't
+        # chased (chasing it throws the robot into a U-turn loop around a passed corner).
+        dmin, imin = math.inf, 0
+        for i, (x, y) in enumerate(self._path):
+            d = math.hypot(x - self.px, y - self.py)
+            if d < dmin:
+                dmin, imin = d, i
+        # lookahead target = first waypoint at least `lookahead` away from the robot,
+        # scanned forward from the nearest one (else the final goal).
         tx, ty = self._path[-1]
-        for (x, y) in self._path:
+        for i in range(imin, len(self._path)):
+            x, y = self._path[i]
             if math.hypot(x - self.px, y - self.py) >= self.lookahead:
                 tx, ty = x, y
                 break
@@ -1554,6 +1671,7 @@ class NavNode(Node):
             "free_m2": round(free_m2, 1),                    # mapped free area
             "score": round(self._last_score, 1),             # scan-match quality
             "mode": mode, "loc": loc, "motion": self.enable_motion,
+            "nogo": self.grid.nogo_count(),                  # no-go zones marked
             "trail": list(self._trail) if self._trail else [],
         }
         header = (json.dumps(meta) + "\n").encode()
@@ -1565,6 +1683,54 @@ class NavNode(Node):
             os.replace(tmp, MAP_FILE)        # atomic: the server never reads a torn file
         except OSError as exc:
             self.get_logger().warning(f"map write failed: {exc}", throttle_duration_sec=10.0)
+        if self._nogo_dirty:
+            self._write_nogo()
+            self._nogo_dirty = False
+
+    def _write_nogo(self):
+        """Publish the current no-go mask blob (only when it changed). Same header+raw
+        layout as the map; the browser decodes `w*h` bytes as a 1-bits-per-cell overlay."""
+        header = json.dumps({
+            "w": self.grid.n, "h": self.grid.n, "res": self.grid.res,
+            "ox": self.grid.origin, "oy": self.grid.origin,
+            "count": self.grid.nogo_count(),
+        }).encode()
+        tmp = NGO_BLOB_FILE + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(header + b"\n")
+                f.write(self.grid.forbidden.tobytes())
+            os.replace(tmp, NGO_BLOB_FILE)
+        except OSError as exc:
+            self.get_logger().warning(f"no-go write failed: {exc}",
+                                      throttle_duration_sec=10.0)
+
+    def _check_edits(self):
+        """Apply any pending web map-editor request (idempotent via its `t` token). The
+        file may persist; we only act on a token we haven't seen, so no delete/rename
+        race. Returns True if a no-go blob rewrite is needed."""
+        try:
+            with open(NGO_EDIT_FILE, "r") as f:
+                req = json.load(f)
+        except (OSError, ValueError):
+            return False
+        try:
+            t = int(req.get("t", 0))
+        except (TypeError, ValueError):
+            t = 0
+        if t <= self._edit_last_t:
+            return False                      # already applied (or older/duplicate)
+        self._edit_last_t = t
+        try:
+            res = self.grid.apply_action(req)   # never raises on bad input
+        except Exception as exc:
+            self.get_logger().warning(f"map edit failed: {exc}")
+            return False
+        self._nogo_dirty = True
+        if self.map_store:
+            self._save_map_file(quiet=True)   # persist the zone edit immediately
+        self.get_logger().info(f"map edit applied: {res}", throttle_duration_sec=2.0)
+        return True
 
 
 def _disable_default_qos_event_callbacks():

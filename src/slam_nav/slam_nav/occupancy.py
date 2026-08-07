@@ -36,6 +36,11 @@ class GridMap:
         # derived exports (occupancy_int8/coverage) instead of recomputing a full-grid
         # np.exp at the map-write rate while nothing is changing.
         self.rev = 0
+        # No-go mask: cells the PLANNER must never route through / treat as an obstacle.
+        # Unlike log-odds it is NOT touched by scan integration (a lidar beam through it
+        # won't slowly "free" it back), so a human-marked restricted zone stays put. It's
+        # persistence, exposed to the web UI as an overlay, and folded into _coarse().
+        self.forbidden = np.zeros((self.n, self.n), dtype=bool)
 
     # --- world <-> grid ------------------------------------------------------
     def w2g(self, x, y):
@@ -93,6 +98,63 @@ class GridMap:
                     best_s, best = float(s[i, j]), (float(xs[i]), float(ys[j]), float(th))
             bx, by, bth = best
         return bx, by, bth
+
+    def relocalize(self, angles, ranges, step=4, n_headings=16, npts=90, keep=6):
+        """Global scan-to-map search (kidnap recovery). Scores a decimated scan against
+        EVERY grid candidate at `step`-cell spacing across `n_headings` yaw steps, then
+        coarse-to-fine refines the top `keep` candidates with the local matcher and keeps
+        the best-scoring one. Keeping several hypotheses matters: at a slightly-wrong
+        coarse heading even the true location scores poorly, so the true pose can rank
+        below a spurious rotated one — refining the top K rescues it. Unlike match(),
+        which only hunts around the current pose, this can snap back after the robot is
+        carried far away (or boots inside an already-loaded map). Returns
+        (x, y, theta, score) or None when the map has little structure and no pose scored
+        above the free-space floor. Compatible with the caller's min_score / exit check."""
+        if len(ranges) > npts:                       # decimate: keeps the big lookup small
+            idx = np.linspace(0, len(ranges) - 1, npts).astype(int)
+            angles, ranges = angles[idx], ranges[idx]
+        xs = self.origin + (np.arange(0, self.n, step) + 0.5) * self.res
+        ys = self.origin + (np.arange(0, self.n, step) + 0.5) * self.res
+        ths = np.linspace(-np.pi, np.pi, n_headings, endpoint=False)
+
+        cands = []                                   # (coarse_score, th, x, y)
+        for th in ths:                               # per-heading (Nx, Ny, npts) broadcast
+            a = angles + th
+            hx = ranges * np.cos(a)                  # hit offsets for this heading
+            hy = ranges * np.sin(a)
+            cx = np.floor((xs[:, None] + hx[None, :] - self.origin) / self.res).astype(np.int32)
+            ry = np.floor((ys[:, None] + hy[None, :] - self.origin) / self.res).astype(np.int32)
+            inx = (cx >= 0) & (cx < self.n)
+            iny = (ry >= 0) & (ry < self.n)
+            cxc = np.clip(cx, 0, self.n - 1)
+            ryc = np.clip(ry, 0, self.n - 1)
+            vals = self.log[ryc[None, :, :], cxc[:, None, :]]     # (Nx, Ny, npts)
+            mask = inx[:, None, :] & iny[None, :, :]
+            s = np.where(mask, vals, 0.0).sum(axis=2)             # (Nx, Ny)
+            # keep the top-2 (x, y) per heading too, so a spurious peak at the true
+            # heading doesn't mask the right location for this heading. (Guard the
+            # argpartition kth bound: it must stay < size, else tiny maps crash.)
+            k2 = min(2, s.size)
+            if k2 >= 1:
+                for fi in np.argpartition(s.ravel(), -k2)[-k2:]:
+                    i, j = np.unravel_index(int(fi), s.shape)
+                    cands.append((float(s[i, j]), float(th), float(xs[i]), float(ys[j])))
+        cands.sort(key=lambda c: -c[0])
+
+        best = None
+        for _, th, x, y in cands[:keep]:
+            # 3 refine passes: a 2-pass climb can trap in a neighbouring basin when the
+            # coarse heading is a few degrees off, leaving the true peak unreached.
+            cand = self.match((x, y, th), angles, ranges,
+                              lin=2 * step * self.res, ang=0.35, half=4, refine=3)
+            sc = self.score(cand, angles, ranges)
+            if best is None or sc > best[3]:
+                best = (cand[0], cand[1], cand[2], sc)
+        if best is None or best[3] <= 0.0:
+            # Free-space cells carry negative log-odds, so a pose that actually hits
+            # occupied structure scores positive; anything at/below zero found no match.
+            return None
+        return best
 
     # --- map update ----------------------------------------------------------
     def integrate(self, pose, angles, ranges):
@@ -161,10 +223,14 @@ class GridMap:
     # --- export --------------------------------------------------------------
     def occupancy_int8(self):
         """ROS-style occupancy: -1 unknown, 0 free .. 100 occupied. Row 0 = origin_y
-        (bottom). Returned row-major as int8, ready to dump to the web map file."""
-        p = 1.0 - 1.0 / (1.0 + np.exp(self.log))      # P(occupied)
-        out = (p * 100.0).astype(np.int8)
-        out[~self.seen] = -1
+        (bottom). Returned row-major as int8, ready to dump to the web map file. Only
+        cells that have been seen get a probability (exp over the ~mostly-unmapped grid
+        dominates the map-write cost early on); unseen cells are -1 directly."""
+        out = np.full(self.log.shape, -1, dtype=np.int8)
+        s = self.seen
+        if s.any():
+            p = 1.0 - 1.0 / (1.0 + np.exp(self.log[s]))      # P(occupied) on seen cells
+            out[s] = (p * 100.0).astype(np.int8)
         return out
 
     def coverage(self):
@@ -176,6 +242,51 @@ class GridMap:
         cell_a = self.res * self.res
         return seen / float(self.n * self.n), free * cell_a, occ * cell_a
 
+    # --- no-go zones (human edits) -------------------------------------------
+    def nogo_count(self):
+        """Number of marked no-go cells (for map telemetry)."""
+        return int(self.forbidden.sum())
+
+    def _brush(self, c, r, radius, val):
+        """Mark the disk of coarse radius `radius` (cells) around (c, r) as val (on/off).
+        Vectorised over the disk bounding box so a web stroke costs ~nothing."""
+        y0, y1 = max(0, r - radius), min(self.n - 1, r + radius)
+        x0, x1 = max(0, c - radius), min(self.n - 1, c + radius)
+        yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+        disk = (xx - c) ** 2 + (yy - r) ** 2 <= radius * radius
+        self.forbidden[yy[disk], xx[disk]] = val
+
+    def apply_stroke(self, x0, y0, x1, y1, brush_cells, erase=False):
+        """Paint a no-go (or erase) stroke from world (x0,y0) to (x1,y1) with a brush of
+        `brush_cells` radius. Walks the line at the grid pitch so a fast drag has no gaps.
+        Returns the number of cells changed."""
+        c0, r0 = self.w2g(x0, y0)
+        c1, r1 = self.w2g(x1, y1)
+        dc, dr = float(c1 - c0), float(r1 - r0)
+        steps = int(math.hypot(dc, dr) / 2) + 1
+        val = False if erase else True              # erase => clear forbidden
+        for i in range(steps + 1):
+            t = i / max(1, steps)
+            c, r = int(round(c0 + dc * t)), int(round(r0 + dr * t))
+            self._brush(c, r, brush_cells, val)
+        return int(self.forbidden.sum())
+
+    def apply_action(self, action):
+        """Apply a single human edit dict (painted by the web map editor). Actions:
+          {"action":"stroke","x0":y?,"y0","x1","y1","brush":n,"erase":bool}
+          {"action":"clear"}               -> wipe ALL no-go zones
+        Any missing/first key -> no-op returning {"nogo": count}. Returns a status dict."""
+        act = (action or {}).get("action")
+        if act == "stroke":
+            x0 = float(action.get("x0", 0.0)); y0 = float(action.get("y0", 0.0))
+            x1 = float(action.get("x1", 0.0)); y1 = float(action.get("y1", 0.0))
+            brush = max(1, int(action.get("brush", 3)))
+            erase = bool(action.get("erase", False))
+            self.apply_stroke(x0, y0, x1, y1, brush, erase)
+        elif act == "clear":
+            self.forbidden[:] = False
+        return {"nogo": self.nogo_count()}
+
     # --- persistence ---------------------------------------------------------
     def save(self, path):
         """Persist the grid (log-odds + seen) compressed. A mostly-empty floor map is a
@@ -183,6 +294,7 @@ class GridMap:
         so a reader (or a crash mid-write) never sees a torn file."""
         tmp = path + ".tmp"
         np.savez_compressed(tmp, log=self.log, seen=self.seen,
+                            forb=self.forbidden,
                             n=np.int32(self.n), res=np.float32(self.res))
         # np.savez appends .npz to a str path; normalise then rename onto the target.
         os.replace(tmp + ".npz" if not tmp.endswith(".npz") else tmp, path)
@@ -200,6 +312,10 @@ class GridMap:
                 return False
             self.log = np.ascontiguousarray(z["log"], dtype=np.float32)
             self.seen = np.ascontiguousarray(z["seen"], dtype=bool)
+            # Older maps won't have the forb key — default to an empty mask rather
+            # than failing to load (no-go zones are opt-in edits).
+            forb = z["forb"] if "forb" in z else np.zeros(self.seen.shape, dtype=bool)
+            self.forbidden = np.ascontiguousarray(forb, dtype=bool)
         except (KeyError, ValueError):
             return False
         self.rev += 1
@@ -245,6 +361,7 @@ class GridMap:
         k = m * ds
         occ_c = (self.log[:k, :k] > self.OBST_L).reshape(m, ds, m, ds).any(axis=(1, 3))
         seen_c = self.seen[:k, :k].reshape(m, ds, m, ds).any(axis=(1, 3))
+        forb_c = self.forbidden[:k, :k].reshape(m, ds, m, ds).any(axis=(1, 3))
 
         # inflate obstacles by the robot radius (L1 / diamond dilation, a few passes)
         blocked = occ_c.copy()
@@ -253,6 +370,18 @@ class GridMap:
             b[1:, :] |= blocked[:-1, :]; b[:-1, :] |= blocked[1:, :]
             b[:, 1:] |= blocked[:, :-1]; b[:, :-1] |= blocked[:, 1:]
             blocked = b
+        # no-go zones: NEVER navigable, regardless of allow_unknown (they only cover a few
+        # cells each, so they get the same robot-radius inflation as obstacles). If a
+        # forbidden cell is reachable it's plannable around; if it walls a corridor the
+        # planner has to route around it like any obstacle.
+        if forb_c.any():
+            forb = forb_c.copy()
+            for _ in range(max(1, int(round(radius_m / res_c)))):
+                b = forb.copy()
+                b[1:, :] |= forb[:-1, :]; b[:-1, :] |= forb[1:, :]
+                b[:, 1:] |= forb[:, :-1]; b[:, :-1] |= forb[:, 1:]
+                forb = b
+            blocked |= forb
         if not allow_unknown:
             blocked |= ~seen_c
         return blocked, seen_c, m, res_c
@@ -273,8 +402,8 @@ class GridMap:
         fr[:, :-1] |= free[:, :-1] & unknown[:, 1:]
         if not fr.any():
             return []
-        sc = int((start[0] - self.origin) / res_c)
-        sr = int((start[1] - self.origin) / res_c)
+        sc = int(math.floor((start[0] - self.origin) / res_c))
+        sr = int(math.floor((start[1] - self.origin) / res_c))
         rs, cs = np.nonzero(fr)
         order = np.argsort((rs - sr) ** 2 + (cs - sc) ** 2)[:max(1, int(k))]
         return [(self.origin + (cs[i] + 0.5) * res_c, self.origin + (rs[i] + 0.5) * res_c)
@@ -290,7 +419,10 @@ class GridMap:
         blocked, seen_c, m, res_c = self._coarse(downsample, radius_m, allow_unknown)
 
         def w2c(x, y):
-            return (int((x - self.origin) / res_c), int((y - self.origin) / res_c))
+            # floor() (not int()) so negative coordinates map like w2g — int() truncates
+            # toward zero and would snap a point just below the origin onto cell 0.
+            return (int(math.floor((x - self.origin) / res_c)),
+                    int(math.floor((y - self.origin) / res_c)))
 
         sc, sr = w2c(*start)
         gc, gr = w2c(*goal)
