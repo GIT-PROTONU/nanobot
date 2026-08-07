@@ -48,11 +48,9 @@ from .gpu_vision import GpuVision
 from .mic_audio import AudioStream
 from .telemetry import TelemetryHub
 from .tts import TtsEngine, VOICES, clamp
-from .llm import LlmClient
-from .skills import resolve_skills_dir
-from .cognition import CognitionCore, sanitize_personality_patch
-from .stress import StressTest
-from .imu_interference import IMUInterferenceTest
+from nanobot_brain.cognition import LlmClient
+from nanobot_brain.cognition import resolve_skills_dir
+from nanobot_brain.cognition import CognitionCore
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
@@ -588,6 +586,12 @@ class WebServerNode(Node):
             f"llm: {'enabled' if self._cog.available() else 'idle (no key / disabled)'}"
             f" model={self._cog.llm.model}")
         self._cog.bank_regen_check()                    # build/refresh the bank if needed
+        # --- brain health monitoring ---
+        # Publish our health for the behavior layer to monitor; subscribe to its health so
+        # the web UI (via /brain/health HTTP) knows whether both layers are alive.
+        self._cog_health_pub = self.create_publisher(String, "brain/cognition_health", latched)
+        self._behavior_health = {}                     # last received from mood_node
+        self.create_subscription(String, "brain/behavior_health", self._on_behavior_health, 10)
         if bool(g("startup_greeting").value):
             # Say hello a few seconds after boot (once the OLED/TTS are up). Offline-safe via
             # the phrase bank's greeting fallback; the boot face is the behaviour node's job.
@@ -601,113 +605,7 @@ class WebServerNode(Node):
         self._announce_tick()                          # piggy-backs on this 1 Hz tick
         self._reflect_tick()                           # ditto (cheap when not due)
         self._llm_health_tick()                        # persistent "AI offline" indicator
-        self._vision_diary_tick()                      # visual diary (core rate-limits)
-
-    # ---- HTTP teleop ---------------------------------------------------------
-    def drive(self, data):
-        """POST /drive {"v","w"}: clamp, publish /cmd_vel now, and arm the 10 Hz
-        keepalive until the page stops refreshing (dead-man) or sends zero."""
-        g = self.get_parameter
-        max_lin = float(g("drive_max_lin").value)
-        max_ang = float(g("drive_max_ang").value)
-        try:
-            # NOT tts.clamp — that one rounds to int, which would turn 0.2 m/s into 0.
-            v = min(max_lin, max(-max_lin, float(data.get("v", 0.0))))
-            w = min(max_ang, max(-max_ang, float(data.get("w", 0.0))))
-        except (TypeError, ValueError):
-            v = w = 0.0
-        with self._drive_lock:
-            self._drive_v, self._drive_w = v, w
-            self._drive_at = time.monotonic() if (v or w) else 0.0
-        self._publish_drive(v, w)
-        return {"status": "ok", "v": v, "w": w}
-
-    def _publish_drive(self, v, w):
-        tw = Twist()
-        tw.linear.x = float(v)
-        tw.angular.z = float(w)
-        self._drive_pub.publish(tw)
-
-    def _drive_tick(self):
-        """10 Hz: re-assert the active HTTP-teleop command (the ESP32 stops the motors
-        if /cmd_vel goes stale) and dead-man-stop when the page vanishes mid-drive."""
-        with self._drive_lock:
-            if not self._drive_at:
-                return
-            stale = (time.monotonic() - self._drive_at
-                     > float(self.get_parameter("drive_timeout").value))
-            if stale:
-                self._drive_v = self._drive_w = 0.0
-                self._drive_at = 0.0
-            v, w = self._drive_v, self._drive_w
-        self._publish_drive(v, w)                      # a stale drive publishes one stop
-
-    # ---- health-event log (written by sys_monitor, served for the web card) ----
-    def get_health_log(self, limit=200):
-        """Tail of the durable ESP32/LDS outage log — the first stop for diagnosing
-        intermittent failures, now visible without an ssh session."""
-        path = os.path.expanduser(self.get_parameter("health_log_path").value
-                                  or "~/.local/state/nanobot/health.log")
-        try:
-            with open(path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                start = max(0, f.tell() - 64 * 1024)   # last 64 KB is plenty for a tail
-                f.seek(start)
-                lines = f.read().decode(errors="replace").splitlines()
-        except OSError:
-            return {"lines": [], "path": path}
-        if start and lines:
-            lines = lines[1:]                          # drop the line the seek cut in half
-        return {"lines": lines[-int(limit):], "path": path}
-
-    # ---- merged log stream: decision log + health log, interleaved by time ----
-    def get_merged_log(self, limit=200):
-        """Read-only merge of the two append-only event logs into one chronological
-        stream: the decision log (cognition.py — LLM/beat/skill activity, kept in an
-        in-memory ring buffer) and the health log (sys_monitor — ESP32/lidar outages,
-        read fresh from disk). Doesn't touch either file — each stays single-writer,
-        this just interleaves reads for the web UI's always-on Logs panel."""
-        limit = int(limit)
-        entries = []
-        for e in self._cog.get_cog_log()["entries"]:
-            d = dict(e)
-            d["source"] = "cognition"
-            entries.append(d)
-        for line in self.get_health_log(limit=limit)["lines"]:
-            t, text = _parse_health_line(line)
-            entries.append({"t": t, "source": "health", "text": text})
-        entries.sort(key=lambda e: e.get("t") or 0, reverse=True)
-        return {"entries": entries[:limit]}
-
-    # ---- stress test mode (see stress.py) ------------------------------------
-    def stress_start(self, data):
-        data = data or {}
-        try:
-            duration = float(data.get("duration", 30.0))
-        except (TypeError, ValueError):
-            duration = 30.0
-        try:
-            workers = int(data.get("workers", 0))
-        except (TypeError, ValueError):
-            workers = 0
-        return self._stress.start(duration=duration, workers=workers)
-
-    def stress_stop(self):
-        return self._stress.stop()
-
-    def stress_status(self):
-        return self._stress.status()
-
-    # ---- IMU mounting-interference self-test (see imu_interference.py) --------
-    def imu_interference_start(self, data):
-        data = data or {}
-        return self._imu_test.start(include_motor=bool(data.get("include_motor", False)))
-
-    def imu_interference_stop(self):
-        return self._imu_test.stop()
-
-    def imu_interference_status(self):
-        return self._imu_test.status()
+        self._brain_health_tick()                      # cognition health heartbeat
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -1623,6 +1521,100 @@ class WebServerNode(Node):
             self._llm_offline_reassert = now               # best-effort re-assert
             self._face_pub.publish(String(data=face))
 
+    def _on_behavior_health(self, msg: String):
+        """Store the latest behavior-layer health from mood_node."""
+        try:
+            self._behavior_health = json.loads(msg.data)
+        except Exception:
+            pass
+
+    def _brain_health_tick(self):
+        """Publish cognition-layer health as JSON on /brain/cognition_health (~1 Hz)."""
+        now = time.monotonic()
+        bh = self._behavior_health
+        behavior_alive = bool(bh.get("alive")) if bh else False
+        behavior_stale = not bh or (now - (bh.get("_t", now))) > 10.0
+        health = {
+            "_t": now,
+            "layer": "cognition",
+            "alive": True,
+            "llm_available": self._cog.available(),
+            "llm_fail_streak": self._cog.llm_fail_streak,
+            "llm_offline": bool(self._llm_offline),
+            "reflecting": self._reflecting,
+            "enabled": bool(self._cog.settings.get("enabled")),
+            "behavior_alive": behavior_alive and not behavior_stale,
+            "behavior_stale": behavior_stale,
+        }
+        self._cog_health_pub.publish(String(data=json.dumps(health)))
+
+    def get_brain_health(self):
+        """Aggregated brain health for the /brain/health HTTP endpoint."""
+        now = time.monotonic()
+        bh = self._behavior_health
+        behavior = dict(bh) if bh else {}
+        behavior_stale = not bh or (now - (bh.get("_t", now))) > 10.0
+        return {
+            "behavior": behavior,
+            "cognition": {
+                "alive": True,
+                "llm_available": self._cog.available(),
+                "llm_fail_streak": self._cog.llm_fail_streak,
+                "llm_offline": bool(self._llm_offline),
+                "reflecting": self._reflecting,
+                "enabled": bool(self._cog.settings.get("enabled")),
+            },
+            "overall": {
+                "behavior_alive": bool(behavior.get("alive")) and not behavior_stale,
+                "behavior_stale": behavior_stale,
+                "cognition_alive": True,
+                "all_healthy": (bool(behavior.get("alive")) and not behavior_stale
+                               and bool(self._cog.settings.get("enabled"))),
+            },
+        }
+
+    def _cpu_sample(self):
+        try:
+            with open(STAT_PATH) as f:
+                parts = [int(x) for x in f.readline().split()[1:]]
+            idle = parts[3] + (parts[4] if len(parts) > 4 else 0)  # idle + iowait
+            return idle, sum(parts)
+        except Exception:
+            return None
+
+    def _cpu_percent(self):
+        """Busy % since the previous sample (the gap between announcements)."""
+        cur = self._cpu_sample()
+        pct = float("nan")
+        if cur and self._cpu_prev:
+            di, dt = cur[0] - self._cpu_prev[0], cur[1] - self._cpu_prev[1]
+            if dt > 0:
+                pct = 100.0 * (1.0 - di / dt)
+        self._cpu_prev = cur
+        return pct
+
+    def _mem_percent(self):
+        try:
+            tot = avail = 0
+            with open(MEMINFO_PATH) as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        tot = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1])
+                    if tot and avail:
+                        break
+            return 100.0 * (tot - avail) / tot if tot else float("nan")
+        except Exception:
+            return float("nan")
+
+    def _cpu_temp(self):
+        try:
+            with open(THERMAL_PATH) as f:
+                return int(f.read().strip()) / 1000.0
+        except Exception:
+            return float("nan")
+
     def destroy_node(self):
         try:
             self._stress.stop()
@@ -1790,6 +1782,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._serve_map()
         if path == "/scan.bin":
             return self._serve_scan()
+        if path == "/brain/health":
+            return self._respond_json(
+                self._node.get_brain_health() if self._node else {"error": "no node"})
         return super().do_GET()
 
     def do_POST(self):
