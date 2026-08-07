@@ -97,7 +97,7 @@ slam_nav:
     match_ang: 0.12                # scan-match search half-window (rad)
     match_points: 90               # scan beams used for matching (decimated)
     min_match_score: 1.0           # reject matches with no real map overlap
-use_imu_yaw: true              # IMU yaw delta for the rotation prior. With the EKF
+    use_imu_yaw: true             # IMU yaw delta for the rotation prior. With the EKF
                                 # providing an IMU-corrected baseline yaw in /odometry/
                                 # filtered, the raw IMU delta from /imu/euler is more
                                 # reliable than ever — the scan matcher's yaw window
@@ -268,6 +268,19 @@ use_imu_yaw: true              # IMU yaw delta for the rotation prior. With the 
     test_dist: 0.35                # m to drive forward, then back
     test_turns: 1.0                # full in-place rotations for the IMU-vs-odom cross-check
     test_settle: 1.2               # s to settle between motion legs
+    # Odom auto-calibration baselines (mirror wheel_odometry below; the self-test's
+    # CALIBRATION line reports corrections to paste back here)
+    cal_ticks_per_rev: 1440
+    cal_wheel_radius: 0.0335
+    cal_wheel_sep: 0.16
+    # Wheel-slip / stall cross-check: gyro-z (IMU) vs wheel-odom-implied rotation.
+    # Informational only — logs WHEEL SLIP / WHEEL DRAG when the wheels turn far more
+    # (slip) or far less (drag/stall) than the IMU says the robot actually rotated.
+    slip_check: true
+    slip_min_rot: 0.15             # rad of accumulated wheel yaw needed to judge slip
+    slip_ratio_hi: 1.6             # |odom|/|imu| rotation above this = slipping wheel
+    slip_ratio_lo: 0.4             # ...below this = dragged/blocked wheel
+    slip_cooldown: 10.0            # s between slip/drag alerts
 
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:
@@ -598,6 +611,9 @@ web_control:
     vision_approach_band: 0.25           # AND motion centred within +-this of frame centre
     # Named colour-target palette (persisted; a calibration now survives restarts).
     vision_targets_path: ""              # "" = ~/.local/state/nanobot/vision_targets.json
+    # Named locations ("go to the kitchen"): name -> pose map for the map panel's waypoint
+    # layer / go-to skill. Persisted like the vision palette (NOT ROS params).
+    locations_path: ""                    # "" = ~/.local/state/nanobot/locations.json
     # Visual diary: slow log of the scene scalars folded into the reflection prompts
     # ("the room got darker and calmer through the evening") — sensory continuity for
     # the self-narrative, same mechanism as the trait trajectory.

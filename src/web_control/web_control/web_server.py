@@ -39,14 +39,14 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped
 
 from . import procstats
 from .jsonio import read_json, write_json
 from .mjpeg_camera import CameraStream
 from .gpu_vision import GpuVision
 from .mic_audio import AudioStream
-from .telemetry import TelemetryHub
+from .telemetry import TelemetryHub, GOAL_MAX_ABS_M
 from .tts import TtsEngine, VOICES, clamp
 from nanobot_brain.cognition import LlmClient
 from nanobot_brain.cognition import resolve_skills_dir
@@ -194,6 +194,12 @@ class WebServerNode(Node):
         # Named colour-target palette: calibrations persist here and survive a restart
         # (previously a picked colour was lost on every stack restart).
         self.declare_parameter("vision_targets_path", "")   # "" -> ~/.local/state/nanobot/vision_targets.json
+        # Named locations ("go to the kitchen"): a durable name->pose map persisted like
+        # the vision-target palette (live-editable from the web map panel, NOT ROS params —
+        # see rclpy-string-array-param-gotcha). slam_nav already has click-to-go + go_home;
+        # Locations is a waypoint layer on top: save current pose as a name, then publish
+        # the stored pose to /goal_pose (go to it).
+        self.declare_parameter("locations_path", "")   # "" -> ~/.local/state/nanobot/locations.json
         # Visual diary: a slow durable log of the scene scalars (luma/motion/edge/
         # novelty/warmth) folded into the reflection prompts -- sensory continuity for
         # the self-narrative, same mechanism as the trait trajectory.
@@ -312,6 +318,16 @@ class WebServerNode(Node):
         self._vision_targets = {}
         self._vision_target_active = None
         self._vision_approach = False      # anticipatory-approach signal (see _vision_state_tick)
+        # Named locations ("go to the kitchen"): name -> {x, y, yaw} map persisted to
+        # locations.json. Live-editable from the web map panel; /locations/go publishes the
+        # stored pose to /goal_pose. Current pose comes from the /slam_pose subscription
+        # (same source the map panel's click-to-go uses), so "save current spot" needs no
+        # extra plumbing.
+        self._locations_path = os.path.expanduser(
+            g("locations_path").value or "~/.local/state/nanobot/locations.json")
+        self._locations = {}
+        self._current_pose = None          # (x, y, yaw) from /slam_pose, None until seen
+        self._load_locations()
         self._oled_mask_on = False         # OLED tracking-mask mirror state
         self._oled_mask_pub = None
         self._vision_state_pub = None
@@ -486,6 +502,7 @@ class WebServerNode(Node):
                 "/fan_pwm": self.create_publisher(Float32, "fan_pwm", 10),
                 "/lds_target_rpm": self.create_publisher(Float32, "lds_target_rpm", 10),
                 "/cmd_vel": self.create_publisher(Twist, "cmd_vel", 10),
+                "/goal_pose": self.create_publisher(PoseStamped, "goal_pose", 5),
             }
         self._cog = CognitionCore(
             llm=llm, tts=self._tts, persona=self._persona, persona_name=self._persona_name,
@@ -597,6 +614,9 @@ class WebServerNode(Node):
         self._cog_health_pub = self.create_publisher(String, "brain/cognition_health", latched)
         self._behavior_health = {}                     # last received from mood_node
         self.create_subscription(String, "brain/behavior_health", self._on_behavior_health, 10)
+        # Named locations: track the live SLAM pose so "save current spot as X" has a pose
+        # to capture (slam_nav publishes /slam_pose in the map frame).
+        self.create_subscription(PoseStamped, "slam_pose", self._on_slam_pose, 10)
         if bool(g("startup_greeting").value):
             # Say hello a few seconds after boot (once the OLED/TTS are up). Offline-safe via
             # the phrase bank's greeting fallback; the boot face is the behaviour node's job.
@@ -1015,6 +1035,21 @@ class WebServerNode(Node):
                 pub.publish(tw)
                 self._later(dur, lambda: pub.publish(Twist()))   # always auto-stop
                 return True, "/cmd_vel lin=%.2f ang=%.2f for %.1fs" % (lin, ang, dur)
+            if topic == "/goal_pose":
+                # VALUE is a saved location NAME -> resolve to its stored pose and publish
+                # a goal in the map frame (like the map panel's click-to-go). Gated by
+                # skills_allow_actions like every other action skill.
+                name = str(val or "").strip()
+                loc = self._locations.get(name) if name else None
+                if loc is None:
+                    return False, "no saved location named '%s'" % (name or "(none)")
+                m = PoseStamped()
+                m.header.frame_id = "map"
+                m.pose.position.x = float(loc["x"])
+                m.pose.position.y = float(loc["y"])
+                m.pose.orientation.w = 1.0
+                pub.publish(m)
+                return True, "/goal_pose -> '%s' (%.2f, %.2f)" % (name, loc["x"], loc["y"])
         except (TypeError, ValueError) as exc:
             return False, "bad value: %s" % exc
         return False, "unhandled topic: " + topic
@@ -1533,6 +1568,76 @@ class WebServerNode(Node):
         except Exception:
             pass
 
+    # --- named locations ("go to the kitchen") --------------------------------
+    # A durable name->pose map persisted to locations.json (live-editable from the web
+    # map panel, same pattern as the vision-target palette / schedule). slam_nav already
+    # has click-to-go (goal_pose) + go_home; Locations adds a named waypoint layer: save
+    # the current pose under a name, then publish the stored pose to /goal_pose to go
+    # there. Current pose tracks /slam_pose so "save current spot" needs no extra plumbing.
+    def _on_slam_pose(self, msg: PoseStamped):
+        p = msg.pose.position
+        q = msg.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
+        self._current_pose = (p.x, p.y, yaw)
+
+    def _load_locations(self):
+        data = read_json(self._locations_path)
+        if isinstance(data, dict) and isinstance(data.get("locations"), dict):
+            cleaned = {}
+            for name, v in data["locations"].items():
+                if isinstance(v, dict):
+                    cleaned[str(name)[:32]] = v
+            self._locations = cleaned
+
+    def _save_locations(self):
+        if not write_json(self._locations_path, {"locations": self._locations}):
+            self.get_logger().warning("locations: save failed")
+
+    def get_locations(self):
+        """GET /locations: the name->pose map (for the map panel's waypoint overlay)."""
+        return {"locations": self._locations, "pose": self._current_pose}
+
+    def location_save(self, d):
+        """POST /locations/save {name, [x,y,yaw]}: remember a spot. If x/y given, use them
+        (the map panel passes a clicked point); else capture the current /slam_pose."""
+        name = str((d or {}).get("name") or "").strip()[:32]
+        if not name:
+            return {"error": "empty name"}
+        pose = d or {}
+        try:
+            x = float(pose.get("x")); y = float(pose.get("y"))
+            yaw = float(pose.get("yaw", 0.0)); from_point = True
+        except (TypeError, ValueError, KeyError):
+            if self._current_pose is None:
+                return {"error": "no current pose yet (has /slam_pose arrived?)"}
+            x, y, yaw = self._current_pose; from_point = False
+        # Clamp like the goal publisher does, so a saved spot is always a navigable goal.
+        x = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, x))
+        y = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, y))
+        self._locations[name] = {"x": x, "y": y, "yaw": yaw,
+                                 "src": "map" if from_point else "current"}
+        self._save_locations()
+        return {"ok": True, "name": name, "location": self._locations[name]}
+
+    def location_delete(self, d):
+        """POST /locations/delete {name}: forget a saved location."""
+        name = str((d or {}).get("name") or "").strip()[:32]
+        if name in self._locations:
+            del self._locations[name]
+            self._save_locations()
+            return {"ok": True, "name": name}
+        return {"error": f"no location named '{name}'"}
+
+    def location_go(self, d):
+        """POST /locations/go {name}: publish the stored pose to /goal_pose (go there)."""
+        name = str((d or {}).get("name") or "").strip()[:32]
+        loc = self._locations.get(name)
+        if loc is None:
+            return {"error": f"no location named '{name}'"}
+        # Publish the goal in the map frame, exactly like the map panel's click-to-go.
+        return self.telemetry.publish_json({"topic": "goal_pose",
+                                            "value": {"x": loc["x"], "y": loc["y"]}})
+
     def _brain_health_tick(self):
         """Publish cognition-layer health as JSON on /brain/cognition_health (~1 Hz)."""
         now = time.monotonic()
@@ -1714,6 +1819,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/stress/status": lambda n: n.stress_status(),
         "/imu/interference/status": lambda n: n.imu_interference_status(),
         "/vision/targets": lambda n: n.get_vision_targets(),
+        "/locations": lambda n: n.get_locations(),
         "/llm/vision_diary": lambda n: n.get_vision_diary(),
     }
     POST_JSON = {
@@ -1740,6 +1846,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/vision/target_select": lambda n, d: n.vision_target_select(d),
         "/vision/target_delete": lambda n, d: n.vision_target_delete(d),
         "/vision/oled_mask": lambda n, d: n.set_oled_mask(d),
+        "/locations/save": lambda n, d: n.location_save(d),
+        "/locations/delete": lambda n, d: n.location_delete(d),
+        "/locations/go": lambda n, d: n.location_go(d),
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.

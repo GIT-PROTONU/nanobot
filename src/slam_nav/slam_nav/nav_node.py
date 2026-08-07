@@ -33,6 +33,7 @@ from std_msgs.msg import Bool, String, Int8, Int64MultiArray, Float32
 from tf2_ros import TransformBroadcaster
 
 from .occupancy import GridMap
+from . import calibrate
 
 MAP_FILE = "/dev/shm/nano_map.bin"
 # Web map-editor handoff: web_control writes a small JSON "edit request" here (atomic
@@ -221,6 +222,16 @@ class NavNode(Node):
             ("test_dist", 0.35),           # m to drive forward, then back
             ("test_turns", 1.0),           # full in-place rotations for the IMU-vs-odom check
             ("test_settle", 1.2),          # s to settle between motion legs
+            # odom auto-calibration baselines (defaults mirror robot.yaml wheel_odometry)
+            ("cal_ticks_per_rev", 1440),
+            ("cal_wheel_radius", 0.0335),
+            ("cal_wheel_sep", 0.16),
+            # --- wheel-slip cross-check (gyro-z vs encoder-implied rotation) ---
+            ("slip_check", True),          # master on/off for the slip/stall detector
+            ("slip_min_rot", 0.15),        # rad of accumulated wheel yaw needed to judge slip
+            ("slip_ratio_hi", 1.6),        # |odom_rot| / |imu_rot| above this = slipping wheel
+            ("slip_ratio_lo", 0.4),        # ...below this = dragged/blocked wheel
+            ("slip_cooldown", 10.0),       # s between slip alerts (no alert spam)
         ])
         g = self.get_parameter
         self.grid = GridMap(
@@ -290,6 +301,17 @@ class NavNode(Node):
         self.test_dist = float(g("test_dist").value)
         self.test_turns = float(g("test_turns").value)
         self.test_settle = float(g("test_settle").value)
+        # Current odometry constants, used as the calibration baseline. Defaults mirror
+        # robot.yaml wheel_odometry (ticks_per_rev / wheel_radius / wheel_separation);
+        # a dev host can inject the true live values for an A/B of the solver.
+        self.cal_ticks_per_rev = float(g("cal_ticks_per_rev").value)
+        self.cal_wheel_radius = float(g("cal_wheel_radius").value)
+        self.cal_wheel_sep = float(g("cal_wheel_sep").value)
+        self.slip_check = bool(g("slip_check").value)
+        self.slip_min_rot = float(g("slip_min_rot").value)
+        self.slip_ratio_hi = float(g("slip_ratio_hi").value)
+        self.slip_ratio_lo = float(g("slip_ratio_lo").value)
+        self.slip_cooldown = float(g("slip_cooldown").value)
         self._target = None      # (x, y, confidence) from /vision/state, or None
         self._target_t = 0.0     # monotonic time of the last /vision/state message
         self._track_prev_yaw = None    # last _imu_yaw sampled by _track_step, for the
@@ -350,6 +372,11 @@ class NavNode(Node):
         self._sig_abs = 0.0
         self._sig_imu = 0.0
         self._sig_odo = 0.0
+        # wheel-slip / stall cross-check accumulators (see _predict)
+        self._slip_abs = 0.0
+        self._slip_imu = 0.0
+        self._slip_odo = 0.0
+        self._slip_last_warn = 0.0
         self._last_write = 0.0
         # _write_map export cache: recomputing occupancy_int8 (a full-grid np.exp) +
         # coverage at the write rate cost ~40% of a core even while SLAM was paused.
@@ -402,6 +429,8 @@ class NavNode(Node):
         self._ticks = None           # latest raw /wheel_ticks [L,R] (lazy sub, test only)
         self._imu_accel = self._imu_gyro = self._imu_hz = 0.0
         self._ticks_sub = self._imuweb_sub = None
+        # calibration result (set by _measure when a leg yields a usable solution)
+        self._calib = {}
 
         # Optionally reload a previously-saved map (relocalize into it from the origin).
         if self.map_store:
@@ -574,6 +603,24 @@ class NavNode(Node):
                 self.test_turns = float(p.value)
             elif p.name == "test_settle":
                 self.test_settle = float(p.value)
+            elif p.name == "cal_ticks_per_rev":
+                self.cal_ticks_per_rev = float(p.value)
+            elif p.name == "cal_wheel_radius":
+                self.cal_wheel_radius = float(p.value)
+            elif p.name == "cal_wheel_sep":
+                self.cal_wheel_sep = float(p.value)
+            elif p.name == "slip_check":
+                self.slip_check = bool(p.value)
+                if not self.slip_check:
+                    self._slip_abs = self._slip_imu = self._slip_odo = 0.0
+            elif p.name == "slip_min_rot":
+                self.slip_min_rot = float(p.value)
+            elif p.name == "slip_ratio_hi":
+                self.slip_ratio_hi = float(p.value)
+            elif p.name == "slip_ratio_lo":
+                self.slip_ratio_lo = float(p.value)
+            elif p.name == "slip_cooldown":
+                self.slip_cooldown = float(p.value)
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
@@ -857,6 +904,36 @@ class NavNode(Node):
                 self.get_logger().warning(
                     "IMU yaw and wheel yaw rotate OPPOSITE signs — set imu_yaw_sign: -1",
                     throttle_duration_sec=10.0)
+
+        # Wheel-slip / stall cross-check: IMU gyro-z rotation (dth, signed, sign-fixed)
+        # vs wheel-odom-implied rotation (dth_odom). If the wheels turn far more than the
+        # IMU says the robot actually rotated, a wheel is slipping (unloaded, low grip);
+        # far less, a wheel is dragged/blocked (stall). Judged on an accumulated window so
+        # tick/IMU quantization noise doesn't fire on tiny steps — same shape as the sign
+        # check above. Informational only: alert + diagnostics, no motion authority.
+        if self.slip_check and dth_odom is not None and dth is not None:
+            self._slip_abs += abs(dth_odom)
+            self._slip_imu += dth
+            self._slip_odo += dth_odom
+            if self._slip_abs >= self.slip_min_rot:
+                si, so = self._slip_imu, self._slip_odo
+                self._slip_imu = self._slip_odo = 0.0
+                if abs(so) > 1e-6:
+                    ratio = abs(so) / (abs(si) if abs(si) > 1e-6 else abs(si) + 1e-9)
+                    now = time.monotonic()
+                    if now - self._slip_last_warn >= self.slip_cooldown:
+                        if ratio > self.slip_ratio_hi:
+                            self._slip_last_warn = now
+                            self.get_logger().warning(
+                                f"WHEEL SLIP: odom rotation {abs(so):.2f} rad vs IMU "
+                                f"{abs(si):.2f} rad (ratio {ratio:.2f}) — a wheel may be "
+                                f"slipping", throttle_duration_sec=max(1.0, self.slip_cooldown))
+                        elif ratio < self.slip_ratio_lo:
+                            self._slip_last_warn = now
+                            self.get_logger().warning(
+                                f"WHEEL DRAG/STALL: odom rotation {abs(so):.2f} rad vs IMU "
+                                f"{abs(si):.2f} rad (ratio {ratio:.2f}) — a wheel may be "
+                                f"blocked", throttle_duration=max(1.0, self.slip_cooldown))
 
         pth = _wrap(pth + dth)
         # Express the odom-frame displacement in the map frame. The map frame is rotated
@@ -1496,6 +1573,14 @@ class NavNode(Node):
                     line += f" -> OK (R/L={bal:.2f})"
                 else:
                     line += f" -> WHEEL IMBALANCE (R/L={bal:.2f})"; self._test_warn += 1
+                mpt = (2.0 * math.pi * self.cal_wheel_radius) / self.cal_ticks_per_rev
+                new_mpt = calibrate.scale_from_forward(self.test_dist, dist, mpt)
+                if abs(new_mpt - mpt) > 1e-9:
+                    new_r = calibrate.radius_from_scale(new_mpt, self.cal_ticks_per_rev)
+                    self._calib["wheel_radius"] = new_r
+                    self._calib["m_per_tick"] = new_mpt
+                    line += (f"; CAL radius {self.cal_wheel_radius:.4f}->{new_r:.4f} "
+                             f"(m/tick {mpt:.6f}->{new_mpt:.6f})")
             R.append(line)
         elif name == "back":
             dL, dR = cur["L"] - s["L"], cur["R"] - s["R"]
@@ -1516,11 +1601,19 @@ class NavNode(Node):
                 line += " -> IMU YAW NOT TRACKING"; self._test_fail += 1
             elif abs(odo_d) > 5.0:
                 ratio = imu_d / odo_d
+                # Corrected: to fit the IMU truth, the separation scales by odom/imu
+                # (dth=(dR-dL)/b). The old hint had this backwards (b * imu/odom),
+                # which pushed the calibration the wrong way.
+                new_sep = calibrate.separation_from_spin(
+                    self._rot_odom, self._rot_imu, self.cal_wheel_sep)
+                if abs(new_sep - self.cal_wheel_sep) > 1e-6:
+                    self._calib["wheel_sep"] = new_sep
                 if 0.85 <= ratio <= 1.18:
                     line += f" -> OK (IMU/odom={ratio:.2f})"
                 else:
                     line += (f" -> MISMATCH (IMU/odom={ratio:.2f}; "
-                             f"set wheel_separation*{ratio:.2f} to match IMU)")
+                             f"set wheel_separation={new_sep:.4f} "
+                             f"(was {self.cal_wheel_sep:.4f}) to match IMU)")
                     self._test_warn += 1
             R.append(line)
         # "settle" / "done" legs: nothing to measure
@@ -1533,6 +1626,10 @@ class NavNode(Node):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._ticks_sub = self._imuweb_sub = None
+        if self._calib:
+            parts = [f"{k}={v:.4f}" for k, v in sorted(self._calib.items())]
+            self._test_report.append(
+                f"CALIBRATION (odom constants to set in robot.yaml): {', '.join(parts)}")
         verdict = "FAIL" if self._test_fail else ("WARN" if self._test_warn else "PASS")
         self._test_report.append(
             f"=== {verdict} (fail {self._test_fail}, warn {self._test_warn}) ===")
