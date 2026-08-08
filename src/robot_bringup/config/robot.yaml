@@ -97,6 +97,16 @@ slam_nav:
     match_ang: 0.12                # scan-match search half-window (rad)
     match_points: 90               # scan beams used for matching (decimated)
     min_match_score: 1.0           # reject matches with no real map overlap
+    # Inlier gate: a scan is only TRUSTED (pose snapped + integrated) when at least
+    # this fraction of its beams land on already-seen map cells. Catches the "good
+    # score, no real overlap" bad scan (a few overlapping beams in front of undegraded
+    # void) without needing any per-beam model. 0 = disabled. Live-tunable.
+    min_overlap_ratio: 0.10
+    # Beam signal-quality floor read from /scan.intensities (the lidar's raw signal
+    # strength); beams below it are dropped before match + integrate. -1 = off (default
+    # until the driver's intensity range is checked on hardware — far returns have
+    # legitimately lower signal). Live-tunable.
+    qual_min: -1.0
     use_imu_yaw: true             # IMU yaw delta for the rotation prior. With the EKF
                                 # providing an IMU-corrected baseline yaw in /odometry/
                                 # filtered, the raw IMU delta from /imu/euler is more

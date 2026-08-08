@@ -39,6 +39,35 @@ def _integrate_rect(grid, cx, cy, n=120, rx=2.0, ry=1.5):
     grid.integrate((cx, cy, 0.0), a, r)
 
 
+def test_overlap_ratio_anchored_vs_void():
+    """The inlier gate (nav_node's min_overlap_ratio): a scan fully resting on mapped
+    structure has ratio ~1.0; the same scan at a pose pointing at unmapped void drops
+    to ~0.0 — so 'good score / no real overlap' scans are distinguishable cheaply."""
+    g = GridMap(size_m=10.0, res=0.05)
+    _integrate_rect(g, 0.0, 0.0)
+    a = np.linspace(0.0, 2.0 * math.pi, 120, endpoint=False).astype(np.float32)
+    r = np.array([_rect_range(float(ang), 2.0, 1.5) for ang in a], dtype=np.float32)
+
+    # At the true pose every beam lands on a seen cell (the whole rect disk was mapped).
+    assert g.overlap_ratio((0.0, 0.0, 0.0), a, r) > 0.9
+
+    # Same scan, pose parked 10 m away: every hit lands outside the mapped region.
+    assert g.overlap_ratio((10.0, 0.0, 0.0), a, r) == 0.0
+
+    # Partially overlapping pose: some beams on seen cells, some into the void.
+    partial = g.overlap_ratio((2.5, 0.0, 0.0), a, r)
+    assert 0.0 < partial < 0.9
+
+
+def test_overlap_ratio_zero_on_empty_map():
+    """On a never-integrated grid nothing is seen, so the ratio is 0 (and must not
+    crash on the empty grid path)."""
+    g = GridMap(size_m=10.0, res=0.05)
+    a = np.linspace(0.0, 2.0 * math.pi, 90, endpoint=False).astype(np.float32)
+    r = np.full(a.shape, 2.0, dtype=np.float32)
+    assert g.overlap_ratio((0.0, 0.0, 0.0), a, r) == 0.0
+
+
 def test_transform_small_warp_consistent_motion():
     """Loop closure only ever warps the grid by a TINY step (alpha*drift, ~sub-cell);
     the occupied region must move by exactly that step (a consistent rigid motion). The

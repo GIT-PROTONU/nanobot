@@ -3,6 +3,9 @@
 # args, so a glob like "nano-*" would let extra unit names ride along).
 #   * poweroff/reboot        — the web UI Shutdown/Reboot buttons
 #   * start/stop/restart of nano-robot.target — scripts/stack.sh {up|down|restart}
+#   * restart nano-ekf.service — the web EKF-tuning card applies saved config by
+#     restarting just the EKF unit (robot_localization reads its params at start).
 # Installed to /etc/sudoers.d/nano-power (mode 0440) by deploy/sbc-setup.sh.
 ibster ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot
 ibster ALL=(root) NOPASSWD: /usr/bin/systemctl start nano-robot.target, /usr/bin/systemctl stop nano-robot.target, /usr/bin/systemctl restart nano-robot.target
+ibster ALL=(root) NOPASSWD: /usr/bin/systemctl restart nano-ekf.service

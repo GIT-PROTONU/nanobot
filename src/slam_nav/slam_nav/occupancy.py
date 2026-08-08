@@ -67,6 +67,24 @@ class GridMap:
             return -1e18
         return float(self.log[r[m], c[m]].sum())
 
+    def overlap_ratio(self, pose, angles, ranges):
+        """Fraction of in-bounds beams that land on a cell the map has actually SEEN.
+
+        The inlier complement of score(): a raw log-odds sum can clear a threshold on
+        the strength of a handful of overlapping beams even when the scan is mostly
+        pointing at unmapped void (carried to a different spot, or a scan whose rays
+        are blind/parked at distance). This ratio says how much of the scan is truly
+        anchored on previously-seen structure, so a "good score / no real overlap"
+        scan gets caught instead of corrupting the map. 1.0 = every beam on a seen
+        cell; 0.0 = nothing overlaps."""
+        px, py, pth = pose
+        a = angles + pth
+        c, r = self.w2g(px + ranges * np.cos(a), py + ranges * np.sin(a))
+        m = self._inb(c, r)
+        if not m.any():
+            return 0.0
+        return float(self.seen[r[m], c[m]].mean())
+
     def match(self, prior, angles, ranges, lin=0.10, ang=0.12, half=4, refine=2):
         """Correlative scan-to-map match: coarse-to-fine search around `prior` for the
         (x, y, theta) that maximises score. `half` = candidates each side per axis;

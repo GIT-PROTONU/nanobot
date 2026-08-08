@@ -28,6 +28,7 @@ import copy
 import json
 import math
 import os
+import re
 import queue
 import subprocess
 import threading
@@ -118,6 +119,111 @@ NGO_MAP_EDIT_FILE = "/dev/shm/nano_map_edit.json"
 SKILL_MOTION_LIN_MAX = 0.15                    # m/s   cap on a skill's commanded linear speed
 SKILL_MOTION_ANG_MAX = 0.8                     # rad/s cap on a skill's commanded yaw rate
 SKILL_MOTION_DUR_MAX = 3.0                     # s     cap on /cmd_vel drive time before auto-stop
+
+# ---- EKF tuning ---------------------------------------------------------------
+# robot_localization loads ALL of its parameters ONCE in RosFilter's constructor and
+# exposes NO runtime set_on_set_parameters callback (verified against the installed
+# 3.5.4 binaries + the upstream repo) — a ros2 param set / POST /param silently changes
+# nothing. So "tuning the EKF from the web UI" genuinely = write the new values into
+# the ekf.yaml the ekf unit loads and restart just the lightweight nano-ekf.service.
+# These helpers read/write that file surgically (regex, no PyYAML dependency on the
+# board), leaving every non-tunable line and comment untouched. The tunables:
+#   frequency / sensor_timeout : scalar EKF params
+#   pn_x / pn_y / pn_yaw       : the (0,0),(1,1),(5,5) diagonal of the 15x15 Q matrix.
+# Keys are clamped to the (low, high) ranges below.
+EKF_TUNABLES = {
+    "frequency":      (2.0, 30.0),    # Hz       (15 Hz matches odom)
+    "sensor_timeout": (0.05, 2.0),    # s        before the filter goes prediction-only
+    "pn_x":           (0.005, 0.5),   # pos X process noise
+    "pn_y":           (0.005, 0.5),   # pos Y process noise
+    "pn_yaw":         (0.01, 1.0),    # yaw process noise
+}
+_PN_DIAG = {"pn_x": 0, "pn_y": 16, "pn_yaw": 80}    # 15x15 row-major diagonal indices
+_PN_LEN = 15 * 15
+
+
+def _ekf_installed_path():
+    """Find the installed ekf.yaml the ekf unit loads (board: $NANO/install/...; dev:
+    the repo copy). Returns the best candidate even if absent (for the error path)."""
+    cands = [
+        os.path.join(os.environ.get("NANO", os.path.expanduser("~/Nano")),
+                     "install", "robot_bringup", "share", "robot_bringup", "config", "ekf.yaml"),
+        os.path.join(os.getcwd(), "install", "robot_bringup", "share",
+                     "robot_bringup", "config", "ekf.yaml"),
+        os.path.join(os.path.expanduser("~"), "Nano", "install", "robot_bringup", "share",
+                     "robot_bringup", "config", "ekf.yaml"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                     "robot_bringup", "config", "ekf.yaml"),
+    ]
+    for p in cands:
+        if os.path.isfile(p):
+            return p
+    return cands[0]
+
+
+def _ekf_read(path):
+    """Parse the tunable subset of ekf.yaml. Returns (dict, None) or (None, err)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        return None, f"can't read {path}: {exc}"
+    out = {}
+
+    def scalar(key):
+        m = re.search(r"(?m)^\s*" + re.escape(key) + r"\s*:\s*([+-]?[0-9.]+[eE]?[+-]?\d*)\b",
+                      text)
+        return float(m.group(1)) if m else None
+
+    out["frequency"] = scalar("frequency")
+    out["sensor_timeout"] = scalar("sensor_timeout")
+    out["two_d_mode"] = True if re.search(r"(?m)^\s*two_d_mode\s*:\s*true\b", text) else False
+    b = re.search(r"(?m)^\s*process_noise_covariance\s*:\s*\[", text)
+    if b:
+        e = text.find("]", b.end())
+        q = [float(x) for x in re.findall(r"[+-]?[0-9.]+[eE]?[+-]?\d*", text[b.end():e])]
+        out["pn"] = {
+            "x": round(q[0], 4), "y": round(q[16], 4), "yaw": round(q[80], 4)} \
+            if len(q) >= 81 else None
+    return out, None
+
+
+def _ekf_write(path, patch):
+    """Atomically apply a {tunable: value} patch (ranges clamped by the caller are not
+    re-checked here). Returns None on success, else an error string."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        return f"can't write {path}: {exc}"
+
+    for key, val in patch.items():
+        if key in ("frequency", "sensor_timeout"):
+            text = re.sub(r"(?m)^( *" + re.escape(key) + r"\s*:\s*)[+-]?[0-9.]+",
+                          lambda m: m.group(1) + repr(float(val)), text, count=1)
+        elif key in _PN_DIAG:
+            idx = _PN_DIAG[key]
+            m = re.search(r"(?m)^\s*process_noise_covariance\s*:\s*\[(.*?)\]\s*$",
+                          text, re.S)
+            if not m:
+                return "process_noise_covariance block not found to update"
+            nums = [float(x) for x in
+                    re.findall(r"[+-]?[0-9.]+[eE]?[+-]?\d*", m.group(1))]
+            if len(nums) != _PN_LEN:
+                return f"unexpected process_noise_covariance length {len(nums)}"
+            nums[idx] = float(val)
+            # Single-line dense array preserves the (0,0),(1,1),...,(14,14) diagonal.
+            block = "process_noise_covariance: [" + \
+                    ", ".join(repr(x) for x in nums) + "]"
+            text = text[:m.start()] + block + text[m.end():]
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError as exc:
+        return f"write failed: {exc}"
+    return None
 
 
 class WebServerNode(Node):
@@ -659,6 +765,58 @@ class WebServerNode(Node):
 
     def get_settings(self):
         return dict(self._settings)
+
+    # ---- EKF (robot_localization) tuning ------------------------------------
+    def get_ekf_config(self):
+        """Current effective EKF tunables from the ekf.yaml the ekf unit loads, plus
+        the measured /odometry/filtered rate. Read-only — changes need a restart."""
+        path = _ekf_installed_path()
+        data, err = _ekf_read(path)
+        if data is None:
+            return {"ok": False, "error": err, "path": path}
+        ecfg = data
+        ecfg["path"] = path
+        ecfg["writable"] = os.path.exists(path) and os.access(path, os.W_OK)
+        ecfg["ekf_hz"] = round(float(getattr(self.telemetry, "_ekf_hz", 0.0) or 0.0), 1)
+        return {"ok": True, **ecfg}
+
+    def set_ekf_config(self, data):
+        """Persist the webtunable EKF values into ekf.yaml (clamped to sane ranges).
+        Does NOT restart the node — the UI shows a 'restart EKF to apply' affordance."""
+        path = _ekf_installed_path()
+        patch = {}
+        for key, (lo, hi) in EKF_TUNABLES.items():
+            v = data.get(key)
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"{key}: not a number"}
+            patch[key] = max(lo, min(hi, v))
+        if not patch:
+            return {"ok": False, "error": "no tunable supplied"}
+        err = _ekf_write(path, patch)
+        if err:
+            return {"ok": False, "error": err, "path": path}
+        return {"ok": True, "saved": patch, "path": path,
+                "restart_required": True}
+
+    def restart_ekf(self):
+        """Apply the saved tuning: robot_localization reads its params only at start,
+        so restart just the lightweight EKF unit. Needs the scoped sudoers rule
+        in deploy/sudoers/nano-power ('systemctl restart nano-ekf.service')."""
+        cmd = ["/usr/bin/systemctl", "restart", "nano-ekf.service"]
+        if os.geteuid() != 0:
+            cmd = ["sudo", "-n"] + cmd
+        try:
+            subprocess.check_call(cmd, timeout=30)
+        except subprocess.CalledProcessError as exc:
+            return {"ok": False, "error": f"systemctl exit {exc.returncode}",
+                    "hint": "re-run deploy/sbc-setup.sh so the nano-ekf restart sudoers rule is live"}
+        except Exception as exc:    # noqa: BLE001  (any spawn/io failure is worth surfacing)
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
 
     def update_settings(self, data):
         """Merge a partial settings dict from the web UI, persist, and apply."""
@@ -1829,6 +1987,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/vision/targets": lambda n: n.get_vision_targets(),
         "/locations": lambda n: n.get_locations(),
         "/llm/vision_diary": lambda n: n.get_vision_diary(),
+        "/ekf/config": lambda n: n.get_ekf_config(),
     }
     POST_JSON = {
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
@@ -1857,6 +2016,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/locations/save": lambda n, d: n.location_save(d),
         "/locations/delete": lambda n, d: n.location_delete(d),
         "/locations/go": lambda n, d: n.location_go(d),
+        "/ekf/config": lambda n, d: n.set_ekf_config(d),   # persist tuning into ekf.yaml
+        "/ekf/apply": lambda n, d: n.restart_ekf(),        # restart nano-ekf.service
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.

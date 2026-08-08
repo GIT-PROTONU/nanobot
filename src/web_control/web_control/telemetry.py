@@ -71,12 +71,15 @@ PARAM_WHITELIST = {
                  "robot_radius", "stuck_timeout", "goal_no_path_timeout", "relocalize",
                  "pickup_pause",
                  "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm",
-                  "track_enable", "track_kp", "track_kd", "track_max_ang", "track_min_eff_ang",
-                   "track_deadband", "track_deadband_soft", "track_conf_min", "track_conf_scale",
-                   "track_timeout", "track_coast", "track_ki", "track_kff",
-                  "loop_closure", "loop_probe_every", "loop_lin", "loop_ang",
-                  "loop_score", "loop_min_shift", "loop_alpha", "loop_apply_thresh",
-                  "test_lin", "test_ang", "test_dist", "test_turns", "test_settle"},
+                 "track_enable", "track_kp", "track_kd", "track_max_ang", "track_min_eff_ang",
+                 "track_deadband", "track_deadband_soft", "track_conf_min", "track_conf_scale",
+                 "track_timeout", "track_coast", "track_ki", "track_kff",
+                 "loop_closure", "loop_probe_every", "loop_lin", "loop_ang",
+                 "loop_score", "loop_min_shift", "loop_alpha", "loop_apply_thresh",
+                 "test_lin", "test_ang", "test_dist", "test_turns", "test_settle",
+                 "slip_check", "slip_min_rot", "slip_ratio_hi", "slip_ratio_lo",
+                 "slip_cooldown",
+                 "qual_min", "min_overlap_ratio"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
                     "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",
@@ -107,6 +110,12 @@ class TelemetryHub:
 
         # --- latest-value stores written by the lazy subscriptions -------------
         self._odom = None             # (x, y, yaw_rad)
+        self._ekf = None              # (x, y, yaw_rad, arrival monotonic) -- /odometry/filtered
+        self._ekf_hz = 0.0            # measured /odometry/filtered publish rate (1 s window)
+        self._ekf_cnt = 0             # messages in the current rate window
+        self._ekf_win = (0, time.monotonic())
+        self._slam_pose = None        # (x, y, yaw_rad, arrival monotonic) -- /slam_pose (map frame)
+        self._sld = None        # slam_nav/diag dict + arrival monotonic, for the motion-chain card
         self._plan = []               # [[x, y], ...] downsampled
         self._diag = ({}, STALE)      # ({key: value}, arrival monotonic)
         self._pipe_diag = None    # (feed dict, arrival, level, message) or None
@@ -411,6 +420,21 @@ class TelemetryHub:
         f["imu_drift"] = self._imu_drift_tick(now)
         if self._odom:
             f["odom"] = [round(v, 3) for v in self._odom]
+        if self._ekf is not None:
+            x, y, yaw, at = self._ekf
+            f["ekf"] = {"x": round(x, 3), "y": round(y, 3),
+                        "yaw": round(yaw, 3), "age": round(now - at, 2)}
+        if self._ekf_hz:
+            f["ekf_hz"] = round(self._ekf_hz, 1)
+        if self._slam_pose is not None:
+            x, y, yaw, at = self._slam_pose
+            f["slam_pose"] = {"x": round(x, 3), "y": round(y, 3),
+                              "yaw": round(yaw, 3), "age": round(now - at, 2)}
+        if self._sld is not None:
+            d, at = self._sld
+            if now - at < 5.0:                    # stale diag = the node is gone
+                f["slam_diag"] = d
+                f["slam_diag_age"] = round(now - at, 2)
         if self._plan:
             f["plan"] = self._plan
         if diag:
@@ -490,6 +514,13 @@ class TelemetryHub:
         n, s = self._node, self._subs.append
         sub = n.create_subscription
         s(sub(Odometry, "odom", self._on_odom, 5))
+        # EKF-fused pose (/odometry/filtered, robot_localization output in the odom
+        # frame) and slam_nav's pure scan-match map pose. The motion-chain card compares
+        # the FOUR yaw sources (wheel / EKF / IMU / scan) side by side to isolate which
+        # link of the odom→ECF→SLAM chain is the one disagreeing when the robot drifts.
+        s(sub(Odometry, "odometry/filtered", self._on_ekf, 5))
+        s(sub(PoseStamped, "slam_pose", self._on_slam_pose, 5))
+        s(sub(String, "slam_nav/diag", self._on_sld, 5))
         s(sub(Path, "plan", self._on_plan, 2))
         s(sub(DiagnosticArray, "diagnostics", self._on_diag, 2))
         s(sub(Int64MultiArray, "wheel_ticks", self._on_ticks, 5))
@@ -538,6 +569,33 @@ class TelemetryHub:
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
         yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
         self._odom = (p.x, p.y, yaw)
+
+    def _on_ekf(self, msg):
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+        self._ekf = (p.x, p.y, yaw, time.monotonic())
+        # Rolling 1 s window: measured /odometry/filtered rate, shown next to the
+        # configured frequency so a throttled EKF is visible without a ruler.
+        now = time.monotonic()
+        start, _ = self._ekf_win
+        if self._ekf_cnt == 0:
+            start = now
+        self._ekf_cnt += 1
+        if now - start >= 1.0:
+            self._ekf_hz = self._ekf_cnt / (now - start)
+            self._ekf_cnt = 0
+            self._ekf_win = (now, now)
+
+    def _on_slam_pose(self, msg):
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+        self._slam_pose = (p.x, p.y, yaw, time.monotonic())
+
+    def _on_sld(self, msg):
+        try:
+            self._sld = (json.loads(msg.data), time.monotonic())
+        except ValueError:
+            self._sld = None
 
     def _on_plan(self, msg):
         pts = [[round(p.pose.position.x, 3), round(p.pose.position.y, 3)]

@@ -604,6 +604,58 @@
             <p class="hint"><b>/odom</b> + TF from <b>wheel_odometry</b>. Lower rate = less CPU.</p>
           </div>
           <div class="card">
+            <h2>Motion chain (wheels → EKF → SLAM)</h2>
+            <div class="kv">
+              <span>wheels /odom θ</span><b id="mcWheel">–</b>
+              <span>EKF θ</span><b id="mcEkf">–</b>
+              <span>IMU θ</span><b id="mcImu">–</b>
+              <span>SLAM map θ</span><b id="mcSlam">–</b>
+            </div>
+            <div class="kv">
+              <span>θ rate wheels</span><b id="mcRotW">–</b>
+              <span>θ rate IMU</span><b id="mcRotI">–</b>
+              <span>wheel↔IMU</span><b id="mcSign">–</b>
+              <span>slip</span><b id="mcSlip">–</b>
+            </div>
+            <div class="kv">
+              <span>match score</span><b id="mcScore">–</b>
+              <span>overlap</span><b id="mcOverlap">–</b>
+              <span>lost</span><b id="mcLost">–</b>
+              <span>loop drift</span><b id="mcLoop">–</b>
+            </div>
+            <div class="kv">
+              <span>feed odom</span><b id="mcFOdo">–</b>
+              <span>feed EKF</span><b id="mcFEkf">–</b>
+              <span>feed IMU</span><b id="mcFImu">–</b>
+              <span>feed lidar</span><b id="mcFScan">–</b>
+            </div>
+            <p class="kv-status" id="mcVerdict">waiting for telemetry…</p>
+          </div>
+          <div class="card">
+            <h2>EKF (robot_localization)</h2>
+            <div class="kv">
+              <span>output rate</span><b id="ekfHz">–</b>
+              <span>feed age</span><b id="ekfAge">–</b>
+              <span>config file</span><b id="ekfPath">–</b>
+              <span>writable</span><b id="ekfWr">–</b>
+            </div>
+            <div class="field"><label>Rate <span id="ekfFreqV">–</span> Hz</label>
+              <input id="ekfFreq" type="range" min="2" max="30" step="1"></div>
+            <div class="field"><label>Sensor timeout <span id="ekfTOV">–</span> s</label>
+              <input id="ekfTO" type="range" min="0.05" max="2.0" step="0.05"></div>
+            <div class="field"><label>Pos-noise X <span id="ekfPnXV">–</span></label>
+              <input id="ekfPnX" type="range" min="0.005" max="0.5" step="0.005"></div>
+            <div class="field"><label>Pos-noise Y <span id="ekfPnYV">–</span></label>
+              <input id="ekfPnY" type="range" min="0.005" max="0.5" step="0.005"></div>
+            <div class="field"><label>Yaw-noise <span id="ekfPnYawV">–</span></label>
+              <input id="ekfPnYaw" type="range" min="0.01" max="1.0" step="0.01"></div>
+            <div class="row" style="margin-top:8px">
+              <button class="btn" id="ekfSave">Save to config</button>
+              <button class="btn primary" id="ekfApply">Restart EKF (apply)</button>
+            </div>
+            <p class="kv-status" id="ekfStatus">loading…</p>
+          </div>
+          <div class="card">
             <h2>Lidar (LDS)</h2>
             <div class="kv">
               <span>rate</span><b id="ldsHz">–</b>
@@ -916,6 +968,27 @@
               Auto-relocalize when lost</label>
             <label class="switch"><input type="checkbox" id="navPickupPause" checked><span class="track"></span>
               Pause SLAM when picked up</label>
+            <details class="hint" open>
+              <summary class="row-label">SLAM scan-matching (alignment gates)</summary>
+              <div class="field"><label>Min map overlap <span id="navOverlapV">10</span>%</label>
+                <input id="navOverlap" type="range" min="0" max="50" step="1" value="10"></div>
+              <div class="field inline">Beam quality floor <span id="navQualV">off</span>
+                <input id="navQual" type="number" min="0" max="65535" value="0"></div>
+              <div class="field"><label>Loop-closure min score <span id="navLoopScoreV">4.0</span></label>
+                <input id="navLoopScore" type="range" min="1" max="10" step="0.5" value="4"></div>
+              <div class="field"><label>Loop re-probe every <span id="navLoopProbeV">50</span> scans</label>
+                <input id="navLoopProbe" type="range" min="10" max="200" step="5" value="50"></div>
+              <label class="switch"><input type="checkbox" id="navLoop" checked><span class="track"></span>
+                True loop closure</label>
+              <p class="hint"><b>Min map overlap</b> = the fraction of beams that must land
+                on already-mapped cells before a scan is trusted (inlier gate). Raising it
+                rejects more garbage/degenerate scans at the cost of refusing to extend the
+                map in freshly-seen areas. <b>Beam quality floor</b> drops
+                /scan.intensities below this value before match+integrate (0 = off — tune
+                after checking the driver's intensity range on hardware). <b>Loop-closure
+                score/probe</b> drive the wide-window far-revisit re-match that bleeds off
+                accumulated odometry drift.</p>
+            </details>
             <p class="hint"><b>Max speed/turn</b> cap the pursuit controller (also used by
               <b>Motion</b> in the Map view). <b>Stop distance</b> = obstacle range ahead that
               triggers a reactive stop+replan; <b>Robot radius</b> = obstacle inflation used by
@@ -1095,7 +1168,7 @@ let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
 let homeTopic=null, saveTopic=null, testTopic=null, testResTopic=null;
 // Brain: purpose / current task / A/B experiment stats (latched, from the behaviour node)
 let purposeTopic=null, taskTopic=null, expTopic=null;
-$("host").value = `${location.hostname||"localhost"}:9090`;
+const HOST=`${location.hostname||"localhost"}:9090`;
 
 $("connect").onclick=()=>connected?disconnect():connect();
 $("fit").onclick=autoFit;
@@ -1265,7 +1338,7 @@ $("btnShutdown").onclick=()=>{
 };
 
 function connect(){
-  ros=new ROSLIB.Ros({url:`ws://${$("host").value}`});
+  ros=new ROSLIB.Ros({url:`ws://${HOST}`});
   ros.on("connection",()=>{connected=true;setConn(true);subscribe();syncLdsTgt();syncFan();});
   ros.on("close",()=>{connected=false;setConn(false);});
   ros.on("error",()=>{setConn(false);});
@@ -2373,6 +2446,265 @@ connect();   // auto-connect on load
   // redraw the editor only while it's on screen (or sim running) — cheap, idle-free.
   setInterval(()=>{ if(on || $("panel-sim").classList.contains("active")) drawEditor(); },100);
   drawEditor();
+})();
+</script>
+<script>
+// ---- live slam_nav / track tuning (same-origin HTTP /param; no rosbridge) ----
+// The nav + tracking sliders in the Sensors panels have no inline wiring (the split
+// app.js file that once held it isn't referenced), so bind them here. Self-contained
+// IIFE: no globals, won't clash with the panel scripts above.
+(function(){
+  "use strict";
+  const el=id=>document.getElementById(id);
+  // POST /param -> telemetry.py PARAM_WHITELIST["slam_nav"], calls the node's
+  // /slam_nav/set_parameters service. 2-arg form: (param name, value).
+  const setParam=(name,value)=>
+    fetch("/param",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({node:"slam_nav",name,value})}).catch(()=>{});
+  // slider (label span id = elId+"V"): show value on input, send on change.
+  // `scale` multiplies the raw slider value before sending (%-sliders use 1/100).
+  const bindSlider=(id,param,{fmt:v=>v,scale=1}={})=>{
+    const i=el(id); if(!i) return;
+    const v=el(id+"V");
+    v && i.addEventListener("input",()=>v.textContent=String(fmt(Number(i.value))));
+    i.addEventListener("change",()=>setParam(param,Number(i.value)*scale));
+  };
+  // checkbox -> param bool.
+  const bindToggle=(id,param)=>{
+    const i=el(id); if(!i) return;
+    i.addEventListener("change",e=>setParam(param,e.target.checked));
+  };
+  const sec=v=>(v==="0"||v===0?"off":v+" s");
+  const pct=v=>(v+"%");
+
+  bindSlider("navMaxLin",     "max_lin",         {fmt:v=>v+" m/s"});
+  bindSlider("navMaxAng",     "max_ang",         {fmt:v=>v+" rad/s"});
+  bindSlider("navStopDist",   "stop_distance",   {fmt:v=>v+" m"});
+  bindSlider("navRadius",     "robot_radius",    {fmt:v=>v+" m"});
+  bindSlider("navStuck",      "stuck_timeout",   {fmt:sec});
+  bindSlider("navLdsIdle",    "lds_idle_timeout",{fmt:sec});
+  bindSlider("navOverlap",    "min_overlap_ratio",{fmt:pct,scale:1/100});
+  bindSlider("navLoopScore",  "loop_score",      {fmt:v=>v});
+  bindSlider("navLoopProbe",  "loop_probe_every",{fmt:v=>v});
+  bindToggle("navRelocalize", "relocalize");
+  bindToggle("navPickupPause","pickup_pause");
+  bindToggle("navLdsIdleEnable","lds_idle_enable");
+  bindToggle("navLoop",       "loop_closure");
+  // map-panel motion toggles (the old rosbridge path they were wired to is dead, so
+  // rebind over it — both listeners fire; the legacy one no-ops without a service).
+  bindToggle("mapMotion",     "enable_motion");
+  bindToggle("mapExplore",    "auto_explore");
+  // LDS spin setpoint -> slam_nav's lds_active_rpm (slam_nav owns /lds_target_rpm and
+  // respects active/idle spin-down).
+  bindSlider("ldsTgt",        "lds_active_rpm",  {fmt:v=>v});
+  // beam quality floor: number input, 0 = "off" -> qual-min param (raw intensity).
+  const nq=el("navQual");
+  if (nq){
+    const nqv=el("navQualV");
+    nq.addEventListener("change",()=>{ const v=Number(nq.value)||0;
+      nqv.textContent=v>0?String(v):"off"; setParam("qual_min",v); });
+  }
+  // vision target tracking sliders -> track_* (deadband/conf are % on the page; the
+  // params are fractions, so scale by 1/100).
+  bindSlider("trackKp",           "track_kp");
+  bindSlider("trackKd",           "track_kd");
+  bindSlider("trackMaxAng",       "track_max_ang");
+  bindSlider("trackMinEffAng",    "track_min_eff_ang");
+  bindSlider("trackDeadband",     "track_deadband",      {fmt:pct,scale:1/100});
+  bindSlider("trackConfMin",      "track_conf_min",      {fmt:pct,scale:1/100});
+  bindSlider("trackDeadbandSoft", "track_deadband_soft", {fmt:pct,scale:1/100});
+  bindSlider("trackConfScale",    "track_conf_scale",    {fmt:pct,scale:1/100});
+  bindSlider("trackCoast",        "track_coast");
+  bindSlider("trackKi",           "track_ki");
+  bindSlider("trackKff",          "track_kff");
+  bindToggle("navTrackEnable",    "track_enable");
+})();
+</script>
+<script>
+// ---- Live motion-chain diagnostics (SSE /telemetry, no rosbridge) ----
+// Watches the four raw yaw sources — wheels (/odom), the EKF (/odometry/filtered),
+// the IMU (/imu/euler) and SLAM's scan-matched map pose (/slam_pose) — plus slam_nav's
+// own diagnostics JSON (/slam_nav/diag, surfaced as f.slam_diag) and reports where the
+// odom→EKF→SLAM chain actually breaks: a dead feed, a wheel-vs-IMU direction mismatch,
+// slip/drag, or a SLAM lost/recovery. The sensors pane has no other live wiring for
+// these (the rosbridge path it was written against is gone), so this is the one reader.
+// Read-only: never publishes or moves the robot.
+(function(){
+  "use strict";
+  const el=id=>document.getElementById(id);
+  if(!el("mcVerdict")) return;                        // card absent → leave the page as-is
+  const DEG=180/Math.PI;
+  const CHK={ok:"#3ddc84", warn:"#f5b83d", err:"#ff5c72"};
+  const set=(id,v,cls)=>{ const e=el(id); if(!e) return;
+    e.textContent=v; if(cls) e.style.color=CHK[cls]||cls; };
+
+  // Per-source state: last yaw sample + smoothed angular speed (deg/s), tracked
+  // client-side so the card stays alive even if one backend field disappears.
+  const srcs={wheel:{},ekf:{},imu:{},slam:{}};
+  const feedLast={};                        // monotonic s of the last sample, for staleness
+  const push=(key,yawDeg,t)=>{
+    if(yawDeg==null||!isFinite(yawDeg)) return;
+    const s=srcs[key]; s.yaw=yawDeg; s.t=t; feedLast[key]=t;
+    const dt=s.pT!=null?(s.t-s.pT):null;
+    if(dt!=null&&dt>=0.25&&dt<=2.5){
+      let d=s.yaw-s.pYaw; d-=Math.round(d/360)*360;   // wrap to [-180,180]
+      const inst=d/dt;
+      s.sp=s.sp==null?inst:s.sp*0.75+inst*0.25;       // EMA the turn rate
+    }
+    s.pT=s.t; s.pYaw=s.yaw;
+  };
+  const ageOf=src=>{ const a=feedLast[src]; return a==null?null:Math.max(0,(latest-a)); };
+  const fmtDeg=v=>v==null?"–":Math.round(v*10)/10+"°";
+  const fmtRate=v=>{ if(v==null||!isFinite(v)) return "–";
+    return (v>=0?"+":"−")+Math.round(Math.abs(v)*10)/10+"°/s"; };
+  const fmtSec=v=>v==null?"–":(v<0?"never":v.toFixed(1)+"s");
+
+  const now=()=>performance.now()/1000;
+  let latest=now(), f={t:latest}, verdictEl=el("mcVerdict");
+
+  function verdict(sd){
+    const die=(src,th)=>{ const a=ageOf(src); return a!=null&&a>th; };
+    if(f.odom==null&&feedLast.wheel==null)     return {cls:"err",text:"wheels /odom missing — encoder chain dead (ESP32 → /wheel_ticks)?"};
+    if(die("wheel",2.0))                        return {cls:"err",text:"wheels /odom silent "+ageOf("wheel").toFixed(1)+"s — encoder feed stalled"};
+    if(feedLast.ekf==null&&feedLast.wheel==null) return {cls:"warn",text:"EKF not streaming yet — robot_localization warming up?"};
+    if(die("ekf",2.0))                          return {cls:"warn",text:"EKF /odometry/filtered stale — robot_localization step lost"};
+    if(die("imu",1.5))                          return {cls:"warn",text:"IMU euler feed silent — check imu_driver / USB"};
+    if(sd&&sd.feeds&&(sd.feeds.scan<0||sd.feeds.scan>3))
+                                                return {cls:"warn",text:"lidar scan feed silent — SLAM cannot localize"};
+    const w=srcs.wheel.sp, i=srcs.imu.sp;
+    if(sd&&sd.sign&&sd.sign_fail)                return {cls:"err",text:"IMU vs wheel: OPPOSITE rotation — set imu_yaw_sign: -1"};
+    if(sd&&sd.slip&&sd.slip.kind==="slip")      return {cls:"err",text:"WHEEL SLIP (r"+sd.slip.ratio+") — odom spins faster than the IMU feels"};
+    if(sd&&sd.slip&&sd.slip.kind==="drag")      return {cls:"warn",text:"wheel drag/stall (r"+sd.slip.ratio+") — blocked wheel?"};
+    if(sd&&sd.recovering)                        return {cls:"warn",text:"SLAM relocalizing (lost "+sd.lost+") — holding the previous pose"};
+    if(w!=null&&i!=null&&Math.abs(w)>15&&Math.abs(i)>15&&Math.abs(w-i)>Math.max(Math.abs(w),Math.abs(i))*0.35)
+                                                return {cls:"warn",text:"wheel & IMU rotation disagree Δ"+(Math.round((w-i)*10)/10).toFixed(1)+"°/s"};
+    if(w!=null&&i!=null&&Math.abs(w)<2&&Math.abs(i)<2)
+                                                return {cls:"ok",text:"all four rotation sources agree — no fault flagged"};
+    return {cls:"ok",text:"rotation sources agree — watch the rate rows while the robot turns"};
+  }
+
+  function render(){
+    const t=latest;
+    push("wheel", f.odom&&f.odom[2]!=null?f.odom[2]*DEG:null, t);
+    push("ekf",   f.ekf&&f.ekf.yaw!=null?f.ekf.yaw*DEG:null, t);
+    push("imu",   f.eul?f.eul.y:null, t);
+    push("slam",  f.slam_pose&&f.slam_pose.yaw!=null?f.slam_pose.yaw*DEG:null, t);
+    set("mcWheel", fmtDeg(srcs.wheel.yaw)); set("mcRotW", fmtRate(srcs.wheel.sp));
+    set("mcEkf",   fmtDeg(srcs.ekf.yaw));
+    set("mcImu",   fmtDeg(srcs.imu.yaw));    set("mcRotI", fmtRate(srcs.imu.sp));
+    set("mcSlam",  fmtDeg(srcs.slam.yaw));
+
+    const sd=f.slam_diag;
+    if(sd){
+      set("mcSign", sd.sign? (sd.sign_fail?"MISMATCH":"agree") : "–",
+          sd.sign? (sd.sign_fail?"err":"ok") : null);
+      const sl=sd.slip;
+      set("mcSlip", sl? ("r"+sl.ratio.toFixed(2))+(sl.kind?" ("+sl.kind+")":""):"–",
+          sl&&sl.kind? (sl.kind==="slip"?"err":"warn") : (sl?"ok":null));
+      set("mcScore",   sd.score!=null?sd.score.toFixed(1):"–");
+      set("mcOverlap", sd.overlap!=null?sd.overlap.toFixed(2):"–");
+      set("mcLost",    sd.lost>0?String(sd.lost):"0", sd.lost>0?"err":null);
+      const l=sd.loop;
+      if(l) set("mcLoop", "x"+l[0].toFixed(2)+" y"+l[1].toFixed(2)+
+                          (Math.abs(l[2])>0.005?" θ"+(l[2]*DEG).toFixed(0)+"°":""));
+    }
+    // Odometry card (its ROSLIB wiring is dead) — reuse the raw /odom sample.
+    if(f.odom){ set("odoX", f.odom[0].toFixed(2)+" m"); set("odoY", f.odom[1].toFixed(2)+" m");
+                set("odoTh", (f.odom[2]*DEG).toFixed(0)+"°"); }
+    // IMU card (same dead wiring) — roll/pitch/yaw straight from /imu/euler.
+    if(f.eul){ set("imuR", f.eul.r.toFixed(1)+"°"); set("imuP", f.eul.p.toFixed(1)+"°");
+               set("imuY", f.eul.y.toFixed(1)+"°"); }
+    // EKF card's live readouts (config itself loads separately via /ekf/config).
+    if(f.ekf_hz!=null) set("ekfHz", f.ekf_hz.toFixed(1)+" Hz",
+        (f.ekf&&f.ekf.age>2.0?"err":"ok"));
+    if(f.ekf) set("ekfAge", f.ekf.age.toFixed(1)+"s",
+        (f.ekf.age>2.0?"err":"ok"));
+    // Feed staleness (client-side ages; lidar age comes from slam_nav's own diag).
+    set("mcFOdo", fmtSec(ageOf("wheel")), ageOf("wheel")==null||ageOf("wheel")>2.0?"err":"ok");
+    set("mcFEkf", fmtSec(ageOf("ekf")),   ageOf("ekf")==null||ageOf("ekf")>2.0?"err":"ok");
+    set("mcFImu", fmtSec(ageOf("imu")),   ageOf("imu")==null||ageOf("imu")>1.5?"err":"ok");
+    set("mcFScan", sd&&sd.feeds? fmtSec(sd.feeds.scan) : "–",
+        sd&&sd.feeds? (sd.feeds.scan<0||sd.feeds.scan>3?"err":"ok") : null);
+
+    const v=verdict(sd);
+    verdictEl.className="kv-status"+(v.cls?" "+v.cls:"");
+    verdictEl.textContent=v.text;
+  }
+
+  const es=new EventSource("/telemetry");
+  es.onmessage=e=>{ try{ const d=JSON.parse(e.data); latest=now(); f=d; render();
+      }catch(_x){} };
+  es.onerror=()=>{ // SSE dropped (no browser on the server side) — show it's offline.
+    const big=performance.now()/1000-latest;
+    if(big>5){ verdictEl.className="kv-status err"; verdictEl.textContent="telemetry link lost — server/browser subscribe broke"; }
+  };
+})();
+</script>
+<script>
+// ---- EKF tuning (robot_localization) ----
+// robot_localization reads its params once at startup (no live set-service), so
+// tuning here = Save sliders to eskf.yaml + apply by restarting just the EKF unit.
+// The live rate/age rows are fed by the motion-chain SSE block above; this block
+// only handles loading + persisting the config.
+(function(){
+  "use strict";
+  const el=id=>document.getElementById(id);
+  if(!el("ekfFreq")) return;            // card absent → skip
+  const fmtV=(id,fmt)=>el(id)&&(el(id).textContent=fmt);
+  const statusEl=el("ekfStatus");
+  const say=(msg,cls)=>{ statusEl.className="kv-status"+(cls?" "+cls:"");
+    statusEl.textContent=msg; };
+  const post=(url,body)=>fetch(url,{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body||{})}).then(r=>{ try{return r.json();}catch(_x){return {ok:false,error:"bad reply"};} });
+
+  let cfg=null;
+  const showVal=(input,label,fmt)=>input.addEventListener("input",()=>
+    fmtV(label,fmt(Number(input.value))));
+  const bindSlider=(id,key,fmt,range)=>{
+    const i=el(id); if(!i) return;
+    showVal(i,id+"V",fmt);
+    i.addEventListener("change",async()=>{
+      const body={}; body[key]=Number(i.value);
+      const d=await post("/ekf/config",body);
+      if(d&&d.ok) say("saved "+key+" → "+fmt(Number(i.value))+" (restart EKF to apply)","ok");
+      else say("save failed: "+((d&&d.error)||"?"),"err");
+    });
+  };
+  bindSlider("ekfFreq","frequency", v=>Math.round(v)+" Hz");
+  bindSlider("ekfTO","sensor_timeout", v=>v.toFixed(2)+" s");
+  bindSlider("ekfPnX","pn_x", v=>v.toFixed(3));
+  bindSlider("ekfPnY","pn_y", v=>v.toFixed(3));
+  bindSlider("ekfPnYaw","pn_yaw", v=>v.toFixed(3));
+  el("ekfApply").addEventListener("click",()=>{
+    if(!cfg){ say("load config first","err"); return; }
+    if(!cfg.writable){ say("config file isn't writable — check path","err"); return; }
+    if(!confirm("Apply saved EKF settings? This restarts the EKF (brief pose-hold)."))return;
+    post("/ekf/apply").then(d=>say(
+      d&&d.ok?"EKF restarting…":("restart failed: "+(d&&(d.error||d.hint)||"?")),
+      d&&d.ok?"ok":"err"));
+  });
+
+  function load(){
+    fetch("/ekf/config").then(r=>r.ok?r.json():null).then(d=>{
+      if(!d||!d.ok){ say((d&&d.error)||"config unavailable","err"); return; }
+      cfg=d;
+      el("ekfPath").textContent=d.path;
+      el("ekfWr").textContent=d.writable?"yes":"no";
+      const setI=(id,v)=>{ const i=el(id); if(i) i.value=v; };
+      const fmt=(e,f)=>el(e)&&(el(e).textContent=f);
+      setI("ekfFreq",d.frequency);  fmt("ekfFreqV", d.frequency.toFixed(0)+" Hz");
+      setI("ekfTO",d.sensor_timeout); fmt("ekfTOV", d.sensor_timeout.toFixed(2)+" s");
+      if(d.pn){ setI("ekfPnX",d.pn.x); fmt("ekfPnXV", d.pn.x.toFixed(3));
+                setI("ekfPnY",d.pn.y); fmt("ekfPnYV", d.pn.y.toFixed(3));
+                setI("ekfPnYaw",d.pn.yaw); fmt("ekfPnYawV", d.pn.yaw.toFixed(3)); }
+      say(d.writable?
+        "loaded from config — edit, Save, then Restart EKF to apply":
+        "loaded read-only — deploy a writable ekf.yaml to tune",
+        d.writable?"ok":null);
+    }).catch(()=>say("error reading /ekf/config","err"));
+  }
+  load();
 })();
 </script>
 </body>

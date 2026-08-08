@@ -86,6 +86,18 @@ class NavNode(Node):
             ("match_ang", 0.12),         # scan-match search half-window, radians
             ("match_points", 90),        # scan points used for matching (decimated)
             ("min_match_score", 1.0),    # below this, keep the prior (no good overlap)
+            # Inlier gate: a scan may only be TRUSTED (pose snapped + integrated) when
+            # at least this FRACTION of its beams land on cells the map has already seen.
+            # Raw log-odds can pass min_match_score on a few overlapping beams while the
+            # scan otherwise points at unmapped void (blind rays / carried elsewhere) —
+            # that's exactly the bad scan we refuse to fold in. 0 = disabled.
+            ("min_overlap_ratio", 0.10),
+            # Beam signal-quality floor read from /scan.intensities (the lidar's raw
+            # signal strength). Beams below it are dropped before match + integrate.
+            # Default -1 = off (don't touch the scan); enable only after checking the
+            # driver's actual intensity range on hardware, since real returns at range
+            # legitimately have lower signal.
+            ("qual_min", -1.0),
             ("use_imu_yaw", True),       # IMU yaw delta for rotation (else wheel odom)
             ("still_skip", True),        # parked (odom+IMU unchanged) -> skip match+integrate
             ("still_lin", 0.005),        # m translation since last processed scan = "moved"
@@ -241,6 +253,8 @@ class NavNode(Node):
         self.match_ang = float(g("match_ang").value)
         self.match_pts = int(g("match_points").value)
         self.min_score = float(g("min_match_score").value)
+        self.min_overlap = float(g("min_overlap_ratio").value)
+        self.qual_min = float(g("qual_min").value)
         self.use_imu = bool(g("use_imu_yaw").value)
         self.still_skip = bool(g("still_skip").value)
         self.still_lin = float(g("still_lin").value)
@@ -388,6 +402,11 @@ class NavNode(Node):
         self._slip_imu = 0.0
         self._slip_odo = 0.0
         self._slip_last_warn = 0.0
+        # Live cross-check readouts for the diagnostics publisher (last completed
+        # monitor window): see _predict's sign/slip monitors.
+        self._sign_fail = False       # IMU yaw and wheel yaw rotate opposite signs
+        self._sign = None             # {"imu": rad, "odom": rad} last sign-check window
+        self._slip_out = None         # {"ratio", "imu", "odom", "kind"|None} last window
         self._last_write = 0.0
         # _write_map export cache: recomputing occupancy_int8 (a full-grid np.exp) +
         # coverage at the write rate cost ~40% of a core even while SLAM was paused.
@@ -406,6 +425,7 @@ class NavNode(Node):
         self._next_explore = 0.0
         self._next_autosave = 0.0
         self._last_score = 0.0       # last accepted scan-match score (localization health)
+        self._last_overlap = 0.0     # last scan's overlap ratio (inlier gate telemetry)
         self._trail = (collections.deque(maxlen=self._trail_max)
                        if self._trail_max > 0 else None)
         # stuck detector
@@ -452,6 +472,13 @@ class NavNode(Node):
                 self.get_logger().info(f"loaded saved map from {self.map_store}")
 
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
+        # Compact JSON health/diagnostics for the web diagnostics card (2 Hz): the
+        # rotation cross-check (IMU vs wheel odom) slam_nav runs anyway, the live slip
+        # ratio + kind, the motion-prior feed ages, and the scan-match score/overlap/
+        # lost/loop state. All of it was log-only before — the UI needs the numbers to
+        # say WHICH link of the odom/IMU/lidar chain is the one disagreeing.
+        self.diag_pub = self.create_publisher(String, "slam_nav/diag", 10)
+        self.create_timer(1.0 / 2.0, self._pub_diag)
         # Publish the SLAM-corrected map->odom transform so the ROS graph (RViz remote
         # view, any node expecting /odom in the map frame) sees the corrected pose. The
         # /odom publisher (wheel_odometry) gives base_link in odom; this transform closes
@@ -633,6 +660,10 @@ class NavNode(Node):
                 self.slip_ratio_lo = float(p.value)
             elif p.name == "slip_cooldown":
                 self.slip_cooldown = float(p.value)
+            elif p.name == "min_overlap_ratio":
+                self.min_overlap = float(p.value)
+            elif p.name == "qual_min":
+                self.qual_min = float(p.value)
         return SetParametersResult(successful=True)
 
     # --- motion-prior inputs -------------------------------------------------
@@ -798,6 +829,11 @@ class NavNode(Node):
 
         # Refine against the map with a decimated set of valid beams.
         v = (np.isfinite(ranges) & (ranges >= self.grid.rmin) & (ranges <= self.grid.rmax))
+        if (self.qual_min > 0.0 and msg.intensities is not None
+                and len(msg.intensities) == n):
+            # Beam signal-quality floor (opt-in, see param docstring). Done on the raw
+            # n-vector before decimation so the match sample reflects good beams only.
+            v &= (np.asarray(msg.intensities, dtype=np.float32) >= self.qual_min)
         va, vr = angles[v], ranges[v]
         if len(vr) > self.match_pts:
             idx = np.linspace(0, len(vr) - 1, self.match_pts).astype(int)
@@ -818,10 +854,11 @@ class NavNode(Node):
                                        ang=self.recover_ang, half=self.recover_half,
                                        refine=self.recover_refine)
                 score = self.grid.score(cand, va, vr)
-                self._last_score = score
-                if score >= self.min_score:
+                overlap = self.grid.overlap_ratio(cand, va, vr)
+                self._last_score, self._last_overlap = score, overlap
+                if score >= self.min_score and overlap >= self.min_overlap:
                     px, py, pth = cand
-                if score >= self.recover_exit_score:
+                if score >= self.recover_exit_score and overlap >= self.min_overlap:
                     self._recovering = False
                     self._lost_count = 0
                     self._next_global_scan = 0.0
@@ -832,10 +869,11 @@ class NavNode(Node):
                     g = self.grid.relocalize(va, vr, step=self.recover_global_step)
                     if g is not None:
                         gx, gy, gth, gscore = g
-                        self._last_score = gscore
-                        if gscore >= self.min_score:
+                        overlap = self.grid.overlap_ratio((gx, gy, gth), va, vr)
+                        self._last_score, self._last_overlap = gscore, overlap
+                        if gscore >= self.min_score and overlap >= self.min_overlap:
                             px, py, pth = gx, gy, gth   # better prior; keep spinning
-                        if gscore >= self.recover_exit_score:
+                        if gscore >= self.recover_exit_score and overlap >= self.min_overlap:
                             self._recovering = False
                             self._lost_count = 0
                             self._next_global_scan = 0.0
@@ -845,10 +883,16 @@ class NavNode(Node):
         elif len(vr) > 10:
             cand = self.grid.match((px, py, pth), va, vr,
                                    lin=self.match_lin, ang=self.match_ang)
-            # Reject a match with no real overlap (e.g. wide-open space) — trust the prior.
+            # Reject a match with no real overlap (e.g. wide-open space) — trust the
+            # prior. Trust additionally needs the OVERLAP inlier gate: a raw log-odds
+            # sum can clear min_match_score on a handful of beams while the rest of the
+            # scan hangs over unmapped void (bad rays, or the robot looking at a fresh
+            # area it hasn't mapped) — folding that in smears the map at a wrong pose,
+            # so the fraction of beams on *seen* cells must clear min_overlap_ratio too.
             score = self.grid.score(cand, va, vr)
-            self._last_score = score
-            if score >= self.min_score:
+            overlap = self.grid.overlap_ratio(cand, va, vr)
+            self._last_score, self._last_overlap = score, overlap
+            if score >= self.min_score and overlap >= self.min_overlap:
                 px, py, pth = cand
                 trusted = True
                 self._lost_count = 0
@@ -861,7 +905,8 @@ class NavNode(Node):
                     self._recover_until = time.monotonic() + self.recover_timeout
                     self._next_global_scan = 0.0   # global search fires this first scan
                     self.get_logger().warning(
-                        f"localization lost (score {score:.1f}) — relocalizing")
+                        f"localization lost (score {score:.1f}, overlap "
+                        f"{overlap:.2f}) — relocalizing")
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
         if trusted:
@@ -956,9 +1001,14 @@ class NavNode(Node):
             si, so = self._sig_imu, self._sig_odo
             self._sig_imu = self._sig_odo = 0.0
             if abs(so) > 0.05 and si * so < 0.0:
+                self._sign_fail = True
+                self._sign = {"imu": round(abs(si), 3), "odom": round(abs(so), 3)}
                 self.get_logger().warning(
                     "IMU yaw and wheel yaw rotate OPPOSITE signs — set imu_yaw_sign: -1",
                     throttle_duration_sec=10.0)
+            else:
+                self._sign_fail = False
+                self._sign = {"imu": round(abs(si), 3), "odom": round(abs(so), 3)}
 
         # Wheel-slip / stall cross-check: IMU gyro-z rotation (dth, signed, sign-fixed)
         # vs wheel-odom-implied rotation (dth_odom). If the wheels turn far more than the
@@ -976,19 +1026,29 @@ class NavNode(Node):
                 if abs(so) > 1e-6:
                     ratio = abs(so) / (abs(si) if abs(si) > 1e-6 else abs(si) + 1e-9)
                     now = time.monotonic()
-                    if now - self._slip_last_warn >= self.slip_cooldown:
-                        if ratio > self.slip_ratio_hi:
+                    kind = None
+                    if ratio > self.slip_ratio_hi:
+                        kind = "slip"
+                        if now - self._slip_last_warn >= self.slip_cooldown:
                             self._slip_last_warn = now
                             self.get_logger().warning(
                                 f"WHEEL SLIP: odom rotation {abs(so):.2f} rad vs IMU "
                                 f"{abs(si):.2f} rad (ratio {ratio:.2f}) — a wheel may be "
                                 f"slipping", throttle_duration_sec=max(1.0, self.slip_cooldown))
-                        elif ratio < self.slip_ratio_lo:
+                    elif ratio < self.slip_ratio_lo:
+                        kind = "drag"
+                        if now - self._slip_last_warn >= self.slip_cooldown:
                             self._slip_last_warn = now
                             self.get_logger().warning(
                                 f"WHEEL DRAG/STALL: odom rotation {abs(so):.2f} rad vs IMU "
                                 f"{abs(si):.2f} rad (ratio {ratio:.2f}) — a wheel may be "
-                                f"blocked", throttle_duration=max(1.0, self.slip_cooldown))
+                                f"blocked", throttle_duration_sec=max(1.0, self.slip_cooldown))
+                    self._slip_out = {
+                        "ratio": round(ratio, 2),
+                        "imu": round(abs(si), 3),
+                        "odom": round(abs(so), 3),
+                        "kind": kind,
+                    }
 
         pth = _wrap(pth + dth)
         # Express the odom-frame displacement in the map frame. The map frame is rotated
@@ -1860,6 +1920,40 @@ class NavNode(Node):
         if self._nogo_dirty:
             self._write_nogo()
             self._nogo_dirty = False
+
+    def _pub_diag(self):
+        """Publish a compact JSON diagnosis (2 Hz) for the web "motion chain" card.
+        Aggregates the internal cross-checks the UI needs to point at a specific link:
+        - feeds: seconds since /odom, /imu/euler and /scan last fed the motion prior
+          (the same -1-never-received convention the map header uses)
+        - rot: last completed IMU-vs-wheel rotation window (signed deltas) so the UI can
+          compare them to the EKF / SLAM yaw without re-deriving anything
+        - slip: wheel-vs-IMU rotation ratio + verdict from the slip/stall monitor
+        - sign: whether IMU and wheel yaw were seen rotating in opposite directions
+        - est: scan-match score / overlap / lost-count / recovering flag
+        - loop: accumulated loop-closure drift offset (x,y in the grid, yaw), i.e. how far
+          the odom/IMU chain has drifted vs the map since the last loop closure
+        No logger spam: this is the diagnostics surface, logs stay as they were."""
+        now = time.monotonic()
+        feeds = {
+            "odom": -1.0 if self._odom_stamp is None else round(now - self._odom_stamp, 2),
+            "imu": -1.0 if self._imu_stamp is None else round(now - self._imu_stamp, 2),
+            "scan": -1.0 if self._scan_stamp is None else round(now - self._scan_stamp, 2),
+        }
+        lx, ly, lth = self._loop_off
+        d = {
+            "t": time.time(),
+            "feeds": feeds,
+            "sign": self._sign,
+            "sign_fail": self._sign_fail,
+            "slip": self._slip_out,
+            "recovering": self._recovering,
+            "lost": self._lost_count,
+            "score": round(self._last_score, 1),
+            "overlap": round(self._last_overlap, 3),
+            "loop": [round(lx, 3), round(ly, 3), round(lth, 4)],
+        }
+        self.diag_pub.publish(String(data=json.dumps(d, separators=(",", ":"))))
 
     def _write_nogo(self):
         """Publish the current no-go mask blob (only when it changed). Same header+raw
