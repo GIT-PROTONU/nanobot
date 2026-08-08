@@ -111,6 +111,18 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
 
 **Web UI:** Sensors panel > "Brain health" card shows behavior, cognition, LLM, purpose, chart status — green/alive or red/lost. Polled every 2s from `/brain/health`. If the endpoint itself fails, all indicators show amber `err`.
 
+### Localization troubleshooting in the web UI
+Sensor chain: ESP32 → `/wheel_ticks` → `wheel_odometry/encoder_node.py` → `/odom` → robot_localization **EKF** (`src/robot_bringup/config/ekf.yaml`, fuses `/odom` + `/imu/data` → `/odometry/filtered` @15 Hz) → `slam_nav` (`odom_topic = odometry/filtered`).
+
+What the page already surfaces for each stage:
+- **Wheel ticks** — Coprocessor/ESP32 card: `/wheel_ticks` L/R counts, tick Hz, heartbeat, stray-tick diagnostic + reset.
+- **Odom** — Odometry card: `/odom` x/y/θ + publish-rate slider (`/wheel_odometry/set_parameters`).
+- **IMU** — IMU card: `/imu/web` rate ("lost" beacon when stale), `/imu/euler` display, 3D mount indicator, spin check, drift tool, interference self-test, mag-cal scatter, 6-axis toggle.
+- **SLAM/feeds** — map panel + mapStats line: mode/explored/match score/loc + `⚠ feeds: odom · imu · lds` staleness, read from the `/map` JSON header written by `slam_nav/nav_node.py` (`meta["feeds"]`; `-1` = never received; re-aged at read time in `index.html:1948`).
+- **EKF** — NOT shown standalone: `/odometry/filtered` only enters the UI indirectly via the SLAM feed-staleness. Any new EKF view must compare raw `/odom` vs `/odometry/filtered` vs SLAM map pose / IMU yaw.
+
+**Served-page contradiction (unresolved):** `src/web_control/web/index.html` (the file `web_server.py` serves via symlink chain `install/ → build/ → src/`) claims "no rosbridge, pure SSE `/telemetry`" in its head comment AND in `robot.yaml`, but the inline JS still uses `ROSLIB` (47 refs) and would throw on load (`$("host")` has no matching element; roslib.js is never loaded). The SSE split files (`app.js`, `map.js`, `chrome.js`…) are committed but not referenced by `index.html`. Before touching the page, decide which is live.
+
 ## Gotchas
 
 - **`stack.sh restart` is unreliable** — can leave stale processes holding ports. Clean `down` → verify via `/proc` → `up`.
