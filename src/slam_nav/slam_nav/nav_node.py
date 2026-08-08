@@ -365,6 +365,12 @@ class NavNode(Node):
         self._imu_yaw = None
         self._prev_odom = None
         self._prev_imu = None
+        # Whether the last rotated-yaw delta came from the wheel-odom fallback (IMU stale).
+        # On IMU recovery, the first fresh delta is measured from a baseline predating the
+        # outage whose rotation was already folded in via the odom fallback — that recovery
+        # sample must not be applied (double-counts the outage rotation as a jump). _predict
+        # consumes this flag and clears it on the first post-recovery sample.
+        self._imu_yaw_outage = False
         # monotonic last-seen times of the motion-prior feeds (freshness guard)
         self._odom_stamp = None
         self._imu_stamp = None
@@ -777,7 +783,7 @@ class NavNode(Node):
             ox, oy, oth = self._odom
             pox, poy, poth = self._prev_odom
             if self.use_imu and self._imu_yaw is not None and self._prev_imu is not None:
-                dth = _wrap(self._imu_yaw - self._prev_imu)
+                dth = self.imu_sign * _wrap(self._imu_yaw - self._prev_imu)
             else:
                 dth = _wrap(oth - poth)
             if math.hypot(ox - pox, oy - poy) < self.still_lin and abs(dth) < self.still_ang:
@@ -919,8 +925,20 @@ class NavNode(Node):
         dth_odom = _wrap(oth - poth)
         if self.use_imu and self._imu_yaw is not None and self._prev_imu is not None:
             if imu_fresh:
-                dth = self.imu_sign * _wrap(self._imu_yaw - self._prev_imu)
+                if self._imu_yaw_outage:
+                    # IMU just recovered from a stale window: the tracked _prev_imu is a
+                    # pre-outage baseline and the outage's rotation has already been folded
+                    # in via the wheel-odom fallback, so the first fresh delta would add the
+                    # last outage's angle on top of that fallback as a single jump. Re-baseline
+                    # to the fresh yaw (drop the deltas through the outage) and keep this one
+                    # sample on wheel-odom yaw so the pose moves smoothly.
+                    self._prev_imu = self._imu_yaw
+                    self._imu_yaw_outage = False
+                    dth = dth_odom
+                else:
+                    dth = self.imu_sign * _wrap(self._imu_yaw - self._prev_imu)
             else:
+                self._imu_yaw_outage = True
                 self.get_logger().warning(
                     "imu/euler stale; using wheel-odom yaw — IMU feed down; check "
                     "imu_driver (/dev/imu)", throttle_duration_sec=5.0)
@@ -1010,7 +1028,15 @@ class NavNode(Node):
         the map un-drifts in lock-step. Measuring against the offset-free prior each time
         avoids feedback (the offset can't chase its own tail)."""
         # Offset-free prior: where the raw odom/IMU chain says we are in the map frame.
-        prior = self._predict(self.px, self.py, self.pth, off=(0.0, 0.0, 0.0))
+        # self.px/py/pth already carry the accumulated _loop_off (re-applied each scan by
+        # _predict), so a plan seed of the corrected pose with off=(0,0,0) would still
+        # measure the *residual against the corrected chain* — a feedback loop where the
+        # offset can chase its own tail and the far-revisit check never fires. Strip the
+        # offset from the seed so the wide-window match is centred where the *raw* chain
+        # lies and cand − prior is the actual accumulated drift.
+        ox_off, oy_off, oth_off = self._loop_off
+        prior = self._predict(self.px - ox_off, self.py - oy_off,
+                              _wrap(self.pth - oth_off), off=(0.0, 0.0, 0.0))
         cand = self.grid.match(prior, va, vr, lin=self.loop_lin, ang=self.loop_ang)
         score = self.grid.score(cand, va, vr)
         if score < self.loop_score:
