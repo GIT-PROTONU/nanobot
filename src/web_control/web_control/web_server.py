@@ -1123,6 +1123,14 @@ class WebServerNode(Node):
                 for k in ("hb_age", "temp_age"):
                     if esp.get(k) is not None:
                         esp[k] = round(float(esp[k]) + file_age, 2)
+            # localization-pipeline feed ages (odom/ekf/imu) — same dead-writer
+            # handling: a stale vitals file ages every feed out naturally.
+            pipe = v.get("pipe")
+            if isinstance(pipe, dict):
+                for k in ("odom", "ekf", "imu"):
+                    sec = pipe.get(k)
+                    if isinstance(sec, dict) and sec.get("age") is not None:
+                        sec["age"] = round(float(sec["age"]) + file_age, 2)
         except (OSError, ValueError, TypeError):
             v = {}
         self._vitals_cache = (v, now)

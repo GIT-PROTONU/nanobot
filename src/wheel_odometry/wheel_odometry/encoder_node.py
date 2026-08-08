@@ -19,6 +19,7 @@ timer and integrates a differential-drive model:
 map/UI use /odom + /wheel_ticks). The invert_* params are an SBC-side sign fallback.
 """
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -86,6 +87,14 @@ class EncoderNode(Node):
         self.enc_pub = self.create_publisher(WheelEncoders, "wheel_encoders", 20)
         self.tf_bc = TransformBroadcaster(self)
 
+        # ESP32 /wheel_ticks liveness: if the coprocessor link dies, /odom keeps
+        # publishing the last integrated pose and the EKF/slam chain silently freezes.
+        # Timeout high enough that a slow boot or transient gap isn't a false alarm.
+        self._last_tick_at = time.monotonic()
+        self._tick_lost_warn = False
+        self._started = time.monotonic()   # boot grace for the liveness check
+        self.create_timer(2.0, self._check_ticks_alive)
+
         # Best-effort to match the ESP32's high-rate sensor publisher.
         ticks_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -118,12 +127,32 @@ class EncoderNode(Node):
     def _on_ticks(self, msg: Int64MultiArray):
         if len(msg.data) < 2:
             return
+        self._last_tick_at = time.monotonic()
+        if self._tick_lost_warn:
+            self._tick_lost_warn = False
+            self.get_logger().warning("/wheel_ticks resumed after a gap")
         self.left_ticks = int(msg.data[0]) * self.inv_l
         self.right_ticks = int(msg.data[1]) * self.inv_r
         if not self._have_ticks:
             # Seed the deltas so the first integration step doesn't lurch.
             self._prev_l, self._prev_r = self.left_ticks, self.right_ticks
             self._have_ticks = True
+
+    def _check_ticks_alive(self):
+        """Troubleshooting aid: if /wheel_ticks goes silent, /odom freezes silently
+        (it keeps republishing the last pose) and the EKF/SLAM chain stalls. Warn once
+        per outage with an actionable cause instead of leaving the operator wondering
+        why the robot's position stopped moving."""
+        age = time.monotonic() - self._last_tick_at
+        if time.monotonic() - self._started < 15.0:
+            return   # boot grace: the ESP32/zenoh link may take a moment to stream
+        if age > 5.0 and not self._tick_lost_warn:
+            self._tick_lost_warn = True
+            cause = ("no /wheel_ticks yet (ESP32 not streaming?)" if not self._have_ticks
+                     else "link to ESP32 stall — heartbeat/ticks stopped")
+            self.get_logger().error(
+                f"wheel_ticks SILENT {age:.0f}s — {cause}. /odom is now frozen; "
+                f"check the ESP32 coprocessor + zenoh link.")
 
     def _on_reset_ticks(self, msg: Bool):
         if msg.data:

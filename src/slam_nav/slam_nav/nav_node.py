@@ -368,6 +368,11 @@ class NavNode(Node):
         # monotonic last-seen times of the motion-prior feeds (freshness guard)
         self._odom_stamp = None
         self._imu_stamp = None
+        # same freshness tracking for the /scan feed + a startup-awaiting warning
+        # (so a dead EKF/IMU/lidar shows up explicitly instead of a frozen map).
+        self._scan_stamp = None
+        self._boot_warned = set()      # topics already warned while awaiting first msg
+        self._started = time.monotonic()   # boot start, for the waiting-feed warning
         # runtime IMU-vs-odom rotation-sign monitor (soft, WARN-only, see _predict)
         self._sig_abs = 0.0
         self._sig_imu = 0.0
@@ -473,6 +478,7 @@ class NavNode(Node):
             self.create_subscription(String, "cognition/traits", self._on_traits, latched)
         self.create_subscription(Bool, "selftest", self._on_selftest, 1)  # calibration drive
         self.create_timer(1.0 / max(1.0, float(g("control_rate").value)), self._control)
+        self.create_timer(2.0, self._check_boot_feeds)
         self.add_on_set_parameters_callback(self._on_params)
 
         self.get_logger().info(
@@ -695,6 +701,33 @@ class NavNode(Node):
         self._imu_gyro = float(msg.vector.y)
         self._imu_hz = float(msg.vector.z)
 
+    def _check_boot_feeds(self):
+        """Startup feed diagnostics (2 Hz until resolved): tell the operator which
+        motion-prior source hasn't arrived yet, with an actionable hint, instead of a
+        silently frozen map. Each topic is warned once — the first time this runs after
+        boot with that feed still absent after the start grace. Old feeds going stale
+        LATER are handled by _predict's freshness guard."""
+        now = time.monotonic()
+        if now - self._started < 15.0:
+            return                                # grace: feeds may take a while
+        expected = {
+            "odom_topic": (self._odom_stamp, "EKF output — is ekf_node (nano-ekf.service)"
+                           " up? check config/ekf.yaml"),
+            "euler_topic": (self._imu_stamp,
+                                "IMU yaw — is imu_driver up? check /dev/imu (BWT901CL CH340)"),
+            "scan_topic": (self._scan_stamp,
+                               "lidar /scan — is lds_driver up? check /dev/ttyS2"),
+        }
+        for tname, (stamp, hint) in expected.items():
+            if stamp is not None:
+                continue                                  # arrived fine
+            if tname not in self._boot_warned:
+                self._boot_warned.add(tname)
+                self.get_logger().warning(
+                    f"waiting on motion-prior feed {tname}: no message yet "
+                    f"{now - self._started:.0f}s after start — {hint}",
+                    throttle_duration_sec=15.0)
+
     # --- the SLAM step (per scan) -------------------------------------------
     def _on_scan(self, msg):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
@@ -703,6 +736,7 @@ class NavNode(Node):
             return  # nothing usable (degenerate / unconfigured lidar)
         angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
         self._last_scan = (angles, ranges)        # for the reactive front-stop layer
+        self._scan_stamp = time.monotonic()
 
         if not self._have_map:
             # Seed: drop the first scan straight in at the origin and prime trackers.
@@ -873,8 +907,10 @@ class NavNode(Node):
         ox, oy, oth = self._odom
         pox, poy, poth = self._prev_odom
         if not odom_fresh:
-            self.get_logger().warning("odom motion stale; not advancing the prior",
-                                      throttle_duration_sec=5.0)
+            self.get_logger().warning(
+                "odom motion stale; not advancing the prior — likely the EKF "
+                "(/odometry/filtered) or wheel-odometry feed stalled; check "
+                "nano-ekf.service / encoder_node", throttle_duration_sec=5.0)
             self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
             return px, py, pth
 
@@ -885,8 +921,9 @@ class NavNode(Node):
             if imu_fresh:
                 dth = self.imu_sign * _wrap(self._imu_yaw - self._prev_imu)
             else:
-                self.get_logger().warning("imu/euler stale; using wheel-odom yaw",
-                                          throttle_duration_sec=5.0)
+                self.get_logger().warning(
+                    "imu/euler stale; using wheel-odom yaw — IMU feed down; check "
+                    "imu_driver (/dev/imu)", throttle_duration_sec=5.0)
                 dth = dth_odom
         else:
             dth = dth_odom
@@ -1770,6 +1807,20 @@ class NavNode(Node):
             "mode": mode, "loc": loc, "motion": self.enable_motion,
             "nogo": self.grid.nogo_count(),                  # no-go zones marked
             "trail": list(self._trail) if self._trail else [],
+            # Wall-clock map-write time so the browser can age the feed staleness at
+            # READ time. When a feed forbids the map writes (e.g. a dead lidar keeps
+            # this function from running again), the header would otherwise freeze its
+            # "seconds since" values at the last write and hide the very stall we flag.
+            "t": time.time(),
+        }
+        # Feed staleness (seconds since each source last moved the prior) — lets the
+        # web map panel + topbar show WHICH feed is dead when the map freezes, instead
+        # of just "my map isn't updating". -1 = never received.
+        now = time.monotonic()
+        meta["feeds"] = {
+            "odom": -1.0 if self._odom_stamp is None else round(now - self._odom_stamp, 2),
+            "imu": -1.0 if self._imu_stamp is None else round(now - self._imu_stamp, 2),
+            "scan": -1.0 if self._scan_stamp is None else round(now - self._scan_stamp, 2),
         }
         header = (json.dumps(meta) + "\n").encode()
         tmp = MAP_FILE + ".tmp"

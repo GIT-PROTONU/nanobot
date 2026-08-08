@@ -27,6 +27,15 @@ START_GRACE = 30.0       # s after start before "never came up" counts as DOWN
 PROGRESS_SECS = 60.0     # during an outage, snapshot counters this often
 MAX_BYTES = 512 * 1024   # rotate health.log -> health.log.1 past this
 
+# Localization-pipeline feed staleness (see FeedWatch below). These feeds publish
+# continuously (raw /odom ~15 Hz, EKF /odometry/filtered ~15 Hz, /imu/euler ~50 Hz),
+# but a STALE feed tells you the publisher (or an intermediate process like the EKF)
+# died without necessarily tripping the ESP32/LDS watchers above — so we watch each
+# one's age independently.
+PIPE_FEEDS = ("odom", "ekf", "imu")   # the three feeds tracked per-launch
+FEED_TIMEOUT = 3.0         # s without a message before a feed is declared DOWN
+FEED_GRACE = 20.0          # s of boot grace before "never seen" counts as DOWN
+
 BLOB_PATH = "/dev/shm/nano_scan.bin"
 
 
@@ -196,6 +205,69 @@ class HealthWatch:
             return f"lidar not spinning (rpm {rpm:.0f}) -> power/spin motor"
         if hz == hz and hz < HZ_MIN:
             return (f"spinning (rpm {rpm:.0f}) but ESP32 sees {hz:.0f} frames/s "
-                    f"-> lidar TX or ESP32 RX branch")
+                    f"-- lidar TX or ESP32 RX branch")
         return (f"no complete revolutions at SBC (rpm {rpm:.0f}, frames {hz:.0f}/s "
                 f"= upstream fine); counter verdict follows")
+
+
+class FeedWatch:
+    """Edge-tracking staleness watch for a single continuously-publishing ROS topic.
+
+    Translates "how many seconds since the last message arrived" into up/down
+    transitions with a boot grace, so a node that never came up isn't reported as a
+    mid-flight failure. Mirrors HealthWatch's shape (edge-only lines, returns them for
+    callers to write/echo) but stays perfectly generic — monitor_node feeds it the
+    per-topic ages it already computes in its tick.
+
+    A watcher that was healthy and then goes stale is reported with how long it was up;
+    a feed held DOWN all boot then appears as "down since start". Distinct from
+    HealthWatch's up/down bools (which callers compute from counts) by being age-driven
+    so the SAME feed list drives both the durable log and the /diagnostics status.
+    """
+
+    def __init__(self, name, timeout=FEED_TIMEOUT, grace=FEED_GRACE, now=None):
+        self.name = name
+        self.timeout = timeout
+        self.grace = grace
+        now = time.monotonic() if now is None else now
+        self.started = now
+        self.up = None          # None (unknown, in boot) | True | False
+        self.since = now        # when the current state began
+        self.ever_seen = False  # feed ever delivered a message since this watch started
+
+    def update(self, now, age):
+        """age = seconds since the feed's last message (None/inf = never seen). Returns
+        transition lines to log, or [] when nothing changed / still in boot grace."""
+        if age is not None and age <= self.grace:
+            self.ever_seen = True
+        fresh = age is not None and age <= self.timeout
+
+        if self.up == fresh:
+            return []
+
+        # Unknown boot state resolves the first time we have enough evidence.
+        if self.up is None:
+            if fresh:
+                self.up, self.since = True, now
+                return []
+            if now - self.started >= self.grace:
+                # Boot grace over and still not fresh. Whether we ever saw a message
+                # (first msg fell inside grace, then the feed died) or never did,
+                # it's DOWN as of the grace expiry — don't sit in "unknown" forever.
+                self.up, self.since = False, now
+                why = ("no message ever" if age is None else f"age {age:.0f}s")
+                if self.ever_seen:
+                    return [f"feed {self.name} DOWN ({why} > {self.timeout}s timeout)"]
+                return [f"feed {self.name} DOWN since start "
+                        f"({why} > {self.timeout}s timeout)"]
+            return []                             # mid-boot, nothing to say yet
+
+        # True up/down transition (boot resolved). `held` is how long the previous
+        # state lasted.
+        prev = self.up
+        held = now - self.since
+        self.up, self.since = fresh, now
+        if fresh:
+            return [f"feed {self.name} UP after {held:.0f}s down"]
+        return [f"feed {self.name} DOWN: was up {held:.0f}s "
+                f"(age {age:.0f}s > {self.timeout}s)"]

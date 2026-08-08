@@ -1941,10 +1941,22 @@ connect();   // auto-connect on load
     if(m.seen!==undefined){
       const q = m.score>=8?"good":(m.score>=2?"ok":"weak");
       const loc = m.loc && m.loc!=="ok" ? ` · ⚠ ${m.loc}` : "";
+      // feed staleness: which motion-prior source is dead (odom/EKF, IMU, LDS)?
+      // Ages are stored as-of the map write (m.t); add the elapsed since that write
+      // so a frozen map file keeps aging each feed at READ time (a dead lidar stops
+      // the map writes themselves, so header ages would otherwise never grow).
+      let feeds="";
+      if(m.feeds){
+        const sinceWrite=Math.max(0,(Date.now()/1000)-(m.t||Date.now()/1000));
+        const fstale=Object.entries(m.feeds).map(([k,v])=>
+          [k, v<0? -1 : v+sinceWrite]).filter(([,v])=>v<0||v>1.5);
+        if(fstale.length) feeds=" · ⚠ feeds: "+fstale.map(([k,v])=>
+          `${k}:${v<0?"none":v.toFixed(0)+"s"}`).join(" ");
+      }
       $("mapStats").textContent =
         `mode: ${m.mode||"—"} · explored ${(m.seen*100).toFixed(0)}% `
         + `(${(m.free_m2||0).toFixed(1)} m² free) · match ${q} (${(m.score||0).toFixed(0)})`
-        + ` · motion ${m.motion?"ON":"off"}${loc}`;
+        + ` · motion ${m.motion?"ON":"off"}${loc}${feeds}`;
     }
   }
 

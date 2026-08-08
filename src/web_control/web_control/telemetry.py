@@ -109,6 +109,7 @@ class TelemetryHub:
         self._odom = None             # (x, y, yaw_rad)
         self._plan = []               # [[x, y], ...] downsampled
         self._diag = ({}, STALE)      # ({key: value}, arrival monotonic)
+        self._pipe_diag = None    # (feed dict, arrival, level, message) or None
         self._ticks = None            # (l, r)
         self._stray = None            # (l, r) ticks seen while stopped -- bad-encoder-signal diagnostic
         self._tick_cnt = 0            # wheel_ticks messages seen (for the rate readout)
@@ -415,6 +416,11 @@ class TelemetryHub:
         if diag:
             f["diag"] = diag
             f["diag_age"] = round(now - diag_at, 2)
+        if self._pipe_diag is not None:
+            pd, pd_at, lvl, msg = self._pipe_diag
+            if now - pd_at < 10.0:           # stale pipeline diag = stale source
+                f["pipeline"] = {"feeds": pd, "level": lvl, "msg": msg,
+                                 "age": round(now - pd_at, 2)}
         if self._fan is not None:
             f["fan"] = self._fan
         if self._selftest:
@@ -545,6 +551,12 @@ class TelemetryHub:
         st = next((s for s in msg.status if s.name == "system"), None)
         if st is not None:
             self._diag = ({p.key: p.value for p in st.values}, time.monotonic())
+        # localization-pipeline feed status (odom/EKF/imu) from sys_monitor
+        pipe = next((s for s in msg.status if s.name == "pipeline"), None)
+        if pipe is not None:
+            self._pipe_diag = (
+                {p.key: p.value for p in pipe.values}, time.monotonic(),
+                pipe.level, pipe.message)
 
     def _on_ticks(self, msg):
         d = list(msg.data)

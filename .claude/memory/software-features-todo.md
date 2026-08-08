@@ -1,6 +1,6 @@
 ---
 name: software-features-todo
-description: "Software-only feature backlog (no new hardware), started 2026-07-13. TODO (approved): named locations + go-to skill, IMU-fused odometry, odom auto-calibration, wheel-slip cross-check. DONE 2026-07-16: IMU quality tools (6-axis toggle, interference self-test, mag-cal scatter, bandwidth filter) -- see imu-quality-tools-built. NICE-TO-HAVE (all user-endorsed, no priority): follow-me, voice, roam, sentry, no-go zones, history graphs, path replay, conversation memory, audio emotes, map-change detection, push notifications, coverage map, odometer stats, TTS prosody, stuck-escape, global relocalization, tap gestures, terrain-from-effort, WiFi fingerprint, chirp self-test, mirror detection, courier mode, alarm clock, rhythm learning, diary page, dream journal, games, expressive fan"
+description: "Software-only feature backlog (no new hardware), started 2026-07-13. DONE (all 4 approved items, as of aede005): named locations + go-to skill, IMU-fused odometry (via robot_localization EKF, NOT a wheel_odometry complementary filter), odom auto-calibration, wheel-slip cross-check. DONE 2026-07-16: IMU quality tools (6-axis toggle, interference self-test, mag-cal scatter, bandwidth filter) -- see imu-quality-tools-built. NICE-TO-HAVE (all user-endorsed, no priority): follow-me, voice input, roam, no-go zones, history sparklines, path replay, conversation memory, audio emotes, map-change detection, push notifications, coverage map, odometer stats, TTS prosody, stuck-escape, global relocalization, tap gestures, terrain-from-effort, WiFi fingerprint, chirp self-test, mirror detection, courier mode, alarm clock, rhythm learning, diary page, dream journal, games, expressive fan"
 metadata: 
   node_type: memory
   type: project
@@ -11,36 +11,18 @@ Post-GPU-vision backlog (that one is cleared — see [[gpu-vision-features-todo]
 here is buildable with the existing hardware: lidar, IMU, encoders, C270 cam+mic, speaker/TTS,
 OLED, ESP32, LED, fan.
 
-## TODO (user-approved 2026-07-13, not yet built)
+## ALL FOUR APPROVED ITEMS DONE (aede005, 2026-08-08)
 
-**1. Named locations + "go to the kitchen".** slam_nav already has click-to-go (`goal_pose`)
-and `go_home`/`save_map`. Add named waypoints: a `locations.json` in
-`~/.local/state/nanobot/` (live-editable from the web map panel, same pattern as the Schedule
-card / `schedule.json` — NOT ROS params, see [[rclpy-string-array-param-gotcha]]), plus a
-`go-to.md` action skill (`kind: topic` → `goal_pose`, gated by `skills_allow_actions` like all
-motion) that takes a location name. Compounds with what exists: scheduled routines ("patrol
-the hallway at 22:00"), the LLM skill picker, and chat ("go check the door"). Save a location
-= "remember this spot as X" (current pose) from the UI, and optionally a chat/skill path.
-
-**2. IMU-fused odometry.** `wheel_odometry` integrates single-channel encoder ticks only —
-differential heading from tick imbalance is its weakest output (ticks are signed by
-*commanded* direction, no true quadrature). The BWT901CL publishes good yaw at 50 Hz on
-`/imu/euler` and nothing fuses it. Add a complementary filter in `wheel_odometry` (encoder
-translation + IMU yaw for rotation, ~30 lines; param-gated so it can be A/B'd against pure
-encoder odom). Directly improves SLAM scan-match quality and the pickup/relocalize recovery.
-Both nodes are already co-resident in sensor_hub, so no new cross-process traffic. Watch:
-IMU yaw drifts slowly (no mag fusion guarantee) — fuse *rate/delta* yaw, not absolute yaw.
-
-**3. Odometry auto-calibration routine.** A skill that spins 360° (gyro-integrated as truth)
-and drives a short straight (lidar-verified), then solves ticks-per-metre + track width from
-the residuals — replaces the hand-tuned `robot.yaml` odom constants. Same spirit as the ESP32
-straight-line trim autocal. Natural to build AFTER IMU-fused odometry (item 2) since it
-leans on trusting the gyro.
-
-**4. Wheel-slip cross-check.** IMU gyro-z vs encoder-implied rotation rate disagree →
-slipping/dragged/stuck. Complements the optical bumper (which needs the camera on);
-near-free once item 2 exists. Consumers: caution fast-rule + a diagnostics alert; later the
-stuck-escape reflex.
+**1. Named locations + "go to the kitchen"** — DONE (aede005).
+**2. IMU-fused odometry** — DONE, but implemented as a `robot_localization` **EKF**, NOT the
+complementary-filter-in-`wheel_odometry` originally specced. Commits `b2b56d6` +
+`07f07e4`: `ekf_node` (src/robot_bringup/config/ekf.yaml) fuses `/odom` (X/Y/Vx) +
+`/imu/data` (yaw, gyro Z, accel) into `/odometry/filtered`, publishes `odom->base_link` TF;
+slam_nav consumes `/odometry/filtered` (`odom_topic` in robot.yaml). `wheel_odometry`
+deliberately stays raw — EKF excludes wheel yaw since single-channel ticks sign by commanded
+direction and drift with slip (ekf.yaml odom0_config).
+**3. Odometry auto-calibration** — DONE (aede005).
+**4. Wheel-slip cross-check** — DONE (aede005).
 
 ## DONE (2026-07-16, same day) — IMU quality tools
 
@@ -138,7 +120,11 @@ in-repo at `docs/TODO.md`. All its code-side items were implemented same-day (tr
 latched-goal fix in `_on_goal`/`_on_go_home`, `brain_timeout` code-default raised to
 1800 + a runtime clamp to >=2x `purpose_period`, `_mk_goal` coordinate clamp, slam_nav
 self-test constants promoted to live params, narrative-skill phrase-bank fallback in
-`CognitionCore._invoke_skill`) — 198 unit tests + `pixi run smoke` pass, not yet
+`CognitionCore._invoke_skill`) -- 198 unit tests + `pixi run smoke` pass, not yet
 deployed (board unreachable that session). What's left in `docs/TODO.md` is
 hardware-only: flash the ESP32 stray-tick firmware, deploy the pending fixes,
 hardware-verify IMU calibration/vision tracking/`ticks_per_rev`. Check both lists.
+
+2026-08-08: all 4 approved items (named locations, IMU-fused odom = robot_localization EKF,
+odom auto-calibration, wheel-slip cross-check) landed in aede005. No open feature items --
+remainder is the nice-to-have pool above.

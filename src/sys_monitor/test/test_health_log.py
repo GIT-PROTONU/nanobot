@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from sys_monitor.health_log import (  # noqa: E402
-    HealthWatch, ESP32_TIMEOUT, START_GRACE, PROGRESS_SECS, MAX_BYTES,
+    HealthWatch, FeedWatch, ESP32_TIMEOUT, START_GRACE, PROGRESS_SECS, MAX_BYTES,
 )
 
 RPM, HZ = 300.0, 450.0
@@ -137,3 +137,54 @@ def test_write_and_rotate(tmp_path):
 
 def test_esp32_timeout_constant_sane():
     assert 2.0 < ESP32_TIMEOUT < 15.0
+
+
+# ---- FeedWatch (localization-pipeline feed staleness) ---------------------
+
+
+def feed_watch(name="odom", timeout=3.0, grace=20.0):
+    return FeedWatch(name, timeout=timeout, grace=grace, now=0.0)
+
+
+def test_feedwatch_healthy_no_lines(tmp_path):
+    w = feed_watch()
+    out = []
+    for t in range(0, 60):                     # steady 1 s-stale feed
+        out += w.update(float(t), 1.0)
+    assert not out                              # transitions only
+
+
+def test_feedwatch_up_after_never_seen(tmp_path):
+    w = feed_watch()
+    oops = [ln for t in range(0, 20)               # still in boot grace (20 s)
+            for ln in w.update(float(t), None)]
+    assert not oops                             # NO down mid-boot
+    late = [ln for ln in w.update(30.0, None)]
+    assert len(late) == 1 and "DOWN since start" in late[0]
+    up = [ln for ln in w.update(35.0, 0.5)]
+    assert len(up) == 1 and "feed odom UP" in up[0]
+
+
+def test_feedwatch_down_after_known_up(tmp_path):
+    w = feed_watch()
+    healthy = [ln for t in range(0, 60) for ln in w.update(float(t), 1.0)]
+    assert not healthy
+    down = [ln for ln in w.update(65.0, 7.0)]       # stale past 3 s timeout
+    assert len(down) == 1 and "odom DOWN: was up" in down[0]
+    still = [ln for ln in w.update(66.0, 9.0)]
+    assert not still                                # no repeat lines while still down
+    up = [ln for ln in w.update(70.0, 1.0)]
+    assert len(up) == 1 and "feed odom UP after" in up[0]
+
+
+def test_feedwatch_seen_once_in_grace_then_stale(tmp_path):
+    """A feed whose only message is already stale when first observed (age between
+    timeout and grace, e.g. the source restarted a while ago) and never delivers again
+    must not sit in 'unknown' forever once grace expires — it flips DOWN."""
+    w = feed_watch(timeout=3.0, grace=20.0)
+    assert not w.update(0.0, None)                    # boot, nothing yet
+    assert not w.update(5.0, 5.0)                     # first obs: already stale (5s),
+    assert w.up is None                               # ...but still inside grace
+    down = [ln for ln in w.update(21.0, 21.0)]       # grace over, still stale
+    assert len(down) == 1 and "feed odom DOWN" in down[0]
+    assert w.up is False

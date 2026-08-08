@@ -29,9 +29,10 @@ import rclpy
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import Vector3Stamped
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, Int32
 
-from .health_log import HealthWatch, read_scan_blob_header
+from .health_log import HealthWatch, FeedWatch, read_scan_blob_header
 
 VITALS_FILE = "/dev/shm/nano_vitals.json"
 
@@ -116,6 +117,20 @@ class MonitorNode(Node):
         self.create_subscription(Vector3Stamped, "/imu/web", self._on_imu_web, 10)
         self.create_subscription(Vector3Stamped, "/imu/euler", self._on_imu_euler, 10)
         self.create_subscription(Float32, "/esp32_temp", self._on_esp_temp, 10)
+
+        # Localization-pipeline feed watchers (see FeedWatch in health_log.py). These
+        # track the raw wheel-odometry feed, the EKF-fused output that slam_nav actually
+        # consumes, and the IMU euler feed. Their ages + a DOWN/UP transition in the
+        # durable health.log tell you whether to blame the ESP32, the EKF process, or
+        # the IMU when SLAM stops moving — instead of poking at an empty map.
+        self._pipe = {}                     # topic -> monotonic time of last message
+        self._feeds = {}
+        for topic, name in (("/odom", "odom"), ("/odometry/filtered", "ekf"),
+                            ("/imu/euler", "imu")):
+            self._pipe[topic] = None
+            self._feeds[topic] = FeedWatch(name)
+        self.create_subscription(Odometry, "/odom", self._on_odom_watch, 10)
+        self.create_subscription(Odometry, "/odometry/filtered", self._on_ekf_watch, 10)
         up = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
         self.watch.write([f"monitor start (boot uptime {up:.0f}s)"])
 
@@ -255,12 +270,35 @@ class MonitorNode(Node):
 
         msg = DiagnosticArray()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.status = [st]
+        msg.status = [st, self._pipeline_diagnostic()]
         self.pub.publish(msg)
 
         self._publish_fan(cpu_t)
         self._health_tick()
         self._write_vitals(cpu_pct, mem_pct, cpu_t, disk_pct)
+
+    def _pipeline_diagnostic(self):
+        """A DiagnosticStatus summarising the localization-pipeline feed freshness —
+        the answer to 'is my IMU / encoder / EKF actually feeding SLAM?'. The web UI
+        renders sensors/staleness; telemetry also carries the per-feed ages."""
+        now = time.monotonic()
+        ok = True
+        vals = []
+        for topic, feed in self._feeds.items():
+            at = self._pipe.get(topic)
+            age = None if at is None else max(0.0, now - at)
+            state = "ok" if feed.up else ("unknown" if feed.up is None else "DOWN")
+            if feed.up is False:
+                ok = False
+            vals.append(KeyValue(
+                key=feed.name,
+                value=f"{state} ({age:.1f}s age)" if age is not None else f"{state}"))
+        st = DiagnosticStatus()
+        st.level = DiagnosticStatus.OK if ok else DiagnosticStatus.ERROR
+        st.name = "pipeline"
+        st.message = "all feeds fresh" if ok else "localization feed(s) stale"
+        st.values = vals
+        return st
 
     def _write_vitals(self, cpu_pct, mem_pct, cpu_t, disk_pct):
         """Write the aggregated body snapshot to /dev/shm (atomic replace). `t` is wall
@@ -284,6 +322,23 @@ class MonitorNode(Node):
         hz, hz_at = self._hz
         if hz == hz:
             v["lds"] = {"hz": num(hz, 2), "age": round(now - hz_at, 2)}
+        # Localization-pipeline feed ages + freshness (odom/EKF/imu) — the "why is the
+        # map frozen" answer at a glance. `ok` is true only when ALL feeds are fresh.
+        pipe = {}
+        pipe_ok = True
+        for topic, feed in self._feeds.items():
+            at = self._pipe.get(topic)
+            age = None if at is None else round(now - at, 2)
+            # `up`: True/False are real; None must STAY None (boot grace = unknown,
+            # not failed) — bool(None) would report a booting feed as DOWN.
+            pipe[feed.name] = {"age": age, "up": None if feed.up is None else feed.up}
+            # `up` is None during the boot grace (unknown, not failed); only an
+            # explicit DOWN should be reported as unhealthy.
+            if feed.up is False:
+                pipe_ok = False
+        if self._pipe:
+            pipe["ok"] = pipe_ok
+            v["pipe"] = pipe
         esp = {}
         if self._hb_at is not None:
             esp["hb_age"] = round(now - self._hb_at, 2)
@@ -309,6 +364,12 @@ class MonitorNode(Node):
     def _on_esp_temp(self, msg):
         self._esp_temp = (msg.data, time.monotonic())
 
+    def _on_odom_watch(self, _msg):
+        self._pipe["/odom"] = time.monotonic()
+
+    def _on_ekf_watch(self, _msg):
+        self._pipe["/odometry/filtered"] = time.monotonic()
+
     def _on_hb(self, _msg):
         self._hb_at = time.monotonic()
 
@@ -318,6 +379,18 @@ class MonitorNode(Node):
     def _on_hz(self, msg):
         self._hz = (msg.data, time.monotonic())
 
+    def _pipeline_feed_lines(self, now):
+        """Feed the localization-pipeline watchers and return any transition lines.
+        The /imu/euler feed is already tracked as `self._eul`; reuse its timestamp
+        rather than double-subscribing."""
+        lines = []
+        self._pipe["/imu/euler"] = self._eul[3] if self._eul is not None else None
+        for topic, feed in self._feeds.items():
+            at = self._pipe.get(topic)
+            age = None if at is None else max(0.0, now - at)
+            lines += feed.update(now, age)
+        return lines
+
     def _health_tick(self):
         now = time.monotonic()
         hb_age = now - self._hb_at if self._hb_at is not None else float("inf")
@@ -325,6 +398,7 @@ class MonitorNode(Node):
         rpm = self._rpm[0] if now - self._rpm[1] < 5.0 else float("nan")
         hz = self._hz[0] if now - self._hz[1] < 5.0 else float("nan")
         lines = self.watch.update(now, hb_age, rpm, hz, read_scan_blob_header())
+        lines += self._pipeline_feed_lines(now)
         self.watch.write(lines)
         for ln in lines:
             self.get_logger().warning(f"[health] {ln}")
