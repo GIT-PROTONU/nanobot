@@ -75,3 +75,23 @@ left needs the physical robot and can't be closed from a dev host.
   "moved", so the lidar never idle-parks while tracking, though tracking itself is
   camera-only. Deliberate (motion should keep the safety lidar hot); revisit if
   tracking sessions turn out to be long/stationary.
+
+# New SLAM/ODOM TODOs from recent investigation
+
+- [ ] **Update EKF yaw process noise covariance** (increase from 0.06 → 0.12) to
+      improve turn handling in SLAM correlation.
+- [ ] **Wheel calibration**: Test `ticks_per_rev` with a measured 1m distance drive.
+      Log discrepancy to debug `wheel_odometry/encoder_node.py` (lines 50-53).
+- [ ] **Add scan-matching logger**: Record residuals to `/scan_matching_queue` for
+      analysis during SLAM failures.
+- [ ] **Implement `/scan_bias` calibration**: Capture scrape noise in lidar data and
+      zero it using raw filter scan offsets.
+- [ ] **Implement `/scan_quality_metrics` pub**: Track correlation score, map drift,
+      and relocalization count during runs.
+
+# Monitoring scripts to add
+
+- [ ] **Define `/scan_matching_quality` topic**: Broadcast ROS2 `float` values during
+      mapping.
+- [ ] **Create `ros2 topic echo /odom` script**: Compare odom drift against ground truth.
+- [ ] **Add `rqt` visualization panels**: For `/odom/filtered`, `/scan_matching_queue`.
