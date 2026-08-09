@@ -38,7 +38,7 @@ import threading
 import time
 import wave
 
-from .llm import strip_em_dash
+from nanobot_brain.cognition import strip_em_dash
 
 # English voices: UK default, Lancaster, Scottish (the install script prunes to
 # these three to keep the rootfs lean).

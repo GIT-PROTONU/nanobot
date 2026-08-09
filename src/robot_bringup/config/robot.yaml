@@ -113,7 +113,7 @@ slam_nav:
                                 # reliable than ever — the scan matcher's yaw window
                                 # (match_ang: 0.12 rad) could potentially be tightened
                                 # (e.g. 0.08) once yaw tracking is verified on hardware.
-    imu_yaw_sign: 1                   # +1/-1. IF "IMU yaw and wheel yaw rotate OPPOSITE
+    imu_yaw_sign: 1.0                 # +1/-1. IF "IMU yaw and wheel yaw rotate OPPOSITE
                                       # signs", flip to -1 (IMU mounted rotated).
     # Parked = skip: when odom AND IMU both say the robot hasn't moved since the last
     # processed scan, skip the scan-match + map-integrate (the bulk of parked idle

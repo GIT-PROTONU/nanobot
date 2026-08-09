@@ -43,6 +43,7 @@ from geometry_msgs.msg import Twist, PoseStamped
 
 from nanobot_brain.behavior import build_interpreter, BEATS, clamp01
 from nanobot_brain.behavior import PurposeBrain, Personality
+from nanobot_brain.behavior import Schedule, merge_beats, load_json, save_json, _state_path
 
 # Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
 # Import defensively so a board that hasn't run `pixi install` yet still boots the
@@ -195,6 +196,10 @@ class MoodNode(Node):
         # this into the /reflect state command we (and it) act on, so there's one entry path
         # for both the manual web toggle and this autonomous trigger.
         self.reflect_req_pub = self.create_publisher(Bool, "reflect_request", 10)
+        # Latched readouts so late subscribers (slam_nav's motion clamp, web_control's
+        # reflection, the web UI brain card) get them immediately; PurposeBrain/Personality
+        # also republish them on a slow heartbeat for late (volatile-QoS) rosbridge subs.
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Brain health: publish our status so web_server (and the web UI via HTTP) can monitor
         # the behavior layer's liveness and the cognition heartbeat RSSI.
         self._health_pub = self.create_publisher(String, "brain/behavior_health", latched)
@@ -204,7 +209,6 @@ class MoodNode(Node):
         # Latched readouts so late subscribers (slam_nav's motion clamp, web_control's
         # reflection, the web UI brain card) get them immediately; PurposeBrain/Personality
         # also republish them on a slow heartbeat for late (volatile-QoS) rosbridge subs.
-        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.traits_pub = self.create_publisher(String, "cognition/traits", latched)
         self.purpose_pub = self.create_publisher(String, "purpose", latched)
         self.task_pub = self.create_publisher(String, "task_current", latched)

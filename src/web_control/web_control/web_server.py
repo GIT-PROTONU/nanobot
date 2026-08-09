@@ -43,15 +43,18 @@ from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, PoseStamped
 
 from . import procstats
+from .procstats import STAT_PATH, MEMINFO_PATH, THERMAL_PATH
 from .jsonio import read_json, write_json
 from .mjpeg_camera import CameraStream
 from .gpu_vision import GpuVision
 from .mic_audio import AudioStream
 from .telemetry import TelemetryHub, GOAL_MAX_ABS_M
 from .tts import TtsEngine, VOICES, clamp
+from .stress import StressTest
+from .imu_interference import IMUInterferenceTest
 from nanobot_brain.cognition import LlmClient
 from nanobot_brain.cognition import resolve_skills_dir
-from nanobot_brain.cognition import CognitionCore
+from nanobot_brain.cognition import CognitionCore, sanitize_personality_patch
 
 # Persisted, web-tunable TTS settings (merged over the file on disk). `voice` is
 # seeded from the tts_default_voice param at load time.
@@ -737,6 +740,45 @@ class WebServerNode(Node):
         self._reflect_tick()                           # ditto (cheap when not due)
         self._llm_health_tick()                        # persistent "AI offline" indicator
         self._brain_health_tick()                      # cognition health heartbeat
+
+    # ---- HTTP teleop ---------------------------------------------------------
+    def drive(self, data):
+        """POST /drive {"v","w"}: clamp, publish /cmd_vel now, and arm the 10 Hz
+        keepalive until the page stops refreshing (dead-man) or sends zero."""
+        g = self.get_parameter
+        max_lin = float(g("drive_max_lin").value)
+        max_ang = float(g("drive_max_ang").value)
+        try:
+            # NOT tts.clamp — that one rounds to int, which would turn 0.2 m/s into 0.
+            v = min(max_lin, max(-max_lin, float(data.get("v", 0.0))))
+            w = min(max_ang, max(-max_ang, float(data.get("w", 0.0))))
+        except (TypeError, ValueError):
+            v = w = 0.0
+        with self._drive_lock:
+            self._drive_v, self._drive_w = v, w
+            self._drive_at = time.monotonic() if (v or w) else 0.0
+        self._publish_drive(v, w)
+        return {"status": "ok", "v": v, "w": w}
+
+    def _publish_drive(self, v, w):
+        tw = Twist()
+        tw.linear.x = float(v)
+        tw.angular.z = float(w)
+        self._drive_pub.publish(tw)
+
+    def _drive_tick(self):
+        """10 Hz: re-assert the active HTTP-teleop command (the ESP32 stops the motors
+        if /cmd_vel goes stale) and dead-man-stop when the page vanishes mid-drive."""
+        with self._drive_lock:
+            if not self._drive_at:
+                return
+            stale = (time.monotonic() - self._drive_at
+                     > float(self.get_parameter("drive_timeout").value))
+            if stale:
+                self._drive_v = self._drive_w = 0.0
+                self._drive_at = 0.0
+            v, w = self._drive_v, self._drive_w
+        self._publish_drive(v, w)                      # a stale drive publishes one stop
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
