@@ -234,6 +234,20 @@ the personality it has evolved on its own; set `DEPLOY_SOUL=1` to overwrite the
 board's persisted soul (`personality.json` + phrase bank + learned skills) with the
 dev-made `memory/` seed. Run `pixi run smoke` before deploying.
 
+> **`deploy.sh` only pushes this repo's `src/` + `scripts/`.** The brain lives in the
+> separate **`nanobot-brain`** repo (a standalone git checkout copied to the board at
+> `/home/ibster/Nano/brain/src`). If you changed the brain you MUST sync it separately
+> **before** restarting the stack:
+>
+> ```bash
+> cd ~/Desktop/nanobot-brain
+> rsync -az --exclude '__pycache__' src/ nano:/home/ibster/Nano/brain/src/
+> ```
+>
+> Failing to do so makes the glue nodes (`mood_node`/`web_server`) fail at runtime with
+> `TypeError: __init__() got an unexpected keyword argument ...` — the glue and brain
+> must stay in lockstep.
+
 ## Notes / gotchas
 
 - **First boot debugging:** UART0 (`/dev/ttyS0`, PA4/5) stays the Armbian serial

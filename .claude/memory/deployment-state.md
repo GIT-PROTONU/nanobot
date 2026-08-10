@@ -16,6 +16,15 @@ The robot board is **live at 192.168.178.141**, user `ibster` (sudo). See [[proj
 - **Bug found+fixed during that deploy:** `scripts/unit_exec.sh`'s `pixi shell-hook` eval ran under `set -u`, and RoboStack's `ros-humble-ros-workspace_activate.sh` references unset `$CONDA_BUILD` → every unit crash-looped on start. Fixed by wrapping the shell-hook eval in `set +u`/`set -u` (same pattern already used for `install/setup.bash` right below it). Committed in `63ef46a`.
 - The stack is 3 hubs (sensor_hub / slam_nav / app_hub) + router + map bridge; rosbridge is deleted.
 - The "Left to do" list at the bottom is ALL done (LDS spins via ESP32 PID, encoders live via ESP32, systemd installed).
+- **[2026-08-10, DEPLOYED + pushed]** web-UI served-page fix (self-contained SSE,
+  `f40724f`) + telemetry zenoh-level-bytes crash fix, plus a **stale-brain incident**:
+  `deploy.sh` does NOT push `nanobot-brain`, so the board's brain wandered out of
+  lockstep with the glue and every app hub node failed to init (`TypeError: unexpected
+  keyword argument …`). Fixed by `rsync src/ → brain/src/` ([[brain-glue-lockstep]])
+  and reapplying the chart API restore (`nanobot-brain` `64c9174`). ESP32 needed a
+  power-cycle after repeated stack down/up churn (SBC side verified healthy — see the
+  esp32-link-wedge memory). Verify state now: `/brain/health` → `all_healthy: true`;
+  ESP fields live in `/telemetry`; page connector "connected".
 - **[SUPERSEDED 2026-07-14]** ESP32 coprocessor is now actively wired and in active use, not
   deferred. See [[esp32-hardware-fried-ground-fix]] for a same-day hardware incident (a board
   fried from a ground-bounce path, replaced, hardware rework in progress) and

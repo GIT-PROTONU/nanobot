@@ -40,3 +40,17 @@ traffic, 0/frozen = ESP32 silent. ESP32 console via dev-PC USB: reset with RTS p
 Note: non-interactive ssh has no `pixi` on PATH — use `~/.pixi/bin/pixi`; stack lives at
 `~/Nano` on the board. Related: [[esp32-zenoh-pico-integration]],
 [[motors-dead-after-gpio-reassign]] (separate issue, still open).
+
+## 2026-08-10 follow-up: "no connection to ESP32" — SBC side was healthy
+Same symptom (web UI ESP fields all `null`, `hb_age ~1e9`), but the SBC side was
+**verified healthy**: `nano-router` held an open fd on `/dev/ttyS1` (the configured
+serial listen) and `web_control` was actively publishing `/esp32_ping` (counter
+incrementing). The ESP's own debug console on `/dev/ttyUSB0` was **completely silent**
+(no boot log, no response to input) — the tell that the ESP itself was unpowered/
+not-booting, NOT a software/link issue. A power-cycle of the ESP fixed it immediately
+(heartbeat + temp + wheel_ticks returned). So: check SBC fd on ttyS1 + ping activity
+first; if both healthy and the ESP console is silent, it's power/hardware, not code.
+
+Note (2026-08-10): the web page is now self-contained SSE — `/esp32_ping` is sent by
+`web_server` at 1 Hz and the ESP fields stream inside the `/telemetry` SSE frame. See
+[[single-webui-from-sbc]] for the page state.

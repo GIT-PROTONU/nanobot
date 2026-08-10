@@ -17,7 +17,7 @@
   cd /home/ib/Desktop/nanobot-brain
   pixi run python -m pytest tests/
   ```
-  All 93 tests are ROS-free (no rclpy, no network). The `nanobot-brain` package is a standalone dependency — no colcon overlay needed.
+  All 94 tests are ROS-free (no rclpy, no network). The `nanobot-brain` package is a standalone dependency — no colcon overlay needed.
 
 ## Dependencies
 
@@ -121,7 +121,9 @@ What the page already surfaces for each stage:
 - **SLAM/feeds** — map panel + mapStats line: mode/explored/match score/loc + `⚠ feeds: odom · imu · lds` staleness, read from the `/map` JSON header written by `slam_nav/nav_node.py` (`meta["feeds"]`; `-1` = never received; re-aged at read time in `index.html:1948`).
 - **EKF** — NOT shown standalone: `/odometry/filtered` only enters the UI indirectly via the SLAM feed-staleness. Any new EKF view must compare raw `/odom` vs `/odometry/filtered` vs SLAM map pose / IMU yaw.
 
-**Served-page contradiction (unresolved):** `src/web_control/web/index.html` (the file `web_server.py` serves via symlink chain `install/ → build/ → src/`) claims "no rosbridge, pure SSE `/telemetry`" in its head comment AND in `robot.yaml`, but the inline JS still uses `ROSLIB` (47 refs) and would throw on load (`$("host")` has no matching element; roslib.js is never loaded). The SSE split files (`app.js`, `map.js`, `chrome.js`…) are committed but not referenced by `index.html`. Before touching the page, decide which is live.
+**Served-page state (RESOLVED 2026-08-10):** `src/web_control/web/index.html` is a **self-contained, pure-SSE** page — no rosbridge/roslib. The main inline script (`app.js`-derived) opens an `EventSource("/telemetry")` and drives everything off the SSE frame + `POST /publish|/param|/drive`; `oled.js` is inlined for the OLED mirror. Brain readouts (`purpose`/`task`/`experiments`) come from the SSE `f.*` fields, NOT `GET /purpose` etc. (those endpoints don't exist — an initial `404` from `pollBrainHttp` before the link is up is harmless). The old stale ROSLIB block and the SSE split files (`app.js`, `map.js`, `oled.js`, `chrome.js`, `sim.js`, …) were superseded — **do not** try to `script src` them or wire a websocket. When editing the page, keep it self-contained SSE and follow the pattern of the existing blocks (map/chrome/sim/motion-chain/EKF/slam-tuning).
+
+**Web-serving chain:** `web_server.py` serves the package's installed `web/` dir, symlinked `install/web_control/share/web_control/web/ → build/web_control/web/ → src/web_control/web/`. Edit `src/web_control/web/index.html`, restart the app — picked up live.
 
 ## Gotchas
 
@@ -131,6 +133,8 @@ What the page already surfaces for each stage:
 - **`rmw_zenoh` ordering:** a node started before `rmw_zenohd` runs islanded (won't appear in the graph).
 - **Python edits are live:** `--symlink-install` means edit `src/<pkg>/<pkg>/foo.py`, restart node = picked up. New modules import fine via egg-link.
 - **nanobot-brain is pip-installed**: edit `src/nanobot_brain/` in the nanobot-brain repo, restart node = picked up (editable install).
+- **`deploy.sh` does NOT push `nanobot-brain`** — the brain repo is a separate git checkout copied to the board at `/home/ibster/Nano/brain/src` (a `brain/src` PYTHONPATH entry, not pip-installed there). If you change the brain on the dev PC you MUST sync it to the board yourself: `rsync -az --exclude __pycache__ src/ nano:/home/ibster/Nano/brain/src/`. A stale brain silently breaks nodes at runtime with `TypeError: __init__() got an unexpected keyword argument ...` (e.g. `vision_diary_enable`, `nudge_looming_caution`, `chart_path`) — the glue (`mood_node`/`web_server`/`dev_webui`) and the brain must stay in lockstep.
+- **`telemetry.py` `DiagnosticStatus.level` is `bytes` under rmw_zenoh** — `pipe.level` arrives as `b'\x00'|b'\x01'|b'\x02'`, which is NOT JSON-serializable and kills the entire app_hub (telemetry `_tick` runs on the executor, so an unhandled `TypeError` crashes the process → systemd respawn loop). Normalize to `int` at ingest (`_on_diag`). Any new raw ROS field put into the telemetry frame must be a JSON-safe type after passing through rmw_zenoh.
 - **`config/robot.yaml` is the single config source** — all ports, pins, rates, LLM params live there.
 - **`plink -m` on Windows:** the script text becomes the shell's argv. `pkill -f` patterns can kill the controlling shell. Fix: `pscp` script, run by path.
 - **ESP32 firmware:** PlatformIO from dev PC (`pio run -t upload`). Don't build on the board. Tunables are `#define`s at top of `src/main.cpp`.

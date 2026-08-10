@@ -375,12 +375,14 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
 - **`rmw_zenoh` ordering matters:** a node started before `rmw_zenohd` runs islanded
   (won't appear in the graph). The systemd units handle this (`After=nano-router.service`
   + the router unit's settle sleep).
-- **`web_control` static server**: serves `web/` — `index.html` (markup only, NO
-  external scripts — roslib is gone) plus `style.css` and one JS file per former
-  inline block (`app.js` main page, `map.js` SLAM panel, `oled.js` OLED mirror,
-  `chrome.js` tabs/joystick, `sim.js` in-browser sim, `devtools.js` dev-harness
-  sensors; kept as separate `<script>`s on purpose — error isolation + per-file
-  strict mode match the old inline blocks).
+- **`web_control` static server**: serves `web/` — `index.html` plus `style.css`. The
+  page is **self-contained**: one big `"use strict"` inline block (`app.js`-derived: the
+  SSE `/telemetry` EventSource + all control) with the OLED-mirror `oled.js` inlined
+  right before it, then smaller self-contained IIFE blocks (map panel, chrome tabs,
+  in-browser sim, motion-chain/EKF/slam-tuning) — all pure same-origin SSE/HTTP, no
+  external scripts, no rosbridge/ROSLIB. Do NOT reintroduce external `<script src>`
+  loading of the old split files (`app.js`, `map.js`, `oled.js`, `chrome.js`, `sim.js`,
+  `devtools.js` — now orphaned).
   `/stream.mjpg` is a zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`);
   `/snapshot.jpg` is one still frame (📸 button); `/audio.pcm` is the webcam
   mic as raw PCM via `arecord` (`mic_audio.py`). Both streams are ref-counted (only
@@ -515,6 +517,12 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   selftest, go_home/save_map, oled_*) and `POST /param {node,name,value}`
   (whitelisted nodes/params via `/<node>/set_parameters`, fire-and-forget). The
   power buttons only POST `/system/*`; the server itself publishes `/oled_system`.
+  **Zenoh gotcha:** `DiagnosticStatus.level` (from `sys_monitor`'s `/diagnostics`,
+  carried as `_pipe_diag`) can arrive as a raw `bytes` (`b'\x00'|b'\x01'|b'\x02'`) under
+  rmw_zenoh rather than a plain `int`. It is normalized to an `int` in
+  `telemetry.py:_on_diag` — keep it that way, and treat every raw ROS field added to the
+  frame as potentially-non-JSON-safe after the zenoh round-trip (an unhandled `bytes`
+  in `json.dumps` in `_tick` kills the whole app hub → systemd respawn loop).
 - **HTTP teleop (`POST /drive`)**: the page POSTs `{v,w}` same-origin; `web_server`
   clamps (`drive_max_lin`/`drive_max_ang`), publishes `/cmd_vel` immediately, and
   re-asserts it at 10 Hz while non-zero with a `drive_timeout` dead-man — so browser
