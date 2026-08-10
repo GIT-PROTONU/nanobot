@@ -537,6 +537,8 @@ class WebServerNode(Node):
         self._drive_lock = threading.Lock()
         self._drive_v = self._drive_w = 0.0
         self._drive_at = 0.0                            # monotonic of last POST; 0 = idle
+        self._cpu_quick_at = 0.0                        # memo TTL for _cpu_percent_quick
+        self._cpu_quick_val = 0.0
         self.create_timer(0.1, self._drive_tick)
 
         # ---- Stress test mode (POST /stress/start|stop, GET /stress/status) -----------
@@ -1356,10 +1358,16 @@ class WebServerNode(Node):
 
     def _cpu_percent_quick(self):
         """A short standalone CPU% sample for the snapshot — does NOT touch _cpu_prev
-        (which belongs to the periodic stats announcer), so the two never interfere."""
+        (which belongs to the periodic stats announcer), so the two never interfere.
+        Memoized for ~0.5 s so the sensor snapshot + signal classifier in the same
+        beat share one sample instead of two /proc/stat reads + two 0.12 s sleeps."""
+        now = time.monotonic()
+        if now - self._cpu_quick_at < 0.5:
+            return self._cpu_quick_val
         a = procstats.cpu_sample()
         time.sleep(0.12)
         pct, _ = procstats.cpu_percent(a)
+        self._cpu_quick_val, self._cpu_quick_at = pct, now
         return pct
 
     def _imu_state(self):
@@ -1508,24 +1516,28 @@ class WebServerNode(Node):
             return
         rate = gv.motion_intercept_rate
         center = gv.motion_center
+        motion_score = gv.motion_score
         self._vision_approach = (
             rate > g("vision_approach_rate").value
             and center is not None
             and abs(center[0] - 0.5) < g("vision_approach_band").value
-            and gv.motion_score > 0.02)
+            and motion_score > 0.02)
         cast = gv.color_cast
+        edge_density = gv.edge_density
+        novelty = gv.novelty
+        target = gv.target
         payload = {
             "approach": self._vision_approach,
-            "looming": gv.motion_intercept_rate > g("vision_looming_alert").value,
-            "clutter": gv.edge_density > g("vision_clutter_alert").value,
-            "novelty": round(gv.novelty, 3),
+            "looming": rate > g("vision_looming_alert").value,
+            "clutter": edge_density > g("vision_clutter_alert").value,
+            "novelty": round(novelty, 3),
             # warmth: R-B of the scene's average colour -- positive = warm (evening
             # lamps), negative = cool (daylight/fluorescent). The ambient-mood input.
             "warmth": round(cast[0] - cast[2], 3) if cast else 0.0,
-            "motion": round(gv.motion_score, 3),
+            "motion": round(motion_score, 3),
             # calibrated colour-blob target, for slam_nav's optional pan-tracking:
             # [x, y, confidence] normalized 0..1 image coords, or None if no lock.
-            "target": list(gv.target) if gv.target is not None else None,
+            "target": list(target) if target is not None else None,
         }
         self._vision_state_pub.publish(String(data=json.dumps(payload)))
 

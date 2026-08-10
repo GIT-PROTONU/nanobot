@@ -46,13 +46,13 @@ ctl() {  # ctl <verb> — root runs it directly; the stack user goes through sud
 }
 
 status() {
-  for u in "${UNITS[@]}"; do
-    if [ "$("$SYSTEMCTL" is-active "$u" 2>/dev/null)" = "active" ]; then
-      echo "  $u: UP"
-    else
-      echo "  $u: down"
-    fi
-  done
+  # One systemctl call for all six units (it prints one line per unit, in order)
+  # instead of six separate subprocess forks — status() runs after every up/down/restart.
+  local i=0 st line
+  while read -r st; do
+    printf '  %s: %s\n' "${UNITS[$i]}" "$([ "$st" = "active" ] && echo UP || echo down)"
+    i=$((i + 1))
+  done < <("$SYSTEMCTL" is-active "${UNITS[@]}" 2>/dev/null)
 }
 
 case "${1:-status}" in

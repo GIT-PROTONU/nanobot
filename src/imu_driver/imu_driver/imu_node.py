@@ -76,6 +76,8 @@ ACC_SCALE = 16.0 / 32768.0 * G              # raw int16 -> m/s^2  (+/-16 g range
 GYRO_SCALE = 2000.0 / 32768.0 * DEG2RAD     # raw int16 -> rad/s  (+/-2000 deg/s)
 ANG_SCALE = 180.0 / 32768.0                 # raw int16 -> degrees (+/-180)
 
+_IDENTITY3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))   # exact 3x3 identity
+
 HEADER = 0x55
 FRAME_LEN = 11
 T_ACC, T_GYRO, T_ANGLE, T_MAG = 0x51, 0x52, 0x53, 0x54
@@ -313,6 +315,10 @@ class ImuNode(Node):
         self._mount_yaw_deg = float(saved.get("mount_yaw_deg", g("mount_yaw_deg").value))
         self._mount_m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg, self._mount_yaw_deg)
         self._mount_m_t = _transpose3(self._mount_m)
+        # A 0/0/0 mount is an exact identity (mount_matrix uses exact 0.0/1.0); with
+        # the default no-mount config, skip the per-frame rotation + orientation
+        # round-trip entirely (see _handle) instead of paying it every cycle.
+        self._use_mount = self._mount_m != _IDENTITY3
         # Reflect the effective (possibly persisted-overridden) values back into the
         # actual ROS parameters -- not just internal state -- so `ros2 param get` and
         # anything else reading these back (a future web-UI refresh, etc.) sees the
@@ -569,6 +575,7 @@ class ImuNode(Node):
                 self._mount_m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg,
                                               self._mount_yaw_deg)
                 self._mount_m_t = _transpose3(self._mount_m)
+                self._use_mount = self._mount_m != _IDENTITY3
                 self._save_mount_settings()
         return SetParametersResult(successful=True)
 
@@ -665,9 +672,11 @@ class ImuNode(Node):
             return
         a, b, c, _ = _UNPACK_FROM(buf, off)     # decode straight from the buffer
         if t == T_ACC:
-            self.acc = rotate_mount((a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE), self._mount_m)
+            self.acc = (rotate_mount((a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE), self._mount_m)
+                        if self._use_mount else (a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE))
         elif t == T_GYRO:
-            gyro = rotate_mount((a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE), self._mount_m)
+            gyro = (rotate_mount((a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE), self._mount_m)
+                    if self._use_mount else (a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE))
             if self._offset_m != (0.0, 0.0, 0.0):
                 now = time.monotonic()
                 if self._prev_gyro is not None:
@@ -677,11 +686,17 @@ class ImuNode(Node):
                 self._prev_gyro, self._prev_gyro_t = gyro, now
             self.gyro = gyro
         elif t == T_MAG:
-            self.mag = rotate_mount((float(a), float(b), float(c)), self._mount_m)
+            self.mag = (rotate_mount((float(a), float(b), float(c)), self._mount_m)
+                        if self._use_mount else (float(a), float(b), float(c)))
         elif t == T_ANGLE:
             roll_s, pitch_s, yaw_s = a * ANG_SCALE, b * ANG_SCALE, c * ANG_SCALE
-            self.euler_deg = correct_orientation(roll_s, pitch_s, yaw_s,
-                                                  self._mount_m, self._mount_m_t)
+            if self._use_mount:
+                self.euler_deg = correct_orientation(roll_s, pitch_s, yaw_s,
+                                                      self._mount_m, self._mount_m_t)
+            else:
+                # identity mount: the Euler round-trip is a no-op to ~1e-13°, so skip
+                # the matrix compose/extract entirely (the default config's hot path)
+                self.euler_deg = (roll_s, pitch_s, yaw_s)
             # angle is the cycle's anchor frame -> publish a coherent set. The device
             # stream auto-follows publish_rate, so when it's already at/below our target
             # we publish EVERY angle frame. The wall-clock gate is only for the in-between
@@ -714,7 +729,7 @@ class ImuNode(Node):
             self._imu_hz = self._rate_n / win
             self._rate_t0 = mono
             self._rate_n = 0
-        stamp = self.get_clock().now().to_msg()
+        stamp = None                  # lazy: only a real clock read when a branch publishes
 
         # /imu/data — full Imu (orientation + covariances). The web UI reads /imu/web
         # instead, and nothing else on the board consumes /imu/data by default, so only
@@ -722,7 +737,10 @@ class ImuNode(Node):
         # robot this skips ~50 Hz of pointless serialization (the biggest idle CPU lever).
         acc = lever_arm_correction(self.acc, self.gyro, self._alpha, self._offset_m)
         if self.pub_imu.get_subscription_count() > 0:
-            roll, pitch, yaw = (v * DEG2RAD for v in self.euler_deg)
+            if stamp is None:
+                stamp = self.get_clock().now().to_msg()
+            rd, pd, yd = self.euler_deg
+            roll, pitch, yaw = rd * DEG2RAD, pd * DEG2RAD, yd * DEG2RAD
             qx, qy, qz, qw = euler_to_quat(roll, pitch, yaw)
             imu = self._imu               # reuse pre-built msg (constants set in __init__)
             imu.header.stamp = stamp
@@ -734,6 +752,8 @@ class ImuNode(Node):
         # /imu/euler — drives the web UI angle readout; its own (lower) rate.
         if self._eul_period is not None and mono >= self._next_eul:
             self._next_eul = mono + self._eul_period
+            if stamp is None:
+                stamp = self.get_clock().now().to_msg()
             eul = self._eul_msg
             eul.header.stamp = stamp
             eul.vector.x, eul.vector.y, eul.vector.z = self.euler_deg
@@ -744,6 +764,8 @@ class ImuNode(Node):
         if (self._mag_period is not None and mono >= self._next_mag):
             self._next_mag = mono + self._mag_period
             if self.pub_mag.get_subscription_count() > 0:
+                if stamp is None:
+                    stamp = self.get_clock().now().to_msg()
                 mag = self._mag_msg
                 mag.header.stamp = stamp
                 mag.magnetic_field.x, mag.magnetic_field.y, mag.magnetic_field.z = self.mag
@@ -754,6 +776,8 @@ class ImuNode(Node):
         # browser drop its 50 Hz /imu/data subscription, cutting rosbridge's load.
         if self._web_period is not None and mono >= self._next_web:
             self._next_web = mono + self._web_period
+            if stamp is None:
+                stamp = self.get_clock().now().to_msg()
             ax, ay, az = acc
             gx, gy, gz = self.gyro
             web = self._web_msg

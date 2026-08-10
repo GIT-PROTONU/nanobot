@@ -86,7 +86,9 @@ class LdsParser:
     def _valid(p) -> bool:
         chk = 0
         for ix in range(0, 20, 2):
-            chk = (chk * 2 + p[ix] + (p[ix + 1] << 8)) & 0xFFFFFFFF
+            chk = chk * 2 + p[ix] + (p[ix + 1] << 8)
+        chk &= 0xFFFFFFFF                       # 2*x+y commutes with mod 2^32 —
+        # masking once after the loop is identical to masking per step
         cs = (chk & 0x7FFF) + (chk >> 15)
         cs &= 0x7FFF
         return (cs & 0xFF) == p[20] and ((cs >> 8) & 0xFF) == p[21]
@@ -222,8 +224,10 @@ class LdsNode(Node):
             dist = dist_mm / 1000.0
             if dist < self.range_min or dist > self.range_max:
                 continue
-            base = (RAYS - angle) % RAYS if self.clockwise else angle
-            idx = (base + self.offset) % RAYS
+            # (RAYS - angle) % RAYS == (-angle) % RAYS, and the second mod of the same
+            # modulus collapses, so one mod per point instead of two.
+            idx = ((self.offset - angle) if self.clockwise
+                   else (angle + self.offset)) % RAYS
             if dist < ranges[idx]:        # keep closest hit per degree bin
                 ranges[idx] = dist
                 intensities[idx] = float(quality)

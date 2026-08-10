@@ -440,15 +440,16 @@ def update_novelty(bg, pixels, n):
     unnecessary once the colour-cast chain existed). Kept a free function so it's
     unit-testable without a GL context."""
     total = 0.0
+    p = pixels
     for i in range(n):
+        off = i * 4
         base = i * 3
         for c in range(3):
-            cur = pixels[i * 4 + c]
-            diff = cur - bg[base + c]
-            if diff < 0:
-                diff = -diff
-            total += diff
-            bg[base + c] += NOVELTY_EMA_ALPHA * (cur - bg[base + c])
+            d = p[off + c] - bg[base + c]    # signed delta, reused for the EMA below
+            if d < 0:
+                d = -d
+            total += d
+            bg[base + c] += NOVELTY_EMA_ALPHA * (p[off + c] - bg[base + c])
     return (total / (n * 3)) / 255.0
 
 
@@ -729,6 +730,7 @@ class GpuVision:
         self._glare_derate = 0.0           # 0 = off; scales blob confidence down under glare
         self._oled_mask_enable = False     # mirror the tracking mask to the OLED (blob writer)
         self._oled_mask_seq = 0
+        self._oled_mask_last = None   # last raw mask bytes (skip rewrite+seq when unchanged)
         self._gpu_duty = 0.0                # software proxy: fraction of the frame period spent
                                              # in the shader+readback block (see gpu_duty's doc)
         self._viewers = 0                  # browser viewers of the JPEG tee (ref-counted)
@@ -917,6 +919,11 @@ class GpuVision:
         Off (the default) costs nothing -- the extra pass/readback is fully gated."""
         with self._lock:
             self._oled_mask_enable = bool(enabled)
+            if not enabled:
+                # Dropping the cache forces a fresh write (and seq bump) the next time
+                # the mask turns back on — otherwise a static scene identical to last
+                # on-segment would never rewrite, leaving "waiting..." on the OLED.
+                self._oled_mask_last = None
 
     @property
     def gpu_duty(self):
@@ -1540,9 +1547,13 @@ class GpuVision:
                 # re-binarize (box-filtered masks come out greyscale), write the blob.
                 if want_oled_mask:
                     raw = bytes(opix)[0::4].translate(_OLED_THRESH_TABLE)
-                    self._oled_mask_seq += 1
-                    write_oled_mask_blob(raw, OLED_MASK_W, OLED_MASK_H,
-                                         self._oled_mask_seq, confidence)
+                    if raw != self._oled_mask_last:
+                        # Unchanged mask bytes -> skip the file write AND the seq bump,
+                        # so the display's dirty-check stops re-flushing a static scene.
+                        self._oled_mask_last = raw
+                        self._oled_mask_seq += 1
+                        write_oled_mask_blob(raw, OLED_MASK_W, OLED_MASK_H,
+                                             self._oled_mask_seq, confidence)
                 # Blob-size gating: a valid lock needs BOTH a nonzero mask (a centroid to
                 # even compute) AND confidence inside [blob_min, blob_max] -- rejects
                 # noise (too small, below blob_min) and "matched almost the whole frame"

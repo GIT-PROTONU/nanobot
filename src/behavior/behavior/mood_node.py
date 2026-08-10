@@ -518,7 +518,7 @@ class MoodNode(Node):
         # scene, so full boost is reached there (novelty*4 clamped to 1).
         return {"looking": 1.0 + self._novelty_boost * min(1.0, novelty * 4.0)}
 
-    def _maybe_greet_approach(self, now, stand):
+    def _maybe_greet_approach(self, now, stand, vision):
         """Anticipatory-approach greeting: web_control's /vision/state flags `approach`
         when the motion saliency is growing fast AND centred (someone walking up) — so
         greet BEFORE contact/pickup, the same expression-only shape as every beat: show
@@ -528,7 +528,7 @@ class MoodNode(Node):
             return
         if stand or self._brain.reflecting:
             return
-        if not self._vision_fresh().get("approach"):
+        if not vision.get("approach"):
             return
         if (now - self._beat_last.get("greet_approach", -1e9)) \
                 < self._greet_approach_min_interval:
@@ -698,7 +698,9 @@ class MoodNode(Node):
 
         try:
             self._auto_reflect(now, stand)                 # maybe enter/exit a self-started reflection
-            self._maybe_greet_approach(now, stand)         # anticipatory-approach greeting
+            vision = self._vision_fresh()                  # read ONCE per tick — the beat
+            # chooser + greeting + heartbeat all consume the same observation.
+            self._maybe_greet_approach(now, stand, vision)  # anticipatory-approach greeting
             if not self._brain.reflecting:                 # don't interrupt a consolidation
                 self._check_schedule()
             # Reflection is a deliberate, sticky mode (only `wake` leaves it), so we skip the
@@ -719,7 +721,7 @@ class MoodNode(Node):
                 elif (not stand) and dormant:
                     self._interp.queue(Event("resume"))
             if self._personality.tick_events(now, picked,               # fast rules + heartbeat
-                                             vision=self._vision_fresh()) == "lost":
+                                             vision=vision) == "lost":
                 self.get_logger().warning(
                     "cognitive layer unreachable — reverting to baseline personality")
             self._interp.execute()

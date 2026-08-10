@@ -421,6 +421,10 @@ class NavNode(Node):
         self._goal_is_frontier = False  # current goal came from auto-explore
         self._path = []              # [(x, y)] world waypoints
         self._last_scan = None       # (angles, ranges) for the reactive layer
+        self._ang_key = None         # memo key for the (fixed) lidar angle vector
+        self._ang_cache = None       # memoized angles array
+        self._ang_abs = None         # np.abs(wrap(angles)) for the front-stop layer
+        self._decim_cache = {}       # {n_valid: decimation index} memo (pure fn of 2 ints)
         self._next_replan = 0.0
         self._next_explore = 0.0
         self._next_autosave = 0.0
@@ -437,6 +441,8 @@ class NavNode(Node):
         self._lds_active = True      # current commanded state; only republish on change
         # map editing (no-go zones from the web UI)
         self._edit_last_t = -1        # last applied edit token (idempotency)
+        self._edit_file_missing = True     # throttle absent-file probes (see _check_edits)
+        self._edit_check_at = 0.0
         self._nogo_dirty = True       # rebuild the no-go blob on the next map frame
         # pick-up + relocalization state
         self._susp_l = self._susp_r = False   # per-wheel off-ground switches (from the ESP)
@@ -771,8 +777,17 @@ class NavNode(Node):
         n = len(ranges)
         if n == 0 or msg.angle_increment <= 0.0:
             return  # nothing usable (degenerate / unconfigured lidar)
-        angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
-        self._last_scan = (angles, ranges)        # for the reactive front-stop layer
+        # The lidar's angle vector is fixed in practice (same n / angle_min /
+        # angle_increment every scan), so memoize it — and its wrapped absolute
+        # value for the front-stop layer — keyed on the geometry, rebuilding only
+        # if the driver ever reconfigures.
+        key = (n, msg.angle_min, msg.angle_increment)
+        if key != self._ang_key:
+            angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
+            self._ang_cache = angles
+            self._ang_abs = np.abs(np.arctan2(np.sin(angles), np.cos(angles)))
+            self._ang_key = key
+        self._last_scan = (self._ang_cache, ranges)   # for the reactive front-stop layer
         self._scan_stamp = time.monotonic()
 
         if not self._have_map:
@@ -836,7 +851,11 @@ class NavNode(Node):
             v &= (np.asarray(msg.intensities, dtype=np.float32) >= self.qual_min)
         va, vr = angles[v], ranges[v]
         if len(vr) > self.match_pts:
-            idx = np.linspace(0, len(vr) - 1, self.match_pts).astype(int)
+            nt = len(vr)
+            idx = self._decim_cache.get(nt)
+            if idx is None:
+                idx = np.linspace(0, nt - 1, self.match_pts).astype(int)
+                self._decim_cache[nt] = idx
             va, vr = va[idx], vr[idx]
 
         # A scan may only be folded into the map when the pose is TRUSTED — i.e. the
@@ -1818,8 +1837,10 @@ class NavNode(Node):
     def _front_blocked(self):
         if self._last_scan is None:
             return False
-        ang, rng = self._last_scan
-        fwd = np.abs(np.arctan2(np.sin(ang), np.cos(ang))) < self.front_angle
+        rng = self._last_scan[1]
+        # `ang_abs` (|wrap(angle)| per beam) is precomputed at scan ingest — same
+        # trigger array every scan, so this is a vector compare, not 3 trig per beam.
+        fwd = self._ang_abs < self.front_angle
         r = rng[fwd]
         r = r[np.isfinite(r) & (r > 0.05)]
         return r.size > 0 and float(r.min()) < self.stop_distance
@@ -1977,10 +1998,19 @@ class NavNode(Node):
         """Apply any pending web map-editor request (idempotent via its `t` token). The
         file may persist; we only act on a token we haven't seen, so no delete/rename
         race. Returns True if a no-go blob rewrite is needed."""
+        now = time.monotonic()
+        # The editor file usually doesn't exist; raising FileNotFoundError every 10 Hz
+        # control tick is pure overhead, so once absent, only probe it at ~1 Hz. Once
+        # it (re)appears we poll every tick again so an applied edit still lands fast.
+        if self._edit_file_missing and now - self._edit_check_at < 1.0:
+            return False
+        self._edit_check_at = now
         try:
             with open(NGO_EDIT_FILE, "r") as f:
                 req = json.load(f)
+            self._edit_file_missing = False
         except (OSError, ValueError):
+            self._edit_file_missing = True
             return False
         try:
             t = int(req.get("t", 0))

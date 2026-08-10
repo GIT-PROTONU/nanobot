@@ -888,28 +888,20 @@ class DisplayNode(Node):
             self._accent_overlay(draw, lcx, rcx, cy)   # emotion overlay on top of the shape
 
     # ---- GPU tracking-mask mirror ----
-    def _read_mask_blob(self):
-        """One JSON header line + w*h raw bytes (0/255) — written atomically by
-        gpu_vision.py, so a plain read never sees a torn frame. (None, None) on any
-        problem (absent, malformed, short read)."""
-        try:
-            with open(MASK_FILE, "rb") as f:
-                header = json.loads(f.readline().decode())
-                w, h = int(header["w"]), int(header["h"])
-                raw = f.read(w * h)
-            if len(raw) != w * h:
-                return None, None
-            return header, raw
-        except Exception:
-            return None, None
-
     def _mask_tick(self):
         """Render the tracking-mask blob (white = pixels matching the calibrated
         colour). The blob's seq is the dirty-check — the panel flushes only when the
         GPU actually produced a new mask frame, so a paused tracker costs nothing. A
         stale/absent blob (no target colour set, capture stopped) shows a static
-        placeholder instead of a frozen mask masquerading as live."""
-        header, raw = self._read_mask_blob()
+        placeholder instead of a frozen mask masquerading as live. The JSON header
+        line is read FIRST: when the seq is unchanged (a static scene — gpu_vision
+        now skips rewriting unchanged masks) we return before the w*h body read AND
+        the panel flush."""
+        try:
+            with open(MASK_FILE, "rb") as f:
+                header = json.loads(f.readline().decode())
+        except Exception:
+            header = None
         if header is None or (time.time() - float(header.get("t", 0))) > MASK_FRESH_S:
             sig = ("mask", "stale")
             if sig == self._face_sig:
@@ -923,8 +915,16 @@ class DisplayNode(Node):
         sig = ("mask", header.get("seq"))
         if sig == self._face_sig:
             return
+        try:
+            w, h = int(header["w"]), int(header["h"])
+            with open(MASK_FILE, "rb") as f:
+                f.readline()                     # skip the header we already parsed
+                raw = f.read(w * h)
+            if len(raw) != w * h:
+                return
+        except Exception:
+            return
         self._face_sig = sig
-        w, h = int(header["w"]), int(header["h"])
         img = Image.frombytes("L", (w, h), raw)
         if (w, h) != (self.width, self.height):
             img = img.resize((self.width, self.height))

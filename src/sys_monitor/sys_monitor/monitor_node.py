@@ -131,8 +131,11 @@ class MonitorNode(Node):
             self._feeds[topic] = FeedWatch(name)
         self.create_subscription(Odometry, "/odom", self._on_odom_watch, 10)
         self.create_subscription(Odometry, "/odometry/filtered", self._on_ekf_watch, 10)
-        up = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
-        self.watch.write([f"monitor start (boot uptime {up:.0f}s)"])
+        # Board uptime is captured once (a boot-time value); per-tick `uptime` is then
+        # derived from the monotonic delta instead of re-reading /proc/uptime every ~s.
+        self._uptime0 = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
+        self._boot_mono = time.monotonic()
+        self.watch.write([f"monitor start (boot uptime {self._uptime0:.0f}s)"])
 
         self.create_timer(1.0 / rate, self._tick)
         self.get_logger().info(
@@ -207,11 +210,13 @@ class MonitorNode(Node):
         return self._ssid if iface else ""
 
     def _tick(self):
+        now = time.monotonic()                       # one clock read for the whole tick
         # memory
         mem = {}
         for line in _read("/proc/meminfo").splitlines():
             k, _, rest = line.partition(":")
-            mem[k] = int(rest.split()[0]) if rest.split() else 0  # kB
+            parts = rest.split()
+            mem[k] = int(parts[0]) if parts else 0   # kB
         total_mb = mem.get("MemTotal", 0) / 1024.0
         avail_mb = mem.get("MemAvailable", 0) / 1024.0
         used_mb = total_mb - avail_mb
@@ -229,12 +234,15 @@ class MonitorNode(Node):
         cpu_pct = cpu.get("cpu", 0.0)
         # per-core busy%, in core order (cpu0, cpu1, ...) -> "12,4,6,8"
         cores, i = [], 0
-        while f"cpu{i}" in cpu:
-            cores.append(f"{cpu[f'cpu{i}']:.0f}")
+        while True:
+            key = f"cpu{i}"
+            if key not in cpu:
+                break
+            cores.append(f"{cpu[key]:.0f}")
             i += 1
         cpu_t = self._temp("cpu-thermal")
         gpu_t = self._temp("gpu-thermal")
-        uptime = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
+        uptime = self._uptime0 + (now - self._boot_mono)
 
         # WiFi: signal/quality (pure /proc read) + SSID (cached subprocess, 0.2 Hz)
         wifi_if, wifi_q, wifi_dbm = self._wifi_link()
@@ -270,18 +278,17 @@ class MonitorNode(Node):
 
         msg = DiagnosticArray()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.status = [st, self._pipeline_diagnostic()]
+        msg.status = [st, self._pipeline_diagnostic(now)]
         self.pub.publish(msg)
 
         self._publish_fan(cpu_t)
-        self._health_tick()
-        self._write_vitals(cpu_pct, mem_pct, cpu_t, disk_pct)
+        self._health_tick(now)
+        self._write_vitals(cpu_pct, mem_pct, cpu_t, disk_pct, now)
 
-    def _pipeline_diagnostic(self):
+    def _pipeline_diagnostic(self, now):
         """A DiagnosticStatus summarising the localization-pipeline feed freshness —
         the answer to 'is my IMU / encoder / EKF actually feeding SLAM?'. The web UI
         renders sensors/staleness; telemetry also carries the per-feed ages."""
-        now = time.monotonic()
         ok = True
         vals = []
         for topic, feed in self._feeds.items():
@@ -300,14 +307,13 @@ class MonitorNode(Node):
         st.values = vals
         return st
 
-    def _write_vitals(self, cpu_pct, mem_pct, cpu_t, disk_pct):
+    def _write_vitals(self, cpu_pct, mem_pct, cpu_t, disk_pct, now):
         """Write the aggregated body snapshot to /dev/shm (atomic replace). `t` is wall
         clock so readers in other processes can add the file's staleness to the per-source
         ages recorded here. NaN -> null (the blob ends up in browser JSON)."""
         def num(x, nd=1):
             return None if x is None or x != x else round(float(x), nd)
 
-        now = time.monotonic()
         v = {"t": time.time(),
              "cpu": num(cpu_pct), "mem": num(mem_pct),
              "temp": num(cpu_t), "disk": num(disk_pct)}
@@ -391,8 +397,7 @@ class MonitorNode(Node):
             lines += feed.update(now, age)
         return lines
 
-    def _health_tick(self):
-        now = time.monotonic()
+    def _health_tick(self, now):
         hb_age = now - self._hb_at if self._hb_at is not None else float("inf")
         # rpm/hz publish at 1 Hz from the ESP32; older than 5 s = stale -> nan
         rpm = self._rpm[0] if now - self._rpm[1] < 5.0 else float("nan")

@@ -133,6 +133,7 @@ class MjpegCamera:
         self.fd = os.open(dev, os.O_RDWR)
         self._streaming = False
         self.maps = []
+        self._buf = _Buffer(type=_BUF_TYPE, memory=_MEMORY_MMAP)   # reused by read()
         try:
             f = _Format(type=_BUF_TYPE)
             f.pix.width, f.pix.height = width, height
@@ -172,7 +173,7 @@ class MjpegCamera:
         # starve them (caps the stream to a fraction of the capture rate).
         if not self._poll.poll(timeout_ms):
             return None                              # no frame within timeout
-        b = _Buffer(type=_BUF_TYPE, memory=_MEMORY_MMAP)
+        b = self._buf                          # one reused DQBUF/QBUF struct per frame
         fcntl.ioctl(self.fd, _DQBUF, b)              # ready now -> returns at once
         jpeg = self.maps[b.index][:b.bytesused]      # copy out of the mmap buffer
         fcntl.ioctl(self.fd, _QBUF, b)

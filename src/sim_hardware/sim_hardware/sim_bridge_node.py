@@ -70,6 +70,7 @@ class SimBridgeNode(Node):
         self.right_joint = g("right_wheel_joint").value
         self.inv_l = -1 if g("invert_left").value else 1
         self.inv_r = -1 if g("invert_right").value else 1
+        self.per_tick = self.ticks_per_rev / (2.0 * math.pi)   # hoisted (per /joint_states msg)
         self.esp_temp = float(g("esp_temp").value)
         self.lds_rpm = float(g("lds_rpm").value)
         self.lds_hz = float(g("lds_hz").value)
@@ -121,7 +122,7 @@ class SimBridgeNode(Node):
             ri = msg.name.index(self.right_joint)
         except ValueError:
             return
-        per_tick = self.ticks_per_rev / (2.0 * math.pi)
+        per_tick = self.per_tick
         left = int(round(msg.position[li] * per_tick)) * self.inv_l
         right = int(round(msg.position[ri] * per_tick)) * self.inv_r
         out = Int64MultiArray()

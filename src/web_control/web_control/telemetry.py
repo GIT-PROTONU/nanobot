@@ -259,7 +259,7 @@ class TelemetryHub:
         return {"alert": held >= confirm_secs, "commanded": commanded,
                 "cmd_vel": [round(lin, 3), round(ang, 3)], "low_motion_secs": round(held, 2)}
 
-    def _vibration_alert(self, now, gv):
+    def _vibration_alert(self, now, edge_density):
         """Vibration/looseness diagnostic: while driving, the image should stay roughly
         as sharp as the room normally looks -- excess motion blur (edge_density far
         below the standing-still baseline, held for a confirm window) indicates chassis
@@ -268,9 +268,9 @@ class TelemetryHub:
         it tracks lighting/scene changes without the drive itself polluting it."""
         g = self._node.get_parameter
         lin, ang = self._cmd_vel
-        moving = abs(lin) > g("vision_bumper_cmd_eps").value or \
-            abs(ang) > g("vision_bumper_cmd_eps").value
-        ed = gv.edge_density
+        eps = g("vision_bumper_cmd_eps").value
+        moving = abs(lin) > eps or abs(ang) > eps
+        ed = edge_density
         if not moving:
             self._edge_still_ema = (ed if self._edge_still_ema is None
                                     else self._edge_still_ema + 0.05 * (ed - self._edge_still_ema))
@@ -333,34 +333,36 @@ class TelemetryHub:
         self._drift_last = (f"{dur:.0f}s stationary: yaw {dy:+.2f}° ({rate:+.2f}°/min), "
                              f"roll {dr:+.2f}°, pitch {dp:+.2f}°")
 
-    def _vision_alerts(self, gv, now=None, frozen=False):
+    def _vision_alerts(self, sc, now=None, frozen=False):
         """Turn GpuVision's raw scalar properties into ALERT booleans against LIVE
         web_control params (not fixed constants), same pattern as _optical_bumper --
         the web UI's sliders actually take effect immediately, no restart needed. Kept
         in telemetry.py rather than gpu_vision.py so tuning never touches the GL thread.
+        `sc` is the one-per-tick snapshot dict of GpuVision scalars pre-read in _build,
+        so this alert pass doesn't re-acquire the GpuVision lock ~13x per frame.
         `frozen` (camera master switch off) suppresses the stateful, time-based
         alerts -- a deliberately stopped capture thread would otherwise read as a
         "frozen camera", and a stale edge_density as vibration."""
         g = self._node.get_parameter
         now = time.monotonic() if now is None else now
-        luma = gv.luma
-        obstructed = (gv.luma_variance < g("vision_obstruction_var_max").value
+        luma = sc["luma"]
+        obstructed = (sc["luma_variance"] < g("vision_obstruction_var_max").value
                       and luma < g("vision_obstruction_dark_max").value)
-        clutter = gv.edge_density > g("vision_clutter_alert").value
-        overhead = gv.overhead_edge_density > g("vision_overhead_alert").value
+        clutter = sc["edge_density"] > g("vision_clutter_alert").value
+        overhead = sc["overhead_edge_density"] > g("vision_overhead_alert").value
         # focus_blur additionally requires decent light -- otherwise it's redundant
         # with `obstructed` (a dark, low-edge-density frame is already covered there).
-        focus_blur = (gv.edge_density < g("vision_focus_blur_max").value and luma > 0.1)
+        focus_blur = (sc["edge_density"] < g("vision_focus_blur_max").value and luma > 0.1)
         # backlit additionally requires a dim-ish overall scene -- a bright highlight in
         # an already-bright frame isn't "backlit," it's just a normally lit room.
-        backlit = ((gv.luma_max - luma) > g("vision_backlit_delta_min").value and luma < 0.5)
-        shiny = gv.highlight_fraction > g("vision_highlight_alert").value
-        looming = gv.motion_intercept_rate > g("vision_looming_alert").value
-        cast = gv.color_cast
+        backlit = ((sc["luma_max"] - luma) > g("vision_backlit_delta_min").value and luma < 0.5)
+        shiny = sc["highlight_fraction"] > g("vision_highlight_alert").value
+        looming = sc["motion_intercept_rate"] > g("vision_looming_alert").value
+        cast = sc["color_cast"]
         colorcast = bool(cast) and (max(cast) - min(cast)) > g("vision_colorcast_alert").value
-        match = gv.motion_target_match
+        match = sc["motion_target_match"]
         motion_matches_target = match is not None and match < g("vision_motiontarget_match_max").value
-        novel = gv.novelty > g("vision_novelty_alert").value
+        novel = sc["novelty"] > g("vision_novelty_alert").value
         # Camera-freeze diagnostic: reads still "succeed" but the device stopped
         # delivering (frame_age growing) OR keeps handing back the identical buffer
         # (an exactly-zero diff for a while -- see GpuVision.zero_motion_secs). Means
@@ -371,10 +373,10 @@ class TelemetryHub:
             self._vibration_since = None
         else:
             stall = g("vision_camera_stall_secs").value
-            age = gv.frame_age
+            age = sc["frame_age"]
             camera_freeze = ((age is not None and age > stall)
-                             or gv.zero_motion_secs > stall)
-            vibration = self._vibration_alert(now, gv)
+                             or sc["zero_motion_secs"] > stall)
+            vibration = self._vibration_alert(now, sc["edge_density"])
         return {
             "obstructed": obstructed, "clutter": clutter, "overhead_alert": overhead,
             "focus_blur": focus_blur, "backlit": backlit, "shiny": shiny, "looming": looming,
@@ -476,30 +478,49 @@ class TelemetryHub:
             blob_threshold, blob_min, blob_max = gv.blob_tuning
             match = gv.motion_target_match
             frame_age = gv.frame_age
+            novelty = gv.novelty
+            intercept_rate = gv.intercept_rate
+            motion_intercept_rate = gv.motion_intercept_rate
+            luma = gv.luma
+            luma_variance = gv.luma_variance
+            luma_max = gv.luma_max
+            color_cast = gv.color_cast
+            edge_density = gv.edge_density
+            overhead_edge_density = gv.overhead_edge_density
+            highlight_fraction = gv.highlight_fraction
+            has_target_color = gv.has_target_color
+            gpu_duty = gv.gpu_duty
             f["vision"] = {
                 "camera_enabled": camera_enabled,
                 "target_name": getattr(n, "_vision_target_active", None),
                 "approach": bool(getattr(n, "_vision_approach", False)),
                 "oled_mask": bool(getattr(n, "_oled_mask_on", False)),
-                "novelty": round(gv.novelty, 3),
+                "novelty": round(novelty, 3),
                 "frame_age": round(frame_age, 2) if frame_age is not None else None,
                 "motion": round(motion_score, 3),
                 "motion_center": [round(v, 3) for v in motion_center] if motion_center else None,
                 "target": [round(v, 3) for v in target] if target else None,
-                "has_target_color": gv.has_target_color,
+                "has_target_color": has_target_color,
                 "blob_tuning": [round(blob_threshold, 3), round(blob_min, 3), round(blob_max, 3)],
-                "intercept_rate": round(gv.intercept_rate, 3),
-                "motion_intercept_rate": round(gv.motion_intercept_rate, 3),
+                "intercept_rate": round(intercept_rate, 3),
+                "motion_intercept_rate": round(motion_intercept_rate, 3),
                 "motion_target_match": round(match, 3) if match is not None else None,
-                "luma": round(gv.luma, 3),
-                "luma_variance": round(gv.luma_variance, 2),
-                "luma_max": round(gv.luma_max, 3),
-                "color_cast": [round(v, 3) for v in gv.color_cast] if gv.color_cast else None,
-                "edge_density": round(gv.edge_density, 3),
-                "overhead_edge_density": round(gv.overhead_edge_density, 3),
-                "highlight_fraction": round(gv.highlight_fraction, 3),
-                "gpu_duty": round(gv.gpu_duty, 3),
-                "alerts": self._vision_alerts(gv, now=now, frozen=frozen),
+                "luma": round(luma, 3),
+                "luma_variance": round(luma_variance, 2),
+                "luma_max": round(luma_max, 3),
+                "color_cast": [round(v, 3) for v in color_cast] if color_cast else None,
+                "edge_density": round(edge_density, 3),
+                "overhead_edge_density": round(overhead_edge_density, 3),
+                "highlight_fraction": round(highlight_fraction, 3),
+                "gpu_duty": round(gpu_duty, 3),
+                "alerts": self._vision_alerts(
+                    {"luma": luma, "luma_variance": luma_variance, "luma_max": luma_max,
+                     "edge_density": edge_density, "overhead_edge_density": overhead_edge_density,
+                     "highlight_fraction": highlight_fraction,
+                     "motion_intercept_rate": motion_intercept_rate, "color_cast": color_cast,
+                     "motion_target_match": match, "novelty": novelty, "frame_age": frame_age,
+                     "zero_motion_secs": gv.zero_motion_secs},
+                    now=now, frozen=frozen),
                 "bumper": bumper,
             }
         # latched brain readouts, passed through as the raw JSON strings the page parses
