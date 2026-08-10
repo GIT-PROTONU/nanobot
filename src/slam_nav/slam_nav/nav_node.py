@@ -787,7 +787,8 @@ class NavNode(Node):
             self._ang_cache = angles
             self._ang_abs = np.abs(np.arctan2(np.sin(angles), np.cos(angles)))
             self._ang_key = key
-        self._last_scan = (self._ang_cache, ranges)   # for the reactive front-stop layer
+        angles = self._ang_cache                      # memoized; always present
+        self._last_scan = (angles, ranges)            # for the reactive front-stop layer
         self._scan_stamp = time.monotonic()
 
         if not self._have_map:

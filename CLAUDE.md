@@ -435,7 +435,12 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   frequency-ratio estimate (`sys_monitor`) turned out to always read "n/a" on this
   board's kernel (no GPU devfreq node) and GPU temp just tracked CPU temp with no new
   information — both pulled from the UI; `gpu_duty` was kept since it's a different,
-  demonstrably-useful number. A **master camera switch** (`POST /vision/camera_enable`,
+  demonstrably-useful number. Scalar readouts are exposed via **one
+  `gpu_vision.snapshot()` atomic read** (single `_lock` acquisition for all ~20
+  fields incl. frame_age/zero_motion_secs, added 2026-08-10): the 5 Hz telemetry
+  build and the 10 Hz `_vision_state_tick` use it instead of ~20 per-property
+  getters, each of which re-took the lock — saving ~60 guarded round-trips/s and
+  removing cross-field reading skew. A **master camera switch** (`POST /vision/camera_enable`,
   the Camera tab's "📷 Camera enabled") fully stops BOTH `GpuVision` and the direct
   passthrough — for when the fuller pass set's cost isn't wanted. While off, the live-view `<img>` shows
   a real `#camWait` overlay message ("Camera disabled…") instead of a broken-image
@@ -523,6 +528,11 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   `telemetry.py:_on_diag` — keep it that way, and treat every raw ROS field added to the
   frame as potentially-non-JSON-safe after the zenoh round-trip (an unhandled `bytes`
   in `json.dumps` in `_tick` kills the whole app hub → systemd respawn loop).
+  **Any** unhandled exception inside a subscription callback runs on the executor
+  thread and kills the hub the same way — e.g. `_on_slam_pose` reading
+  `msg.pose.pose` (the Odometry layout) on the actually-`PoseStamped` `/slam_pose`
+  was an `AttributeError` respawn loop (fixed 2026-08-10). New callbacks must
+  match the real message type and be JSON-safe end-to-end after the zenoh round-trip.
 - **HTTP teleop (`POST /drive`)**: the page POSTs `{v,w}` same-origin; `web_server`
   clamps (`drive_max_lin`/`drive_max_ang`), publishes `/cmd_vel` immediately, and
   re-asserts it at 10 Hz while non-zero with a `drive_timeout` dead-man — so browser

@@ -810,6 +810,25 @@ class WebServerNode(Node):
     def get_settings(self):
         return dict(self._settings)
 
+    # ---- stress test mode (see stress.py) ------------------------------------
+    def stress_start(self, data):
+        data = data or {}
+        try:
+            duration = float(data.get("duration", 30.0))
+        except (TypeError, ValueError):
+            duration = 30.0
+        try:
+            workers = int(data.get("workers", 0))
+        except (TypeError, ValueError):
+            workers = 0
+        return self._stress.start(duration=duration, workers=workers)
+
+    def stress_stop(self):
+        return self._stress.stop()
+
+    def stress_status(self):
+        return self._stress.status()
+
     # ---- EKF (robot_localization) tuning ------------------------------------
     def get_ekf_config(self):
         """Current effective EKF tunables from the ekf.yaml the ekf unit loads, plus
@@ -1514,18 +1533,19 @@ class WebServerNode(Node):
         if self._camera_disabled or not gv.running():
             self._vision_approach = False
             return
-        rate = gv.motion_intercept_rate
-        center = gv.motion_center
-        motion_score = gv.motion_score
+        sc = gv.snapshot()            # one lock for all readouts below
+        rate = sc["motion_intercept_rate"]
+        center = sc["motion_center"]
+        motion_score = sc["motion_score"]
         self._vision_approach = (
             rate > g("vision_approach_rate").value
             and center is not None
             and abs(center[0] - 0.5) < g("vision_approach_band").value
             and motion_score > 0.02)
-        cast = gv.color_cast
-        edge_density = gv.edge_density
-        novelty = gv.novelty
-        target = gv.target
+        cast = sc["color_cast"]
+        edge_density = sc["edge_density"]
+        novelty = sc["novelty"]
+        target = sc["target"]
         payload = {
             "approach": self._vision_approach,
             "looming": rate > g("vision_looming_alert").value,
@@ -1548,10 +1568,11 @@ class WebServerNode(Node):
         gv = self._gpu_vision
         if gv is None or self._camera_disabled or not gv.running():
             return
-        cast = gv.color_cast
+        sc = gv.snapshot()
+        cast = sc["color_cast"]
         self._cog.record_vision_snapshot({
-            "luma": gv.luma, "motion": gv.motion_score, "edge": gv.edge_density,
-            "novelty": gv.novelty, "warmth": (cast[0] - cast[2]) if cast else 0.0})
+            "luma": sc["luma"], "motion": sc["motion_score"], "edge": sc["edge_density"],
+            "novelty": sc["novelty"], "warmth": (cast[0] - cast[2]) if cast else 0.0})
 
     def _set_oled_mask_state(self, enabled):
         self._oled_mask_on = bool(enabled)
@@ -2394,7 +2415,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if self._node is None:
             self.send_error(503, "no node")
             return
-        hub = self._node.telemetry
+        hub = getattr(self._node, "telemetry", None)
+        if hub is None:
+            self.send_error(503, "telemetry not ready")
+            return
         hub.add_client()
         self.close_connection = True   # never-ending stream: no keep-alive reuse
         try:

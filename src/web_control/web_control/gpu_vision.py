@@ -754,6 +754,38 @@ class GpuVision:
         self._motion_mask_jpeg_cond = threading.Condition()
 
     # ---- thread-safe readouts ----
+    def snapshot(self):
+        """All scalar readouts under ONE lock acquisition (the per-property getters
+        each take _lock separately; callers on a timer save ~20 lock round-trips per
+        tick by taking a single atomic snapshot instead). frame_age / zero_motion_secs
+        are computed from one shared monotonic read, not two."""
+        with self._lock:
+            now = time.monotonic()
+            return {
+                "motion_score": self._motion,
+                "motion_center": self._motion_center,
+                "target": self._target,
+                "intercept_rate": self._intercept_rate,
+                "motion_intercept_rate": self._motion_intercept_rate,
+                "luma": self._luma,
+                "luma_variance": self._luma_variance,
+                "luma_max": self._luma_max,
+                "color_cast": self._color_cast,
+                "edge_density": self._edge_density,
+                "overhead_edge_density": self._overhead_edge_density,
+                "highlight_fraction": self._highlight_fraction,
+                "motion_target_match": self._motion_target_match,
+                "novelty": self._novelty,
+                "frame_age": (None if self._frame_at is None
+                              else now - self._frame_at),
+                "zero_motion_secs": (0.0 if self._zero_motion_since is None
+                                     else now - self._zero_motion_since),
+                "gpu_duty": self._gpu_duty,
+                "has_target_color": self._target_color is not None,
+                "blob_tuning": (self._target_thresh, self._blob_min_confidence,
+                                self._blob_max_confidence),
+            }
+
     @property
     def motion_score(self):
         with self._lock:

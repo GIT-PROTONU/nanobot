@@ -399,8 +399,9 @@ class TelemetryHub:
         f = {
             "susp": [n._susp_l, n._susp_r],
             "pickup_override": n._susp_override,
-            "esp": {"hb": hb, "hb_age": round(now - hb_at, 2),
-                    "temp": esp_temp, "temp_age": round(now - esp_temp_at, 2),
+            "esp": {"hb": hb, "hb_age": round(now - hb_at, 2) if hb is not None else None,
+                    "temp": esp_temp, "temp_age": round(now - esp_temp_at, 2)
+                    if esp_temp is not None else None,
                     "hall": self._hall, "ticks": self._ticks,
                     "stray": self._stray,
                     "tick_hz": round(self._tick_hz, 1),
@@ -470,26 +471,27 @@ class TelemetryHub:
             # lets the page grey them out / label them stale instead of implying
             # they're updating.
             frozen = not camera_enabled
-            target = gv.target
-            motion_center = gv.motion_center
-            motion_score = gv.motion_score
+            sc = gv.snapshot()         # one lock acquisition for all ~20 readouts
+            target = sc["target"]
+            motion_center = sc["motion_center"]
+            motion_score = sc["motion_score"]
             bumper = ({"alert": False, "commanded": False, "cmd_vel": [0.0, 0.0], "low_motion_secs": 0.0}
                       if frozen else self._optical_bumper(now, motion_score))
-            blob_threshold, blob_min, blob_max = gv.blob_tuning
-            match = gv.motion_target_match
-            frame_age = gv.frame_age
-            novelty = gv.novelty
-            intercept_rate = gv.intercept_rate
-            motion_intercept_rate = gv.motion_intercept_rate
-            luma = gv.luma
-            luma_variance = gv.luma_variance
-            luma_max = gv.luma_max
-            color_cast = gv.color_cast
-            edge_density = gv.edge_density
-            overhead_edge_density = gv.overhead_edge_density
-            highlight_fraction = gv.highlight_fraction
-            has_target_color = gv.has_target_color
-            gpu_duty = gv.gpu_duty
+            blob_threshold, blob_min, blob_max = sc["blob_tuning"]
+            match = sc["motion_target_match"]
+            frame_age = sc["frame_age"]
+            novelty = sc["novelty"]
+            intercept_rate = sc["intercept_rate"]
+            motion_intercept_rate = sc["motion_intercept_rate"]
+            luma = sc["luma"]
+            luma_variance = sc["luma_variance"]
+            luma_max = sc["luma_max"]
+            color_cast = sc["color_cast"]
+            edge_density = sc["edge_density"]
+            overhead_edge_density = sc["overhead_edge_density"]
+            highlight_fraction = sc["highlight_fraction"]
+            has_target_color = sc["has_target_color"]
+            gpu_duty = sc["gpu_duty"]
             f["vision"] = {
                 "camera_enabled": camera_enabled,
                 "target_name": getattr(n, "_vision_target_active", None),
@@ -519,8 +521,8 @@ class TelemetryHub:
                      "highlight_fraction": highlight_fraction,
                      "motion_intercept_rate": motion_intercept_rate, "color_cast": color_cast,
                      "motion_target_match": match, "novelty": novelty, "frame_age": frame_age,
-                     "zero_motion_secs": gv.zero_motion_secs},
-                    now=now, frozen=frozen),
+                     "zero_motion_secs": sc["zero_motion_secs"]},
+                     now=now, frozen=frozen),
                 "bumper": bumper,
             }
         # latched brain readouts, passed through as the raw JSON strings the page parses
@@ -608,7 +610,7 @@ class TelemetryHub:
             self._ekf_win = (now, now)
 
     def _on_slam_pose(self, msg):
-        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        p, q = msg.pose.position, msg.pose.orientation
         yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
         self._slam_pose = (p.x, p.y, yaw, time.monotonic())
 
