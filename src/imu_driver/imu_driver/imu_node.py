@@ -262,6 +262,15 @@ class ImuNode(Node):
             ("mount_yaw_deg", 0.0),     # above. All three together handle a sensor
                                         # tipped/twisted in any direction, not just a
                                         # flat spin.
+            ("yaw_sign", 1.0),          # +1/-1: heading DIRECTION knob. Flip when the
+                                        # corrected yaw rotates OPPOSITE the wheels (the
+                                        # "OPPOSITE signs" alarm slam_nav raises). A
+                                        # yaw-only mount rotation can't invert the
+                                        # rotation sign, so a residual flip means the
+                                        # sensor is physically mirrored (upside-down /
+                                        # edge-mounted). Mirrors gyro-z + euler-yaw +
+                                        # mag-z at publish, so /imu/data (EKF) and
+                                        # /imu/euler (slam_nav prior) stay consistent.
             ("mount_settings_path", ""),  # "" -> ~/.local/state/nanobot/imu_mount.json;
                                            # persists offset_{x,y,z}_mm + mount_{roll,
                                            # pitch,yaw}_deg across restarts once set
@@ -319,6 +328,7 @@ class ImuNode(Node):
         # the default no-mount config, skip the per-frame rotation + orientation
         # round-trip entirely (see _handle) instead of paying it every cycle.
         self._use_mount = self._mount_m != _IDENTITY3
+        self._yaw_sign = -1.0 if float(g("yaw_sign").value) < 0 else 1.0
         # Reflect the effective (possibly persisted-overridden) values back into the
         # actual ROS parameters -- not just internal state -- so `ros2 param get` and
         # anything else reading these back (a future web-UI refresh, etc.) sees the
@@ -458,6 +468,19 @@ class ImuNode(Node):
                 # matcher in slam_nav absorbs continuously.
                 self.ser.write(bytes((0xff, 0xaa, 0x24, 0x01, 0x00)))
                 time.sleep(0.05)
+            # Enforce the measurement ranges the decode constants above assume
+            # (GYRO_SCALE = +/-2000 deg/s, ACC_SCALE = +/-16 g). These register
+            # writes are idempotent re-sends on every (re)connect — but if the
+            # unit boots on a narrower range the raw counts decode ~8x too big
+            # and the device's fused heading comes out scaled (EKF/SLAM garbage).
+            # BWT901CL register map (low-WitMotion): 0x29 accel range, 0x2b gyro
+            # range, and the codes are INVERTED (0x00 = narrowest, 0x03 = widest):
+            #   0x29: 0=+/-2g, 1=+/-4g, 2=+/-8g, 3=+/-16g
+            #   0x2b: 0=+/-250, 1=+/-500, 2=+/-1000, 3=+/-2000 deg/s
+            self.ser.write(bytes((0xff, 0xaa, 0x29, 0x03, 0x00)))  # accel +/-16 g
+            time.sleep(0.05)
+            self.ser.write(bytes((0xff, 0xaa, 0x2b, 0x03, 0x00)))  # gyro +/-2000 deg/s
+            time.sleep(0.05)
             self.ser.reset_input_buffer()
         except Exception as exc:
             self.get_logger().warning(f"IMU rate config failed: {exc}")
@@ -677,6 +700,7 @@ class ImuNode(Node):
         elif t == T_GYRO:
             gyro = (rotate_mount((a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE), self._mount_m)
                     if self._use_mount else (a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE))
+            gyro = (gyro[0], gyro[1], gyro[2] * self._yaw_sign)
             if self._offset_m != (0.0, 0.0, 0.0):
                 now = time.monotonic()
                 if self._prev_gyro is not None:
@@ -686,8 +710,9 @@ class ImuNode(Node):
                 self._prev_gyro, self._prev_gyro_t = gyro, now
             self.gyro = gyro
         elif t == T_MAG:
-            self.mag = (rotate_mount((float(a), float(b), float(c)), self._mount_m)
-                        if self._use_mount else (float(a), float(b), float(c)))
+            mag = (rotate_mount((float(a), float(b), float(c)), self._mount_m)
+                   if self._use_mount else (float(a), float(b), float(c)))
+            self.mag = (mag[0], mag[1], mag[2] * self._yaw_sign)
         elif t == T_ANGLE:
             roll_s, pitch_s, yaw_s = a * ANG_SCALE, b * ANG_SCALE, c * ANG_SCALE
             if self._use_mount:
@@ -697,6 +722,10 @@ class ImuNode(Node):
                 # identity mount: the Euler round-trip is a no-op to ~1e-13°, so skip
                 # the matrix compose/extract entirely (the default config's hot path)
                 self.euler_deg = (roll_s, pitch_s, yaw_s)
+            # yaw_sign: mirror the heading (yaw only; roll/pitch keep the physical
+            # attitude). Applied AFTER the mount rotation, to the corrected value.
+            self.euler_deg = (self.euler_deg[0], self.euler_deg[1],
+                              self.euler_deg[2] * self._yaw_sign)
             # angle is the cycle's anchor frame -> publish a coherent set. The device
             # stream auto-follows publish_rate, so when it's already at/below our target
             # we publish EVERY angle frame. The wall-clock gate is only for the in-between

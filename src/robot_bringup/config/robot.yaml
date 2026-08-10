@@ -311,7 +311,17 @@ imu_driver:
   ros__parameters:
     port: "/dev/imu"          # stable udev symlink (CH340 by VID:PID, any USB port)
     baud: 115200              # BWT901CL is fixed at 115200
-    frame_id: "imu_link"
+    # The driver pre-rotates every raw frame into the chassis frame (mount_*_deg)
+    # and lever-arm-corrects accel to the base_link centre, so the published data
+    # is ALREADY in base_link coordinates. Declare it base_link so
+    # robot_localization can fuse the absolute yaw: with "imu_link" there is no
+    # base_link->imu_link static transform anywhere (confirmed 2026-08-10 — imu_link
+    # missing from the TF tree), the EKF cannot transform the measurement and
+    # silently drops the orientation, and /odometry/filtered yaw is then pure gyro
+    # dead-reckoning that SLAM's scan matcher fights. Adding an imu_link static TF
+    # here is pointless while the data is already chassis-aligned (it would double
+    # the rotation), so base_link is both simpler and exact.
+    frame_id: "base_link"
     publish_rate: 50.0        # Hz; /imu/data rate. Raised for the robot_localization
                               # EKF (20 Hz): at 50 Hz the IMU gyro arrives >2x per EKF
                               # step, so every prediction gets fresh gyro data for smooth
@@ -355,6 +365,15 @@ imu_driver:
     mount_roll_deg: 0.0
     mount_pitch_deg: 0.0
     mount_yaw_deg: 0.0
+    # Heading DIRECTION knob (-1 = mirrored). The BWT901CL's corrected yaw rotates
+    # OPPOSITE the wheel encoders (slam_nav logs "OPPOSITE SIGNS — set
+    # imu_yaw_sign: -1"; live spin test: command +CCW -> wheels +0.09 rad, IMU
+    # -0.85 rad). A yaw-only mount rotation can't invert a rotation sign, so this
+    # mirrors gyro-z + euler-yaw + mag-z at publish so /imu/data (EKF) and
+    # /imu/euler (slam_nav rotation prior) are both wheel-consistent. Set here,
+    # not in imu_mount.json: the web IMU card rewrites that file and would clobber
+    # it. Re-verify with the spin test after any physical remount.
+    yaw_sign: -1.0
     # A web-UI change to either the offset or rotation above persists here (default
     # ~/.local/state/nanobot/imu_mount.json) and wins over the values above on the
     # next start, same "outlives a restart" contract as tts_settings_path.
