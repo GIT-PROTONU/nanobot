@@ -612,9 +612,15 @@ class TelemetryHub:
         # localization-pipeline feed status (odom/EKF/imu) from sys_monitor
         pipe = next((s for s in msg.status if s.name == "pipeline"), None)
         if pipe is not None:
+            # DiagnosticStatus.level can arrive as a raw byte under rmw_zenoh
+            # (b'\x00'|b'\x01'|b'\x02'...) rather than a plain int -- normalize it
+            # here so it survives json.dumps in the telemetry frame.
+            lvl = pipe.level
+            if isinstance(lvl, bytes):
+                lvl = int.from_bytes(lvl, byteorder="little") if lvl else 0
             self._pipe_diag = (
                 {p.key: p.value for p in pipe.values}, time.monotonic(),
-                pipe.level, pipe.message)
+                lvl, pipe.message)
 
     def _on_ticks(self, msg):
         d = list(msg.data)

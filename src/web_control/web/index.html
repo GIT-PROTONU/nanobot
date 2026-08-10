@@ -1144,6 +1144,314 @@
 </div>
 
 <script>
+// ===== OLED mirror — a pixel-exact, fully client-side copy of the physical SSD1306 =====
+// Renders the SAME screen the panel shows (dashboard / mood face / TTS karaoke / shutdown),
+// from the SAME inputs: /oled_face, /oled_word, /oled_text, /oled_system + live telemetry.
+// This is a faithful port of src/oled_display/oled_display/display_node.py — all the drawing
+// happens here in the browser, so it works identically on the robot (state in the SSE
+// telemetry frame) and on the dev harness (state polled from /oled/state; dev_webui.py). Blink &
+// gaze are animated locally with their own RNG, so they aren't frame-identical to the panel,
+// but the mode / mood / words / dashboard all mirror exactly.
+window.OLED=(function(){
+  "use strict";
+  const W=128, H=64;                       // logical SSD1306 resolution
+  const ON="#cfe9ff", OFF="#000";          // lit pixel (blue-white OLED) / dark
+  const FONT='8px "DejaVu Sans Mono","Courier New",monospace';
+  const KNOWN=["happy","angry","focused","stress","sleepy","looking"];
+  const IDLE_FACE="neutral";               // resting face when no mood is up (== oled_display idle_face)
+  const EYE_DX=37, EYE_W=20, EYE_H=26, BLINK_DUR=0.16;   // eye geometry (== display_node.py)
+
+  let cv=null, ctx=null, timer=0;
+  // ---- panel state (mirrors DisplayNode fields) ----
+  let face="", accent="", word="", brand="", sys="", pinned=false, showWords=true;
+  // The EFFECTIVE mood rendered: "" = dashboard (pinned), else a face (the requested mood, or
+  // IDLE_FACE between beats) — the single arbiter, mirroring DisplayNode._recompute_mood.
+  const effMood=()=>pinned ? "" : (face||IDLE_FACE);
+  // The emotion accent rides only an actively-requested mood (not the resting idle face), and
+  // `has` treats it as in-play alongside the base shape — mirroring DisplayNode._has.
+  const effAccent=()=>(pinned || !face) ? "" : accent;
+  const has=m=>effMood()===m || effAccent()===m;
+  const tel={espTemp:NaN, espAt:-1e9, imuHz:0, imuAt:-1e9, roll:0, pitch:0, lds:0, ldsAt:-1e9,
+             cpu:NaN, mem:NaN, sbc:NaN, ip:"0.0.0.0"};
+  // ---- animation state (== _anim_update) ----
+  let aT=0, open=1, blinkT=null, dbl=false, nextBlink=0,
+      gxf=0, gyf=0, gtx=0, gty=0, nextGaze=0, nextSmile=0, smileUntil=0, frame=0;
+  const now=()=>performance.now()/1000;
+  const rand=(a,b)=>a+Math.random()*(b-a);
+
+  // ---- primitives (1:1 with PIL's ImageDraw on a 128x64 mono buffer) ----
+  function clear(){ ctx.fillStyle=OFF; ctx.fillRect(0,0,W,H); }
+  function rect(x0,y0,x1,y1,on){ ctx.fillStyle=on?ON:OFF; ctx.fillRect(x0,y0,x1-x0+1,y1-y0+1); }
+  function line(x0,y0,x1,y1){ ctx.strokeStyle=ON; ctx.lineWidth=1; ctx.beginPath();
+    ctx.moveTo(x0+0.5,y0+0.5); ctx.lineTo(x1+0.5,y1+0.5); ctx.stroke(); }
+  // PIL ellipse takes a bounding box; centre/radii derived from it.
+  function bell(x0,y0,x1,y1,on){ const cx=(x0+x1)/2, cy=(y0+y1)/2,
+      rx=Math.max(0.5,Math.abs(x1-x0)/2), ry=Math.max(0.5,Math.abs(y1-y0)/2);
+    ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fillStyle=on?ON:OFF; ctx.fill(); }
+  function arc(x0,y0,x1,y1,a0,a1){ const cx=(x0+x1)/2, cy=(y0+y1)/2,
+      rx=Math.abs(x1-x0)/2, ry=Math.abs(y1-y0)/2;
+    ctx.strokeStyle=ON; ctx.lineWidth=1; ctx.beginPath();
+    ctx.ellipse(cx,cy,rx,ry,0,a0*Math.PI/180,a1*Math.PI/180); ctx.stroke(); }
+  function poly(pts,on){ ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
+    for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
+    ctx.closePath(); ctx.fillStyle=on?ON:OFF; ctx.fill(); }
+  function textW(s){ ctx.font=FONT; return ctx.measureText(s).width; }
+  function text(x,y,s,on){ ctx.fillStyle=on?ON:OFF; ctx.font=FONT;
+    ctx.textBaseline="top"; ctx.textAlign="left"; ctx.fillText(s,x,y); }
+
+  // ---- dashboard (== _dashboard_tick / _row) ----
+  function row(y,name,alive,value){
+    text(2,y,name,1);
+    const cx=30, cy=y+1;                    // 6px disc; ring when not alive
+    bell(cx,cy,cx+6,cy+6,1);
+    if(!alive) bell(cx+1,cy+1,cx+5,cy+5,0);
+    text(48,y,value,1);
+  }
+  function clock(){ return new Date().toTimeString().slice(0,8); }
+  function dashboard(){
+    const t=performance.now();
+    const espUp=t-tel.espAt<4000, imuUp=t-tel.imuAt<2500,
+          ldsUp=(t-tel.ldsAt<3000)&&tel.lds>0.1;
+    clear();
+    rect(0,0,W-1,11,1);                                       // header bar (inverted)
+    text(2,2,(brand||"NANOBOT").slice(0,12),0);
+    const clk=clock(); text(W-2-textW(clk),2,clk,0);
+    text(2,14,tel.ip||"0.0.0.0",1);
+    if(!isNaN(tel.sbc)){ const s=Math.round(tel.sbc)+"C"; text(W-2-textW(s),14,s,1); }
+    line(0,25,W-1,25);
+    row(28,"ESP",espUp, (espUp&&!isNaN(tel.espTemp))?Math.round(tel.espTemp)+"C":"off");
+    row(40,"IMU",imuUp, imuUp?Math.round(tel.imuHz)+"Hz":"off");
+    row(52,"LDS",ldsUp, ldsUp?tel.lds.toFixed(1)+"Hz":"off");
+    [[28,tel.cpu,"CPU"],[40,tel.mem,"RAM"]].forEach(([y,val,lab])=>{
+      if(isNaN(val)) return;
+      const s=lab+" "+Math.round(val)+"%";
+      text(Math.max(0,W-3-textW(s)),y,s,1);
+    });
+    if(imuUp){                                                // row 52: IMU roll/pitch tilt (deg)
+      const sgn=v=>(v>=0?"+":"")+Math.round(v);
+      const s="R"+sgn(tel.roll)+" P"+sgn(tel.pitch);
+      text(Math.max(0,W-3-textW(s)),52,s,1);
+    }
+  }
+
+  // ---- TTS karaoke: one word, as big as it fits, centred (== _draw_word) ----
+  function drawWord(w){
+    clear();
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    let fs=H-8; ctx.font="bold "+fs+'px "DejaVu Sans Mono","Courier New",monospace';
+    while(fs>6 && ctx.measureText(w).width>W-4){
+      fs--; ctx.font="bold "+fs+'px "DejaVu Sans Mono","Courier New",monospace'; }
+    ctx.fillStyle=ON; ctx.fillText(w,W/2,H/2);
+    ctx.textAlign="left"; ctx.textBaseline="top";
+  }
+
+  // ---- face / mood animation (== _anim_update + the *_eye helpers) ----
+  function animUpdate(n){
+    const dt=n-aT; aT=n;
+    if(blinkT!==null){
+      blinkT+=dt; const p=blinkT/BLINK_DUR;
+      if(p>=1){ blinkT=null; open=1;
+        if(dbl){ dbl=false; nextBlink=n+0.18; }
+        else if(has("focused")){ nextBlink=n+rand(5,9); dbl=false; }
+        else { nextBlink=n+rand(2,5); dbl=Math.random()<0.3; }
+      } else open=Math.abs(1-2*p);
+    } else if(n>=nextBlink){ blinkT=0; open=1; }
+    else open=1;
+    if(n>=nextGaze){
+      if(Math.random()<0.35){ gtx=0; gty=0; }
+      else { gtx=rand(-3,3); gty=rand(-3,3); }
+      const fast=(has("focused")||has("looking"));
+      nextGaze=n+rand(fast?0.6:1.0, fast?1.8:3.0);
+    }
+    if(has("happy") && n>=nextSmile){ smileUntil=n+0.45; nextSmile=n+rand(3,7); }
+    const k=Math.min(1,dt*6);
+    gxf+=(gtx-gxf)*k; gyf+=(gty-gyf)*k;
+    if(Math.abs(gtx-gxf)<0.4) gxf=gtx;
+    if(Math.abs(gty-gyf)<0.4) gyf=gty;
+  }
+  function pupil(cx,cy,eh,px,py,pw,ph,sparkle){
+    const mx=Math.max(0,EYE_W-pw-2), my=Math.max(0,eh-ph-2);
+    const pcx=cx+Math.max(-mx,Math.min(mx,px)), pcy=cy+Math.max(-my,Math.min(my,py));
+    bell(pcx-pw,pcy-ph,pcx+pw,pcy+ph,0);
+    if(sparkle) bell(pcx-pw+1,pcy-ph+1,pcx-pw+4,pcy-ph+4,1);
+  }
+  function smileEye(cx,cy){           // happy upward crescent (== _smile_eye)
+    const top=cy-16, bot=cy+10;
+    bell(cx-EYE_W,top,cx+EYE_W,bot,1);
+    bell(cx-EYE_W,top+8,cx+EYE_W,bot+8,0);
+  }
+  function happyEye(cx,cy,px,py,smiling){
+    if(smiling || open<0.3){ smileEye(cx,cy); return; }
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,7,9,true);
+  }
+  function brow(cx,cy,inner,eh){      // slanted scowl brow (== _brow)
+    const xin=cx+inner*(EYE_W+2), xout=cx-inner*(EYE_W+2), b=Math.round(eh*1.1);
+    poly([[xout,cy-eh-3],[xin,cy-eh-3],[xin,cy-eh+b],[xout,cy-eh+3]],0);
+  }
+  function droop(cx,cy){              // heavy upper eyelid (sleepy accent, == _droop)
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    rect(cx-EYE_W-1,cy-eh-1,cx+EYE_W+1,cy+Math.round(eh*0.35),0);
+  }
+  function angryEye(cx,cy,inner,px,py){
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    if(open<0.25){ line(cx-EYE_W,cy,cx+EYE_W,cy); return; }
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,6,7,false);
+    brow(cx,cy,inner,eh);
+  }
+  // Emotion accent ON TOP of the base shape (== _accent_overlay): angry brows / sleepy lids.
+  // Happy folds to a smile crescent earlier (faceTick); focused/looking/neutral are cadence-only.
+  function accentOverlay(lcx,rcx,cy){
+    const a=effAccent();
+    if(!a || a===effMood()) return;
+    if(a==="angry"){ const eh=Math.max(2,Math.round(EYE_H*open)); brow(lcx,cy,1,eh); brow(rcx,cy,-1,eh); }
+    else if(a==="sleepy"){ droop(lcx,cy); droop(rcx,cy); }
+  }
+  function focusedEye(cx,cy,px,py){
+    if(open<0.25){ line(cx-EYE_W,cy,cx+EYE_W,cy); return; }
+    const eh=Math.max(3,Math.round(EYE_H*0.6*open));
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,5,Math.max(2,eh-3),false);
+  }
+  function lookingEye(cx,cy,px,py){
+    if(open<0.25){ line(cx-EYE_W,cy,cx+EYE_W,cy); return; }
+    const eh=Math.max(2,Math.round(EYE_H*open));
+    bell(cx-EYE_W,cy-eh,cx+EYE_W,cy+eh,1);
+    pupil(cx,cy,eh,px,py,6,8,false);
+  }
+  function sleepy(n){
+    const zc=Math.floor(n*1.2)%3+1;
+    clear();
+    const cy=H/2+4;
+    for(const cx of [W/2-EYE_DX, W/2+EYE_DX])
+      for(const dy of [0,1,2]) arc(cx-EYE_W,cy-8+dy,cx+EYE_W,cy+8+dy,20,160);
+    const zx=W-30, zy=18;
+    for(let i=0;i<zc;i++) text(zx+i*8,zy-i*6,"z",1);
+  }
+  function stress(){
+    clear(); const ph=frame, o=ph%8;
+    for(let x=-H;x<W;x+=8) line(x+o,0,x+o+H,H);
+    const bx=Math.round(W/2+(W/2-9)*Math.sin(ph*0.5)),
+          by=Math.round(H/2+(H/2-9)*Math.cos(ph*0.33));
+    bell(bx-9,by-9,bx+9,by+9,0);
+    ctx.strokeStyle=ON; ctx.lineWidth=1; ctx.beginPath();
+    ctx.ellipse(bx,by,9,9,0,0,Math.PI*2); ctx.stroke();
+  }
+  function faceTick(){
+    const n=now(); animUpdate(n); frame++; const m=effMood();
+    if(m==="stress"){ stress(); return; }
+    if(m==="sleepy"){ sleepy(n); return; }
+    const cy=H/2, lcx=W/2-EYE_DX, rcx=W/2+EYE_DX;
+    const px=Math.round(gxf*3.0), py=Math.round(gyf*2.5);
+    const smiling=has("happy") && n<smileUntil;
+    clear();
+    // Happy (base OR accent) folds the whole eye into a smile crescent on the smile beat/blink.
+    if(has("happy") && (smiling || open<0.3)){ smileEye(lcx,cy); smileEye(rcx,cy); return; }
+    if(m==="angry"){ angryEye(lcx,cy,1,px,py); angryEye(rcx,cy,-1,px,py); }
+    else if(m==="focused"){ focusedEye(lcx,cy,px,py); focusedEye(rcx,cy,px,py); }
+    else if(m==="looking"){ lookingEye(lcx,cy,px,py); lookingEye(rcx,cy,px,py); }
+    else { happyEye(lcx,cy,px,py,smiling); happyEye(rcx,cy,px,py,smiling); }   // happy / neutral
+    accentOverlay(lcx,rcx,cy);                                                 // emotion on top
+  }
+
+  // ---- end screens (== _shutdown_screen / _restart_screen) ----
+  function shutdownScreen(){
+    clear(); const cx=W/2, gy=H/2-12, r=8;
+    arc(cx-r,gy-r,cx+r,gy+r,300,240); line(cx,gy-r-1,cx,gy+2);
+    const msg="Shutting down"; text((W-textW(msg))/2,gy+r+4,msg,1);
+  }
+  function restartScreen(msg){
+    clear(); const cx=W/2, gy=H/2-12, r=8;
+    arc(cx-r,gy-r,cx+r,gy+r,70,360);
+    const ax=cx+Math.round(r*Math.cos(70*Math.PI/180)),
+          ay=gy+Math.round(r*Math.sin(70*Math.PI/180));
+    poly([[ax-3,ay-1],[ax+3,ay-1],[ax,ay+4]],1);
+    text((W-textW(msg))/2,gy+r+4,msg,1);
+  }
+
+  // ---- frame router (== the owner priority in display_node.py) ----
+  // Face is the default; the dashboard shows only when pinned (effMood()==="").  Karaoke words
+  // take over only while showWords is on — else speech keeps the face up.
+  function render(){
+    if(!ctx) return;
+    const m=effMood();
+    if(sys==="shutdown") shutdownScreen();
+    else if(sys==="restart"||sys==="reboot") restartScreen(sys==="restart"?"Restarting stack":"Restarting");
+    else if(word && showWords) drawWord(word);
+    else if(m) faceTick();
+    else dashboard();
+  }
+
+  function reseed(){ const n=now(); aT=n; open=1; blinkT=null; dbl=false;
+    nextBlink=n+rand(1.5,3.5); gxf=gyf=gtx=gty=0;
+    nextGaze=n+rand(1.0,2.5); nextSmile=n+rand(2.0,5.0); smileUntil=0; }
+
+  return {
+    init(){
+      cv=document.getElementById("oledcv"); if(!cv) return;
+      cv.width=W; cv.height=H; ctx=cv.getContext("2d");
+      ctx.imageSmoothingEnabled=false; reseed();
+    },
+    // Only animate while the OLED hero view is visible (zero cost otherwise).
+    setActive(on){
+      if(on && !timer){ render(); timer=setInterval(render,50); }   // ~20 fps
+      else if(!on && timer){ clearInterval(timer); timer=0; }
+    },
+    setFace(raw){ raw=(raw||"").trim().toLowerCase();
+      let next="", acc="";
+      if(!["","off","dashboard","none"].includes(raw)){
+        const i=raw.indexOf(":");                                    // compound "shape:emotion"
+        const shape=i<0?raw:raw.slice(0,i); acc=i<0?"":raw.slice(i+1);
+        next=KNOWN.includes(shape)?shape:"neutral";
+        acc=(KNOWN.includes(acc)&&acc!==next)?acc:"";
+      }
+      if(next===face && acc===accent) return;
+      if(next && !face) reseed();                                    // entering face mode
+      face=next; accent=acc;
+    },
+    setWord(w){ word=(w||"").trim(); },
+    setBrand(t){ brand=t||""; },
+    setDashboard(on){ on=!!on; if(on===pinned) return;
+      if(pinned && !on) reseed();          // unpinning -> re-enter the resting face cleanly
+      pinned=on; },
+    setShowWords(on){ showWords=!!on; },
+    setSystem(s){ s=(s||"").trim().toLowerCase();
+      if(["restart","reboot","shutdown"].includes(s)) sys=s; },
+    tel(p){ const t=performance.now();
+      if("espTemp" in p){ tel.espTemp=p.espTemp; tel.espAt=t; }     // temp also proves ESP alive
+      if("espBeat" in p){ tel.espAt=t; }
+      if("imuHz" in p){ tel.imuHz=p.imuHz; tel.imuAt=t; }
+      if("roll" in p) tel.roll=p.roll;
+      if("pitch" in p) tel.pitch=p.pitch;
+      if("lds" in p){ tel.lds=p.lds; tel.ldsAt=t; }
+      if("cpu" in p) tel.cpu=p.cpu;
+      if("mem" in p) tel.mem=p.mem;
+      if("sbc" in p) tel.sbc=p.sbc;
+      if("ip" in p) tel.ip=p.ip;
+    },
+  };
+})();
+OLED.init();
+// Dev harness (no /telemetry stream): poll the panel state the robot would stream.
+// On the robot we're `connected`, so this never fires (the telemetry frame drives the
+// mirror); a 404 here is harmless.
+setInterval(()=>{
+  if(typeof connected!=="undefined" && connected) return;
+  fetch("/oled/state").then(r=>r.ok?r.json():null).then(s=>{
+    if(!s) return;
+    OLED.setFace(s.face||""); OLED.setWord(s.word||""); OLED.setBrand(s.brand||"");
+    if(s.system) OLED.setSystem(s.system);
+    const p={imuHz:s.imu_hz, roll:s.roll, pitch:s.pitch, lds:s.lds_hz, cpu:s.cpu, mem:s.mem, sbc:s.temp, ip:s.ip};
+    if(s.esp_alive) p.espTemp=s.esp_temp;
+    OLED.tel(p);
+  }).catch(()=>{});
+},500);
+
+</script>
+
+<script>
 "use strict";
 const $=id=>document.getElementById(id);
 const cv=$("cv"), ctx=cv.getContext("2d");
@@ -1154,73 +1462,131 @@ let dragging=false,dsx=0,dsy=0,dpx=0,dpy=0;
 let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
 
-// ---- ROS state ----
-let ros=null, odomTopic=null, cmdTopic=null, faceTopic=null, systemTopic=null,
-    imuTopic=null, eulTopic=null, sysTopic=null,
-    imuParamSrv=null, ldsParamSrv=null, odoParamSrv=null, connected=false;
-// ESP32 coprocessor topics
-let hbTopic=null, ticksTopic=null, suspLTopic=null, suspRTopic=null, tempTopic=null,
-    hallTopic=null, ldsRpmTopic=null, ldsHzTopic=null, ldsDutyTopic=null, ldsTgtTopic=null;
-// cooling fan: read /fan_pwm, override via /sys_monitor/set_parameters
-let fanTopic=null, fanParamSrv=null;
-// slam_nav view+plan state (read by the map panel script below)
-let goalTopic=null, planTopic=null, navMotionSrv=null, mapPlan=[], mapGoal=null;
-let homeTopic=null, saveTopic=null, testTopic=null, testResTopic=null;
-// Brain: purpose / current task / A/B experiment stats (latched, from the behaviour node)
-let purposeTopic=null, taskTopic=null, expTopic=null;
-const HOST=`${location.hostname||"localhost"}:9090`;
+// ---- server link state (SSE /telemetry — there is no rosbridge anymore) ----
+let connected=false;                     // the /telemetry stream is live
+// slam_nav view+plan state (read by the map panel script)
+let mapPlan=[], mapGoal=null;
 
 $("connect").onclick=()=>connected?disconnect():connect();
 $("fit").onclick=autoFit;
 $("lin").oninput=()=>$("linv").textContent=$("lin").value;
 $("ang").oninput=()=>$("angv").textContent=$("ang").value;
 
-// retune a node's publish_rate live via its own /<node>/set_parameters service
-// (rcl_interfaces/SetParameters — works without rosapi). type 3 = double.
-function setNodeRate(srv,hz){
-  if(!srv) return;
-  srv.callService(new ROSLIB.ServiceRequest({parameters:[{name:"publish_rate",
-    value:{type:3,bool_value:false,integer_value:0,double_value:hz,string_value:"",
-      byte_array_value:[],bool_array_value:[],integer_array_value:[],
-      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
+// set one WHITELISTED parameter on a node live via POST /param (the server calls the
+// node's /<node>/set_parameters service). All the tuning sliders/toggles funnel here.
+function setParam(node,name,value){
+  fetch("/param",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({node,name,value})}).catch(()=>{});
 }
+// publish on a WHITELISTED topic via POST /publish (see telemetry.py's whitelist).
+function pub(topic,value){
+  fetch("/publish",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({topic,value})}).catch(()=>{});
+}
+const setNodeRate=(node,hz)=>setParam(node,"publish_rate",hz);
 $("imuRate").oninput=()=>$("imuRateV").textContent=$("imuRate").value;
-$("imuRate").onchange=()=>setNodeRate(imuParamSrv,Number($("imuRate").value));
+// Also retunes euler_rate (not just publish_rate/imu_data) -- /imu/euler is what
+// feeds the 3D orientation view, and it has its own independent rate cap in
+// imu_driver, so leaving it behind made the slider look like it did nothing for
+// that view even at 200 Hz.
+$("imuRate").onchange=()=>{
+  const hz=Number($("imuRate").value);
+  setNodeRate("imu_driver",hz);
+  setParam("imu_driver","euler_rate",hz);
+};
+// IMU mounting offset (mm from robot centre, REP-103 x/y/z) -> imu_driver's
+// offset_{x,y,z}_mm, which drives its lever-arm accel correction (imu_node.py).
+[["imuOffX","offset_x_mm"],["imuOffY","offset_y_mm"],["imuOffZ","offset_z_mm"]].forEach(([id,param])=>{
+  $(id).onchange=()=>setParam("imu_driver",param,Number($(id).value));
+});
+// IMU mount ROTATION (separate from the translation offset above) -> imu_driver's
+// mount_{roll,pitch,yaw}_deg, a full 3-axis fixed rotation that maps raw accel/gyro/mag
+// and roll/pitch/yaw from the sensor's own tilted/twisted frame into the robot's frame
+// (imu_node.py's mount_matrix/rotate_mount/correct_orientation).
+[["imuMountRoll","mount_roll_deg"],["imuMountPitch","mount_pitch_deg"],["imuMountYaw","mount_yaw_deg"]]
+  .forEach(([id,param])=>{ $(id).onchange=()=>setParam("imu_driver",param,Number($(id).value)); });
+// IMU calibration (WitMotion 5-byte hex protocol, see imu_driver._do_calibrate) — the
+// four steps are separate button presses since accel cal needs the robot held still
+// and mag cal needs it physically rotated; status comes back async via imuCalStatus.
+$("imuCalAccel").onclick=()=>{
+  if(!confirm("Set the robot on a flat, level, still surface, then calibrate the accelerometer?")) return;
+  pub("/imu_calibrate","accel");
+};
+$("imuCalMagStart").onclick=()=>pub("/imu_calibrate","mag_start");
+$("imuCalMagStop").onclick=()=>pub("/imu_calibrate","mag_stop");
+$("imuCalSave").onclick=()=>{
+  if(!confirm("Save IMU calibration to flash?")) return;
+  pub("/imu_calibrate","save");
+};
+// 6-axis/9-axis toggle (drop/restore the magnetometer from the fused yaw) + zero-yaw
+// -- same WitMotion command channel as the cal buttons above.
+$("imuAxis6").onclick=()=>{
+  if(!confirm("Switch to 6-axis mode? Yaw becomes gyro-only (no magnetometer). Remember to Save.")) return;
+  pub("/imu_calibrate","axis6");
+};
+$("imuAxis9").onclick=()=>{
+  if(!confirm("Switch back to 9-axis mode (magnetometer fused into yaw)? Remember to Save.")) return;
+  pub("/imu_calibrate","axis9");
+};
+$("imuZeroYaw").onclick=()=>pub("/imu_calibrate","zero_yaw");
+// Internal analog low-pass bandwidth (register 0x1F) -- device default vs 20/10/5 Hz.
+$("imuBandwidth").onchange=()=>setParam("imu_driver","bandwidth_hz",Number($("imuBandwidth").value));
 $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
-$("ldsRate").onchange=()=>setNodeRate(ldsParamSrv,Number($("ldsRate").value));
+$("ldsRate").onchange=()=>setNodeRate("lds_driver",Number($("ldsRate").value));
 $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
-$("odoRate").onchange=()=>setNodeRate(odoParamSrv,Number($("odoRate").value));
+$("odoRate").onchange=()=>setNodeRate("wheel_odometry",Number($("odoRate").value));
 // publish a navigation goal in the map frame; slam_nav plans a path toward it.
-function mapSetGoal(wx,wy){
-  if(!goalTopic) return;
-  goalTopic.publish(new ROSLIB.Message({header:{frame_id:"map"},
-    pose:{position:{x:wx,y:wy,z:0},orientation:{x:0,y:0,z:0,w:1}}}));
-  mapGoal=[wx,wy];
-}
-// flip a slam_nav bool param live (rcl_interfaces SetParameters; type 1 = bool).
-function setNavBool(name,on){
-  if(!navMotionSrv) return;
-  navMotionSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name,
-    value:{type:1,bool_value:on,integer_value:0,double_value:0,string_value:"",
-      byte_array_value:[],bool_array_value:[],integer_array_value:[],
-      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
-}
-const setNavMotion=on=>setNavBool("enable_motion",on);
-const setNavExplore=on=>setNavBool("auto_explore",on);
-// LDS spin-speed setpoint -> /lds_target_rpm (Float32). The ESP32 PID holds it.
+function mapSetGoal(wx,wy){ pub("/goal_pose",{x:wx,y:wy}); mapGoal=[wx,wy]; }
+const setNavMotion=on=>setParam("slam_nav","enable_motion",on);
+const setNavExplore=on=>setParam("slam_nav","auto_explore",on);
+// slam_nav navigation tuning (Sensors tab) — all whitelisted + live, no restart needed.
+$("navMaxLin").oninput=()=>$("navMaxLinV").textContent=$("navMaxLin").value;
+$("navMaxLin").onchange=()=>setParam("slam_nav","max_lin",Number($("navMaxLin").value));
+$("navMaxAng").oninput=()=>$("navMaxAngV").textContent=$("navMaxAng").value;
+$("navMaxAng").onchange=()=>setParam("slam_nav","max_ang",Number($("navMaxAng").value));
+$("navStopDist").oninput=()=>$("navStopDistV").textContent=$("navStopDist").value;
+$("navStopDist").onchange=()=>setParam("slam_nav","stop_distance",Number($("navStopDist").value));
+$("navRadius").oninput=()=>$("navRadiusV").textContent=$("navRadius").value;
+$("navRadius").onchange=()=>setParam("slam_nav","robot_radius",Number($("navRadius").value));
+$("navStuck").oninput=()=>$("navStuckV").textContent=Number($("navStuck").value)===0?"off":$("navStuck").value+" s";
+$("navStuck").onchange=()=>setParam("slam_nav","stuck_timeout",Number($("navStuck").value));
+$("navRelocalize").onchange=e=>setParam("slam_nav","relocalize",e.target.checked);
+$("navPickupPause").onchange=e=>setParam("slam_nav","pickup_pause",e.target.checked);
+$("navLdsIdleEnable").onchange=e=>setParam("slam_nav","lds_idle_enable",e.target.checked);
+$("navLdsIdle").oninput=()=>$("navLdsIdleV").textContent=Number($("navLdsIdle").value)===0?"off":$("navLdsIdle").value;
+$("navLdsIdle").onchange=()=>setParam("slam_nav","lds_idle_timeout",Number($("navLdsIdle").value));
+// LDS spin-speed setpoint -> slam_nav's lds_active_rpm param (the rpm to resume to).
+// NOT a direct /lds_target_rpm publish: slam_nav owns that topic (idle spin-down
+// toggles it between active/idle), and publishing over it here would win on every
+// browser (re)connect and fight the parked state -- which is why spin-down was never
+// observed. slam_nav applies the new rpm immediately if currently spinning, or at the
+// next wake if currently parked.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
-function publishLdsTgt(){ if(ldsTgtTopic)
-  ldsTgtTopic.publish(new ROSLIB.Message({data:Number($("ldsTgt").value)})); }
-// Fan override -> sys_monitor fan_override param (rcl_interfaces SetParameters; type 3 =
-// double). v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
-function setFanOverride(v){
-  if(!fanParamSrv) return;
-  fanParamSrv.callService(new ROSLIB.ServiceRequest({parameters:[{name:"fan_override",
-    value:{type:3,bool_value:false,integer_value:0,double_value:v,string_value:"",
-      byte_array_value:[],bool_array_value:[],integer_array_value:[],
-      double_array_value:[],string_array_value:[]}}]}), ()=>{}, ()=>{});
-}
+function publishLdsTgt(){ setParam("slam_nav","lds_active_rpm",Number($("ldsTgt").value)); }
+// Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
+$("pickupOv").onchange=()=>publishPickupOv();
+function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value)); }
+// Zero the ESP32's raw + stray tick counters (bench calibration / clearing a stray-tick
+// count after fixing a wiring issue); wheel_odometry re-seeds itself off the same topic
+// so /odom doesn't jump.
+$("espResetTicks").addEventListener("click",()=>{ pub("/reset_ticks",true); $("espStray").style.color=""; });
+// ESP32 motor accel-ramp rate (duty/s, see main.cpp's MOTOR_SLEW_DEFAULT) -- how fast
+// applied motor duty may follow a commanded change; lower = smoother/gentler & laggier,
+// higher = snappier & jerkier. Fire-and-forget like reset_ticks -- not read back, so a
+// page reload shows the slider's default rather than the ESP32's actual live value.
+$("motorAccel").oninput=()=>$("motorAccelV").textContent=$("motorAccel").value;
+$("motorAccel").onchange=()=>pub("/motor_accel",Number($("motorAccel").value));
+// ESP32 straight-line wheel trim: negative = boost left / cut right (robot veers left),
+// positive = the opposite. The slider only sends; the live value comes back from the
+// telemetry frame (f.esp.wheel_trim) and is shown in the readout + re-syncs the slider
+// once on first arrival so the page matches the persisted NVS value.
+$("motorTrim").oninput=()=>$("motorTrimV").textContent=Number($("motorTrim").value).toFixed(2);
+$("motorTrim").onchange=()=>pub("/motor_trim",Number($("motorTrim").value));
+$("motorTrimReset").addEventListener("click",()=>{ $("motorTrim").value="0"; $("motorTrimV").textContent="0.00"; pub("/motor_trim",0); });
+// Fan override -> sys_monitor fan_override param.
+// v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
+const setFanOverride=v=>setParam("sys_monitor","fan_override",v);
 function fanApply(){
   const auto=$("fanAuto").checked;
   $("fanOv").disabled=auto;
@@ -1230,22 +1596,130 @@ function fanApply(){
 $("fanAuto").onchange=fanApply;
 $("fanOv").oninput=()=>$("fanOvV").textContent=$("fanOv").value;
 $("fanOv").onchange=()=>{ if(!$("fanAuto").checked) setFanOverride(Number($("fanOv").value)/100); };
+// Fan start temperature -> sys_monitor fan_temp_min param (°C below which the auto
+// curve idles at 0% duty; the ramp runs from here up to fan_temp_max=70°C).
+$("fanStart").oninput=()=>$("fanStartV").textContent=$("fanStart").value;
+$("fanStart").onchange=()=>setParam("sys_monitor","fan_temp_min",Number($("fanStart").value));
+// Fan floor duty -> sys_monitor fan_min_duty param (0..1 duty at/below "Fan starts at" —
+// keeps the ramp above the fan's own stall/dead-band duty instead of crawling too weakly
+// to move air).
+$("fanFloor").oninput=()=>$("fanFloorV").textContent=$("fanFloor").value;
+$("fanFloor").onchange=()=>setParam("sys_monitor","fan_min_duty",Number($("fanFloor").value)/100);
+// Fan smoothing -> sys_monitor fan_smooth_alpha param (0..1 EMA rate on the auto-curve
+// duty; lower = smoother/slower response, 100% = unsmoothed passthrough).
+$("fanSmooth").oninput=()=>$("fanSmoothV").textContent=$("fanSmooth").value;
+$("fanSmooth").onchange=()=>setParam("sys_monitor","fan_smooth_alpha",Number($("fanSmooth").value)/100);
 // On (re)connect, push the current Auto/override state once so the node matches the UI.
 function syncFan(){ setFanOverride($("fanAuto").checked?-1:Number($("fanOv").value)/100); }
-// On (re)connect, push the slider's current value once so the robot's spin setpoint
-// matches the UI without a manual drag (the firmware boots at 300 rpm; this keeps the
-// shown value authoritative even if it differs).
+// On (re)connect, push the slider's current value once so slam_nav's active-rpm param
+// matches the UI without a manual drag. Safe to call on every reconnect now that this
+// only sets the param slam_nav reads, not the /lds_target_rpm topic it owns.
 function syncLdsTgt(){ publishLdsTgt(); }
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
 // server). Toggling off drops the connection so the camera stops (ref-counted).
+// camMode swaps which endpoint is used -- the normal feed, the GPU vision colour-
+// threshold tracking mask (/stream_mask.mjpg), or the motion-diff mask
+// (/stream_motion_mask.mjpg) -- see gpu_vision.py's mask viewers. Only one mode is
+// active at a time; clicking the active mode's button returns to the normal feed.
+let camMode="normal";
+function camStreamUrl(){
+  const path = camMode==="color" ? "/stream_mask.mjpg"
+             : camMode==="motion" ? "/stream_motion_mask.mjpg"
+             : "/stream.mjpg";
+  return path+"?t="+Date.now();
+}
+// camWait: a proper "camera disabled"/"camera unavailable" message instead of a
+// blank red <img> broken-image square. lastCameraEnabled tracks the master switch
+// (see set_camera_enable in web_server.py) as last reported by telemetry (onVision
+// below), so the message is specific ("disabled" vs a generic connection failure) and
+// -- the main point -- re-enabling the camera auto-retries the stream on its own
+// instead of requiring a manual page refresh.
+let lastCameraEnabled=true;
+function showCamWait(){
+  const img=$("cam"), wait=$("camWait");
+  img.style.display="none";
+  wait.textContent = lastCameraEnabled
+    ? "⚠ Camera unavailable — check the connection"
+    : "📷 Camera disabled — enable it in Sensors → Camera (GPU vision)";
+  wait.style.display="flex";
+}
+function hideCamWait(){ $("camWait").style.display="none"; }
 $("camOn").addEventListener("change",e=>{
   const img=$("cam"), hint=$("camHint");
-  if(e.target.checked){ img.src="/stream.mjpg?t="+Date.now();
-    img.style.display="block"; hint.style.display="block"; }
-  else { img.removeAttribute("src"); img.style.display="none"; hint.style.display="none"; }
+  if(e.target.checked){
+    hint.style.display="block";
+    if(lastCameraEnabled){ img.src=camStreamUrl(); img.style.display="block"; hideCamWait(); }
+    else showCamWait();
+  }
+  else { img.removeAttribute("src"); img.style.display="none"; hideCamWait(); hint.style.display="none"; }
 });
-$("cam").onerror=()=>{ if($("camOn").checked) $("cam").style.background="#3d1418"; };
+$("cam").onerror=()=>{ if($("camOn").checked) showCamWait(); };
+$("cam").onload=()=>{ hideCamWait(); $("cam").style.display="block"; };
+function setCamMode(mode){
+  camMode = (camMode===mode) ? "normal" : mode;
+  $("visionMaskToggle").textContent=camMode==="color"?"🎥 Show normal feed":"🎭 Show tracking mask";
+  $("visionMaskToggle").classList.toggle("primary",camMode==="color");
+  $("visionMotionMaskToggle").textContent=camMode==="motion"?"🎥 Show normal feed":"👣 Show motion mask";
+  $("visionMotionMaskToggle").classList.toggle("primary",camMode==="motion");
+  if($("camOn").checked){ $("cam").style.background=""; $("cam").src=camStreamUrl(); }
+}
+$("visionMaskToggle").onclick=()=>setCamMode("color");
+$("visionMotionMaskToggle").onclick=()=>setCamMode("motion");
+
+// OLED mask mirror: show the tracking mask on the robot's physical 128x64 panel
+// (POST /vision/oled_mask; gpu_vision writes /dev/shm/nano_oled_mask.bin, oled_display
+// renders it). lastOledMask is synced FROM telemetry in onVision, so this button always
+// toggles the real server state, not a local guess.
+let lastOledMask=false;
+$("visionOledMask").onclick=()=>{
+  fetch("/vision/oled_mask",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({enabled:!lastOledMask})})
+    .then(r=>r.json()).then(d=>{ if(d&&d.error) alert(d.error); }).catch(()=>{});
+};
+
+// Named colour-target palette (GET /vision/targets + select/delete): calibrations are
+// saved server-side under the name typed in #visionTargetName and survive restarts.
+function loadVisionTargets(){
+  fetch("/vision/targets").then(r=>r.ok?r.json():null).then(d=>{
+    if(!d||!d.targets) return;
+    const sel=$("visTargetSel"), names=Object.keys(d.targets);
+    sel.innerHTML="";
+    if(!names.length){ sel.innerHTML='<option value="">(none stored)</option>'; return; }
+    names.forEach(n=>{
+      const o=document.createElement("option");
+      o.value=n; o.textContent=n+(n===d.active?" (active)":"");
+      if(n===d.active) o.selected=true;
+      sel.appendChild(o);
+    });
+  }).catch(()=>{});
+}
+$("visTargetUse").onclick=()=>{
+  const name=$("visTargetSel").value;
+  if(!name) return;
+  fetch("/vision/target_select",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name})}).then(r=>r.json()).then(d=>{
+      if(d&&d.error){ alert(d.error); return; }
+      // the server restored the stored blob tuning -- sync the sliders to it
+      if(d&&d.target){
+        const t=d.target;
+        $("visBlobThresh").value=Math.round((t.threshold||0.22)*100);
+        $("visBlobThreshV").textContent=$("visBlobThresh").value;
+        $("visBlobMin").value=Math.round((t.min_confidence||0)*100);
+        $("visBlobMinV").textContent=$("visBlobMin").value;
+        $("visBlobMax").value=Math.round((t.max_confidence!=null?t.max_confidence:1)*100);
+        $("visBlobMaxV").textContent=$("visBlobMax").value;
+      }
+      loadVisionTargets();
+    }).catch(()=>{});
+};
+$("visTargetDel").onclick=()=>{
+  const name=$("visTargetSel").value;
+  if(!name || !confirm(`Forget the stored target colour "${name}"?`)) return;
+  fetch("/vision/target_delete",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name})}).then(()=>loadVisionTargets()).catch(()=>{});
+};
+loadVisionTargets();
 
 // Webcam mic: stream raw S16LE PCM from /audio.pcm and play it via the Web Audio
 // API. We schedule small AudioBuffers on a short jitter buffer (~180 ms) for low
@@ -1318,32 +1792,189 @@ function micStop(){
 $("micOn").addEventListener("change",e=>{ e.target.checked ? micStart() : micStop(); });
 
 // Power controls -> POST to the web server (same origin). Both are confirmed.
+// The server publishes /oled_system itself so the physical panel flips immediately.
 $("btnReset").onclick=()=>{
   if(!confirm("Restart the whole ROS stack? The page will reconnect in a few seconds.")) return;
-  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"restart"}));  // OLED switches now
   fetch("/system/restart",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
 $("btnReboot").onclick=()=>{
   if(!confirm("REBOOT the SBC?\nThe whole board restarts — the page reconnects once it boots back up.")) return;
-  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"reboot"}));   // OLED switches now
   fetch("/system/reboot",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
 $("btnShutdown").onclick=()=>{
   if(!confirm("SHUT DOWN the SBC?\nIt powers off completely — you must turn it back on by hand.")) return;
-  if(systemTopic) systemTopic.publish(new ROSLIB.Message({data:"shutdown"}));  // OLED switches now
   fetch("/system/shutdown",{method:"POST"}).catch(()=>{});
   setConn(false);
 };
 
-function connect(){
-  ros=new ROSLIB.Ros({url:`ws://${HOST}`});
-  ros.on("connection",()=>{connected=true;setConn(true);subscribe();syncLdsTgt();syncFan();});
-  ros.on("close",()=>{connected=false;setConn(false);});
-  ros.on("error",()=>{setConn(false);});
+// ---- Stress test mode ---- pegs every CPU core with niced (lowest-priority) worker
+// processes server-side (see stress.py) to validate the watchdog/fan-curve hardening
+// under real load; the niceness is what keeps this very page responding throughout, not
+// a reserved core. Status is polled only while a run might be active (started here, or
+// left running by another tab/reload — one poll on load picks that up).
+let stressTimer=null;
+function stressRender(d){
+  const st=$("stressStatus");
+  if(!d || !d.active){
+    st.textContent="idle"; $("stressWorkers").textContent="–"; $("stressRemaining").textContent="–";
+    if(stressTimer){ clearInterval(stressTimer); stressTimer=null; }
+    return;
+  }
+  st.textContent="running";
+  $("stressWorkers").textContent=d.cpu_workers;
+  $("stressRemaining").textContent=Math.ceil(d.remaining)+"s";
+  if(!stressTimer) stressTimer=setInterval(stressPoll,1000);
 }
-function disconnect(){ if(ros) ros.close(); connected=false; setConn(false); }
+function stressPoll(){
+  fetch("/stress/status").then(r=>r.ok?r.json():null).then(stressRender).catch(()=>{});
+}
+$("stressDur").oninput=()=>$("stressDurV").textContent=$("stressDur").value;
+$("stressStart").onclick=()=>{
+  fetch("/stress/start",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({duration:Number($("stressDur").value)})})
+    .then(r=>r.json()).then(d=>{ if(d&&d.error){ alert(d.error); return; } stressRender(d); })
+    .catch(()=>{});
+};
+$("stressStop").onclick=()=>fetch("/stress/stop",{method:"POST"})
+  .then(r=>r.json()).then(stressRender).catch(()=>{});
+stressPoll();
+
+// ---- IMU mounting-interference self-test ---- automates the "walk the loose IMU
+// around by hand" mag-noise hunt (see imu_interference.py): cycles LDS/fan/LED/
+// motors one at a time while parked, server-side, and scores each phase's mag
+// disturbance. Same poll-while-active pattern as the stress test above.
+let imuTestTimer=null;
+const IMU_PHASE_LABEL={baseline:"baseline (quiet)", lds:"LDS spin", fan:"cooling fan",
+  led:"LED", motor:"motor wiggle"};
+function imuTestRender(d){
+  const st=$("imuInterferenceStatus"), rowsEl=$("imuInterferenceResults");
+  if(!d){ return; }
+  if(d.error && !d.active){
+    st.textContent="error: "+d.error;
+  } else if(d.active){
+    st.textContent=`running — phase ${d.phase_i+1}/${d.phase_n}: ${IMU_PHASE_LABEL[d.phase]||d.phase}`;
+  } else if(d.results && d.results.length){
+    st.textContent="done";
+  } else {
+    st.textContent="";
+  }
+  if(!d.active && imuTestTimer){ clearInterval(imuTestTimer); imuTestTimer=null; }
+  if(d.active && !imuTestTimer) imuTestTimer=setInterval(imuTestPoll,500);
+  const rows=(d.results||[]).slice().sort((a,b)=>b.mag_noise_pct-a.mag_noise_pct);
+  rowsEl.innerHTML="";
+  const baselinePct=(d.results||[]).find(r=>r.phase==="baseline");
+  for(const r of rows){
+    const div=document.createElement("div");
+    div.className="row";
+    const over=baselinePct && r.phase!=="baseline" ? r.mag_noise_pct-baselinePct.mag_noise_pct : null;
+    div.style.color = r.mag_noise_pct>=6 ? "var(--red)" : r.mag_noise_pct>=2 ? "var(--amber)" : "var(--green)";
+    div.textContent=`${IMU_PHASE_LABEL[r.phase]||r.phase}: mag noise ${r.mag_noise} (${r.mag_noise_pct}% of field`
+      +(over!==null ? `, +${over.toFixed(1)} over baseline` : "")+`)`
+      +(r.yaw_wobble_deg ? `, yaw wobble ${r.yaw_wobble_deg}°` : "");
+    rowsEl.appendChild(div);
+  }
+}
+function imuTestPoll(){
+  fetch("/imu/interference/status").then(r=>r.ok?r.json():null).then(imuTestRender).catch(()=>{});
+}
+$("imuInterferenceStart").onclick=()=>{
+  const motor=$("imuInterferenceMotor").checked;
+  const warn=motor
+    ? "Run the IMU interference self-test? The robot will spin the LDS, blip the fan/LED, "
+      +"and briefly TURN IN PLACE (motor wiggle) -- make sure the area around it is clear."
+    : "Run the IMU interference self-test? The robot will spin the LDS and blip the fan/LED "
+      +"while parked -- it will NOT drive (motor wiggle is unchecked).";
+  if(!confirm(warn)) return;
+  fetch("/imu/interference/start",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({include_motor:motor})})
+    .then(r=>r.json()).then(d=>{ if(d&&d.error){ alert(d.error); return; } imuTestRender(d); })
+    .catch(()=>{});
+};
+$("imuInterferenceStop").onclick=()=>fetch("/imu/interference/stop",{method:"POST"})
+  .then(r=>r.json()).then(imuTestRender).catch(()=>{});
+imuTestPoll();
+
+// Camera snapshot: one still JPEG in a new tab (the server ref-counts the camera,
+// so this works with the live stream off). Cache-busted so each click is a new grab.
+$("camShot").onclick=()=>window.open("/snapshot.jpg?t="+Date.now(),"_blank");
+
+// GPU vision click-to-calibrate: arm, then the next click on the video samples that
+// pixel's colour client-side (canvas) and POSTs it -- see onCamPickClick above.
+$("visionPick").onclick=()=>visionPickArmed?disarmVisionPick():armVisionPick();
+$("visionClear").onclick=()=>{
+  disarmVisionPick();
+  fetch("/vision/calibrate",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({clear:true})}).then(()=>loadVisionTargets()).catch(()=>{});
+  resetBlobTuneUI();   // clearing also resets tuning server-side, same as a fresh pick
+};
+$("cam").addEventListener("click",onCamPickClick);
+
+// Master camera on/off (see set_camera_enable in web_server.py) -- stops GpuVision AND
+// the direct passthrough entirely. Synced FROM telemetry (see onVision), so this
+// handler only fires on a genuine user click, not the programmatic sync.
+$("visCameraEnable").onchange=()=>{
+  const enabled=$("visCameraEnable").checked;
+  fetch("/vision/camera_enable",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({enabled})}).catch(()=>{});
+};
+
+// Health events: poll sys_monitor's durable outage log only while the box is open
+// (each poll is an HTTP round-trip to the board — no point when nobody's looking).
+(function(){
+  const box=$("healthBox"), out=$("healthLog"); let timer=null;
+  function load(){
+    fetch("/health/log").then(r=>r.json()).then(d=>{
+      const lines=(d.lines||[]);
+      out.textContent=lines.length?lines.slice().reverse().join("\n"):"no events logged yet";
+    }).catch(()=>{ out.textContent="log unavailable (dev harness / server too old)"; });
+  }
+  box.addEventListener("toggle",()=>{
+    clearInterval(timer); timer=null;
+    if(box.open){ load(); timer=setInterval(load,5000); }
+  });
+})();
+
+// Live telemetry: ONE EventSource on /telemetry replaces every rosbridge
+// subscription — the server pushes a compact JSON frame ~5x/s with all the light
+// readouts (odom/IMU/diagnostics/ESP32/LDS/OLED mirror/brain). /scan and /map stay
+// on their /dev/shm+HTTP polls (heaviest data, unchanged). Auto-reconnects with a
+// gentle backoff across a stack restart / reboot; manual Disconnect stops retrying.
+// On the dev harness /telemetry doesn't exist, so the page shows disconnected and
+// the HTTP pollers (brain card, OLED mirror) take over — same behaviour as before.
+let es=null, wantConn=true, reconnT=null, reconnDelay=1000;
+function scheduleReconnect(){
+  if(!wantConn || reconnT) return;
+  $("conn").textContent="reconnecting…";
+  reconnT=setTimeout(()=>{ reconnT=null; if(wantConn && !connected) connect(); }, reconnDelay);
+  reconnDelay=Math.min(10000, reconnDelay*1.5);
+}
+function connect(){
+  wantConn=true;
+  if(reconnT){ clearTimeout(reconnT); reconnT=null; }
+  if(es){ es.close(); es=null; }
+  es=new EventSource("/telemetry");
+  es.onopen=()=>{
+    connected=true; reconnDelay=1000; setConn(true);
+    OLED.tel({ip:location.hostname||"robot"});
+    // Re-assert the page's authoritative state on every (re)connect: LDS setpoint,
+    // fan override, pickup override (a fresh load publishes auto = clears stale
+    // overrides), and the OLED dashboard/words toggles.
+    syncLdsTgt(); syncFan(); publishPickupOv(); sendDash(); sendWords();
+  };
+  es.onmessage=e=>{ try{ onFrame(JSON.parse(e.data)); }catch(err){} };
+  es.onerror=()=>{
+    if(es){ es.close(); es=null; }
+    connected=false; setConn(false); scheduleReconnect();
+  };
+}
+function disconnect(){
+  wantConn=false;
+  if(reconnT){ clearTimeout(reconnT); reconnT=null; }
+  if(es){ es.close(); es=null; }
+  connected=false; setConn(false);
+}
 function setConn(ok){
   $("dot").classList.toggle("ok",ok);
   $("conn").textContent=ok?"connected":"disconnected";
@@ -1351,106 +1982,492 @@ function setConn(ok){
   $("connect").classList.toggle("primary",!ok);
 }
 
-function subscribe(){
-  // NB: /scan is NOT bridged here — it's the heaviest message (360 floats) and
-  // dominated rosbridge CPU. The lidar driver writes a compact blob to /dev/shm and we
-  // poll it over HTTP (see pollScan below), same update rate, no rosbridge cost.
-  odomTopic=new ROSLIB.Topic({ros,name:"/odom",messageType:"nav_msgs/msg/Odometry",
-    throttle_rate:100,queue_length:1});
-  odomTopic.subscribe(onOdom);
-  cmdTopic=new ROSLIB.Topic({ros,name:"/cmd_vel",messageType:"geometry_msgs/msg/Twist"});
-  // (TTS/speech goes over HTTP POST /tts, not rosbridge — see sendOled.)
-  faceTopic=new ROSLIB.Topic({ros,name:"/oled_face",messageType:"std_msgs/msg/String"});
-  systemTopic=new ROSLIB.Topic({ros,name:"/oled_system",messageType:"std_msgs/msg/String"});
-  // /imu/web is a tiny summary (|accel|,|gyro|,actual /imu/data Hz) the node emits at
-  // ~15 Hz, so we don't make rosbridge bridge the full 50 Hz /imu/data just for a readout.
-  imuTopic=new ROSLIB.Topic({ros,name:"/imu/web",messageType:"geometry_msgs/msg/Vector3Stamped",
-    throttle_rate:0,queue_length:1});
-  imuTopic.subscribe(onImu);
-  eulTopic=new ROSLIB.Topic({ros,name:"/imu/euler",messageType:"geometry_msgs/msg/Vector3Stamped",
-    throttle_rate:100,queue_length:1});
-  eulTopic.subscribe(onEul);
-  sysTopic=new ROSLIB.Topic({ros,name:"/diagnostics",messageType:"diagnostic_msgs/msg/DiagnosticArray",
-    throttle_rate:1000,queue_length:1});
-  sysTopic.subscribe(onDiag);
-  imuParamSrv=new ROSLIB.Service({ros,name:"/imu_driver/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  ldsParamSrv=new ROSLIB.Service({ros,name:"/lds_driver/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  odoParamSrv=new ROSLIB.Service({ros,name:"/wheel_odometry/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  // cooling fan: live duty readout + override service (sys_monitor owns the curve).
-  fanTopic=new ROSLIB.Topic({ros,name:"/fan_pwm",messageType:"std_msgs/msg/Float32",
-    throttle_rate:1000,queue_length:1});
-  fanTopic.subscribe(m=>$("fanDuty").textContent=(m.data*100).toFixed(0)+"%");
-  fanParamSrv=new ROSLIB.Service({ros,name:"/sys_monitor/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
+// ---- telemetry frame fan-out: one frame updates every readout ----------------
+let rawPurpose="", rawTask="", rawExp="", rawSelftest="", rawSchedule="", rawImuCal="", rawMountSettings="";
+function onFrame(f){
+  if(f.odom) onOdom(f.odom);
+  if(f.imu) onImu(f.imu);
+  if(f.eul) onEul(f.eul);
+  if(f.diag) onDiag(f.diag);
+  onEsp(f.esp||{}, f.susp||[]);
+  onLds(f.lds||{});
+  if(f.fan!==undefined) $("fanDuty").textContent=(f.fan*100).toFixed(0)+"%";
+  if(f.plan) mapPlan=f.plan;
+  onVision(f.vision);
+  if(f.selftest && f.selftest!==rawSelftest){ rawSelftest=f.selftest;
+    const el=$("mapTestOut"); el.style.display="block"; el.textContent=f.selftest; }
+  // IMU mag readout for eyeballing calibration quality (see the IMU card's hint) +
+  // the async status line from imu_driver._publish_cal_status.
+  if(f.imuMag) onImuMag(f.imuMag);
+  if(f.imuCalStatus && f.imuCalStatus!==rawImuCal){ rawImuCal=f.imuCalStatus;
+    const el=$("imuCalOut"); el.style.display="block"; el.textContent=f.imuCalStatus; }
+  // Populate the offset/mount-rotation fields with the TRUE effective values (they're
+  // plain inputs with a static "0" in the HTML -- nothing else tells the browser what
+  // imu_driver actually loaded from its persisted settings file). Latched + only
+  // re-applied on an actual change, so it won't fight with the user mid-edit (a saved
+  // value only republishes after the SAME onchange that set it, echoing back what was
+  // just typed).
+  if(f.imuMountSettings && f.imuMountSettings!==rawMountSettings){
+    rawMountSettings=f.imuMountSettings;
+    try{
+      const s=JSON.parse(f.imuMountSettings);
+      $("imuOffX").value=s.offset_x_mm; $("imuOffY").value=s.offset_y_mm; $("imuOffZ").value=s.offset_z_mm;
+      $("imuMountRoll").value=s.mount_roll_deg; $("imuMountPitch").value=s.mount_pitch_deg;
+      $("imuMountYaw").value=s.mount_yaw_deg;
+      updateImu3dOffset();
+    }catch(e){}
+  }
+  if(f.imu_drift) onImuDrift(f.imu_drift);
+  // Brain readouts arrive as the same latched JSON strings the behaviour node
+  // publishes; only re-render when they actually change (frames tick ~5 Hz).
+  if(f.purpose && f.purpose!==rawPurpose){ rawPurpose=f.purpose; renderPurpose(f.purpose); }
+  if(f.task && f.task!==rawTask){ rawTask=f.task; renderTask(f.task); }
+  if(f.experiments && f.experiments!==rawExp){ rawExp=f.experiments; renderExperiments(f.experiments); }
+  if(f.schedule && f.schedule!==rawSchedule){ rawSchedule=f.schedule; onScheduleFrame(f.schedule); }
+  // OLED mirror: feed the client-side panel copy the same inputs the physical
+  // panel renders from. (Dashboard/words toggles are page-owned — sendDash/sendWords.)
+  const o=f.oled||{};
+  OLED.setFace(o.face||""); OLED.setWord(o.word||""); OLED.setBrand(o.brand||"");
+  if(o.system) OLED.setSystem(o.system);
+}
 
-  // ---- ESP32 coprocessor (native zenoh-pico over UART, in the rmw_zenoh graph) ----
-  hbTopic=new ROSLIB.Topic({ros,name:"/esp32_heartbeat",
-    messageType:"std_msgs/msg/Int32",throttle_rate:0,queue_length:1});
-  hbTopic.subscribe(onHb);
-  ticksTopic=new ROSLIB.Topic({ros,name:"/wheel_ticks",
-    messageType:"std_msgs/msg/Int64MultiArray",throttle_rate:100,queue_length:1});
-  ticksTopic.subscribe(onTicks);
-  suspLTopic=new ROSLIB.Topic({ros,name:"/left_wheel_suspended",
-    messageType:"std_msgs/msg/Bool",queue_length:1});
-  suspLTopic.subscribe(m=>suspTxt("espSuspL",m.data));
-  suspRTopic=new ROSLIB.Topic({ros,name:"/right_wheel_suspended",
-    messageType:"std_msgs/msg/Bool",queue_length:1});
-  suspRTopic.subscribe(m=>suspTxt("espSuspR",m.data));
-  tempTopic=new ROSLIB.Topic({ros,name:"/esp32_temp",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  tempTopic.subscribe(m=>$("espTemp").textContent=m.data.toFixed(1)+"°C");
-  hallTopic=new ROSLIB.Topic({ros,name:"/esp32_hall",
-    messageType:"std_msgs/msg/Int32",queue_length:1});
-  hallTopic.subscribe(m=>$("espHall").textContent=m.data);
-  ldsRpmTopic=new ROSLIB.Topic({ros,name:"/lds_rpm",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  ldsRpmTopic.subscribe(m=>$("espLdsRpm").textContent=m.data.toFixed(0)+" rpm");
-  ldsHzTopic=new ROSLIB.Topic({ros,name:"/lds_hz",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  ldsHzTopic.subscribe(m=>$("espLdsHz").textContent=m.data.toFixed(1)+" Hz");
-  ldsDutyTopic=new ROSLIB.Topic({ros,name:"/lds_duty",
-    messageType:"std_msgs/msg/Float32",queue_length:1});
-  ldsDutyTopic.subscribe(m=>$("espLdsDuty").textContent=(m.data*100).toFixed(0)+"%");
-  ldsTgtTopic=new ROSLIB.Topic({ros,name:"/lds_target_rpm",messageType:"std_msgs/msg/Float32"});
-  // slam_nav: click-to-go goal, the planned path overlay, and the motion toggle.
-  goalTopic=new ROSLIB.Topic({ros,name:"/goal_pose",messageType:"geometry_msgs/msg/PoseStamped"});
-  homeTopic=new ROSLIB.Topic({ros,name:"/slam_nav/go_home",messageType:"std_msgs/msg/Bool"});
-  saveTopic=new ROSLIB.Topic({ros,name:"/slam_nav/save_map",messageType:"std_msgs/msg/Bool"});
-  // calibration self-test: trigger on /selftest (Bool), read the report on /selftest_result
-  testTopic=new ROSLIB.Topic({ros,name:"/selftest",messageType:"std_msgs/msg/Bool"});
-  testResTopic=new ROSLIB.Topic({ros,name:"/selftest_result",
-    messageType:"std_msgs/msg/String",throttle_rate:0,queue_length:1});
-  testResTopic.subscribe(m=>{ const el=$("mapTestOut"); el.style.display="block"; el.textContent=m.data; });
-  navMotionSrv=new ROSLIB.Service({ros,name:"/slam_nav/set_parameters",
-    serviceType:"rcl_interfaces/srv/SetParameters"});
-  planTopic=new ROSLIB.Topic({ros,name:"/plan",messageType:"nav_msgs/msg/Path",
-    throttle_rate:200,queue_length:1});
-  planTopic.subscribe(m=>{ mapPlan=(m.poses||[]).map(p=>[p.pose.position.x,p.pose.position.y]); });
-  // Brain: purpose / current task / experiment stats (latched JSON strings from the
-  // behaviour node; it also republishes on a ~5 s heartbeat so we don't miss the latch).
-  purposeTopic=new ROSLIB.Topic({ros,name:"/purpose",messageType:"std_msgs/msg/String"});
-  purposeTopic.subscribe(m=>renderPurpose(m.data));
-  taskTopic=new ROSLIB.Topic({ros,name:"/task_current",messageType:"std_msgs/msg/String"});
-  taskTopic.subscribe(m=>renderTask(m.data));
-  expTopic=new ROSLIB.Topic({ros,name:"/experiments",messageType:"std_msgs/msg/String"});
-  expTopic.subscribe(m=>renderExperiments(m.data));
+// GPU vision (gpu_vision.py): absent from the frame entirely when gpu_vision_enable
+// is off, so the Sensors card just shows "off" -- no behavior change otherwise. Runs
+// continuously server-side regardless of whether the Camera tab is open, so this
+// readout works even with the video view never opened. The status numbers live in the
+// Sensors panel only (no on-video badge, per user preference) -- the crosshair is kept
+// on the video itself since it's a spatial indicator, not a text label.
+// Hover explanations for the Sensors tab (both "System health" and "Camera (GPU
+// vision)" cards) -- readouts AND every tunable slider/toggle. Applied as plain
+// native `title` attributes (zero new UI component, browser handles the hover) via
+// element ID, so this needed no changes to the HTML markup itself. Toggleable
+// (#hintsToggle) and persisted across reloads via localStorage, since it's a pure
+// display preference, not robot state.
+const HINTS = {
+  // System health
+  sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
+  sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
+  sysMem: "RAM used/total (from /proc/meminfo: MemTotal - MemAvailable).",
+  sysTemp: "SBC CPU die temperature, from the cpu-thermal sysfs zone.",
+  sysDisk: "Root filesystem usage percent.",
+  sysWifi: "WiFi signal strength (dBm) and link quality (green ≥ -60dBm, amber ≥ -75, red below).",
+  sysUp: "Time since this stack process last started (not the board's boot time).",
+  // Camera (GPU vision) card -- toggles
+  visCameraEnable: "Master camera switch -- turns off BOTH GPU vision AND the direct passthrough entirely.",
+  visDarkAuto: "Auto-toggles the ESP32's /led from frame brightness, with hysteresis (on/off thresholds must stay apart to avoid flicker).",
+  // Camera card -- readouts
+  visMotion2: "PIR-style motion score: average per-pixel frame-to-frame change (0-100%). Near zero = static scene.",
+  visMotionCenter2: "Where in frame motion is concentrated (x%,y% from top-left), weighted by change magnitude.",
+  visTarget2: "Colour-blob tracker lock status -- \"locked N%\" means N% of the frame matches the calibrated colour.",
+  visIntercept2: "Kinetic intercept: growth rate of the tracked colour target's size (per second) -- high + sustained = approaching the lens.",
+  visMotionIntercept2: "Same growth-rate idea, but for raw motion -- no calibrated colour needed, flags anything looming.",
+  visMotionTargetMatch2: "Distance between the motion centroid and the tracked colour's centroid -- small = the thing that's moving IS the tracked target.",
+  visLuma2: "Average frame brightness (0-100%), same shader pass the flashlight/dark reflex uses.",
+  visObstructed2: "Flags a flat, dark frame (hand/dust over the lens) -- shows the raw flatness (variance) number plus the alert.",
+  visColorCast2: "Average scene colour split by channel (R/G/B%) -- flags a strong colour cast (e.g. warm incandescent light).",
+  visEdgeDensity2: "How much texture/contrast is in the whole frame -- a static complement to \"motion,\" flags visual clutter.",
+  visOverhead2: "Same texture signal, cropped to just the top 30% of frame -- a heuristic for structure above the lidar's 2D scan plane (an overhang the lidar can't see).",
+  visShiny2: "Fraction of frame matching a fixed near-white colour -- flags shiny/wet/reflective surfaces.",
+  visBacklit2: "Flags a bright spot in an otherwise dim scene (e.g. a window behind a dark subject) -- shows the brightness delta.",
+  visFocusBlur2: "Flags a sudden texture drop while the scene is still lit -- something close/blocking the lens, distinct from full darkness.",
+  visGpuDuty2: "Software-measured fraction of each frame's time budget spent in the shader+readback pipeline. Over 100% means the vision loop is falling behind the configured fps.",
+  visBumper2: "Optical virtual bumper: commanded to move but no visual motion detected for a while -- a possible wheel stall/slip.",
+  visBumperCmd2: "The /cmd_vel currently being commanded, as seen by the bumper check.",
+  visBumperHeld2: "How long the stall condition has held, while commanded to move.",
+  // Dark reflex sliders
+  visDarkOn: "Brightness below which the LED turns on.",
+  visDarkOff: "Brightness above which the LED turns back off (kept above the on-threshold to avoid flicker).",
+  // Optical bumper tuning
+  visBumpEps: "Minimum commanded speed (linear or angular) to count as \"actually driving.\"",
+  visBumpFloor: "GPU motion score below this counts as \"nothing visibly moved.\"",
+  visBumpSecs: "How long the stall condition must hold before the bumper alerts.",
+  // Blob tracking tuning
+  visBlobThresh: "Colour-match tolerance -- how close a pixel must be to the calibrated colour to count (higher = more forgiving).",
+  visBlobMin: "Minimum matched fraction of frame to count as a real lock (raise to reject a few stray matching pixels).",
+  visBlobMax: "Maximum matched fraction of frame to still count as a lock (lower to reject a colour that also matches the background).",
+  // Vision alerts tuning (all initial guesses except var_max, informed by a real reading)
+  visObstrVar: "Luma-variance ceiling for \"flat/textureless\" -- lower = stricter. Tuned from a real reading (400, vs. an ordinary scene's ~2700).",
+  visObstrDark: "Brightness ceiling, combined with flatness above, for the obstruction alert -- both conditions must hold.",
+  visClutter: "Visual-interest (edge-density) ceiling above which the scene counts as \"cluttered.\"",
+  visOverhead: "Same edge-density ceiling, for the top-of-frame \"overhead structure\" signal.",
+  visFocusBlur: "Edge-density floor below which (while still lit) the scene counts as defocused/blocked.",
+  visBacklit: "Brightness-delta floor (brightest patch minus average) for the backlit alert.",
+  visHighlight: "Highlight-fraction ceiling above which the scene counts as \"shiny.\"",
+  visLooming: "Motion-intercept-rate ceiling above which something counts as looming.",
+  visColorcast: "Colour-channel spread (max minus min of R/G/B) above which the scene counts as colour-cast.",
+  visMotionTarget: "Distance BELOW which the motion centroid counts as matching the tracked colour target.",
+  // 2026-07-13 batch
+  visTargetName2: "Which named palette entry is currently being tracked (see the Named targets row / the target-name box in the Camera view).",
+  visApproach2: "Motion growing fast AND centred in frame = someone/something walking up to the robot. Drives the behaviour layer's anticipatory greeting.",
+  visNovelty2: "How different the scene looks vs. a slow ~20s background average -- stays high while something is genuinely different, then habituates. Boosts the autonomous \"looking\" beat.",
+  visCamFreeze2: "Flags a capture path that stopped delivering frames (or keeps delivering the identical buffer) -- a USB/driver wedge, distinct from the optical bumper's wheel-stall case.",
+  visVibration2: "Image much blurrier while driving than the standing-still baseline -- excess chassis vibration (loose screw, wheel imbalance). A maintenance hint, not a stop.",
+  visTargetSel: "The persistent calibration palette -- pick a stored colour target and press Track to make it live.",
+  visTargetUse: "Make the selected stored target the live tracked colour (also restores its saved tuning).",
+  visTargetDel: "Forget the selected stored target. Deleting the active one stops tracking.",
+  navTrackEnable: "Turns the robot in place to keep the calibrated colour target centered in the camera frame (pan only, never drives forward/back). Wins over any active nav goal/auto-explore while on; still respects enable_motion, pick-up freeze, and self-test.",
+  trackKp: "Turn gain -- rad/s commanded per unit of horizontal off-center error. Higher = snappier, but can overshoot/oscillate.",
+  trackKd: "Braking -- opposes the robot's OWN measured turning speed (from the IMU), damping overshoot from momentum near the setpoint. Higher = brakes harder, but too high can make it feel sluggish/hesitant.",
+  trackMaxAng: "Cap on the turn rate while tracking. Raised well above the old 0.8 default -- the ESP32's stiction compensation means real motor duty barely changes across this whole range, so a higher cap is nearly free extra tracking speed.",
+  trackMinEffAng: "Smallest turn rate that reliably moves the wheels at all (below this the ESP32's stiction compensation means the command does nothing). Fine corrections below this are time-dithered -- short pulses at this rate -- instead of asking for a rate the hardware can't produce, which is what actually fixes overshoot right at the setpoint. Shouldn't normally need tuning.",
+  trackDeadband: "How close to dead-center counts as \"close enough\" -- no turning inside this band.",
+  trackConfMin: "Minimum blob-lock confidence to trust before turning -- rejects noise/flicker locks too small to act on.",
+  visGlare: "Glare rejection: derates the blob lock confidence by the frame's specular-highlight fraction, so a shiny reflection matching the tracked hue can't hold a false lock. 0 = off.",
+  visNoveltyAlert: "Novelty score above which the \"scene changed\" alert fires.",
+  visCamStall: "Seconds without a new frame (or with an exactly-zero diff) before the camera counts as frozen.",
+  visVibRatio: "Driving edge-density below this fraction of the standing-still baseline counts as excess blur.",
+  visVibSecs: "How long the excess blur must hold before the vibration flag fires.",
+  visApproachRate: "Motion growth rate above which something counts as approaching.",
+  visApproachBand: "How close to frame centre the motion must be to count as approaching (rules out edge clutter).",
+  visionTargetName: "Name this calibration ('ball', 'dock marker', ...) -- every pick is saved to a persistent palette under this name.",
+  visionOledMask: "Mirror the tracking mask to the robot's physical OLED (128x64) -- the face yields while it's on.",
+  // IMU card -- SLAM error margins. Grounded in slam_nav's params: the scan matcher
+  // corrects heading by up to ±6.9° per scan (match_ang 0.12 rad); a parked robot
+  // re-matches after ~0.3° drift (still_ang), so slow bias is continuously absorbed.
+  imuA: "Total acceleration magnitude. Parked it must read gravity: 9.81 ±0.3 green, ±1.0 amber, worse red -- off means the accel needs calibrating (tilts the fused roll/pitch/yaw SLAM leans on). Colour-graded only while stationary; driving legitimately moves it.",
+  imuG: "Gyro magnitude. Parked it should be ~0: ≤1°/s green, ≤3 amber, above red (uncorrected bias or vibration). Graded only while stationary.",
+  imuMagNoise: "Peak-to-peak wobble of the mag field magnitude over 2s, plus that wobble as a % of the field -- ~0.6° of heading error per 1%. ≤2% green (≤~1° wobble), ≤6% amber, above red: eats half+ of the scan matcher's ±6.9°/scan correction window.",
+  imuMagWorst: "Biggest 2s mag wobble since the last reset (raw counts) -- peak-hold for walking the loose IMU around candidate mounting spots.",
+  driftStill: "How long the robot has been provably stationary (not commanded, wheels grounded). The drift numbers below only accumulate -- and only get colour-graded -- during this.",
+  driftRoll: "Roll change while parked. Should be ~0: ≤0.3° green, ≤1° amber, above red. 2D SLAM ignores roll directly, but real movement here means bad accel cal or vibration tilting the scan plane.",
+  driftPitch: "Pitch change while parked. Same margins as roll: ≤0.3° green, ≤1° amber, above red.",
+  driftYaw: "Total yaw change this still period. Graded against the scan matcher's ±6.9°/scan correction budget: ≤1° green, ≤3.5° (half window) amber, above red. Slow drift is auto-corrected (SLAM re-matches after ~0.3°); a sudden JUMP past ~7° between scans is what actually loses localization.",
+  driftRate: "Yaw drift normalized to °/min -- the IMU heading-health number. ≤1°/min green (a real gyro-bias level); 1-6 amber (SLAM still corrects it, but run the mag cal / check mounting); ≥6 red -- that's magnetometer interference territory, the prime suspect for the erratic self-test SPIN check and map corruption.",
+  imuAxis6: "Switch the BWT901CL to 6-axis fusion: yaw becomes gyro-only, no magnetometer. Trades mag interference JUMPS (which the scan matcher can't absorb) for slow gyro DRIFT (which it's built to absorb). Try this if the mag-noise/drift-rate numbers above keep reading red. Save (above) to persist to flash.",
+  imuAxis9: "Switch back to the BWT901CL's default 9-axis fusion (magnetometer fused into yaw). Save (above) to persist to flash.",
+  imuZeroYaw: "Reset the currently-reported heading to 0°. Only meaningful in 6-axis mode -- in 9-axis mode the magnetometer re-asserts its own heading on the next update.",
+  imuBandwidth: "The BWT901CL's own internal analog low-pass filter on accel/gyro (separate from the publish-rate slider above). Lower rejects more motor/chassis vibration noise at the source, at the cost of response lag. Try 10 Hz if readings are noisy even while genuinely stationary.",
+  imuInterferenceStart: "Automates the mounting-interference hunt: while parked, cycles the LDS spin / cooling fan / LED (and optionally a brief motor wiggle) one at a time and scores each one's magnetometer disturbance, worst first -- no more holding the loose IMU near each part by hand. Runs on its own publishers regardless of skills_allow_actions (that flag only gates AUTONOMOUS skills) -- this WILL actuate the LDS/fan/LED and, if checked, briefly turn the robot.",
+  imuInterferenceStop: "Cancel a running interference self-test and restore every actuator (fan/LED/motors) to its resting state.",
+  imuInterferenceMotor: "Add a brief in-place turn as a 4th test phase. Mag magnitude is rotation-invariant so it still attributes cleanly; this phase is scored on yaw wobble instead of the stationary-only mag-noise numbers the other phases use.",
+};
+function applyHints(on){
+  for(const [id,text] of Object.entries(HINTS)){
+    const el=document.getElementById(id);
+    if(!el) continue;
+    if(on) el.title=text; else el.removeAttribute("title");
+  }
+}
+let hintsOn = localStorage.getItem("nano_hints")!=="off";
+$("hintsToggle").checked=hintsOn;
+applyHints(hintsOn);
+$("hintsToggle").onchange=()=>{
+  hintsOn=$("hintsToggle").checked;
+  localStorage.setItem("nano_hints", hintsOn?"on":"off");
+  applyHints(hintsOn);
+};
+
+let blobTuneSynced=false, cameraEnableSynced=false;
+function onVision(v){
+  const cross=$("visionCrosshair");
+  const ids=["visMotion2","visMotionCenter2","visTarget2","visTargetName2","visIntercept2",
+    "visMotionIntercept2","visMotionTargetMatch2","visApproach2","visNovelty2","visLuma2",
+    "visObstructed2","visCamFreeze2","visVibration2","visColorCast2","visEdgeDensity2",
+    "visOverhead2","visShiny2","visBacklit2","visFocusBlur2","visGpuDuty2","visBumper2"];
+  if(!v){
+    if(cross) cross.style.display="none";
+    ids.forEach(id=>{ const el=$(id); if(el) el.textContent="off"; });
+    return;
+  }
+  if(!cameraEnableSynced && v.camera_enabled!=null){
+    $("visCameraEnable").checked=!!v.camera_enabled; cameraEnableSynced=true;
+  }
+  // Sync the blob-tuning sliders to whatever's ACTUALLY active once (e.g. a target was
+  // already calibrated from a previous session, or another browser tab) -- after that,
+  // resetBlobTuneUI() on a fresh pick/clear keeps them in sync without fighting drags.
+  if(!blobTuneSynced && v.has_target_color && v.blob_tuning){
+    const [th,mn,mx]=v.blob_tuning;
+    $("visBlobThresh").value=Math.round(th*100); $("visBlobThreshV").textContent=Math.round(th*100);
+    $("visBlobMin").value=Math.round(mn*100); $("visBlobMinV").textContent=Math.round(mn*100);
+    $("visBlobMax").value=Math.round(mx*100); $("visBlobMaxV").textContent=Math.round(mx*100);
+    blobTuneSynced=true;
+  }
+  const camOff=(v.camera_enabled===false);
+  // Track the master camera switch's state across ticks so the live-view <img> reacts
+  // immediately (not just on its own onerror) -- disabling shows the message even if
+  // this specific connection hasn't errored yet (a mid-stream toggle only takes effect
+  // on the NEXT connection, see web_server.py's _cam property comment); re-enabling
+  // auto-retries the stream instead of leaving the user needing a manual page refresh.
+  const wasCameraEnabled=lastCameraEnabled;
+  lastCameraEnabled=!camOff;
+  if($("camOn").checked){
+    if(camOff) showCamWait();
+    else if(!wasCameraEnabled){
+      $("cam").src=camStreamUrl(); $("cam").style.display="block"; hideCamWait();
+    }
+  }
+  const paused=camOff;
+  const pausedReason="camera off";
+  [$("visionPick"),$("visionClear")].forEach(b=>{ if(b) b.disabled=paused; });
+  // OLED mask mirror: label + highlight follow the server state (v.oled_mask), so a
+  // toggle from another tab -- or the server auto-dropping it when the camera stops --
+  // is always reflected here.
+  lastOledMask=!!v.oled_mask;
+  const om=$("visionOledMask");
+  if(om){ om.disabled=paused;
+    om.classList.toggle("primary",lastOledMask);
+    om.textContent=lastOledMask?"🖥 Stop OLED mirror":"🖥 Mask → OLED"; }
+  // A reported target has already passed the server's min/max blob-size gate (see
+  // GpuVision._loop / the "Blob tracking tuning" sliders) -- that IS the lock condition
+  // now, so there's no separate confidence floor here to fight the tuning sliders.
+  const locked=!paused && !!v.target;
+  const set=(id,txt)=>{ const el=$(id); if(el){ el.textContent=txt; el.style.opacity=paused?0.5:1; } };
+  set("visMotion2", paused?pausedReason:(v.motion*100).toFixed(1)+"%");
+  set("visMotionCenter2", paused?"–":(v.motion_center
+    ? `${(v.motion_center[0]*100).toFixed(0)}%,${(v.motion_center[1]*100).toFixed(0)}%` : "none"));
+  set("visTarget2", paused?"–":(v.target ? "locked "+(v.target[2]*100).toFixed(0)+"%"
+                              : (v.has_target_color ? "searching" : "no target set")));
+  set("visTargetName2", v.target_name||"–");
+  const alerts=v.alerts||{};
+  set("visApproach2", paused?"–":(v.approach?"⚠ something approaching":"no"));
+  set("visNovelty2", paused?"–":((v.novelty||0)*100).toFixed(1)+"%"
+    +(alerts.novelty?" ⚠ scene changed":""));
+  const cfEl=$("visCamFreeze2");
+  if(cfEl){ cfEl.textContent=paused?"–":(alerts.camera_freeze?"⚠ FROZEN":"live"
+      +(v.frame_age!=null?` (${v.frame_age.toFixed(1)}s)`:""));
+    cfEl.style.color=(!paused && alerts.camera_freeze)?"var(--red)":""; cfEl.style.opacity=paused?0.5:1; }
+  set("visVibration2", paused?"–":(alerts.vibration?"⚠ excess blur while driving":"clear"));
+  set("visIntercept2", paused?"–":(v.target ? (v.intercept_rate*100).toFixed(0)+"%/s" : "–"));
+  set("visMotionIntercept2", paused?"–":(v.motion_intercept_rate*100).toFixed(0)+"%/s"
+    +(!paused && alerts.looming?" ⚠ looming":""));
+  set("visMotionTargetMatch2", paused?"–":(v.motion_target_match!=null
+    ? (v.motion_target_match*100).toFixed(0)+"%"+(alerts.motion_matches_target?" ✓ match":"") : "–"));
+  set("visLuma2", paused?"–":(v.luma*100).toFixed(0)+"%");
+  const obEl=$("visObstructed2");
+  if(obEl){ obEl.textContent=paused?"–":
+      `var ${v.luma_variance.toFixed(0)}`+(alerts.obstructed?" ⚠ covered/dark":" clear");
+    obEl.style.color=(!paused && alerts.obstructed)?"var(--red)":""; obEl.style.opacity=paused?0.5:1; }
+  set("visColorCast2", paused?"–":(v.color_cast
+    ? `R${(v.color_cast[0]*100).toFixed(0)} G${(v.color_cast[1]*100).toFixed(0)} B${(v.color_cast[2]*100).toFixed(0)}`
+      +(alerts.colorcast?" ⚠ cast":"")
+    : "–"));
+  set("visEdgeDensity2", paused?"–":(v.edge_density*100).toFixed(0)+"%"+(alerts.clutter?" ⚠ cluttered":""));
+  set("visOverhead2", paused?"–":(v.overhead_edge_density*100).toFixed(0)+"%"+(alerts.overhead_alert?" ⚠ possible overhang":""));
+  set("visShiny2", paused?"–":(v.highlight_fraction*100).toFixed(0)+"%"+(alerts.shiny?" ⚠ shiny":""));
+  set("visBacklit2", paused?"–":
+    `Δ${((v.luma_max-v.luma)*100).toFixed(0)}%`+(alerts.backlit?" ⚠ backlit":" clear"));
+  set("visFocusBlur2", paused?"–":(alerts.focus_blur?"⚠ blurred/close":"clear"));
+  set("visGpuDuty2", paused?"–":(v.gpu_duty*100).toFixed(0)+"%");
+  const bump=v.bumper||{alert:false,commanded:false,cmd_vel:[0,0],low_motion_secs:0};
+  const bEl=$("visBumper2");
+  if(bEl){ bEl.textContent=paused?"–":(bump.alert?"⚠ possible stall":"clear");
+    bEl.style.color=(!paused && bump.alert)?"var(--red)":""; bEl.style.opacity=paused?0.5:1; }
+  set("visBumperCmd2", paused?"–":(bump.commanded
+    ? `lin ${bump.cmd_vel[0].toFixed(2)} ang ${bump.cmd_vel[1].toFixed(2)}` : "not driving"));
+  set("visBumperHeld2", paused?"–":(bump.commanded ? bump.low_motion_secs.toFixed(1)+"s" : "–"));
+  if(cross){
+    const r=locked && camDisplayRect();
+    if(r){
+      cross.style.left=(r.left+v.target[0]*r.width)+"px";
+      cross.style.top=(r.top+v.target[1]*r.height)+"px";
+      cross.style.display="block";
+    } else cross.style.display="none";
+  }
+}
+
+// Dark reflex config -> web_control params (see PARAM_WHITELIST in telemetry.py).
+// UI sliders are 0-100%, the backend stores 0..1 luma fractions.
+function syncDarkReflex(){
+  let on=Number($("visDarkOn").value), off=Number($("visDarkOff").value);
+  if(off<=on){ off=Math.min(100,on+5); $("visDarkOff").value=off; }
+  $("visDarkOnV").textContent=on; $("visDarkOffV").textContent=off;
+  setParam("web_control","vision_dark_threshold",on/100);
+  setParam("web_control","vision_dark_recover",off/100);
+}
+$("visDarkAuto").onchange=()=>setParam("web_control","vision_dark_reflex_enable",$("visDarkAuto").checked);
+
+$("bumperTuneToggle").onclick=()=>{
+  const box=$("bumperTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("bumperTuneToggle").textContent=(open?"▾":"▸")+" Optical bumper tuning";
+};
+// Optical bumper thresholds -> web_control params. cmd_eps/confirm_secs are already in
+// the backend's native units (m/s-or-rad/s, seconds); motion_floor is a 0-100% slider
+// over the backend's 0..1 gpu motion-score fraction, same conversion idiom as dark reflex.
+$("visBumpEps").oninput=()=>$("visBumpEpsV").textContent=$("visBumpEps").value;
+$("visBumpEps").onchange=()=>setParam("web_control","vision_bumper_cmd_eps",Number($("visBumpEps").value));
+$("visBumpFloor").oninput=()=>$("visBumpFloorV").textContent=$("visBumpFloor").value;
+$("visBumpFloor").onchange=()=>setParam("web_control","vision_bumper_motion_floor",Number($("visBumpFloor").value)/100);
+$("visBumpSecs").oninput=()=>$("visBumpSecsV").textContent=$("visBumpSecs").value;
+$("visBumpSecs").onchange=()=>setParam("web_control","vision_bumper_confirm_secs",Number($("visBumpSecs").value));
+
+$("blobTuneToggle").onclick=()=>{
+  const box=$("blobTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("blobTuneToggle").textContent=(open?"▾":"▸")+" Blob tracking tuning";
+};
+// Blob tuning -> POST /vision/blob_tune (NOT a ROS param -- this lives inside
+// gpu_vision.py's own state, adjusted via a dedicated action endpoint, same reasoning
+// as /vision/calibrate). All three sliders are 0-100% over the backend's 0..1 fractions.
+function blobTune(body){
+  fetch("/vision/blob_tune",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)}).catch(()=>{});
+}
+$("visBlobThresh").oninput=()=>$("visBlobThreshV").textContent=$("visBlobThresh").value;
+$("visBlobThresh").onchange=()=>blobTune({threshold:Number($("visBlobThresh").value)/100});
+$("visBlobMin").oninput=()=>$("visBlobMinV").textContent=$("visBlobMin").value;
+$("visBlobMin").onchange=()=>blobTune({min_confidence:Number($("visBlobMin").value)/100});
+$("visBlobMax").oninput=()=>$("visBlobMaxV").textContent=$("visBlobMax").value;
+$("visBlobMax").onchange=()=>blobTune({max_confidence:Number($("visBlobMax").value)/100});
+$("visDarkOn").oninput=()=>$("visDarkOnV").textContent=$("visDarkOn").value;
+$("visDarkOff").oninput=()=>$("visDarkOffV").textContent=$("visDarkOff").value;
+$("visDarkOn").onchange=syncDarkReflex;
+$("visDarkOff").onchange=syncDarkReflex;
+
+// Vision target tracking (pan-only visual servoing, owned by slam_nav — see
+// track_* params/robot.yaml). Turning it on WINS over any active goal/auto-explore.
+$("navTrackEnable").onchange=e=>setParam("slam_nav","track_enable",e.target.checked);
+$("trackTuneToggle").onclick=()=>{
+  const box=$("trackTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("trackTuneToggle").textContent=(open?"▾":"▸")+" Tracking tuning";
+};
+$("trackKp").oninput=()=>$("trackKpV").textContent=$("trackKp").value;
+$("trackKp").onchange=()=>setParam("slam_nav","track_kp",Number($("trackKp").value));
+$("trackKd").oninput=()=>$("trackKdV").textContent=$("trackKd").value;
+$("trackKd").onchange=()=>setParam("slam_nav","track_kd",Number($("trackKd").value));
+$("trackMaxAng").oninput=()=>$("trackMaxAngV").textContent=$("trackMaxAng").value;
+$("trackMaxAng").onchange=()=>setParam("slam_nav","track_max_ang",Number($("trackMaxAng").value));
+$("trackMinEffAng").oninput=()=>$("trackMinEffAngV").textContent=$("trackMinEffAng").value;
+$("trackMinEffAng").onchange=()=>setParam("slam_nav","track_min_eff_ang",Number($("trackMinEffAng").value));
+$("trackDeadband").oninput=()=>$("trackDeadbandV").textContent=$("trackDeadband").value;
+$("trackDeadband").onchange=()=>setParam("slam_nav","track_deadband",Number($("trackDeadband").value)/100);
+$("trackConfMin").oninput=()=>$("trackConfMinV").textContent=$("trackConfMin").value;
+$("trackConfMin").onchange=()=>setParam("slam_nav","track_conf_min",Number($("trackConfMin").value)/100);
+$("trackDeadbandSoft").oninput=()=>$("trackDeadbandSoftV").textContent=$("trackDeadbandSoft").value;
+$("trackDeadbandSoft").onchange=()=>setParam("slam_nav","track_deadband_soft",Number($("trackDeadbandSoft").value)/100);
+$("trackConfScale").oninput=()=>$("trackConfScaleV").textContent=$("trackConfScale").value;
+$("trackConfScale").onchange=()=>setParam("slam_nav","track_conf_scale",Number($("trackConfScale").value)/100);
+$("trackCoast").oninput=()=>$("trackCoastV").textContent=Number($("trackCoast").value).toFixed(2);
+$("trackCoast").onchange=()=>setParam("slam_nav","track_coast",Number($("trackCoast").value));
+$("trackKi").oninput=()=>$("trackKiV").textContent=Number($("trackKi").value).toFixed(1);
+$("trackKi").onchange=()=>setParam("slam_nav","track_ki",Number($("trackKi").value));
+$("trackKff").oninput=()=>$("trackKffV").textContent=Number($("trackKff").value).toFixed(2);
+$("trackKff").onchange=()=>setParam("slam_nav","track_kff",Number($("trackKff").value));
+
+$("visionAlertsToggle").onclick=()=>{
+  const box=$("visionAlertsTune"), open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  $("visionAlertsToggle").textContent=(open?"▾":"▸")+" Vision alerts tuning";
+};
+// Vision alert thresholds -> web_control params (see PARAM_WHITELIST/telemetry.py's
+// _vision_alerts). All 0-100(-ish)% sliders over the backend's 0..1 fractions, same
+// conversion idiom as dark reflex/bumper, except the obstruction-flatness slider which
+// is raw variance units (not a percentage -- see gpu_vision.py's luma_variance).
+const VISION_ALERT_SLIDERS=[
+  ["visObstrVar","vision_obstruction_var_max",1],       // raw units, no /100
+  ["visObstrDark","vision_obstruction_dark_max",100],
+  ["visClutter","vision_clutter_alert",100],
+  ["visOverhead","vision_overhead_alert",100],
+  ["visFocusBlur","vision_focus_blur_max",100],
+  ["visBacklit","vision_backlit_delta_min",100],
+  ["visHighlight","vision_highlight_alert",100],
+  ["visLooming","vision_looming_alert",100],
+  ["visColorcast","vision_colorcast_alert",100],
+  ["visMotionTarget","vision_motiontarget_match_max",100],
+  ["visNoveltyAlert","vision_novelty_alert",100],
+  ["visCamStall","vision_camera_stall_secs",1],          // raw seconds, no /100
+  ["visVibRatio","vision_vibration_ratio",100],
+  ["visVibSecs","vision_vibration_confirm_secs",1],      // raw seconds
+  ["visApproachRate","vision_approach_rate",100],
+  ["visApproachBand","vision_approach_band",100],
+  ["visGlare","vision_glare_derate",1],                  // raw multiplier, no /100
+];
+VISION_ALERT_SLIDERS.forEach(([id,param,scale])=>{
+  const el=$(id), vEl=$(id+"V");
+  if(!el||!vEl) return;
+  el.oninput=()=>vEl.textContent=el.value;
+  el.onchange=()=>setParam("web_control",param,Number(el.value)/scale);
+});
+
+// Maps the displayed <img>'s rendered rect (accounting for object-fit:contain
+// letterboxing) in coordinates relative to #cam itself -- shared by the crosshair
+// overlay and the click-to-calibrate colour picker below.
+function camDisplayRect(){
+  const img=$("cam");
+  const iw=img.naturalWidth||640, ih=img.naturalHeight||480;
+  const cw=img.clientWidth, ch=img.clientHeight;
+  if(!iw||!ih||!cw||!ch) return null;
+  const scale=Math.min(cw/iw, ch/ih);
+  const dw=iw*scale, dh=ih*scale;
+  return {left:(cw-dw)/2, top:(ch-dh)/2, width:dw, height:dh, iw, ih};
+}
+
+let visionPickArmed=false;
+function armVisionPick(){
+  visionPickArmed=true;
+  $("cam").classList.add("pick-armed");
+  $("visionPickHint").style.display="block";
+}
+function disarmVisionPick(){
+  visionPickArmed=false;
+  $("cam").classList.remove("pick-armed");
+  $("visionPickHint").style.display="none";
+}
+function onCamPickClick(e){
+  if(!visionPickArmed) return;
+  const r=camDisplayRect();
+  if(!r){ disarmVisionPick(); return; }
+  const px=e.offsetX-r.left, py=e.offsetY-r.top;
+  if(px<0||py<0||px>=r.width||py>=r.height) return;    // clicked the letterbox margin
+  const nx=Math.min(r.iw-1, Math.max(0, Math.floor(px/r.width*r.iw)));
+  const ny=Math.min(r.ih-1, Math.max(0, Math.floor(py/r.height*r.ih)));
+  const cv=document.createElement("canvas");
+  cv.width=r.iw; cv.height=r.ih;
+  let data;
+  try{
+    const ctx=cv.getContext("2d");
+    ctx.drawImage($("cam"), 0, 0, r.iw, r.ih);
+    data=ctx.getImageData(nx, ny, 1, 1).data;
+  }catch(err){ disarmVisionPick(); return; }
+  const name=($("visionTargetName").value||"").trim()||"default";
+  fetch("/vision/calibrate",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({r:data[0]/255, g:data[1]/255, b:data[2]/255, threshold:0.22, name})})
+    .then(()=>loadVisionTargets()).catch(()=>{});
+  resetBlobTuneUI();   // server resets threshold/min/max on every fresh colour pick -- match it
+  disarmVisionPick();
+}
+function resetBlobTuneUI(){
+  $("visBlobThresh").value=22; $("visBlobThreshV").textContent=22;
+  $("visBlobMin").value=0; $("visBlobMinV").textContent=0;
+  $("visBlobMax").value=100; $("visBlobMaxV").textContent=100;
 }
 
 // ---- ESP32 coprocessor handlers ----
-let espTickCount=0, espTickHzT=performance.now(), lastHb=null, lastHbT=0;
-function onHb(msg){ lastHb=msg.data; lastHbT=performance.now(); }
-function onTicks(msg){
-  const d=msg.data||[];
-  $("espTicks").textContent = d.length>=2 ? `${d[0]} / ${d[1]}` : "–";
-  espTickCount++;
-  const now=performance.now();
-  if(now-espTickHzT>=1000){
-    $("espTickHz").textContent=(espTickCount*1000/(now-espTickHzT)).toFixed(0)+" Hz";
-    espTickCount=0; espTickHzT=now;
+let lastHb=null, lastHbT=0;
+function onEsp(e, susp){
+  if(e.hb!=null && e.hb_age<2.5){
+    lastHb=e.hb; lastHbT=performance.now()-e.hb_age*1000; OLED.tel({espBeat:1});
   }
+  if(e.ticks) $("espTicks").textContent=`${e.ticks[0]} / ${e.ticks[1]}`;
+  if(e.tick_hz!=null) $("espTickHz").textContent=e.tick_hz.toFixed(0)+" Hz";
+  if(e.stray){
+    const bad=e.stray[0]!==0||e.stray[1]!==0;
+    const el=$("espStray");
+    el.textContent=`${e.stray[0]} / ${e.stray[1]}`;
+    el.style.color=bad?"var(--red)":"var(--green)";
+  }
+  suspTxt("espSuspL",susp[0]); suspTxt("espSuspR",susp[1]);
+  if(e.temp!=null && e.temp_age<5){
+    $("espTemp").textContent=e.temp.toFixed(1)+"°C"; OLED.tel({espTemp:e.temp});
+  }
+  if(e.hall!=null) $("espHall").textContent=e.hall;
+  if(e.wheel_trim!=null){
+    const t=e.wheel_trim;
+    $("motorTrimLive").textContent=`(live ${t>=0?"+":""}${t.toFixed(2)})`;
+    // Re-seed the slider once from the live value so the page matches the ESP32's
+    // persisted NVS trim instead of the slider's default 0.
+    if(!motorTrimSynced){
+      motorTrimSynced=true;
+      $("motorTrim").value=String(t);
+      $("motorTrimV").textContent=t.toFixed(2);
+    }
+  }
+}
+function onLds(l){
+  if(l.rpm!=null) $("espLdsRpm").textContent=l.rpm.toFixed(0)+" rpm";
+  if(l.hz!=null){ $("espLdsHz").textContent=l.hz.toFixed(1)+" Hz"; OLED.tel({lds:l.hz}); }
+  if(l.duty!=null) $("espLdsDuty").textContent=(l.duty*100).toFixed(0)+"%";
 }
 // suspension: green = on the ground (ready to drive), amber = up/suspended.
 function suspTxt(id,val){
@@ -1468,48 +2485,140 @@ setInterval(()=>{
   el.style.color = alive ? "var(--green)" : "var(--red)";
 },1000);
 
-// ---- brain health (polled from HTTP /brain/health) ----
-function bhTxt(id, ok, label){
-  const el=$(id);
-  if(ok===true){ el.textContent=label||"alive"; el.style.color="var(--green)"; }
-  else if(ok===false){ el.textContent=label||"lost"; el.style.color="var(--red)"; }
-  else { el.textContent="–"; el.style.color=""; }
+// SLAM error margins -- what "within margin" means for the IMU numbers below.
+// Grounded in slam_nav's actual parameters, not guesses: the scan matcher corrects
+// the IMU/odom heading prior by up to match_ang (0.12 rad = ±6.9°) EVERY scan, and
+// the parked still-skip resumes matching after only ~0.3° of accumulated drift
+// (still_ang) -- so slow gyro bias is continuously absorbed. What actually loses
+// localization is a heading error bigger than that window between two scans, i.e.
+// a sudden magnetometer jump (interference), not slow drift. Colours: green = well
+// inside the budget, amber = SLAM still fine but worth recalibrating, red = bad
+// enough to corrupt the map / the likely SPIN-check culprit.
+function slamGrade(el, v, warn, bad){
+  el.style.color = v>=bad ? "var(--red)" : v>=warn ? "var(--amber)" : "var(--green)";
 }
-setInterval(()=>{
-  fetch("/brain/health").then(r=>r.json()).then(d=>{
-    const b=d.behavior||{}, c=d.cognition||{}, o=d.overall||{};
-    bhTxt("bhBehavior", o.behavior_alive, b.chart_states?.join(", ")||"alive");
-    bhTxt("bhCognition", o.cognition_alive);
-    bhTxt("bhLlm", c.llm_available, c.llm_offline ? "offline" : "online");
-    bhTxt("bhPurpose", b.purpose_enabled, b.reflecting?"reflecting":(b.purpose_enabled?"on":"off"));
-    bhTxt("bhChart", b.alive, (b.chart_states||[]).slice(-2).join("·")||"–");
-  }).catch(()=>{
-    ["bhBehavior","bhCognition","bhLlm","bhPurpose","bhChart"].forEach(id=>{
-      $(id).textContent="err"; $(id).style.color="var(--amber)";
-    });
-  });
-},2000);
-
+let driftStillS=0;   // >0 while provably stationary (gates the |accel|/|gyro| grading)
 let lastImuT=0;
-function onImu(msg){
-  // /imu/web Vector3Stamped: x=|accel| m/s^2, y=|gyro| rad/s, z=actual /imu/data Hz
-  lastImuT=performance.now();
-  $("imuA").textContent=msg.vector.x.toFixed(2);
-  $("imuG").textContent=(msg.vector.y*180/Math.PI).toFixed(1);
-  const el=$("imuHz"); el.textContent=msg.vector.z.toFixed(0)+" Hz"; el.style.color="";
+let spinWorst=0;      // worst |accel-9.81| seen while spinning, since last reset
+function onImu(m){
+  // frame imu: {a:|accel| m/s^2, g:|gyro| rad/s, hz:actual /imu/data Hz, age:s}.
+  // Sourced from sys_monitor's 1 Hz vitals blob, so a healthy age can reach ~2 s.
+  if(m.age>=3 || m.a==null) return;        // stale: the "lost" watchdog below owns the text
+  lastImuT=performance.now()-m.age*1000;
+  $("imuA").textContent=m.a.toFixed(2);
+  $("imuG").textContent=(m.g*180/Math.PI).toFixed(1);
+  // Grade only while provably stationary -- driving legitimately moves both numbers.
+  // Stationary, |accel| must read gravity (9.81) and |gyro| ~0 (residual = bias/noise).
+  if(driftStillS>0){
+    slamGrade($("imuA"), Math.abs(m.a-9.81), 0.3, 1.0);
+    slamGrade($("imuG"), m.g*180/Math.PI, 1.0, 3.0);
+  } else { $("imuA").style.color=""; $("imuG").style.color=""; }
+  // Mount-offset spin check: while actually rotating (|gyro| above ~15 deg/s) a
+  // CORRECT offset keeps |accel| pinned near 9.81 same as parked, since
+  // lever_arm_correction (imu_node.py) cancels the rotation-induced centripetal/
+  // tangential term -- any residual here is the offset being wrong/mis-signed, not
+  // a real acceleration. Independent of the stationary grading above.
+  const gDeg=m.g*180/Math.PI, spinEl=$("imuSpinCheck");
+  if(gDeg>15){
+    const dev=Math.abs(m.a-9.81);
+    spinEl.textContent=dev.toFixed(2);
+    slamGrade(spinEl, dev, 0.5, 1.5);
+    if(dev>spinWorst){ spinWorst=dev; $("imuSpinWorst").textContent=spinWorst.toFixed(2); }
+  } else { spinEl.textContent="–"; spinEl.style.color=""; }
+  const el=$("imuHz"); el.textContent=m.hz.toFixed(0)+" Hz"; el.style.color="";
+  OLED.tel({imuHz:m.hz});
 }
-// IMU connectivity: /imu/web streams ~15 Hz whenever the IMU is up. If it stops (USB
-// unplugged, or the driver lost the port) the rate readout goes red "lost" — so even
-// with the sensor nodes merged into one process you can still see the IMU drop out.
+$("imuSpinResetWorst").onclick=()=>{ spinWorst=0; $("imuSpinWorst").textContent="0.0"; };
+// IMU connectivity: if the IMU stream stops (USB unplugged, or the driver lost the
+// port) the rate readout goes red "lost" — so even with the sensor nodes merged into
+// one process you can still see the IMU drop out.
 setInterval(()=>{
-  if(lastImuT && performance.now()-lastImuT<2000) return;   // fresh: onImu owns the text
+  if(lastImuT && performance.now()-lastImuT<3500) return;   // fresh: onImu owns the text
   const el=$("imuHz"); el.textContent="lost"; el.style.color="var(--red)";
 },1000);
-function onEul(msg){
-  $("imuR").textContent=msg.vector.x.toFixed(1)+"°";
-  $("imuP").textContent=msg.vector.y.toFixed(1)+"°";
-  $("imuY").textContent=msg.vector.z.toFixed(1)+"°";
+// IMU drift check (telemetry.py's _imu_drift_tick): live while the robot is
+// provably stationary, "last" is a latched one-line summary that persists once it
+// starts moving again -- see the IMU card's hint for what this means.
+function onImuDrift(d){
+  driftStillS=d.still_s;
+  $("driftStill").textContent=d.still_s>0 ? d.still_s.toFixed(1)+"s" : "moving";
+  $("driftRoll").textContent=d.still_s>0 ? d.roll.toFixed(2)+"°" : "–";
+  $("driftPitch").textContent=d.still_s>0 ? d.pitch.toFixed(2)+"°" : "–";
+  $("driftYaw").textContent=d.still_s>0 ? d.yaw.toFixed(2)+"°" : "–";
+  $("driftRate").textContent=d.still_s>0 ? d.yaw_per_min.toFixed(2)+"°/min" : "–";
+  if(d.still_s>0){
+    // Roll/pitch: 2D SLAM never reads them, but real movement here = bad accel cal
+    // or vibration tilting the scan plane. Yaw is graded against the scan-matcher's
+    // ±6.9°/scan correction window (amber at half of it); the RATE is the health
+    // number -- ≥6°/min is interference-grade, not normal gyro bias.
+    slamGrade($("driftRoll"),  Math.abs(d.roll),  0.3, 1.0);
+    slamGrade($("driftPitch"), Math.abs(d.pitch), 0.3, 1.0);
+    slamGrade($("driftYaw"),   Math.abs(d.yaw),   1.0, 3.5);
+    slamGrade($("driftRate"),  Math.abs(d.yaw_per_min), 1.0, 6.0);
+  } else for(const id of ["driftRoll","driftPitch","driftYaw","driftRate"]) $(id).style.color="";
+  $("driftLast").textContent=d.last||"";
 }
+// IMU mounting-position interference check -- entirely client-side (the raw mag
+// xyz was already sent every frame for the "mag xyz" readout; this just derives
+// magnitude + a rolling peak-to-peak "noise" off it in the browser instead of
+// adding any backend/ROS computation). See the IMU card's hint for how to use it.
+let magHist=[];             // [[performance.now() ms, magnitude], ...] trailing ~2s
+let magWorst=0;             // peak-to-peak noise seen since the last reset
+function onImuMag(xyz){
+  $("imuMag").textContent=xyz.map(v=>v.toFixed(1)).join(", ");
+  const mag=Math.hypot(xyz[0], xyz[1], xyz[2]);
+  $("imuMagMag").textContent=mag.toFixed(1);
+  const now=performance.now();
+  magHist.push([now, mag]);
+  while(magHist.length && now-magHist[0][0]>2000) magHist.shift();
+  if(magHist.length<2) return;
+  const vals=magHist.map(p=>p[1]);
+  const noise=Math.max(...vals)-Math.min(...vals);
+  // Raw counts are only comparable spot-to-spot, but noise as a % OF the field is an
+  // absolute health number: a transverse wobble of x% of the field is ~0.6x° of
+  // heading wobble, so 6% ≈ 3.4° -- half the scan-matcher's ±6.9° correction window.
+  const pct=mag>1 ? noise/mag*100 : 0;
+  const nEl=$("imuMagNoise");
+  nEl.textContent=noise.toFixed(1)+(mag>1 ? ` (${pct.toFixed(1)}%)` : "");
+  if(mag>1) slamGrade(nEl, pct, 2, 6); else nEl.style.color="";
+  if(noise>magWorst){ magWorst=noise; $("imuMagWorst").textContent=magWorst.toFixed(1); }
+}
+$("imuMagResetWorst").onclick=()=>{ magWorst=0; magHist=[]; $("imuMagWorst").textContent="0.0"; };
+function onEul(m){
+  if(m.age>=4 || m.r==null) return;
+  $("imuR").textContent=m.r.toFixed(1)+"°";
+  $("imuP").textContent=m.p.toFixed(1)+"°";
+  $("imuY").textContent=m.y.toFixed(1)+"°";
+  OLED.tel({roll:m.r, pitch:m.p});
+  updateImu3d(m.r, m.p, m.y);
+}
+// IMU 3D attitude view (see style.css's .imu3d-* block): a CSS-only cube+wheels
+// rig, re-oriented by writing one `transform` string per frame -- no canvas, no
+// render loop, nothing server-side. rotateY/X/Z map onto the model's forward=+Z,
+// right=+X, up=-Y rest pose so this composes to the same Z*Y*X (yaw-pitch-roll)
+// matrix imu_driver's euler_to_quat uses, just expressed as CSS transforms.
+function updateImu3d(rollDeg, pitchDeg, yawDeg){
+  const rig=$("imu3dRig");
+  if(!rig) return;
+  rig.style.transform=`rotateY(${-yawDeg}deg) rotateX(${-pitchDeg}deg) rotateZ(${rollDeg}deg)`;
+}
+// IMU offset gizmo: RGB axis triad (red=X fwd, green=Y left, blue=Z up) inside the
+// same rotating rig as the body, translated to the mm offset entered below -- sits
+// on the body's centre dot at 0,0,0 and slides out to visually match the real mount.
+// PX_PER_MM is illustrative (the body box isn't drawn to a real scale); clamped so
+// an unrealistic entry can't fly the marker out of the scene.
+const IMU3D_PX_PER_MM=0.5, IMU3D_MAX_PX=70;
+function updateImu3dOffset(){
+  const el=$("imu3dAxes"); if(!el) return;
+  const clamp=v=>Math.max(-IMU3D_MAX_PX, Math.min(IMU3D_MAX_PX, v));
+  const ox=Number($("imuOffX").value)||0, oy=Number($("imuOffY").value)||0, oz=Number($("imuOffZ").value)||0;
+  // rig rest pose: forward=+Z, right=+X, up=-Y -- REP-103 x/y/z (fwd/left/up) map
+  // onto that as (+z, -x, -y).
+  const lx=clamp(-oy*IMU3D_PX_PER_MM), ly=clamp(-oz*IMU3D_PX_PER_MM), lz=clamp(ox*IMU3D_PX_PER_MM);
+  el.style.transform=`translate3d(${lx}px,${ly}px,${lz}px)`;
+}
+["imuOffX","imuOffY","imuOffZ"].forEach(id=>$(id).addEventListener("input", updateImu3dOffset));
+updateImu3dOffset();
 
 function fmtUptime(s){
   const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
@@ -1534,10 +2643,10 @@ function renderCores(s){
     const b=$("corev"+i); if(b) b.textContent=v.toFixed(0)+"%";
   });
 }
-function onDiag(msg){
-  const st=(msg.status||[]).find(s=>s.name==="system"); if(!st) return;
-  const kv={}; for(const p of st.values) kv[p.key]=p.value;
+function onDiag(kv){
+  // frame diag: the /diagnostics "system" status as a flat {key: value} dict
   $("sysCpu").textContent=(kv.cpu_percent??"–")+"%";
+  OLED.tel({cpu:Number(kv.cpu_percent), mem:Number(kv.mem_percent), sbc:Number(kv.cpu_temp_c)});
   renderCores(kv.cpu_cores);
   $("sysLoad").textContent=kv.load1??"–";
   $("sysMem").textContent=`${kv.mem_used_mb??"?"}/${kv.mem_total_mb??"?"}MB (${kv.mem_percent??"?"}%)`;
@@ -1556,9 +2665,9 @@ function onDiag(msg){
   }
 }
 
-// ---- Speech (TTS) ---- POSTs to web_control, which speaks via pico2wave and
-// streams the words to the OLED (/oled_word). Not over rosbridge — keeps the bridge
-// light and lets the server own the audio + word timing in one place. Voice/volume/
+// ---- Speech (TTS) ---- POSTs to web_control, which speaks via espeak-ng and
+// streams the words to the OLED (/oled_word), owning the audio + word timing in
+// one place. Voice/volume/
 // speed/pitch + the stats-announcer are persisted server-side (survive a reboot),
 // so the page just mirrors them: GET them on load, POST /tts/config on change.
 function sendOled(){
@@ -1584,6 +2693,7 @@ function bindSlider(id,labelId,key){
 bindSlider("ttsVol","ttsVolV","volume");
 bindSlider("ttsSpeed","ttsSpeedV","speed");
 bindSlider("ttsPitch","ttsPitchV","pitch");
+bindSlider("ttsLead","ttsLeadV","lead_silence");
 $("ttsVoice").addEventListener("change",()=>saveTts({voice:$("ttsVoice").value}));
 $("announceOn").addEventListener("change",()=>saveTts({announce:$("announceOn").checked}));
 $("announceInterval").addEventListener("change",
@@ -1596,9 +2706,11 @@ function loadTts(){
     if(!s) return;
     const set=(id,v)=>{ if($(id)) $(id).value=v; };
     set("ttsVoice",s.voice); set("ttsVol",s.volume); set("ttsSpeed",s.speed);
-    set("ttsPitch",s.pitch); set("announceInterval",s.announce_interval);
+    set("ttsPitch",s.pitch); set("ttsLead",s.lead_silence);
+    set("announceInterval",s.announce_interval);
     $("ttsVolV").textContent=s.volume; $("ttsSpeedV").textContent=s.speed;
-    $("ttsPitchV").textContent=s.pitch; $("announceOn").checked=!!s.announce;
+    $("ttsPitchV").textContent=s.pitch;
+    $("ttsLeadV").textContent=s.lead_silence; $("announceOn").checked=!!s.announce;
   }).catch(()=>{});
 }
 loadTts();
@@ -1612,7 +2724,14 @@ function llmApply(s){
   if(!s) return;
   const set=(id,v)=>{ if($(id)&&v!=null) $(id).value=v; };
   if($("llmOn")) $("llmOn").checked=!!s.enabled;
-  set("llmModel",s.model); set("llmPersona",s.persona);
+  set("llmModel",s.model);
+  set("llmSmartModel",s.smart_model);
+  set("llmVisionModel",s.vision_model);
+  set("llmVisionFallbackModel",s.vision_fallback_model);
+  set("llmFreeModel",s.free_model);
+  set("llmFreeSmartModel",s.free_smart_model);
+  set("llmPersona",s.persona);
+  if($("llmKeyStatus")) $("llmKeyStatus").textContent = s.api_key_set ? "· saved" : "· not set";
   if($("llmStatus")) $("llmStatus").textContent =
     s.available ? ("ready · "+(s.model_effective||"")) :
     (s.enabled ? "enabled but no API key configured" : "disabled");
@@ -1647,6 +2766,26 @@ $("llmChat").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefaul
 $("llmPrompt").addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();$("llmSay").click();} });
 $("llmOn").addEventListener("change",()=>llmSave({enabled:$("llmOn").checked}));
 $("llmModel").addEventListener("change",()=>llmSave({model:$("llmModel").value.trim()}));
+$("llmSmartModel").addEventListener("change",()=>llmSave({smart_model:$("llmSmartModel").value.trim()}));
+$("llmVisionModel").addEventListener("change",()=>llmSave({vision_model:$("llmVisionModel").value.trim()}));
+$("llmVisionFallbackModel").addEventListener("change",()=>llmSave({vision_fallback_model:$("llmVisionFallbackModel").value.trim()}));
+$("llmFreeModel").addEventListener("change",()=>llmSave({free_model:$("llmFreeModel").value.trim()}));
+$("llmFreeSmartModel").addEventListener("change",()=>llmSave({free_smart_model:$("llmFreeSmartModel").value.trim()}));
+// API key: never pre-filled (the server never sends the saved key back — see llmApply),
+// so the field starts blank. Typing one + leaving the field saves it (persists server-side,
+// survives a reboot); the field is cleared right after so the secret doesn't linger in the
+// DOM. There's no way to "blank out" via the field itself (blur with no edits is a no-op),
+// so clearing a saved key is a dedicated action.
+$("llmApiKey").addEventListener("change",()=>{
+  const v=$("llmApiKey").value;
+  if(!v) return;
+  llmSave({api_key:v});
+  $("llmApiKey").value="";
+});
+$("llmKeyClear").onclick=()=>{
+  if(!confirm("Clear the saved OpenRouter API key?")) return;
+  llmSave({api_key:""});
+};
 // Persona is read-only here — it's single-sourced from personality.json (the creator's
 // output). Edit it by re-running scripts/personality_creator.py and restarting.
 fetch("/llm/config").then(r=>r.ok?r.json():null).then(llmApply).catch(()=>{});
@@ -1692,10 +2831,15 @@ function fmtSkill(s){
   const gated=s.is_action && !s.enabled;            // an off-by-default action skill
   const act=s.is_action?` <span class="lm">${s.topic||"action"}</span>`:"";
   const tag=gated?` <span class="ls">disabled</span>`:"";
+  const likes=s.likes||0;                            // 👍 count: the brain favours liked skills
   return `<div class="skillrow${gated?" disabled":""}"><div class="skmeta">`
     +`<b>${ic} ${s.name}</b>${act}${tag}<div class="skdesc">${s.description||""}</div></div>`
+    +`<button class="btn sklike${likes>0?" liked":""}" data-name="${s.name}"`
+    +` title="Like — the brain performs liked skills more often. Click again to like more;`
+    +` shift-click to take one back.">👍 ${likes}</button>`
     +`<button class="btn skinvoke" data-name="${s.name}">Run</button></div>`;
 }
+let skillNames=[];   // populated by loadSkills(); used to build the Schedule card's skill picker
 function loadSkills(){
   const box=$("skillsList"), st=$("skillsStatus"); if(!box||!st) return;
   fetch("/skills").then(r=>r.ok?r.json():null).then(d=>{
@@ -1706,7 +2850,17 @@ function loadSkills(){
       +(d.allow_actions?"on":"off");
     box.innerHTML=sk.length?sk.map(fmtSkill).join(""):"<i>no skills found — add a .md to skills/</i>";
     box.querySelectorAll(".skinvoke").forEach(b=>b.onclick=()=>invokeSkill(b.dataset.name));
+    box.querySelectorAll(".sklike").forEach(b=>b.onclick=e=>likeSkill(b.dataset.name,e.shiftKey?-1:1));
+    skillNames=sk.map(s=>s.name);
+    renderSchedule();   // refresh the skill <select> options now that names are known
   }).catch(()=>{ st.textContent="offline"; });
+}
+// Like (👍) a skill so the brain performs it more often — repeatable (each click +1), shift-click
+// takes one back. The count is a per-skill weight in the autonomous skill-beat lottery.
+function likeSkill(name,delta){
+  fetch("/skills/like",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name,delta})}).then(r=>r.ok?r.json():null)
+    .then(()=>loadSkills()).catch(()=>{});
 }
 function invokeSkill(name){
   const st=$("skillsStatus"); if(st) st.textContent="running "+name+"…";
@@ -1729,7 +2883,6 @@ loadSkills();
 // puts it on trial; it auto-adopts after enough good runs + 👍 (no errors) or auto-retires on
 // errors/👎. Keep/Kill are the manual overrides (POST to web_control / the dev harness).
 function fmtTrial(t){
-  const net=(t.reward_pos||0)-(t.reward_neg||0);
   const stat=`runs ${t.runs||0} · 👍${t.reward_pos||0} 👎${t.reward_neg||0}`
     +((t.errors)?` · ⚠${t.errors}`:"");
   const badge=t.status==="adopted"?`<span class="ls" style="color:#7fd">adopted</span>`
@@ -1765,6 +2918,43 @@ function workshopAct(act,name){
     .catch(()=>{ if(st) st.textContent="network error"; });
 }
 loadWorkshop();
+
+// ---- Schedule · routines ---- fires a NAMED skill once a day at a local HH:MM (a manual-
+// style invocation, unlike the autonomous skill-beat picker above). The behaviour node
+// echoes the normalized list on the latched /schedule topic (see onFrame); editing here
+// replaces the whole list via the whitelisted /schedule_edit topic (see telemetry.py).
+let scheduleEntries=[];   // the editable working copy: [{time,skill}]
+function renderSchedule(){
+  const box=$("scheduleList"); if(!box) return;
+  if(!scheduleEntries.length){ box.innerHTML="<i>no routines — Add one</i>"; return; }
+  const opts=n=>(skillNames.length?skillNames:[n]).map(s=>
+    `<option value="${s}"${s===n?" selected":""}>${s||"(no skills loaded)"}</option>`).join("");
+  box.innerHTML=scheduleEntries.map((e,i)=>
+    `<div class="row" data-i="${i}">`
+    +`<input type="time" class="schTime" value="${e.time||""}">`
+    +`<select class="schSkill grow">${opts(e.skill)}</select>`
+    +`<button class="btn danger schDel" data-i="${i}">✕</button></div>`).join("");
+  box.querySelectorAll(".schTime").forEach(el=>el.onchange=e=>{
+    scheduleEntries[+e.target.closest("[data-i]").dataset.i].time=e.target.value; });
+  box.querySelectorAll(".schSkill").forEach(el=>el.onchange=e=>{
+    scheduleEntries[+e.target.closest("[data-i]").dataset.i].skill=e.target.value; });
+  box.querySelectorAll(".schDel").forEach(b=>b.onclick=()=>{
+    scheduleEntries.splice(+b.dataset.i,1); renderSchedule(); });
+}
+function onScheduleFrame(raw){
+  try{ scheduleEntries=(JSON.parse(raw)||[]).map(e=>({time:e.time||"",skill:e.skill||""})); }
+  catch(e){ scheduleEntries=[]; }
+  const st=$("scheduleStatus");
+  if(st) st.textContent=scheduleEntries.length
+    ?`${scheduleEntries.length} routine${scheduleEntries.length===1?"":"s"}`:"no routines configured";
+  renderSchedule();
+}
+if($("scheduleAdd")) $("scheduleAdd").onclick=()=>{
+  scheduleEntries.push({time:"09:00",skill:skillNames[0]||""}); renderSchedule(); };
+if($("scheduleSave")) $("scheduleSave").onclick=()=>{
+  pub("/schedule_edit", scheduleEntries.filter(e=>e.time&&e.skill));
+  const st=$("scheduleStatus"); if(st) st.textContent="saved";
+};
 
 // ---- Brain · purpose & learning ---- the Purpose Engine (goals + intrinsic reward) and
 // the Horizon Planner's A/B bandit live in the behaviour node and publish latched JSON on
@@ -1809,9 +2999,9 @@ if($("reflectOn")) $("reflectOn").addEventListener("change",()=>{
   fetch("/brain/reflect",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({on:$("reflectOn").checked})}).catch(()=>{});
 });
-// No-rosbridge fallback (the dev_webui harness): when not connected to rosbridge, poll the
-// brain readouts over plain HTTP. On the real robot these come over rosbridge (and the GETs
-// 404), so this only does anything on the dev host while disconnected.
+// Dev-harness fallback (scripts/dev_webui.py): with no /telemetry stream, poll the
+// brain readouts over plain HTTP. On the real robot these come in the telemetry frame
+// (and these GETs 404), so this only does anything on the dev host while disconnected.
 function pollBrainHttp(){
   if(connected) return;
   fetch("/purpose").then(r=>r.ok?r.text():null).then(s=>{ if(s) renderPurpose(s); }).catch(()=>{});
@@ -1820,22 +3010,37 @@ function pollBrainHttp(){
 }
 setInterval(pollBrainHttp, 3000); pollBrainHttp();
 
-// ---- OLED face / mood ---- empty string = dashboard, else the selected mood.
+// ---- OLED face / mood ---- empty string = the resting idle face, else the selected mood.
 function sendFace(){
-  if(!faceTopic){ return; }
   const mood=$("faceOn").checked ? $("faceMood").value : "";
-  faceTopic.publish(new ROSLIB.Message({data:mood}));
+  pub("/oled_face",mood);
 }
 $("faceOn").addEventListener("change",sendFace);
 $("faceMood").addEventListener("change",()=>{ if($("faceOn").checked) sendFace(); });
 
-// ---- lidar scan over HTTP (same-origin /dev/shm), not rosbridge ----
+// ---- OLED dashboard pin + spoken-text toggle ----
+// Each updates the client-side mirror immediately AND publishes the Bool (via /publish)
+// so the physical panel follows. Off-robot (dev harness) the publish 404s harmlessly and
+// the mirror is the only display, so the local set is what makes the toggle work there.
+function sendDash(){
+  const on=$("dashOn").checked; OLED.setDashboard(on);
+  pub("/oled_dashboard",on);
+}
+function sendWords(){
+  const on=$("wordsOn").checked; OLED.setShowWords(on);
+  pub("/oled_show_words",on);
+}
+$("dashOn").addEventListener("change",sendDash);
+$("wordsOn").addEventListener("change",sendWords);
+
+// ---- lidar scan over HTTP (same-origin /dev/shm) ----
 // /scan.bin = a JSON header line ({seq,amin,ainc,n}), '\n', then n raw float32 ranges
 // (inf = no hit). The driver rewrites it per scan; we poll a touch faster and skip
-// unchanged seqs, so the canvas + point count + scan-Hz readouts are identical to the
-// old rosbridge path, minus the LaserScan deserialization that dominated rosbridge CPU.
-let lastScanSeq=-1;
+// unchanged seqs. Deliberately NOT in the telemetry frame: it's the heaviest data and
+// polling lets the page control the rate per view (see the interval below).
+let lastScanSeq=-1, lastScanErr=null, lastScanRx=null;
 const scanDec=new TextDecoder();
+let curHeroView="lidar";     // tracked by the hero view switcher (showView)
 async function pollScan(){
   try{
     const r=await fetch("/scan.bin?t="+Date.now());
@@ -1845,6 +3050,28 @@ async function pollScan(){
     const h=JSON.parse(scanDec.decode(buf.subarray(0,nl)));
     if(h.seq===lastScanSeq) return;            // no new scan since the last poll
     lastScanSeq=h.seq;
+    if(h.stale){
+      // Driver heartbeat: the port-level truth when no revolutions are arriving.
+      // Distinguish the failure modes instead of showing nothing at all.
+      const el=$("ldsErr");
+      if(!h.open)                el.textContent="port open failed";
+      else if(!h.rx)             el.textContent="no RX data (wiring?)";
+      else if(h.rx===lastScanRx) el.textContent="RX stopped ("+h.rx+" B)";
+      else                       el.textContent="RX garbled · err "+h.err;
+      el.style.color="var(--red)";
+      $("ldsLost").textContent="–";
+      lastScanRx=h.rx; lastScanErr=h.err;
+      frame=[]; $("pts").textContent=0; $("ldsPts").textContent=0;
+      $("hz").textContent="0"; $("ldsHz").textContent="0 Hz";
+      return;
+    }
+    if(h.rx!==undefined) lastScanRx=h.rx;
+    // RX-health counters from the real driver's blob header (absent in the sim).
+    if(h.lost!==undefined){ const el=$("ldsLost"); el.textContent=h.lost;
+      el.style.color = h.lost>36 ? "var(--amber)" : ""; }      // >10% of a rev missing
+    if(h.err!==undefined){ const el=$("ldsErr"); el.textContent=h.err;
+      el.style.color = (lastScanErr!==null && h.err>lastScanErr) ? "var(--red)" : "";
+      lastScanErr=h.err; }
     const dv=new DataView(buf.buffer, buf.byteOffset+nl+1);
     const maxr=Number($("maxr").value)||1e9, pts=[];
     for(let i=0;i<h.n;i++){
@@ -1860,26 +3087,49 @@ async function pollScan(){
       $("hz").textContent=scanHz.toFixed(1); $("ldsHz").textContent=scanHz.toFixed(1)+" Hz"; }
   }catch(e){ /* transient: keep polling */ }
 }
-setInterval(pollScan,80);    // ~12.5 Hz poll; the file updates at the scan rate (~5-10 Hz)
-function onOdom(msg){
-  const p=msg.pose.pose.position, q=msg.pose.pose.orientation;
-  const yaw=Math.atan2(2*(q.w*q.z),1-2*(q.z*q.z));
-  $("px").textContent=p.x.toFixed(2); $("py").textContent=p.y.toFixed(2);
+// Poll fast (a touch above the scan rate, which runs ~5-10 Hz) only while the lidar hero
+// view is up AND the tab is visible — every poll is an HTTP round-trip the board serves
+// from /dev/shm, so there's no point hammering it when nobody's looking at the lidar.
+// Off-view we still tick ~1 Hz to keep the header scan-Hz / pts readouts alive; when the
+// tab is backgrounded we stop entirely.
+let scanTick=0;
+setInterval(()=>{
+  if(document.hidden) return;
+  if(curHeroView==="lidar" || (++scanTick % 12)===0) pollScan();
+},80);
+function onOdom(o){
+  const [x,y,yaw]=o;
+  $("px").textContent=x.toFixed(2); $("py").textContent=y.toFixed(2);
   $("pth").textContent=(yaw*180/Math.PI).toFixed(0);
-  $("odoX").textContent=p.x.toFixed(2)+" m"; $("odoY").textContent=p.y.toFixed(2)+" m";
+  $("odoX").textContent=x.toFixed(2)+" m"; $("odoY").textContent=y.toFixed(2)+" m";
   $("odoTh").textContent=(yaw*180/Math.PI).toFixed(0)+"°";
 }
 
 // ---- teleop ----
-let curV=0, curW=0;
+// POST /drive to the web server, which publishes /cmd_vel itself and runs its OWN
+// 10 Hz keepalive + dead-man on the board, so browser jank can't outlast the ESP32's
+// 500 ms /cmd_vel watchdog and stutter the drive. The dev harness accepts it as a no-op.
+let curV=0, curW=0, driveBusy=false;
+let motorTrimSynced=false;   // whether the wheel-trim slider has been seeded from live ESP state
 function setCmd(v,w){ curV=v; curW=w; }
 function publishCmd(){
-  if(!cmdTopic) return;
-  cmdTopic.publish(new ROSLIB.Message({
-    linear:{x:curV*Number($("lin").value),y:0,z:0},
-    angular:{x:0,y:0,z:curW*Number($("ang").value)}}));
+  const v=curV*Number($("lin").value), w=curW*Number($("ang").value);
+  sendDrive(v,w);
 }
-setInterval(()=>{ if(connected && (curV||curW)) publishCmd(); },100); // 10 Hz while moving
+function sendDrive(v,w){
+  if(driveBusy) return;              // one POST in flight; the 10 Hz tick re-sends
+  driveBusy=true;
+  fetch("/drive",{method:"POST",body:JSON.stringify({v:v,w:w})})
+    .catch(()=>{})
+    .finally(()=>{ driveBusy=false; });
+}
+// 10 Hz refresh while moving: the server's dead-man stops the motors if commands stop
+// arriving. Skip it when the tab is backgrounded; and if we get hidden mid-drive, send
+// one stop right away so the robot halts immediately instead of coasting to the watchdog.
+setInterval(()=>{ if(!document.hidden && (curV||curW)) publishCmd(); },100);
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden && (curV||curW)){ setCmd(0,0); publishCmd(); }
+});
 $("stop").onclick=()=>{setCmd(0,0);publishCmd();};
 
 // keyboard
@@ -1892,6 +3142,10 @@ addEventListener("keydown",e=>{
   keys[e.key.toLowerCase()]=true; updateKeys();
 });
 addEventListener("keyup",e=>{ if(typing(e)) return; keys[e.key.toLowerCase()]=false; updateKeys(); });
+// If the window/tab loses focus mid-drive (alt-tab, devtools, click away), keyup events
+// may never arrive — leaving a direction stuck "held". Clear all keys on blur so the
+// robot stops instead of turning forever.
+addEventListener("blur",()=>{ for(const k in keys) keys[k]=false; setCmd(0,0); publishCmd(); });
 function updateKeys(){
   let v=0,w=0;
   if(keys["w"]||keys["arrowup"])v+=1;
@@ -1899,6 +3153,7 @@ function updateKeys(){
   if(keys["a"]||keys["arrowleft"])w+=1;
   if(keys["d"]||keys["arrowright"])w-=1;
   if(keys[" "]){v=0;w=0;}
+  if(v===curV && w===curW) return;  // key autorepeat: unchanged command, the 10 Hz keepalive covers it
   setCmd(v,w); publishCmd();
 }
 
@@ -1936,6 +3191,7 @@ cv.addEventListener("pointerup",()=>dragging=false);
 
 resize(); requestAnimationFrame(draw);
 connect();   // auto-connect on load
+
 </script>
 
 <script>
@@ -2463,7 +3719,8 @@ connect();   // auto-connect on load
       body:JSON.stringify({node:"slam_nav",name,value})}).catch(()=>{});
   // slider (label span id = elId+"V"): show value on input, send on change.
   // `scale` multiplies the raw slider value before sending (%-sliders use 1/100).
-  const bindSlider=(id,param,{fmt:v=>v,scale=1}={})=>{
+  const bindSlider=(id,param,opts)=>{
+    const {fmt=v=>v,scale=1}=opts||{};
     const i=el(id); if(!i) return;
     const v=el(id+"V");
     v && i.addEventListener("input",()=>v.textContent=String(fmt(Number(i.value))));
