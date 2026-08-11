@@ -161,6 +161,15 @@ class NavNode(Node):
                                           # partial overlap); a 2nd agreeing scan costs ~0.2 s
                                           # and stops both the map-pose teleport and the map-
                                           # corrupting integration at a wrong pose.
+            ("recover_min_move", 0.10),   # min linear odom travel (m) before a recovery
+                                          # candidate may be adopted OR confirmed. A still (or
+                                          # only in-place-spinning) robot in a symmetric or
+                                          # sparse room sees the SAME geometry from the correct
+                                          # heading and the 180°-flipped one, so scans re-scoring
+                                          # in place would self-confirm the wrong flip (the
+                                          # boot-into-saved-map "front is back", 2026-08-11).
+                                          # Only translation changes what the scan sees,
+                                          # breaking the ambiguity.
             ("recover_lin", 0.5),         # recovery scan-match search half-window (m)
             ("recover_ang", 1.0),         # recovery scan-match search half-window (rad)
             ("recover_half", 6),          # recovery candidates per axis (2*half+1)
@@ -380,6 +389,7 @@ class NavNode(Node):
         self.recover_overlap = float(g("recover_overlap").value)
         self.recover_confirm = max(1, int(g("recover_confirm").value))
         self.recover_min_seen = float(g("recover_min_seen").value)
+        self.recover_min_move = float(g("recover_min_move").value)
         self.recover_lin = float(g("recover_lin").value)
         self.recover_ang = float(g("recover_ang").value)
         self.recover_half = int(g("recover_half").value)
@@ -472,6 +482,10 @@ class NavNode(Node):
         self._picked_up = False
         self._recovering = False     # actively re-searching for the pose (lost / set down)
         self._recover_until = 0.0
+        self._recover_odom = None    # odom (x, y) when recovery was entered; used to require
+                                     # real translation (recover_min_move) before a candidate
+                                     # can be adopted/confirmed — see _enter_recovery
+        self._recover_moved = False  # the robot has since translated >= recover_min_move
         self._lost_count = 0         # consecutive scans the match has failed
         # Recovery confirmation: a relocalize candidate must be REPRODUCED by a later scan
         # before it's trusted+integrated. On a smeared/fragmented map a single scan can
@@ -608,6 +622,8 @@ class NavNode(Node):
                 self.recover_confirm = max(1, int(p.value))
             elif p.name == "recover_min_seen":
                 self.recover_min_seen = float(p.value)
+            elif p.name == "recover_min_move":
+                self.recover_min_move = max(0.0, float(p.value))
             elif p.name == "recover_global":
                 self.recover_global = bool(p.value)
             elif p.name == "recover_global_step":
@@ -830,6 +846,24 @@ class NavNode(Node):
                     throttle_duration_sec=15.0)
 
     # --- the SLAM step (per scan) -------------------------------------------
+    def _enter_recovery(self, kidnap):
+        """Start an active localization search. `kidnap` = the robot may genuinely be far
+        away (carried + set down / woke into a saved map) so the full-grid search is
+        allowed, vs. a loss while driving (the robot is within recover_lin of the true pose
+        and a global "better" match is a spurious far peak). Records the odom position at
+        entry: a recovery candidate is only adopted/confirmed once the robot has translated
+        >= recover_min_move (see _on_scan) — the stationary case is heading-ambiguous on a
+        symmetric map and must not self-confirm a 180°-flipped lock."""
+        self._recovering = True
+        self._recover_kidnap = kidnap
+        self._recover_conf = None
+        self._recover_conf_hits = 0
+        self._recover_until = time.monotonic() + self.recover_timeout
+        self._lost_count = 0
+        self._next_global_scan = 0.0   # global search fires this first scan
+        self._recover_odom = (self._odom[0], self._odom[1]) if self._odom is not None else None
+        self._recover_moved = False
+
     def _on_scan(self, msg):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
         n = len(ranges)
@@ -925,6 +959,19 @@ class NavNode(Node):
         trusted = False
 
         if self._recovering:
+            # A recovery candidate may only be adopted/confirmed once the robot has
+            # actually TRANSLATED since recovery started (recover_min_move): a still robot
+            # (or one only spinning in place) in a symmetric or sparse room sees identical
+            # geometry from the correct heading and the 180°-flipped one, so scans
+            # re-scoring in place would self-confirm the wrong flip (boot-into-saved-map
+            # "front is back", 2026-08-11). Translation changes what the scan sees and
+            # breaks the ambiguity, so until then the pose holds the odom-derived heading.
+            if self._odom is not None:
+                if self._recover_odom is None:
+                    self._recover_odom = (self._odom[0], self._odom[1])  # odom arrived late
+                elif math.hypot(self._odom[0] - self._recover_odom[0],
+                                self._odom[1] - self._recover_odom[1]) >= self.recover_min_move:
+                    self._recover_moved = True
             # Local wide window every scan (cheap — keeps snapping as the spin varies
             # geometry); a full-grid search periodically BUT only for a genuine kidnap /
             # boot-locate (the robot moved or woke into a saved map) — NEVER on a driving
@@ -938,7 +985,8 @@ class NavNode(Node):
                 overlap = self.grid.overlap_ratio(cand, va, vr)
                 self._last_score, self._last_overlap = score, overlap
                 if score >= self.min_score and overlap >= self.min_overlap:
-                    px, py, pth = cand   # refine the prior; keep searching
+                    if self._recover_moved:
+                        px, py, pth = cand   # refine the prior; keep searching
                 recovered = (score >= self.recover_exit_score
                              and overlap >= self.recover_overlap)
                 if recovered:
@@ -957,9 +1005,10 @@ class NavNode(Node):
                             or abs(_wrap(cand[2] - self._recover_conf[2])) > 0.15):
                         self._recover_conf = cand          # first sighting (or moved off)
                         self._recover_conf_hits = 1
-                    else:
-                        self._recover_conf_hits += 1
-                    if self._recover_conf_hits >= self.recover_confirm:
+                    elif self._recover_moved:
+                        self._recover_conf_hits += 1       # reproduced while the robot moved
+                    if (self._recover_moved
+                            and self._recover_conf_hits >= self.recover_confirm):
                         self._recovering = False
                         self._lost_count = 0
                         self._next_global_scan = 0.0
@@ -997,10 +1046,12 @@ class NavNode(Node):
                                     or abs(_wrap(gth - (self._recover_conf[2]))) > 0.15):
                                 self._recover_conf = (gx, gy, gth)
                                 self._recover_conf_hits = 1
-                            else:
+                            elif self._recover_moved:
                                 self._recover_conf_hits += 1
-                            px, py, pth = (gx, gy, gth)   # tighter prior; keep confirming
-                            if self._recover_conf_hits >= self.recover_confirm:
+                            if self._recover_moved:
+                                px, py, pth = (gx, gy, gth)   # tighter prior; keep confirming
+                            if (self._recover_moved
+                                    and self._recover_conf_hits >= self.recover_confirm):
                                 self._recovering = False
                                 self._lost_count = 0
                                 self._next_global_scan = 0.0
@@ -1033,14 +1084,9 @@ class NavNode(Node):
                 # plenty of structure in view but it doesn't match the map -> we're drifting
                 self._lost_count += 1
                 if self._lost_count >= self.recover_patience:
-                    self._recovering = True
                     # lost WHILE DRIVING: the robot is within recover_lin of the true pose.
                     # Mark this as a non-kidnap loss so the full-grid search stays disabled.
-                    self._recover_kidnap = False
-                    self._recover_conf = None
-                    self._recover_conf_hits = 0
-                    self._recover_until = time.monotonic() + self.recover_timeout
-                    self._next_global_scan = 0.0   # global search fires this first scan
+                    self._enter_recovery(kidnap=False)
                     self.get_logger().warning(
                         f"localization lost (score {score:.1f}, overlap "
                         f"{overlap:.2f}) — relocalizing")
@@ -1404,6 +1450,8 @@ class NavNode(Node):
                 self._lost_count = 0                   # ...and run on the best estimate
                 self._recover_conf = None
                 self._recover_conf_hits = 0
+                self._recover_odom = None
+                self._recover_moved = False
                 self._send(0.0, 0.0)
                 self.get_logger().warning("relocalize timed out; using best estimate")
             else:
@@ -1503,17 +1551,11 @@ class NavNode(Node):
         else:
             self._set_face("")                         # back to the normal dashboard
             if self.relocalize:
-                self._recovering = True
                 # Real kidnap (carried + set down elsewhere): the robot genuinely may be
                 # far away, so the full-grid search is allowed this time and the pose is
-                # re-found from scratch (still behind the 2-scan confirmation gate in
-                # _on_scan before it's trusted + integrated).
-                self._recover_kidnap = True
-                self._recover_conf = None
-                self._recover_conf_hits = 0
-                self._recover_until = now + self.recover_timeout
-                self._lost_count = 0
-                self._next_global_scan = 0.0
+                # re-found from scratch (still behind the confirmation gate in _on_scan
+                # before it's trusted + integrated).
+                self._enter_recovery(kidnap=True)
             self.get_logger().info("set down — relocalizing")
 
     def _update_lds_idle(self, now):

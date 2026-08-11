@@ -79,7 +79,7 @@ PARAM_WHITELIST = {
                  "test_lin", "test_ang", "test_dist", "test_turns", "test_settle",
                  "slip_check", "slip_min_rot", "slip_ratio_hi", "slip_ratio_lo",
                  "slip_cooldown",
-                 "qual_min", "min_overlap_ratio", "recover_min_seen"},
+                 "qual_min", "min_overlap_ratio", "recover_min_seen", "recover_min_move"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
                     "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",
@@ -286,6 +286,19 @@ class TelemetryHub:
             self._vibration_since = now
         return (now - self._vibration_since) >= g("vision_vibration_confirm_secs").value
 
+    def _drift_yaw_deg(self):
+        """Heading source for the yaw-drift numbers: the EKF's /odometry/filtered
+        yaw (radians), NOT the BWT901CL's raw fused 0x53 angle. The device's own
+        fused yaw develops a large decaying bias transient for a minute+ after any
+        real motion (measured 2026-08-11: +450° in 76s post-drive while the raw
+        gyro-z stayed ~0), so it is NOT a trustworthy "is my heading stable at rest"
+        reference even though it looks fine on the 3D display. The EKF yaw is now
+        gyro-z-integrated (imu0 yaw fusion disabled) -- clean at rest, no transient.
+        Falls back to the raw device yaw if the EKF hasn't arrived yet."""
+        if self._ekf is not None:
+            return math.degrees(self._ekf[2])
+        return self._eul[2]           # pre-EKF fallback (raw device yaw, degrees)
+
     def _imu_drift_tick(self, now):
         """IMU drift check: while the robot is provably stationary (not commanded to
         move, same eps as the bumper/vibration checks above, AND both wheels
@@ -294,6 +307,9 @@ class TelemetryHub:
         the selftest-spin-imu-mismatch investigation), not real motion. Purely
         observational, like the other alerts here: nothing acts on it, it just
         answers "is my IMU trustworthy at rest" from the web UI.
+        Roll/pitch come from the raw /imu/euler (accel-corrected, no transient);
+        yaw comes from the EKF heading (see _drift_yaw_deg) so the post-drive
+        device-fused-yaw transient can't light this up red.
         Returns the live in-progress reading (zeros while moving) plus `last`, a
         latched one-line summary of the most recently completed still period long
         enough to mean anything (>= imu_drift_min_secs)."""
@@ -310,7 +326,8 @@ class TelemetryHub:
             self._drift_base = None
             return {"still_s": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
                     "yaw_per_min": 0.0, "last": self._drift_last}
-        r, p, y, _ = self._eul
+        r, p, _, _ = self._eul
+        y = self._drift_yaw_deg()
         if self._drift_base is None:
             self._drift_base = (r, p, y, now)
         dr, dp, dy, dur = self._drift_since(r, p, y, now)
@@ -325,7 +342,8 @@ class TelemetryHub:
         return r - r0, p - p0, dy, now - t0
 
     def _latch_drift(self, now, min_secs):
-        r, p, y, _ = self._eul
+        r, p, _, _ = self._eul
+        y = self._drift_yaw_deg()
         dr, dp, dy, dur = self._drift_since(r, p, y, now)
         if dur < min_secs:
             return                # too brief to mean anything -- don't overwrite the last real reading

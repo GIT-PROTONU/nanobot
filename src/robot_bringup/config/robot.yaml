@@ -199,6 +199,12 @@ slam_nav:
                                    # suppressed (fresh/cleared map: a low score is expected, not
                                    # drift; spinning only smears the grid + drains battery). Hold
                                    # pose and keep matching until the map fills in.
+    recover_min_move: 0.10         # min linear odom travel (m) before a recovery candidate may be
+                                   # adopted/confirmed. A still (or in-place-spinning) robot in a
+                                   # symmetric/sparse room sees the same geometry from the correct
+                                   # and the 180°-flipped heading, so scans re-scoring in place
+                                   # would self-confirm the wrong flip (boot-into-saved-map "front
+                                   # is back", 2026-08-11); only translation breaks the ambiguity.
     recover_lin: 0.5               # recovery search half-window (m) around the prior
     recover_ang: 1.0               # recovery search half-window (rad)
     recover_half: 6                # recovery candidates per axis (2*half+1)
