@@ -601,6 +601,15 @@ web_control:
     drive_max_lin: 0.4        # m/s clamp (the ESP32 maps 0.4 to full PWM)
     drive_max_ang: 3.0        # rad/s clamp
     drive_timeout: 0.6        # s without a fresh POST -> publish one stop
+    # Manual-teleop wall clearance guard: when ON, POST /drive (web joystick /
+    # keyboard teleop) refuses to drive TOWARD a wall/obstacle closer than
+    # wall_guard_distance — rotation is always allowed so the driver can turn away.
+    # Inert while the SLAM pose is stale or the map blob is missing. Live-tunable
+    # from the Map card (the "Wall distance" slider sets this AND slam_nav's
+    # stop_distance together, so the drawn keep-away bubble matches the autonomous
+    # stop distance; the guard is a separate opt-in toggle).
+    wall_guard_enable: false
+    wall_guard_distance: 0.25   # m keep-away bubble for the manual guard
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"

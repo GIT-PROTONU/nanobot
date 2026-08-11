@@ -90,7 +90,8 @@ PARAM_WHITELIST = {
                     "vision_novelty_alert", "vision_camera_stall_secs",
                     "vision_vibration_ratio", "vision_vibration_confirm_secs",
                     "vision_glare_derate", "vision_approach_rate", "vision_approach_band",
-                    "imu_drift_min_secs"},
+                    "imu_drift_min_secs",
+                    "wall_guard_enable", "wall_guard_distance"},
 }
 
 
@@ -453,6 +454,8 @@ class TelemetryHub:
             x, y, yaw, at = self._slam_pose
             f["slam_pose"] = {"x": round(x, 3), "y": round(y, 3),
                               "yaw": round(yaw, 3), "age": round(now - at, 2)}
+        # Manual-teleop wall guard: the Map card's toggle + keep-away bubble read this.
+        f["wall_guard"] = getattr(n, "wall_guard_state", lambda: {})()
         if self._sld is not None:
             d, at = self._sld
             if now - at < 5.0:                    # stale diag = the node is gone

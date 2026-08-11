@@ -35,6 +35,8 @@ import threading
 import time
 from datetime import datetime
 
+import numpy as np
+
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
@@ -113,6 +115,19 @@ VITALS_FILE = "/dev/shm/nano_vitals.json"     # sys_monitor's aggregated body sn
 # os.replace). slam_nav polls this file on its control tick and applies them to the grid;
 # a rising "t" token makes each request idempotent (so the file may persist between writes).
 NGO_MAP_EDIT_FILE = "/dev/shm/nano_map_edit.json"
+
+# ---- Manual-teleop wall clearance guard -------------------------------------
+# Opt-in safety for POST /drive (the web joystick / keyboard teleop): when
+# wall_guard_enable is on, a drive command is refused if the robot would push
+# toward a wall/obstacle closer than wall_guard_distance. Reads the SLAM pose
+# (telemetry._slam_pose) + the /dev/shm map blob nav_node writes, so it needs no
+# new ROS wiring. Rotation is always allowed (that's how the driver turns away).
+WALL_GUARD_MAP_FILE = "/dev/shm/nano_map.bin"
+WALL_GUARD_STALE = 1.5      # s: SLAM pose older than this = guard inert (pose lost)
+WALL_GUARD_OCC = 50         # int8 occupancy above this counts as a wall
+WALL_GUARD_PROBE = 0.06     # m ahead/behind the centre to probe (motion between the
+                            # 10 Hz re-checks can't outrun this: max_lin 0.15 / 10 Hz)
+WALL_GUARD_LOG = 2.0        # s throttle on the "drive blocked" log line
 
 # The GATED "action tier" for topic-skills: the ONLY ROS topics a skill may publish, each
 # with a hard clamp. Anything else is refused. Motion is ALSO clamped reflexively by
@@ -531,6 +546,11 @@ class WebServerNode(Node):
         self.declare_parameter("drive_max_lin", 0.4)    # m/s clamp (ESP32 maps 0.4 to full PWM)
         self.declare_parameter("drive_max_ang", 3.0)    # rad/s clamp
         self.declare_parameter("drive_timeout", 0.6)    # s without a POST -> stop
+        # Manual-teleop wall guard (opt-in): refuse to drive TOWARD a wall closer
+        # than wall_guard_distance. The Map card's "Wall distance" slider sets this
+        # together with slam_nav/stop_distance so the drawn keep-away bubble matches.
+        self.declare_parameter("wall_guard_enable", False)
+        self.declare_parameter("wall_guard_distance", 0.25)   # m keep-away bubble
         # Same default as sys_monitor's health_log_path (it writes, we serve).
         self.declare_parameter("health_log_path", "~/.local/state/nanobot/health.log")
         self._drive_pub = self.create_publisher(Twist, "cmd_vel", 10)
@@ -538,6 +558,11 @@ class WebServerNode(Node):
         self._drive_v = self._drive_w = 0.0
         self._drive_at = 0.0                            # monotonic of last POST; 0 = idle
         self._last_drive_log = 0.0                      # throttle for the /drive log line
+        # wall-guard live state (read by telemetry's frame for the web UI)
+        self._guard_cache = None                        # (mtime_ns, size) -> parsed map
+        self._guard_blocked = False                     # a drive was just refused
+        self._guard_closest = 0.0                       # m to the nearest wall at the refusal
+        self._guard_last_log = 0.0                      # throttle for the block log line
         self._cpu_quick_at = 0.0                        # memo TTL for _cpu_percent_quick
         self._cpu_quick_val = 0.0
         self.create_timer(0.1, self._drive_tick)
@@ -766,6 +791,7 @@ class WebServerNode(Node):
         if (v or w) and time.monotonic() - self._last_drive_log > 2.0:
             self._last_drive_log = time.monotonic()
             self.get_logger().info(f"POST /drive v {v:.2f} w {w:.2f} (web teleop)")
+        v, w = self._wall_guard(v, w)                  # opt-in wall clearance guard
         self._publish_drive(v, w)
         return {"status": "ok", "v": v, "w": w}
 
@@ -787,7 +813,120 @@ class WebServerNode(Node):
                 self._drive_v = self._drive_w = 0.0
                 self._drive_at = 0.0
             v, w = self._drive_v, self._drive_w
+        v, w = self._wall_guard(v, w)                  # re-assert the same guarded values
         self._publish_drive(v, w)                      # a stale drive publishes one stop
+
+    # ---- manual-teleop wall clearance guard ------------------------------------
+    def wall_guard_state(self):
+        """Live guard state for the telemetry frame (web UI toggle + map bubble)."""
+        g = self.get_parameter
+        return {"enable": bool(g("wall_guard_enable").value),
+                "distance": round(float(g("wall_guard_distance").value), 3),
+                "blocked": bool(self._guard_blocked),
+                "closest": round(self._guard_closest, 3)}
+
+    def _wall_guard(self, v, w):
+        """Refuse to drive TOWARD a wall closer than wall_guard_distance (opt-in).
+        Only the linear axis is gated; rotation is always passed through so the driver
+        can turn away. Inert when: disabled, distance <= 0, no/stale SLAM pose, or the
+        map blob is unreadable (restart/teardown window) — never worse than a no-op."""
+        g = self.get_parameter
+        if not bool(g("wall_guard_enable").value) or v == 0.0:
+            self._guard_blocked = False
+            return v, w
+        dist = float(g("wall_guard_distance").value)
+        if dist <= 0:
+            self._guard_blocked = False
+            return v, w
+        tm = getattr(self, "telemetry", None)
+        pose = tm._slam_pose if tm is not None else None
+        if pose is None:
+            self._guard_blocked = False
+            return v, w
+        x, y, yaw, at = pose
+        if time.monotonic() - at > WALL_GUARD_STALE:
+            self._guard_blocked = False                 # pose lost -> guard can't judge
+            return v, w
+        gm = self._guard_map()
+        if gm is None:
+            self._guard_blocked = False
+            return v, w
+        # Probe along the direction of travel: only block when THAT path runs into
+        # the bubble. A robot next to a wall can still drive parallel / away from it
+        # (a corridor narrower than 2*dist stays drivable down its middle).
+        d = math.cos(yaw) if v > 0 else -math.cos(yaw)
+        dy = math.sin(yaw) if v > 0 else -math.sin(yaw)
+        d0 = self._guard_clearance(gm, x, y, dist)
+        dp = self._guard_clearance(gm, x + d * WALL_GUARD_PROBE,
+                                   y + dy * WALL_GUARD_PROBE, dist)
+        self._guard_closest = min(d0, dp)
+        if dp >= dist:
+            self._guard_blocked = False
+            return v, w
+        self._guard_blocked = True
+        if time.monotonic() - self._guard_last_log > WALL_GUARD_LOG:
+            self._guard_last_log = time.monotonic()
+            self.get_logger().info(
+                f"wall guard: {'reverse' if v < 0 else 'forward'} drive blocked "
+                f"({self._guard_closest:.2f} m to wall, keep-away {dist:.2f} m)")
+        return 0.0, w
+
+    def _guard_map(self):
+        """Cached parse of nav_node's /dev/shm map blob (JSON header + int8 grid).
+        Re-reads only when the file mtime/size changes (the blob rewrites ~2 Hz)."""
+        try:
+            st = os.stat(WALL_GUARD_MAP_FILE)
+        except OSError:
+            self._guard_cache = None
+            return None
+        key = (st.st_mtime_ns, st.st_size)
+        if self._guard_cache is not None and self._guard_cache[0] == key:
+            return self._guard_cache[1]
+        try:
+            with open(WALL_GUARD_MAP_FILE, "rb") as f:
+                data = f.read()
+        except OSError:
+            self._guard_cache = None
+            return None
+        nl = data.find(b"\n")
+        if nl < 0:
+            self._guard_cache = None
+            return None
+        try:
+            meta = json.loads(data[:nl])
+        except ValueError:
+            self._guard_cache = None
+            return None
+        h = int(meta.get("h", 0)); w = int(meta.get("w", 0))
+        if not h or not w or len(data) - nl - 1 < h * w:
+            self._guard_cache = None
+            return None
+        g = {
+            "w": w, "h": h, "res": float(meta["res"]),
+            "ox": float(meta["ox"]), "oy": float(meta["oy"]),
+            # row 0 = origin_y (bottom); same orientation the browser map renders
+            "occ": np.frombuffer(data, dtype=np.int8, offset=nl + 1).reshape(h, w),
+        }
+        self._guard_cache = (key, g)
+        return g
+
+    def _guard_clearance(self, gm, x, y, dist):
+        """Nearest-occupied distance (m) from the world point (x, y), or inf when the
+        window is clear. Searches only a ~dist-sized window around the cell (cheap)."""
+        occ = gm["occ"]; res = gm["res"]; h, w = occ.shape
+        cx = (x - gm["ox"]) / res
+        cy = (y - gm["oy"]) / res
+        R = max(1, int(math.ceil(dist / res)) + 2)
+        r0 = max(0, int(math.floor(cy)) - R); r1 = min(h, int(math.ceil(cy)) + R + 1)
+        c0 = max(0, int(math.floor(cx)) - R); c1 = min(w, int(math.ceil(cx)) + R + 1)
+        if r0 >= r1 or c0 >= c1:
+            return float("inf")
+        win = occ[r0:r1, c0:c1]
+        mask = win > WALL_GUARD_OCC
+        if not mask.any():
+            return float("inf")
+        rows, cols = np.nonzero(mask)
+        return float(np.hypot((r0 + rows) - cy, (c0 + cols) - cx).min() * res)
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):

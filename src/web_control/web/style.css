@@ -229,6 +229,11 @@ input[type=range]:disabled::-moz-range-thumb{background:var(--muted)}
   font-family:var(--mono);font-variant-numeric:tabular-nums}
 .field.inline{flex-direction:row;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
 .field.inline input{width:auto;flex:none;max-width:6em;min-height:40px}
+/* Map-card wall-guard row: "Wall guard" switch + the keep-away distance slider */
+.wall-dist{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted)}
+.wall-dist input[type=range]{width:110px;min-height:26px}
+.wall-dist span{color:var(--txt);min-width:2.6em;text-align:right;
+  font-family:var(--mono);font-variant-numeric:tabular-nums}
 .row{display:flex;gap:8px;align-items:center}
 .grow{flex:1;min-width:0}
 .prefix{color:var(--muted);font-family:var(--mono);font-size:13px;flex:none}

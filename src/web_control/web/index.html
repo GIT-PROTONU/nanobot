@@ -98,13 +98,21 @@
             <button id="mapClear" class="btn danger">🗑 Clear map</button>
             <button id="mapTest" class="btn">🔧 Self-test</button>
           </div>
+          <div id="wallCtl" class="chiprow">
+            <label class="switch"><input type="checkbox" id="mapWallGuard"><span class="track"></span> Wall guard</label>
+            <label class="wall-dist">Keep-away <span id="mapWallDistV">0.25</span> m
+              <input id="mapWallDist" type="range" min="0.05" max="0.80" step="0.01" value="0.25"></label>
+          </div>
           <div id="mapStats"></div>
           <pre id="mapTestOut" style="display:none"></pre>
           <p class="hint" id="mapHint" style="display:none">2D occupancy map from
             <b>slam_nav</b>, served raw from <b>/dev/shm</b>. Scroll / pinch to zoom, drag to
             pan, <b>⤢ Fit</b> recentres. <b>Tap the map to set a goal</b> —
             the green line is the plan. It only drives when <b>Motion</b> is on (else it just
-            plans). Red = robot, yellow = goal, cyan = trail, ⌂ = home. <b>Auto-explore</b>
+            plans). Red = robot, yellow = goal, cyan = trail, ⌂ = home, dashed circle =
+            the <b>keep-away distance</b> the robot keeps from walls. <b>Wall guard</b> applies
+            that same distance to <b>manual driving</b> (the robot won't drive into a wall,
+            only turn away). <b>Auto-explore</b>
             drives to unmapped frontiers; <b>Save map</b> persists it. <b>Clear map</b> wipes
             the current grid and starts fresh from wherever the robot is standing right now
             (like a reboot) — use it to recover from a corrupted/smeared map without
@@ -1477,6 +1485,9 @@ let scale=40, panX=0, panY=0;            // px per metre
 let dragging=false,dsx=0,dsy=0,dpx=0,dpy=0;
 let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
+// wall-guard state from the telemetry frame (f.wall_guard) — the map draw() uses it
+// to colour the keep-away bubble; onFrame keeps it in sync with the server.
+let wallGuardActive=false, wallGuardBlocked=false;
 
 // ---- server link state (SSE /telemetry — there is no rosbridge anymore) ----
 let connected=false;                     // the /telemetry stream is live
@@ -1561,7 +1572,10 @@ $("navMaxLin").onchange=()=>setParam("slam_nav","max_lin",Number($("navMaxLin").
 $("navMaxAng").oninput=()=>$("navMaxAngV").textContent=$("navMaxAng").value;
 $("navMaxAng").onchange=()=>setParam("slam_nav","max_ang",Number($("navMaxAng").value));
 $("navStopDist").oninput=()=>$("navStopDistV").textContent=$("navStopDist").value;
-$("navStopDist").onchange=()=>setParam("slam_nav","stop_distance",Number($("navStopDist").value));
+$("navStopDist").onchange=()=>{
+  setParam("slam_nav","stop_distance",Number($("navStopDist").value));
+  setParam("web_control","wall_guard_distance",Number($("navStopDist").value));
+};
 $("navRadius").oninput=()=>$("navRadiusV").textContent=$("navRadius").value;
 $("navRadius").onchange=()=>setParam("slam_nav","robot_radius",Number($("navRadius").value));
 $("navStuck").oninput=()=>$("navStuckV").textContent=Number($("navStuck").value)===0?"off":$("navStuck").value+" s";
@@ -2019,6 +2033,19 @@ function onFrame(f){
   onLds(f.lds||{});
   if(f.fan!==undefined) $("fanDuty").textContent=(f.fan*100).toFixed(0)+"%";
   if(f.plan) mapPlan=f.plan;
+  // wall-guard state -> Map card toggle + slider + the keep-away bubble colour. Only
+  // re-apply on an actual change so it never fights the user mid-drag.
+  if(f.wall_guard){
+    const wg=f.wall_guard;
+    const tg=$("mapWallGuard");
+    if(tg && tg.checked!==!!wg.enable) tg.checked=!!wg.enable;
+    const sd=$("mapWallDist");
+    if(sd && Math.abs(Number(sd.value)-wg.distance)>0.005){
+      sd.value=wg.distance; $("mapWallDistV").textContent=wg.distance.toFixed(2);
+    }
+    wallGuardActive=!!wg.enable;
+    wallGuardBlocked=!!wg.blocked;
+  }
   onVision(f.vision);
   if(f.selftest && f.selftest!==rawSelftest){ rawSelftest=f.selftest;
     const el=$("mapTestOut"); el.style.display="block"; el.textContent=f.selftest; }
@@ -3356,6 +3383,18 @@ connect();   // auto-connect on load
     ctx.beginPath(); ctx.arc(rx,ry,4,0,6.2832); ctx.fill();
     ctx.beginPath(); ctx.moveTo(rx,ry);
     ctx.lineTo(rx+9*Math.cos(m.pth), ry-9*Math.sin(m.pth)); ctx.stroke();
+    // wall keep-away bubble: the distance the robot keeps from walls (stop_distance,
+    // in the map header as `wd`), drawn as a dashed circle around the robot. Grey =
+    // the autonomous-navigation distance; blue = the manual wall-guard is on; orange
+    // = the guard is actively refusing a drive into a wall right now.
+    if(m.wd!==undefined && m.wd>0){
+      const R=m.wd/m.res;
+      ctx.strokeStyle=wallGuardBlocked?"#ff9500":(wallGuardActive?"#0a84ff":"#63666b");
+      ctx.lineWidth=wallGuardBlocked?2.5:1.5;
+      ctx.setLineDash([5,4]);
+      ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
+      ctx.setLineDash([]);
+    }
     // telemetry line (coverage + localization health + mode)
     if(m.seen!==undefined){
       const q = m.score>=8?"good":(m.score>=2?"ok":"weak");
@@ -3401,6 +3440,18 @@ connect();   // auto-connect on load
   });
   $("mapMotion").addEventListener("change",e=>setNavMotion(e.target.checked));
   $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));
+  // wall guard: the toggle flips web_control's guard; the Keep-away slider sets BOTH
+  // slam_nav's stop_distance (autonomous keep-away) and web_control's
+  // wall_guard_distance (manual guard) so one control drives the whole bubble.
+  $("mapWallGuard").addEventListener("change",e=>setParam("web_control","wall_guard_enable",e.target.checked));
+  $("mapWallDist").addEventListener("input",()=>{
+    $("mapWallDistV").textContent=Number($("mapWallDist").value).toFixed(2);
+  });
+  $("mapWallDist").addEventListener("change",()=>{
+    const v=Number($("mapWallDist").value);
+    setParam("slam_nav","stop_distance",v);
+    setParam("web_control","wall_guard_distance",v);
+  });
   $("mapHome").addEventListener("click",()=>pub("/slam_nav/go_home",true));
   $("mapSave").addEventListener("click",()=>pub("/slam_nav/save_map",true));
   $("mapClear").addEventListener("click",()=>{

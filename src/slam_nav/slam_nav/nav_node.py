@@ -2111,6 +2111,7 @@ class NavNode(Node):
             "w": self.grid.n, "h": self.grid.n, "res": self.grid.res,
             "ox": self.grid.origin, "oy": self.grid.origin,
             "px": self.px, "py": self.py, "pth": self.pth,
+            "wd": round(self.stop_distance, 3),   # keep-away distance (m) — web map draws the bubble
             # --- telemetry the web map panel renders (all cheap to compute) ---
             "hx": self.home[0], "hy": self.home[1],          # home marker
             "seen": round(seen_frac, 3),                     # fraction of grid observed
