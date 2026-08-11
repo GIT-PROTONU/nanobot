@@ -25,6 +25,17 @@ The robot board is **live at 192.168.178.141**, user `ibster` (sudo). See [[proj
   power-cycle after repeated stack down/up churn (SBC side verified healthy — see the
   esp32-link-wedge memory). Verify state now: `/brain/health` → `all_healthy: true`;
   ESP fields live in `/telemetry`; page connector "connected".
+- **[2026-08-11, DEPLOYED + pushed]** `71f1462` "fix(slam_nav): 2-scan recovery
+  confirmation, kidnap-gated global relocalize, working map clear". Covers (a) the SLAM
+  **map-pose teleport** fix — recovery hardened (`recover_overlap` 0.30, `recover_exit_score`
+  20.0, `recover_confirm` 2) + **kidnap-gated full-grid relocalize** (fires on pick-up
+  set-down or never-trusted, NOT on drive-time loss) — see [[slam-autonomy-pickup-relocalize]];
+  (b) the web map **Clear/Home/Save/Test buttons** rewired from dead ROSLIB stubs to the SSE
+  `pub()`/`sendDrive()` gateway and `_on_clear_map` now drops goal/path + rewrites the no-go
+  blob to count 0 — see [[web-map-clear-buttons-nogo]]. Verified live on the board: clear→
+  `count:0` blob + HTTP 200 `/map/nogo`, save→`nano_map.npz`, home→origin, selftest properly
+  motion-gated; the nogo blob's transient "vanishing" was just the deploy-restart teardown
+  window (no code deletes it). 11 slam_nav tests pass.
 - **[SUPERSEDED 2026-07-14]** ESP32 coprocessor is now actively wired and in active use, not
   deferred. See [[esp32-hardware-fried-ground-fix]] for a same-day hardware incident (a board
   fried from a ground-bounce path, replaced, hardware rework in progress) and

@@ -78,6 +78,16 @@ left needs the physical robot and can't be closed from a dev host.
 
 # New SLAM/ODOM TODOs from recent investigation
 
+- [x] **SLAM map-pose "teleport" / lost-storm recovery hardened (DONE 2026-08-11,
+      deployed, `71f1462`)** — recovery now requires an overlap-inlier gate
+      (`recover_overlap`), a raised `recover_exit_score` (20.0), and **2 consecutive
+      scans reproducing the same candidate** (`recover_confirm`) before trusting a
+      recovered pose; a full-grid relocalize is gated to kidnap/never-trusted only.
+      See `.claude/memory/slam-autonomy-pickup-relocalize.md`.
+- [x] **Web map Clear/Home/Save/Test/Stop buttons (DONE 2026-08-11, deployed)**
+      rewired from a dead ROSLIB block to the SSE `pub()`/`sendDrive()` gateway;
+      `_on_clear_map` drops the goal/path and rewrites the no-go blob to `count:0`.
+      See `.claude/memory/web-map-clear-buttons-nogo.md`.
 - [ ] **Update EKF yaw process noise covariance** (increase from 0.06 → 0.12) to
       improve turn handling in SLAM correlation.
 - [ ] **Wheel calibration**: Test `ticks_per_rev` with a measured 1m distance drive.
