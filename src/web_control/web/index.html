@@ -60,6 +60,10 @@
             <div id="mapWait"><span>waiting for map… is the lidar spinning?<br>
               (set <b>Spin target</b> &gt; 0 rpm in <b>Sensors</b> → Lidar (LDS))</span></div>
           </div>
+          <div id="mapZoomBtns" class="map-zoom overlay-btn">
+            <button id="mapZoomOut" title="Zoom out">−</button>
+            <button id="mapZoomIn" title="Zoom in">+</button>
+          </div>
           <button id="mapFit" class="overlay-btn">⤢ Fit</button>
         </div>
         <div id="view-cam" class="view">
@@ -3207,6 +3211,69 @@ connect();   // auto-connect on load
   const dec=new TextDecoder();
   let timer=null, img=null, lastMeta=null;
 
+  // ---- zoom / pan: the canvas keeps its full grid resolution and is scaled with a
+  //      CSS transform, so draw() stays cheap and overlays stay pixel-accurate. ----
+  const wrap=$("mapWrap");
+  let zoom=0, panX=0, panY=0;                       // zoom 0 = auto-fit to the wrap
+  const fitZoom=()=>Math.min(wrap.clientWidth/cv.width, wrap.clientHeight/cv.height)||1;
+  const cX=z=>((wrap.clientWidth-cv.width*z)/2), cY=z=>((wrap.clientHeight-cv.height*z)/2);
+  function applyTf(){
+    const z=zoom||fitZoom();
+    cv.style.transformOrigin="0 0";
+    cv.style.transform=`translate(${cX(z)+panX}px, ${cY(z)+panY}px) scale(${z})`;
+  }
+  function fitMap(){ zoom=0; panX=0; panY=0; applyTf(); }
+  function zoomAt(factor,mx,my){
+    const z=zoom||fitZoom();
+    const z1=Math.min(20,Math.max(fitZoom()*0.5, z*factor));
+    if(z1===z) return;
+    const tx=cX(z)+panX, ty=cY(z)+panY;
+    const x0=(mx-tx)/z, y0=(my-ty)/z;               // map pixel under cursor / pinch centre
+    zoom=z1; panX=mx-x0*z1-cX(z1); panY=my-y0*z1-cY(z1);
+    applyTf();
+  }
+  wrap.addEventListener("wheel",e=>{
+    e.preventDefault();
+    const r=wrap.getBoundingClientRect();
+    zoomAt(e.deltaY<0?1.15:1/1.15, e.clientX-r.left, e.clientY-r.top);
+  },{passive:false});
+  // pan with one pointer, pinch-zoom with two. Capture on the canvas so the
+  // subsequent click still targets cv (click-to-goal), not the wrap container.
+  let panDrag=false, panMoved=false, pdsx=0,pdsy=0,pdpx=0,pdpy=0, pinch=null;
+  const pointers=new Map();
+  cv.addEventListener("pointerdown",e=>{
+    pointers.set(e.pointerId,[e.clientX,e.clientY]);
+    if(pointers.size===2){
+      const [[ax,ay],[bx,by]]=[...pointers.values()];
+      pinch={d:Math.hypot(bx-ax,by-ay), mx:(ax+bx)/2, my:(ay+by)/2};
+    } else { panDrag=true; panMoved=false; pdsx=e.clientX; pdsy=e.clientY; pdpx=panX; pdpy=panY; }
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener("pointermove",e=>{
+    if(pointers.has(e.pointerId)) pointers.set(e.pointerId,[e.clientX,e.clientY]);
+    if(pointers.size===2 && pinch){
+      const [[ax,ay],[bx,by]]=[...pointers.values()];
+      const d=Math.hypot(bx-ax,by-ay), mx=(ax+bx)/2, my=(ay+by)/2;
+      const r=wrap.getBoundingClientRect();
+      zoomAt(d/pinch.d, mx-r.left, my-r.top);
+      pinch={d, mx, my};
+    } else if(panDrag){
+      if(Math.hypot(e.clientX-pdsx,e.clientY-pdsy)>4) panMoved=true;
+      panX=pdpx+(e.clientX-pdsx); panY=pdpy+(e.clientY-pdsy); applyTf();
+    }
+  });
+  const upPtr=e=>{
+    pointers.delete(e.pointerId);
+    if(pointers.size<2) pinch=null;
+    if(pointers.size===0) panDrag=false;
+  };
+  cv.addEventListener("pointerup",upPtr);
+  cv.addEventListener("pointercancel",upPtr);
+  $("mapFit").onclick=fitMap;
+  $("mapZoomIn").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1.5, r.width/2, r.height/2); };
+  $("mapZoomOut").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1/1.5, r.width/2, r.height/2); };
+  window.addEventListener("resize",applyTf);
+
   async function poll(){
     try{
       const r=await fetch("/map?t="+Date.now());
@@ -3222,6 +3289,7 @@ connect();   // auto-connect on load
   function draw(m, grid){
     const w=m.w, h=m.h;
     if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; img=ctx.createImageData(w,h); }
+    applyTf();
     const d=img.data;
     for(let row=0;row<h;row++){
       const cy=h-1-row, base=row*w;            // grid row 0 = bottom -> flip for canvas
@@ -3299,9 +3367,10 @@ connect();   // auto-connect on load
     } else { clearInterval(timer); timer=null; }
   });
 
-  // click the map -> goal in world metres (account for CSS scaling + the y-flip)
+  // click the map -> goal in world metres (account for CSS zoom/pan + the y-flip)
   cv.addEventListener("click",e=>{
     if(!lastMeta) return;
+    if(panMoved){ panMoved=false; return; }   // a pan just ended, not a goal tap
     const rect=cv.getBoundingClientRect();
     const cx=(e.clientX-rect.left)*cv.width/rect.width;
     const cy=(e.clientY-rect.top)*cv.height/rect.height;
