@@ -29,6 +29,13 @@ fails with "Failed to connect to ESP32: No serial data received".** Always pass
 `--upload-port /dev/ttyUSB0` explicitly. The debug console (`pio device monitor`) is also
 on ttyUSB0.
 
+**GOTCHA (2026-08-11):** `pio device monitor` fails in a non-interactive shell
+(tcgetattr/TTY error) — read the console directly with pyserial instead, but do NOT toggle
+DTR/RTS after the reset pulse: every `serial.Serial()` open pulses the CP2102 auto-reset
+lines and drops the chip into ROM download mode ("waiting for download" / `try 0x400805e4`
+boot-loop noise). Open once, pulse RTS to reset, leave the lines alone. Verified: a clean
+reset boots the current firmware stably (see firmware README).
+
 NOTE (2026-06): the firmware dir is now `firmware/nanobot_coprocessor` (native zenoh-pico,
 NOT micro-ROS — the penv/cmake/ninja notes above were for the retired micro-ROS build and
 no longer apply). Build/flash that survived a stale zenoh-pico CMakeCache from the old

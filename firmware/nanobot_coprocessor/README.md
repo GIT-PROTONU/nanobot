@@ -46,6 +46,31 @@ pio device monitor         # debug console (115200 on the CP2102 port)
 Tunables (pins, PID gains, diff-drive limits) are inline `#define`s at the top of
 `src/main.cpp` (there is no `include/config.h`).
 
+### Console capture without a TTY (`pio device monitor` fails in non-interactive shells)
+`pio device monitor` needs a real terminal (tcgetattr on the CP2102), so it fails in a
+scripted / non-interactive session. Read the console directly instead:
+
+```python
+import serial, time
+ser = serial.Serial("/dev/ttyUSB0", 115200, timeout=0.5, rtscts=False, dsrdtr=False)
+# reset once via RTS (EN low) then release, then LEAVE the lines alone —
+# every serial.Serial() open pulses DTR/RTS on the CP2102 auto-reset circuit,
+# which drops the chip into ROM download mode ("waiting for download") and
+# looks like a reset storm / boot loop. It is NOT a firmware problem.
+ser.setRTS(True); time.sleep(0.05); ser.setRTS(False)
+time.sleep(1.0)
+t0 = time.time()
+while time.time() - t0 < 5:
+    d = ser.read(8192)
+    if d:
+        sys.stdout.write(d.decode(errors="replace")); sys.stdout.flush()
+```
+
+Verified 2026-08-11: a clean reset boots the current firmware stably
+(`[nano] ticks L=… | lds rpm≈300 hz≈450`, no resets). Repeated port opens that pulse
+DTR/RTS produce the ROM `waiting for download` / `try 0x400805e4` noise instead — that
+is an artifact of line toggling, not a flash or firmware fault.
+
 ## Wiring (UART2 link via host USB-serial / FTDI adapter, 3.3V logic)
 | FTDI | ESP32 |
 |------|-------|
