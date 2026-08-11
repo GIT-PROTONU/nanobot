@@ -4,9 +4,11 @@ The ESP32-WROOM motor/encoder/LDS coprocessor. It runs as a **native zenoh peer 
 serial** (no micro-ROS agent, no Fast-DDS), talking straight to the Humble `rmw_zenoh`
 graph in rmw_zenoh's exact wire format. Topic contract (see `src/main.cpp` header):
 
-- **sub** `cmd_vel`, `led`, `lds_target_rpm`
+- **sub** `cmd_vel`, `led`, `lds_target_rpm`, `fan_pwm`, `motor_trim`, `motor_accel`,
+  `reset_ticks`, `laser_pwm` (`Int32MultiArray [v1,v2,v3]`, 0..255 → line laser PWM on
+  GPIO 23/32/13 via LEDC ch 6-8)
 - **pub** `wheel_ticks`, `left/right_wheel_suspended`, `esp32_temp`, `esp32_hall`,
-  `lds_rpm`, `lds_hz`, `lds_duty`, `esp32_heartbeat`
+  `lds_rpm`, `lds_hz`, `lds_duty`, `esp32_heartbeat`, `wheel_trim`
 
 ## How the link works (and why)
 - **Wire format**: the firmware emits Humble rmw_zenoh's format (keyexpr

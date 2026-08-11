@@ -143,6 +143,8 @@ What the page already surfaces for each stage:
 
 **Web-serving chain:** `web_server.py` serves the package's installed `web/` dir, symlinked `install/web_control/share/web_control/web/ → build/web_control/web/ → src/web_control/web/`. Edit `src/web_control/web/index.html`, restart the app — picked up live.
 
+**Line lasers (added 2026-08-11):** the Sensors tab's "Line lasers" card has three 0–255 sliders (Laser 1–3). They POST `/laser_pwm` `[v1,v2,v3]` (Int32MultiArray) via `pub()` → telemetry whitelist (`telemetry.py _mk_laser`, clamps 0..255) → bare ROS topic `laser_pwm` → ESP32 `laser_cb` parses the empty-layout CDR body (`hdr(4) | dim_len | data_offset | data_len | int32×3` — values at payload +16/+20/+24, no pad; verified byte-for-byte against rclpy `serialize_message`). Pins **GPIO 23/32/13** (`LASER1..3_PIN`), LEDC channels **6–8**, 10-bit duty = `value*1023/255`. Publish-only (like `/motor_accel`) — no read-back, so a page reload shows 0 until the next drag. Lasers park at 0 while the SBC link isn't `alive` (same `linkAlive()` gating as the fan/LDS) and resume at 0, not the stale pre-drop value. The pins are free: 23/32 are untouched outputs, 13 is the default UART1 TX but `Serial1.begin(..., TX=-1)` leaves it a free GPIO. Verify the CDR parse in `laser_cb` matches the serialized layout if the message definition ever changes.
+
 ## Gotchas
 
 - **`stack.sh restart` is unreliable** — can leave stale processes holding ports. Clean `down` → verify via `/proc` → `up`.

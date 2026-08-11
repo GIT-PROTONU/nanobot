@@ -10,6 +10,7 @@
 //   sub  motor_trim            std_msgs/Float32 (-0.3..0.3) -> manual L/R trim set/reset
 //   sub  motor_accel           std_msgs/Float32 (0.3..8.0)  -> accel-ramp rate (duty/s)
 //   sub  reset_ticks           std_msgs/Bool (true)      -> zero wheel_ticks + wheel_stray_ticks
+//   sub  laser_pwm             std_msgs/Int32MultiArray  [v1,v2,v3] 0..255 -> line laser PWM 1-3
 //   pub  wheel_ticks           std_msgs/Int64MultiArray  [L,R] raw cumulative counts
 //   pub  wheel_stray_ticks     std_msgs/Int64MultiArray  [L,R] cumulative ticks seen while the
 //                                                         wheel was commanded+settled stopped
@@ -90,6 +91,13 @@
 // no heat to move once the SBC isn't running, so the fan shouldn't run either. g_fan_duty
 // just holds the last /fan_pwm value; only applied to hardware while alive.
 #define FAN_BOOT_DUTY 0.0f
+
+// Line laser PWM pins 1-3. GPIO23/32 are free outputs; GPIO13 is the UART1 default TX but
+// the LDS link is RX-only (Serial1.begin passes TX=-1, see LDS_RX_PIN), so it's a free GPIO.
+// All three are LEDC-routable (any output-capable GPIO) — use the free LEDC channels 6-15.
+#define LASER1_PIN    23
+#define LASER2_PIN    32
+#define LASER3_PIN    13
 
 #define PWM_FREQ_HZ   20000
 #define PWM_RES_BITS  10
@@ -235,6 +243,9 @@ static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RAD
 #define CH_RIGHT_REV 3
 #define CH_LDS       4
 #define CH_FAN       5
+#define CH_LASER1    6
+#define CH_LASER2    7
+#define CH_LASER3    8
 
 // ============================ shared cross-core state =========================
 static volatile int32_t  g_left_ticks  = 0, g_right_ticks = 0;   // encoder ISR counts (signed)
@@ -252,6 +263,7 @@ static volatile float    g_lds_rpm = 0, g_lds_duty = 0, g_lds_hz = 0;
 static volatile uint32_t g_lds_frames = 0, g_lds_last_ms = 0;
 static volatile float    g_lds_target = LDS_TARGET_RPM;
 static volatile float    g_fan_duty = FAN_BOOT_DUTY;   // /fan_pwm 0..1 (Core0 write, Core1 apply)
+static volatile uint16_t g_laser[3] = {0,0,0};         // /laser_pwm 0..255 per laser (Core0 write, Core1 apply)
 // Straight-line trim: loaded from NVS in setup(), adapted on Core 1 (autocal), manually
 // set from the zenoh RX task (/motor_trim cb). Aligned-32-bit volatile = atomic enough.
 static volatile float    g_trim = 0;
@@ -309,6 +321,7 @@ static size_t cdr_i64arr2(uint8_t* b, int64_t a, int64_t bb){
 #define T_F32  "std_msgs::msg::dds_::Float32_"
 #define T_BOOL "std_msgs::msg::dds_::Bool_"
 #define T_I64A "std_msgs::msg::dds_::Int64MultiArray_"
+#define T_I32A "std_msgs::msg::dds_::Int32MultiArray_"
 #define T_TWIST "geometry_msgs::msg::dds_::Twist_"
 
 // Fixed session ZID so we can hardcode it in the rmw_zenoh liveliness tokens below.
@@ -452,6 +465,23 @@ static void ldstgt_cb(z_loaned_sample_t* sm, void*){
 static void fan_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_fan_duty = clampf(f,0,1); }
 }
+// /laser_pwm (Int32MultiArray [v1,v2,v3], 0..255 per laser) -> line laser PWM 1-3. CDR body
+// of an empty-layout std_msgs/Int32MultiArray: hdr(4) | dim_len=0 | data_offset=0 | data_len=3
+// | int32 v1..v3. int32 is 4-aligned from the body start, so no pad bytes (unlike int64).
+static void laser_cb(z_loaned_sample_t* sm, void*){
+  uint8_t b[40]; size_t n = sample_bytes(sm,b,sizeof(b));
+  uint32_t dim=0, off=0;
+  if (n >= 16){ memcpy(&dim,b+4,4); memcpy(&off,b+8,4); }
+  if (dim != 0) return;                                  // empty layout only
+  for (int i=0;i<3;i++){
+    if (n >= 16+off+(i+1)*4){
+      int32_t v; memcpy(&v,b+16+off+i*4,4);
+      g_laser[i] = (uint16_t)(v<0?0:(v>255?255:v));
+    }
+  }
+  Serial.printf("[nano] laser pwm %u %u %u\n",
+                (unsigned)g_laser[0],(unsigned)g_laser[1],(unsigned)g_laser[2]);
+}
 // /motor_trim (Float32): manual trim set/reset (0 clears). With TRIM_AUTOCAL on, the next
 // straight drive re-adapts from here — so this is mainly a reset, or THE knob when autocal
 // is compiled out. Persisted by the loop()'s rate-limited NVS save (within ~TRIM_SAVE_MS).
@@ -496,7 +526,7 @@ static bool zenohConnect(){
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
-  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset, sub_accel;   // kept alive (static)
+  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset, sub_accel, sub_laser;   // kept alive (static)
   z_owned_closure_sample_t cl;
   z_view_keyexpr_t ke;
   z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
@@ -517,6 +547,9 @@ static bool zenohConnect(){
   z_view_keyexpr_from_str_unchecked(&ke, KE("motor_accel",T_F32));
   z_closure_sample(&cl, motor_slew_cb, NULL, NULL);
   z_declare_subscriber(z_session_loan(&s), &sub_accel, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  z_view_keyexpr_from_str_unchecked(&ke, KE("laser_pwm",T_I32A));
+  z_closure_sample(&cl, laser_cb, NULL, NULL);
+  z_declare_subscriber(z_session_loan(&s), &sub_laser, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
 #if LINK_RX_TIMEOUT_MS
   static z_owned_subscriber_t sub_ping;
   z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
@@ -681,6 +714,10 @@ void setup(){
   // SBC cooling fan PWM — off until the SBC link is alive (see FAN_BOOT_DUTY above).
   ledcSetup(CH_FAN,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(FAN_PIN,CH_FAN);
   ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
+  // Line lasers — off at boot; commanded via /laser_pwm once the link is up.
+  ledcSetup(CH_LASER1,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LASER1_PIN,CH_LASER1); ledcWrite(CH_LASER1,0);
+  ledcSetup(CH_LASER2,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LASER2_PIN,CH_LASER2); ledcWrite(CH_LASER2,0);
+  ledcSetup(CH_LASER3,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LASER3_PIN,CH_LASER3); ledcWrite(CH_LASER3,0);
 
   pinMode(LEFT_ENC,INPUT_PULLUP);  attachInterrupt(digitalPinToInterrupt(LEFT_ENC),leftEncISR,RISING);
   pinMode(RIGHT_ENC,INPUT_PULLUP); attachInterrupt(digitalPinToInterrupt(RIGHT_ENC),rightEncISR,RISING);
@@ -866,6 +903,17 @@ void loop(){   // Core 1: real-time control
     // off) since there's no SBC heat to move, and resume the instant sys_monitor reconnects.
     if (alive) ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
     else       { g_fan_duty = 0; ledcWrite(CH_FAN, 0); }
+    // Line lasers track true SBC presence like the fan: park (off) whenever the link
+    // isn't alive and zero the setpoints so they resume at 0, not the stale pre-drop value.
+    // 0..255 web value -> 10-bit LEDC duty.
+    if (alive){
+      ledcWrite(CH_LASER1, (uint32_t)g_laser[0]*PWM_MAX/255u);
+      ledcWrite(CH_LASER2, (uint32_t)g_laser[1]*PWM_MAX/255u);
+      ledcWrite(CH_LASER3, (uint32_t)g_laser[2]*PWM_MAX/255u);
+    } else {
+      g_laser[0] = g_laser[1] = g_laser[2] = 0;
+      ledcWrite(CH_LASER1,0); ledcWrite(CH_LASER2,0); ledcWrite(CH_LASER3,0);
+    }
   }
   if (now-last_sens >= 100){                                // suspension debounce + LED @10 Hz
     last_sens=now;

@@ -31,7 +31,7 @@ import time
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
-from std_msgs.msg import Bool, Int8, Int32, Float32, Int64MultiArray, String
+from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import MagneticField
@@ -166,6 +166,8 @@ class TelemetryHub:
             # (robot veers left), positive = the opposite. Live-tunes the open-loop trim that
             # rebalances the mismatched gearmotors in main.cpp's applyMotors(); persisted to NVS.
             "/motor_trim": (pub(Float32, "motor_trim", 5), self._mk_motor_trim),
+            # ESP32 line lasers 1-3 (GPIO 23/32/13): [v1,v2,v3] PWM 0..255 each.
+            "/laser_pwm": (pub(Int32MultiArray, "laser_pwm", 5), self._mk_laser),
             # NOTE: the ROS topic string here is bare ("go_home", not "slam_nav/go_home")
             # -- nav_node subscribes to the same bare name with no namespace of its own
             # (neither the systemd unit_exec.sh path nor bringup.launch.py sets one), so
@@ -738,7 +740,7 @@ class TelemetryHub:
         # go there / spin" is in the app log. Throttle the chatty spin-down? No — these
         # are discrete user actions, not a hot loop; every one is a meaningful event.
         if topic in ("/goal_pose", "/slam_nav/go_home", "/slam_nav/save_map",
-                     "/slam_nav/clear_map", "/selftest", "/reset_ticks"):
+                     "/slam_nav/clear_map", "/selftest", "/reset_ticks", "/laser_pwm"):
             self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
         return {"status": "ok", "topic": topic}
 
@@ -774,6 +776,12 @@ class TelemetryHub:
     @staticmethod
     def _mk_bool(v):
         return Bool(data=bool(v))
+
+    @staticmethod
+    def _mk_laser(v):
+        if not isinstance(v, (list, tuple)) or len(v) != 3:
+            raise ValueError("expected a 3-element list [v1, v2, v3]")
+        return Int32MultiArray(data=[min(255, max(0, int(x))) for x in v])
 
     @staticmethod
     def _mk_face(v):
