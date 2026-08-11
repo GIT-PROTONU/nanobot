@@ -195,6 +195,10 @@ slam_nav:
                                    # spot (symmetrical room / smeared map); the 2nd agreeing scan
                                    # costs ~0.2 s and stops both the map-pose teleport and the
                                    # map-corrupting integration at a wrong pose.
+    recover_min_seen: 0.25         # map coverage fraction below which the relocalize SPIN is
+                                   # suppressed (fresh/cleared map: a low score is expected, not
+                                   # drift; spinning only smears the grid + drains battery). Hold
+                                   # pose and keep matching until the map fills in.
     recover_lin: 0.5               # recovery search half-window (m) around the prior
     recover_ang: 1.0               # recovery search half-window (rad)
     recover_half: 6                # recovery candidates per axis (2*half+1)

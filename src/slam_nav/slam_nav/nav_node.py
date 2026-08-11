@@ -149,6 +149,11 @@ class NavNode(Node):
                                           # is far too permissive to TRUST a recovered pose on
                                           # a smeared map — overlap ~0.9 with score ~-200 was
                                           # exactly the lost-storm signature)
+             ("recover_min_seen", 0.25),   # map coverage fraction below which recovery spin
+                                          # is suppressed: on a near-empty map there is nothing
+                                          # to match against, so a low score is expected (not
+                                          # drift) and spinning just smears the grid + drains
+                                          # the battery. The robot holds pose and keeps building.
             ("recover_confirm", 2),       # consecutive scans that must reproduce the same
                                           # candidate before it's trusted + integrated. A single
                                           # global search run can score well at a WRONG-but-
@@ -374,6 +379,7 @@ class NavNode(Node):
         self.recover_exit_score = float(g("recover_exit_score").value)
         self.recover_overlap = float(g("recover_overlap").value)
         self.recover_confirm = max(1, int(g("recover_confirm").value))
+        self.recover_min_seen = float(g("recover_min_seen").value)
         self.recover_lin = float(g("recover_lin").value)
         self.recover_ang = float(g("recover_ang").value)
         self.recover_half = int(g("recover_half").value)
@@ -416,6 +422,8 @@ class NavNode(Node):
         self._slip_imu = 0.0
         self._slip_odo = 0.0
         self._slip_last_warn = 0.0
+        self._last_cmd_log = 0.0       # monotonic: throttle for the cmd_vel publish log
+        self._last_cmd = (0.0, 0.0)    # last cmd_vel (v, w) published, for the map header
         # Live cross-check readouts for the diagnostics publisher (last completed
         # monitor window): see _predict's sign/slip monitors.
         self._sign_fail = False       # IMU yaw and wheel yaw rotate opposite signs
@@ -560,7 +568,12 @@ class NavNode(Node):
         # let the web UI flip enable_motion / retune speeds live via set_parameters
         for p in params:
             if p.name == "enable_motion":
+                was = self.enable_motion
                 self.enable_motion = bool(p.value)
+                if self.enable_motion != was:
+                    self.get_logger().warning(
+                        f"enable_motion -> {self.enable_motion} (was {was}) — "
+                        f"cmd_vel now {'live' if self.enable_motion else 'blocked'}")
                 if not self.enable_motion:
                     self._send(0.0, 0.0)     # drop to a stop the moment it's disabled
             elif p.name == "max_lin":
@@ -593,6 +606,8 @@ class NavNode(Node):
                 self.recover_overlap = float(p.value)
             elif p.name == "recover_confirm":
                 self.recover_confirm = max(1, int(p.value))
+            elif p.name == "recover_min_seen":
+                self.recover_min_seen = float(p.value)
             elif p.name == "recover_global":
                 self.recover_global = bool(p.value)
             elif p.name == "recover_global_step":
@@ -1392,7 +1407,20 @@ class NavNode(Node):
                 self._send(0.0, 0.0)
                 self.get_logger().warning("relocalize timed out; using best estimate")
             else:
-                self._send(0.0, self.recover_spin)     # slow in-place spin (only if motion on)
+                # Empty-map guard: on a near-empty grid there is nothing for the scan
+                # matcher to lock onto, so a persistent low score is EXPECTED (fresh map /
+                # just cleared) rather than evidence of drift — and the in-place spin only
+                # smears the grid and drains the battery. Hold pose instead; the recovery
+                # matching in _on_scan keeps running, and once the map fills in (coverage
+                # clears recover_min_seen) the spin resumes automatically.
+                seen = self.grid.coverage()[0]
+                if seen < self.recover_min_seen:
+                    self._send(0.0, 0.0)
+                    self.get_logger().warning(
+                        f"map too empty (seen {seen:.0%}) to relocalize — holding pose, "
+                        f"not spinning; build the map first", throttle_duration_sec=5.0)
+                else:
+                    self._send(0.0, self.recover_spin)  # slow in-place spin (only if motion on)
             return
 
         # Vision target tracking wins over goal-follow/explore while enabled -- see
@@ -1999,9 +2027,18 @@ class NavNode(Node):
     def _send(self, v, w):
         if not self.enable_motion:               # view/plan-only mode: never drive
             return
+        # Diagnosability: throttle-log the first non-zero command published after an
+        # idle stretch so a "who spun the robot" question is answered by the log. The
+        # last published command (incl. stops) is always in the map header as mcmd.
+        if (abs(v) > 0.0 or abs(w) > 0.0) and time.monotonic() - self._last_cmd_log > 2.0:
+            self._last_cmd_log = time.monotonic()
+            self.get_logger().warning(
+                f"cmd_vel -> v {v:.2f} w {w:.2f} (mode "
+                f"{'recover' if self._recovering else 'goal' if self._goal is not None else 'other'})")
         t = Twist()
         t.linear.x = float(v)
         t.angular.z = float(w)
+        self._last_cmd = (round(float(v), 3), round(float(w), 3))
         self.cmd_pub.publish(t)
 
     def _publish_path(self):
@@ -2038,6 +2075,7 @@ class NavNode(Node):
             "free_m2": round(free_m2, 1),                    # mapped free area
             "score": round(self._last_score, 1),             # scan-match quality
             "mode": mode, "loc": loc, "motion": self.enable_motion,
+            "mcmd": self._last_cmd,                          # last cmd_vel (v, w) sent
             "nogo": self.grid.nogo_count(),                  # no-go zones marked
             "trail": list(self._trail) if self._trail else [],
             # Wall-clock map-write time so the browser can age the feed staleness at

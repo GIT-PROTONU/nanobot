@@ -79,7 +79,7 @@ PARAM_WHITELIST = {
                  "test_lin", "test_ang", "test_dist", "test_turns", "test_settle",
                  "slip_check", "slip_min_rot", "slip_ratio_hi", "slip_ratio_lo",
                  "slip_cooldown",
-                 "qual_min", "min_overlap_ratio"},
+                 "qual_min", "min_overlap_ratio", "recover_min_seen"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
                     "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",
@@ -716,6 +716,12 @@ class TelemetryHub:
         if msg is None:
             return {"error": "bad value"}
         pub.publish(msg)
+        # Diagnosability: log map-click goals + LDS rpm etc. so "who told the robot to
+        # go there / spin" is in the app log. Throttle the chatty spin-down? No — these
+        # are discrete user actions, not a hot loop; every one is a meaningful event.
+        if topic in ("/goal_pose", "/slam_nav/go_home", "/slam_nav/save_map",
+                     "/slam_nav/clear_map", "/selftest", "/reset_ticks"):
+            self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
         return {"status": "ok", "topic": topic}
 
     @staticmethod
@@ -808,4 +814,9 @@ class TelemetryHub:
         req = SetParameters.Request()
         req.parameters = [Parameter(name=name, value=pv)]
         client.call_async(req)
+        # Diagnosability: who/what changed a param (esp. enable_motion) must be in the
+        # app log — nav_node's _on_params only logs the transition it receives, so this
+        # records the browser-facing side too.
+        self._node.get_logger().info(
+            f"POST /param {node}/{name} = {value!r} (source: web UI)")
         return {"status": "sent", "node": node, "name": name}

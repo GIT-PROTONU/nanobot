@@ -537,6 +537,7 @@ class WebServerNode(Node):
         self._drive_lock = threading.Lock()
         self._drive_v = self._drive_w = 0.0
         self._drive_at = 0.0                            # monotonic of last POST; 0 = idle
+        self._last_drive_log = 0.0                      # throttle for the /drive log line
         self._cpu_quick_at = 0.0                        # memo TTL for _cpu_percent_quick
         self._cpu_quick_val = 0.0
         self.create_timer(0.1, self._drive_tick)
@@ -759,6 +760,12 @@ class WebServerNode(Node):
         with self._drive_lock:
             self._drive_v, self._drive_w = v, w
             self._drive_at = time.monotonic() if (v or w) else 0.0
+        # Diagnosability: log the first non-zero /drive after an idle stretch (the hot
+        # path runs ~10 Hz while driving, so a throttle keeps the log readable while a
+        # single "who drove the robot" line still answers the question).
+        if (v or w) and time.monotonic() - self._last_drive_log > 2.0:
+            self._last_drive_log = time.monotonic()
+            self.get_logger().info(f"POST /drive v {v:.2f} w {w:.2f} (web teleop)")
         self._publish_drive(v, w)
         return {"status": "ok", "v": v, "w": w}
 
@@ -1255,6 +1262,8 @@ class WebServerNode(Node):
                 tw.angular.z = ang
                 pub.publish(tw)
                 self._later(dur, lambda: pub.publish(Twist()))   # always auto-stop
+                self.get_logger().info(
+                    f"skill action /cmd_vel lin={lin:.2f} ang={ang:.2f} for {dur:.1f}s")
                 return True, "/cmd_vel lin=%.2f ang=%.2f for %.1fs" % (lin, ang, dur)
             if topic == "/goal_pose":
                 # VALUE is a saved location NAME -> resolve to its stored pose and publish
@@ -1270,6 +1279,8 @@ class WebServerNode(Node):
                 m.pose.position.y = float(loc["y"])
                 m.pose.orientation.w = 1.0
                 pub.publish(m)
+                self.get_logger().info(
+                    f"goal_pose -> '{name}' ({loc['x']:.2f}, {loc['y']:.2f}) (skill)")
                 return True, "/goal_pose -> '%s' (%.2f, %.2f)" % (name, loc["x"], loc["y"])
         except (TypeError, ValueError) as exc:
             return False, "bad value: %s" % exc
