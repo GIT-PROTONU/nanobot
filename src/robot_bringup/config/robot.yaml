@@ -184,15 +184,28 @@ slam_nav:
                                    # Live-tunable.
     recover_patience: 5            # consecutive unmatched scans before declaring "lost"
     recover_min_beams: 40          # need this many in-range beams to trust a "mismatch"
-    recover_exit_score: 4.0        # scan-match score that ends recovery (relocalized)
+    recover_exit_score: 20.0       # scan-match score that ends recovery (relocalized)
+    recover_overlap: 0.30          # recovery must ALSO pass this overlap inlier gate before a
+                                   # candidate can be trusted. min_overlap_ratio (0.10) is tuned
+                                   # for building and is far too permissive to TRUST a recovered
+                                   # pose on a smeared map.
+    recover_confirm: 2             # consecutive scans that must reproduce the same recovery
+                                   # candidate before it's trusted + integrated. A single (esp.
+                                   # global) match can clear the exit bar at a wrong-but-plausible
+                                   # spot (symmetrical room / smeared map); the 2nd agreeing scan
+                                   # costs ~0.2 s and stops both the map-pose teleport and the
+                                   # map-corrupting integration at a wrong pose.
     recover_lin: 0.5               # recovery search half-window (m) around the prior
     recover_ang: 1.0               # recovery search half-window (rad)
     recover_half: 6                # recovery candidates per axis (2*half+1)
     recover_refine: 3              # recovery coarse-to-fine passes
     recover_spin: 0.6              # rad/s in-place spin while relocalizing (needs enable_motion)
     recover_timeout: 12.0          # s before giving up the active relocalize search
-    recover_global: true           # also run a FULL-GRID relocalize search while lost (kidnap:
-                                   # being carried to a far spot beats the local window above)
+    recover_global: true           # also run a FULL-GRID relocalize search while lost. ONLY fires
+                                   # on a genuine kidnap (set down after being carried / boot into
+                                   # a saved map) — nav_node gates it on the recovery being marked
+                                   # as a kidnap. A driving loss keeps the local window search, so
+                                   # a far spurious global "better" peak can't teleport the pose.
     recover_global_step: 4         # grid-cell step of the global search (4 = 20 cm cells)
     recover_global_period: 2.0     # min s between full-grid searches while recovering
     # --- personality -> motion (the behaviour layer's `caution` trait) ---
