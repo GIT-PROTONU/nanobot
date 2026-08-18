@@ -92,12 +92,12 @@
 // just holds the last /fan_pwm value; only applied to hardware while alive.
 #define FAN_BOOT_DUTY 0.0f
 
-// Line laser PWM pins 1-3. GPIO23/32 are free outputs; GPIO13 is the UART1 default TX but
-// the LDS link is RX-only (Serial1.begin passes TX=-1, see LDS_RX_PIN), so it's a free GPIO.
-// All three are LEDC-routable (any output-capable GPIO) — use the free LEDC channels 6-15.
+// Line laser PWM pins (laser 3 was removed — GPIO13 stayed stuck full-on via every PWM
+// peripheral tried: LEDC low-speed ch 8 stuck the pin high silently, and MCPWM couldn't
+// sink it either, so the laser was controlled by hardware, not /laser_pwm. Dropped from
+// firmware + web UI on 2026-08-18; leave GPIO13 free so the pin can't be driven).
 #define LASER1_PIN    23
 #define LASER2_PIN    32
-#define LASER3_PIN    13
 
 #define PWM_FREQ_HZ   20000
 #define PWM_RES_BITS  10
@@ -245,7 +245,7 @@ static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RAD
 #define CH_FAN       5
 #define CH_LASER1    6
 #define CH_LASER2    7
-#define CH_LASER3    8
+// no LASER3 pin/channel: laser 3 was removed (see LASER1_PIN note)
 
 // ============================ shared cross-core state =========================
 static volatile int32_t  g_left_ticks  = 0, g_right_ticks = 0;   // encoder ISR counts (signed)
@@ -263,7 +263,7 @@ static volatile float    g_lds_rpm = 0, g_lds_duty = 0, g_lds_hz = 0;
 static volatile uint32_t g_lds_frames = 0, g_lds_last_ms = 0;
 static volatile float    g_lds_target = LDS_TARGET_RPM;
 static volatile float    g_fan_duty = FAN_BOOT_DUTY;   // /fan_pwm 0..1 (Core0 write, Core1 apply)
-static volatile uint16_t g_laser[3] = {0,0,0};         // /laser_pwm 0..255 per laser (Core0 write, Core1 apply)
+static volatile uint16_t g_laser[2] = {0,0};                 // /laser_pwm 0..255 per laser (Core0 write, Core1 apply)
 // Straight-line trim: loaded from NVS in setup(), adapted on Core 1 (autocal), manually
 // set from the zenoh RX task (/motor_trim cb). Aligned-32-bit volatile = atomic enough.
 static volatile float    g_trim = 0;
@@ -465,22 +465,22 @@ static void ldstgt_cb(z_loaned_sample_t* sm, void*){
 static void fan_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_fan_duty = clampf(f,0,1); }
 }
-// /laser_pwm (Int32MultiArray [v1,v2,v3], 0..255 per laser) -> line laser PWM 1-3. CDR body
-// of an empty-layout std_msgs/Int32MultiArray: hdr(4) | dim_len=0 | data_offset=0 | data_len=3
-// | int32 v1..v3. int32 is 4-aligned from the body start, so no pad bytes (unlike int64).
+// /laser_pwm (Int32MultiArray [v1,v2], 0..255 per laser) -> line laser PWM 1-2. CDR body
+// of an empty-layout std_msgs/Int32MultiArray: hdr(4) | dim_len=0 | data_offset=0 | data_len=2
+// | int32 v1..v2. int32 is 4-aligned from the body start, so no pad bytes (unlike int64).
 static void laser_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[40]; size_t n = sample_bytes(sm,b,sizeof(b));
   uint32_t dim=0, off=0;
   if (n >= 16){ memcpy(&dim,b+4,4); memcpy(&off,b+8,4); }
   if (dim != 0) return;                                  // empty layout only
-  for (int i=0;i<3;i++){
+  for (int i=0;i<2;i++){
     if (n >= 16+off+(i+1)*4){
       int32_t v; memcpy(&v,b+16+off+i*4,4);
       g_laser[i] = (uint16_t)(v<0?0:(v>255?255:v));
     }
   }
-  Serial.printf("[nano] laser pwm %u %u %u\n",
-                (unsigned)g_laser[0],(unsigned)g_laser[1],(unsigned)g_laser[2]);
+  Serial.printf("[nano] laser pwm %u %u\n",
+                (unsigned)g_laser[0],(unsigned)g_laser[1]);
 }
 // /motor_trim (Float32): manual trim set/reset (0 clears). With TRIM_AUTOCAL on, the next
 // straight drive re-adapts from here — so this is mainly a reset, or THE knob when autocal
@@ -714,10 +714,9 @@ void setup(){
   // SBC cooling fan PWM — off until the SBC link is alive (see FAN_BOOT_DUTY above).
   ledcSetup(CH_FAN,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(FAN_PIN,CH_FAN);
   ledcWrite(CH_FAN,(uint32_t)(clampf(g_fan_duty,0,1)*PWM_MAX));
-  // Line lasers — off at boot; commanded via /laser_pwm once the link is up.
+  // Line lasers 1-2 — off at boot; commanded via /laser_pwm once the link is up.
   ledcSetup(CH_LASER1,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LASER1_PIN,CH_LASER1); ledcWrite(CH_LASER1,0);
   ledcSetup(CH_LASER2,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LASER2_PIN,CH_LASER2); ledcWrite(CH_LASER2,0);
-  ledcSetup(CH_LASER3,PWM_FREQ_HZ,PWM_RES_BITS); ledcAttachPin(LASER3_PIN,CH_LASER3); ledcWrite(CH_LASER3,0);
 
   pinMode(LEFT_ENC,INPUT_PULLUP);  attachInterrupt(digitalPinToInterrupt(LEFT_ENC),leftEncISR,RISING);
   pinMode(RIGHT_ENC,INPUT_PULLUP); attachInterrupt(digitalPinToInterrupt(RIGHT_ENC),rightEncISR,RISING);
@@ -909,10 +908,9 @@ void loop(){   // Core 1: real-time control
     if (alive){
       ledcWrite(CH_LASER1, (uint32_t)g_laser[0]*PWM_MAX/255u);
       ledcWrite(CH_LASER2, (uint32_t)g_laser[1]*PWM_MAX/255u);
-      ledcWrite(CH_LASER3, (uint32_t)g_laser[2]*PWM_MAX/255u);
     } else {
-      g_laser[0] = g_laser[1] = g_laser[2] = 0;
-      ledcWrite(CH_LASER1,0); ledcWrite(CH_LASER2,0); ledcWrite(CH_LASER3,0);
+      g_laser[0] = g_laser[1] = 0;
+      ledcWrite(CH_LASER1,0); ledcWrite(CH_LASER2,0);
     }
   }
   if (now-last_sens >= 100){                                // suspension debounce + LED @10 Hz

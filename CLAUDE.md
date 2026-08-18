@@ -221,15 +221,18 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (**tune on hardware**) holds `/lds_target_rpm` by driving the motor PWM, output on
   `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 1; UART1 is drained once
   per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
-- **Line lasers (2026-08-11, built, not yet flashed)**: subscribes `/laser_pwm`
-  (`std_msgs/Int32MultiArray [v1,v2,v3]`, each 0..255) and drives three line-laser PWM
-  outputs via LEDC ch 6-8 on **GPIO 23/32/13** (`LASER1..3_PIN`). 10-bit duty =
-  `value*1023/255`. The web "Line lasers" card's three sliders POST `/laser_pwm` via
+- **Line lasers**: subscribes `/laser_pwm`
+  (`std_msgs/Int32MultiArray [v1,v2]`, each 0..255) and drives two line-laser PWM
+  outputs on **GPIO 23/32** (`LASER1..2_PIN`). 10-bit duty =
+  `value*1023/255`. The web "Line lasers" card's two sliders POST `/laser_pwm` via
   `telemetry.py`'s `_mk_laser` whitelist builder. Publish-only (like `/motor_accel`) —
   no read-back. Lasers park at 0 while the SBC link isn't alive (same
   `linkAlive()`-gated park as the fan/LDS) and zero the setpoints so they resume at 0,
-  not the stale pre-drop value. GPIO 13 is the default UART1 TX, but the LDS link is
-  RX-only (`Serial1.begin(..., TX=-1)`), so it's a free GPIO.
+  not the stale pre-drop value. **Laser 3 was removed 2026-08-18**: its GPIO13 stayed
+  stuck full-on through every PWM peripheral tried (LEDC low-speed ch 8 stuck it high
+  silently — every `ledcWrite()` incl. 0 drove the pin high; MCPWM couldn't sink it
+  either), so the laser was hardware-controlled, not `/laser_pwm`-controlled, and it's
+  gone from both firmware and the web UI. GPIO13 + LEDC ch 8 are now untouched.
 - **Bad-encoder-signal diagnostic (2026-07-15, built, not yet flashed/deployed)**: a
   per-wheel `/wheel_stray_ticks` (Int64MultiArray `[L,R]`, same cadence as `/wheel_ticks`)
   counts ISR ticks that land while that wheel is commanded **and settled** (`STRAY_SETTLE_MS`

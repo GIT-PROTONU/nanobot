@@ -912,9 +912,7 @@
               <input id="laser1" type="range" min="0" max="255" step="1" value="0"></div>
             <div class="field"><label>Laser 2 <span id="laser2V">0</span></label>
               <input id="laser2" type="range" min="0" max="255" step="1" value="0"></div>
-            <div class="field"><label>Laser 3 <span id="laser3V">0</span></label>
-              <input id="laser3" type="range" min="0" max="255" step="1" value="0"></div>
-            <p class="hint">Line-laser PWM on the ESP32 (<b>/laser_pwm</b>, GPIO 23/32/13).
+            <p class="hint">Line-laser PWM on the ESP32 (<b>/laser_pwm</b>, GPIO 23/32).
               0 = off, 255 = full brightness. Publish-only, so a page reload resets to 0
               until the next drag; the lasers also cut out if the SBC link drops.</p>
           </div>
@@ -1614,16 +1612,14 @@ $("motorAccel").onchange=()=>pub("/motor_accel",Number($("motorAccel").value));
 $("motorTrim").oninput=()=>$("motorTrimV").textContent=Number($("motorTrim").value).toFixed(2);
 $("motorTrim").onchange=()=>pub("/motor_trim",Number($("motorTrim").value));
 $("motorTrimReset").addEventListener("click",()=>{ $("motorTrim").value="0"; $("motorTrimV").textContent="0.00"; pub("/motor_trim",0); });
-// Line laser PWM 1..3 (0..255 each) -> /laser_pwm Int32MultiArray on the ESP32
-// (GPIO 23/32/13). Publish-only like motor_accel: not read back, so a page reload
+// Line laser PWM 1..2 (0..255 each) -> /laser_pwm Int32MultiArray on the ESP32
+// (GPIO 23/32). Publish-only like motor_accel: not read back, so a page reload
 // shows 0 until the next drag.
 $("laser1").oninput=()=>$("laser1V").textContent=$("laser1").value;
 $("laser2").oninput=()=>$("laser2V").textContent=$("laser2").value;
-$("laser3").oninput=()=>$("laser3V").textContent=$("laser3").value;
-const publishLasers=()=>pub("/laser_pwm",[$("laser1").value,$("laser2").value,$("laser3").value].map(Number));
+const publishLasers=()=>pub("/laser_pwm",[$("laser1").value,$("laser2").value].map(Number));
 $("laser1").onchange=publishLasers;
 $("laser2").onchange=publishLasers;
-$("laser3").onchange=publishLasers;
 // Fan override -> sys_monitor fan_override param.
 // v<0 => auto (track CPU temp); 0..1 => forced fixed duty.
 const setFanOverride=v=>setParam("sys_monitor","fan_override",v);

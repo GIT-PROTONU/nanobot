@@ -167,7 +167,7 @@ class TelemetryHub:
             # (robot veers left), positive = the opposite. Live-tunes the open-loop trim that
             # rebalances the mismatched gearmotors in main.cpp's applyMotors(); persisted to NVS.
             "/motor_trim": (pub(Float32, "motor_trim", 5), self._mk_motor_trim),
-            # ESP32 line lasers 1-3 (GPIO 23/32/13): [v1,v2,v3] PWM 0..255 each.
+            # ESP32 line lasers 1-2 (GPIO 23/32): [v1,v2] PWM 0..255 each.
             "/laser_pwm": (pub(Int32MultiArray, "laser_pwm", 5), self._mk_laser),
             # NOTE: the ROS topic string here is bare ("go_home", not "slam_nav/go_home")
             # -- nav_node subscribes to the same bare name with no namespace of its own
@@ -782,8 +782,8 @@ class TelemetryHub:
 
     @staticmethod
     def _mk_laser(v):
-        if not isinstance(v, (list, tuple)) or len(v) != 3:
-            raise ValueError("expected a 3-element list [v1, v2, v3]")
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            raise ValueError("expected a 2-element list [v1, v2]")
         return Int32MultiArray(data=[min(255, max(0, int(x))) for x in v])
 
     @staticmethod
