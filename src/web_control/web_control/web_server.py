@@ -318,6 +318,10 @@ class WebServerNode(Node):
         # Named colour-target palette: calibrations persist here and survive a restart
         # (previously a picked colour was lost on every stack restart).
         self.declare_parameter("vision_targets_path", "")   # "" -> ~/.local/state/nanobot/vision_targets.json
+        # Master camera switch (set_camera_enable below): persisted so a web-UI "camera
+        # off" survives a stack restart/reboot. Was in-memory only, so the camera+GPU
+        # vision always came back on every boot.
+        self.declare_parameter("vision_settings_path", "")  # "" -> ~/.local/state/nanobot/vision.json
         # Named locations ("go to the kitchen"): a durable name->pose map persisted like
         # the vision-target palette (live-editable from the web map panel, NOT ROS params —
         # see rclpy-string-array-param-gotcha). slam_nav already has click-to-go + go_home;
@@ -433,7 +437,13 @@ class WebServerNode(Node):
             width=g("cam_width").value, height=g("cam_height").value,
             fps=g("cam_fps").value, logger=self.get_logger().info)
         self._gpu_vision = None
-        self._camera_disabled = False      # master off switch, see set_camera_enable() below
+        # Master off switch for ALL camera processing (see set_camera_enable below).
+        # Seeded from the persisted vision-settings file so a web-UI "camera off"
+        # survives a reboot; default enabled when the file is absent/has no key.
+        self._vision_settings_path = os.path.expanduser(
+            g("vision_settings_path").value or "~/.local/state/nanobot/vision.json")
+        _vs = read_json(self._vision_settings_path)
+        self._camera_disabled = not bool((_vs or {}).get("camera_enabled", True))
         self._dark_led_pub = None
         self._dark_led_on = False
         # Named colour-target palette (persisted; empty when GPU vision is off).
@@ -460,7 +470,11 @@ class WebServerNode(Node):
                 dev=g("cam_device").value or None,
                 width=g("cam_width").value, height=g("cam_height").value,
                 fps=g("cam_fps").value, logger=self.get_logger().info)
-            self._gpu_vision.start()
+            # Start only when the master switch isn't persisted-off (mirrors
+            # set_camera_enable's stop/release of the V4L2 device); re-enabling from
+            # the web UI calls .start(). Targets still load so the palette is ready.
+            if not self._camera_disabled:
+                self._gpu_vision.start()
             self._load_vision_targets()    # re-apply the persisted calibration, if any
             # Publisher + timer always created (cheap, idle-safe) whenever GPU vision is
             # on, regardless of vision_dark_reflex_enable's startup value -- the tick
@@ -1615,7 +1629,8 @@ class WebServerNode(Node):
         now (see gpu-vision-implemented memory's gpu_duty finding: the fuller pass set
         can run 60-190% of the frame budget per tick). Disabling stops GpuVision's
         capture thread entirely if it was running (releasing the V4L2 device);
-        re-enabling resumes it."""
+        re-enabling resumes it. The state is persisted to vision-settings.json so it
+        survives a reboot (see the vision_settings_path param)."""
         want_enabled = bool(d.get("enabled", True))
         if want_enabled == (not self._camera_disabled):
             return {"ok": True, "camera_enabled": not self._camera_disabled}
@@ -1629,7 +1644,15 @@ class WebServerNode(Node):
             self._camera_disabled = False
             if self._gpu_vision is not None:
                 self._gpu_vision.start()    # reacquire + resume PIR/blob/luma/dark-reflex
+        self._save_camera_state()
         return {"ok": True, "camera_enabled": not self._camera_disabled}
+
+    def _save_camera_state(self):
+        """Persist the master camera switch out so it survives a reboot (atomic JSON,
+        same pattern as the vision-target palette / TTS / LLM settings)."""
+        if not write_json(self._vision_settings_path,
+                          {"camera_enabled": not self._camera_disabled}):
+            self.get_logger().warning("vision: could not persist camera state")
 
     def _dark_reflex_tick(self):
         """Flashlight/dark reflex: auto-toggle /led from the GPU's average frame
