@@ -141,6 +141,11 @@ class NavNode(Node):
             # applied uniformly to the three heading references (IMU yaw, EKF/odom yaw, lidar
             # beam angles) so every downstream difference stays identical (see __init__).
             ("heading_flip", False),
+            ("head_tol", 0.6),            # rad: max trusted heading correction per scan vs the
+                                          # wheel-anchored prior (see _on_scan authority gate)
+            ("pos_tol", 0.35),            # m: same idea for POSITION — a trusted scan match
+                                          # may land at most this far from the odom-anchored
+                                          # pose, else the wheels win (see _on_scan)
             ("map_write_rate", 2.0),     # Hz to (re)write the /dev/shm map file
             # --- navigation (Stages 2/3) ---
             ("enable_motion", False),    # SAFETY: when false, plan+show path but DON'T drive
@@ -332,16 +337,29 @@ class NavNode(Node):
         self.still_ang = float(g("still_ang").value)
         self.imu_sign = -1.0 if float(g("imu_yaw_sign").value) < 0 else 1.0
         # Sensor-frame vs drive-frame heading reference. When the sensor head (LDS + IMU) is
-        # mounted facing the robot's BACK, every heading input — IMU yaw, EKF/odom yaw, and the
-        # lidar beam angles — shares one coherent 180° rotation: the relative geometry is
-        # identical but the global "which way is the front" anchor is off, so the map icon's
-        # front tick points at the physical back and autonomous nav drives the wrong way (manual
-        # driving is unaffected — it never consults the map). Rotating all three references
-        # together preserves every downstream DIFFERENCE (yaw deltas, the (pth - oth) map-vs-odom
-        # rotation, the scan-match/integrate geometry) while making pth mean the PHYSICAL front
-        # heading — hence one knob, three ingest points (_on_odom, _on_euler, _on_scan).
-        # Restart-only: a live flip would re-anchor a live map by 180°.
+        # mounted facing the robot's BACK, the SENSOR references — the lidar beam angles and
+        # the IMU yaw — share one coherent 180° rotation: relative geometry is identical but
+        # the global "which way is the front" anchor is off, so the map icon's front tick
+        # pointed at the physical back and autonomous nav drove the wrong way. The flip now
+        # rotates ONLY those sensor references (IMU yaw + beams). The /odom WHEEL yaw is NOT
+        # flipped: it is the physical drive frame and needs no rotation (2026-09-11: the old
+        # "one knob, three ingest flips" logic was written when the yaw came from the
+        # IMU-anchored EKF; after the retune to raw /odom it double-rotated the heading by π,
+        # locking the map 180° from the drive direction — see _on_odom). Restart-only.
         self.heading_flip = math.pi if bool(g("heading_flip").value) else 0.0
+        # Heading-authority bound (rad). The scan matcher may correct the pose heading this
+        # far per scan relative to the wheel/odom-anchored prior; beyond it the WHEELS win
+        # and the contradicting scan is NOT trusted or folded into the grid. Stops a
+        # sparse/symmetric-map well from slowly walking pth away from the physical heading
+        # (the 2026-09-11 "map is shifting / nav circles" drift: pth −4.9 rad vs wheels
+        # +0.96 rad over ~25 s). Generous vs match_ang (0.35) so legit slip corrections pass.
+        self.head_tol = float(g("head_tol").value)
+        self.pos_tol = float(g("pos_tol").value)
+        # While the map is too sparse to localize against, the matcher's heading pull is
+        # pocket noise too (a symmetric box has a broad flat heading well), so the heading
+        # lock there is TIGHT — only genuine per-scan wheel-slip corrections (~0.15 rad)
+        # pass; everything else stays on the wheel-anchored heading (see _on_scan).
+        self.head_tol_sparse = min(self.head_tol, 0.15)
         # Motion-prior freshness: if /odom or /imu/euler goes silent longer than this while
         # the robot behaves, _predict must not keep trusting the stale value (it would smear
         # the map / spurious "lost"). Odom = 15 Hz, euler = 25 Hz, so 0.35 s ~ 4-8 periods.
@@ -467,6 +485,14 @@ class NavNode(Node):
         # rotation is a CONSTANT, and _predict rotates the odom displacement with it
         # instead of the mutable (pth - oth) that smeared the map (2026-09-11).
         self.rot_from = 0.0
+        # Seed bookkeeping for the WHEEL-ANCHORED pose reference (see _on_scan's authority
+        # gates): the odom-frame pose/yaw the map seeded with, plus the map heading it got.
+        # Every scan recomputes the ABSOLUTE wheel-chain pose/yaw from these and clamps the
+        # scan matcher's trusted corrections against it — without this the matcher slowly
+        # walks the pose away from the physical one (observed 2026-09-11: pose +0.51 m vs
+        # wheels +0.09 m; pth −4.9 rad vs wheels +0.96 rad).
+        self._seed_pth = 0.0
+        self._seed_odom = None          # (ox, oy, oth) in the odom frame at seed
         # Motion-prior trackers (last odom pose + last IMU yaw consumed by a scan).
         self._odom = None
         self._imu_yaw = None
@@ -817,8 +843,19 @@ class NavNode(Node):
     def _on_odom(self, msg):
         q = msg.pose.pose.orientation
         th = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
-        self._odom = (msg.pose.pose.position.x, msg.pose.pose.position.y,
-                      _wrap(th + self.heading_flip))
+        # heading_flip does NOT touch the odom yaw. /odom (wheel_odometry) yaw is
+        # integrated from the wheel ENCODERS, so it lives in the PHYSICAL DRIVE frame
+        # (0 = the direction the chassis faced at boot) — it is the one absolute
+        # "which way is the front" reference we have. The 2026-09-11 retune switched
+        # odom_topic from the IMU-anchored EKF (a SENSOR-frame yaw: 0 = sensor front)
+        # to this raw wheel feed, and the old flip-everything knob rotated this
+        # physical yaw by π too — pth ended up meaning the physical BACK, so the scan
+        # matcher locked the map's heading 180° from the drive direction (goal nav
+        # circles; the map icon front tick points at the physical back). The flip now
+        # applies ONLY to sensor-frame references (IMU yaw, lidar beams); wheel yaw
+        # is already "front". (If odom_topic were re-pointed at odometry/filtered,
+        # the EKF yaw IS sensor-anchored and would need +heading_flip again.)
+        self._odom = (msg.pose.pose.position.x, msg.pose.pose.position.y, _wrap(th))
         self._odom_stamp = time.monotonic()
 
     def _on_euler(self, msg):
@@ -965,13 +1002,17 @@ class NavNode(Node):
             # map frame's X == odom frame's X rotated by that seed yaw. rot_from
             # records that seed yaw ONCE; _predict uses this FIXED map↔odom rotation
             # to translate odom deltas — never the mutable pose (the (pth−oth) that
-            # smeared the map 2026-09-11). On a heading_flip mount the seed yaw
-            # already carries π (via _on_odom), so the flip folds in automatically.
+            # smeared the map 2026-09-11). The seed yaw comes from _on_odom, which does
+            # NOT apply heading_flip (the /odom wheel yaw already IS the physical front),
+            # so a fresh map always seeds aligned to the drive frame.
             if self.use_imu and self._imu_yaw is not None:
                 self.pth = self._imu_yaw
             elif self._odom is not None:
                 self.pth = self._odom[2]
             self.rot_from = self.pth
+            self._seed_pth = self.pth
+            self._seed_odom = (self._odom[0], self._odom[1], self._odom[2]) \
+                if self._odom is not None else None
             self.grid.integrate((0.0, 0.0, self.pth), angles, ranges)
             self._have_map = True
             self._ever_trusted = True      # the origin scan is accepted (map seeded)
@@ -1179,12 +1220,53 @@ class NavNode(Node):
             improve = score - score_prior
             self._last_score, self._last_overlap = score, overlap
             coverage = self.grid.coverage()[0]
+            # Absolute wheel-anchored pose reference (2026-09-11): the odom frame is a fixed
+            # world frame and the map is a CONSTANT rotation R(rot_from) of it, so the pose
+            # the WHEELS alone imply is recomputable every scan from the seed pose + the odom
+            # delta. It never absorbs the matcher's pulls, so clamping trusted corrections
+            # against it bounds the sparse/symmetric-map well's self-reinforcing walk for good
+            # (observed pre-fix: pose +0.51 m vs wheels +0.09 m; pth −4.9 rad vs +0.96 rad).
+            ax, ay, ath = px, py, pth
+            if self._seed_odom is not None and self._odom is not None:
+                sx, sy, st = self._seed_odom
+                c, s = math.cos(self.rot_from), math.sin(self.rot_from)
+                dx, dy = self._odom[0] - sx, self._odom[1] - sy
+                ax, ay = c * dx - s * dy, s * dx + c * dy
+                ath = _wrap(self._seed_pth + (self._odom[2] - st))
             if (improve >= self.min_improve or score >= self.min_score
                     or (overlap >= self.min_overlap and coverage < self.recover_min_seen)):
-                px, py, pth = cand
-                trusted = True
-                self._lost_count = 0
-                self._ever_trusted = True
+                # Wheel-authority gates. Below recover_min_seen the map is too sparse to
+                # LOCALIZE against (a just-cleared grid, or a tight symmetric pocket): the
+                # matcher's cand is noise and trusting it made the pose run acres ahead of
+                # the wheels (the "map is shifting" + premature "goal reached"). So the
+                # ODOM pose IS the location: keep the predicted position, only take small
+                # heading corrections (head_tol — real wheel-slip fixes), and STILL integrate
+                # so the map keeps building, anchored to the wheels. Above the threshold real
+                # structure exists: the matcher gets position+heading authority, but never
+                # farther from the wheel chain than pos_tol / head_tol in one scan, so a
+                # well bias can't accumulate across scans.
+                dhead = abs(_wrap(cand[2] - ath))
+                dpos = math.hypot(cand[0] - ax, cand[1] - ay)
+                if coverage < self.recover_min_seen:
+                    # TIGHT heading lock while unbuilt: the pocket matcher has a broad
+                    # flat heading well, so even head_tol (0.6) let the map heading sit
+                    # ~0.5 rad off the wheels (nav then turns the wrong way again). Only
+                    # small real slip-fixes pass; otherwise the WHEELS OWN the heading.
+                    if dhead > self.head_tol_sparse:
+                        trusted = False
+                    else:
+                        pth = cand[2]                   # small wheel-slip-fix only
+                        trusted = True
+                        self._lost_count = 0
+                        self._ever_trusted = True
+                else:
+                    if dhead > self.head_tol or dpos > self.pos_tol:
+                        trusted = False
+                    else:
+                        px, py, pth = cand
+                        trusted = True
+                        self._lost_count = 0
+                        self._ever_trusted = True
             elif (self.relocalize and not self._test_active
                   and len(vr) >= self.recover_min_beams):
                 # NOT trusted here means overlap < min_overlap too (or the map is
@@ -1512,6 +1594,8 @@ class NavNode(Node):
         # rot_from is reset by the next seed path (it captures the seed yaw); leaving
         # it at the old value would rotate deltas with a stale seed until re-seed.
         self.rot_from = 0.0
+        self._seed_pth = 0.0
+        self._seed_odom = None
         self._prev_odom = None
         self._prev_imu = None
         self._loop_off = (0.0, 0.0, 0.0)   # fresh map -> no accumulated drift

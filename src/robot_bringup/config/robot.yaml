@@ -133,12 +133,19 @@ slam_nav:
                                    # is still published for the web IMU card / OLED / RViz.
     imu_yaw_sign: 1.0                 # +1/-1. IF "IMU yaw and wheel yaw rotate OPPOSITE
                                       # signs", flip to -1 (IMU mounted rotated).
-    # Rotate the sensor heading frame 180° so map "front" = the robot's PHYSICAL drive
-    # front. ON for this unit: the sensor head (LDS + IMU) is mounted facing the back, so
-    # autonomous nav was driving the wrong way and the map icon's front tick pointed at the
-    # physical back (manual driving is unaffected). Applied to the two heading references
-    # slam_nav actually consumes (odom yaw + lidar beam angles) together. Restart-only.
+    # Rotate the SENSOR heading references (lidar beam angles + IMU yaw) 180° so the
+    # map's "front" = the robot's PHYSICAL drive front. ON for this unit: the sensor
+    # head (LDS + IMU) is mounted facing the back. The /odom WHEEL yaw is deliberately
+    # NOT rotated — it comes from the wheel encoders and IS the physical drive frame
+    # (a leftover rot-of-all-three harmed the pose when the 2026-09-11 retune moved
+    # the yaw source to raw /odom; see nav_node._on_odom). Restart-only.
     heading_flip: true
+    head_tol: 0.6                 # rad: per-scan heading-correction trust bound vs the wheel
+                                  # anchor (see nav_node) — stops the map heading slowly walking
+                                  # away from the physical heading on sparse/symmetric maps
+    pos_tol: 0.35                 # m: per-scan POSITION-correction trust bound vs the wheel
+                                  # anchor — below recover_min_seen the pose is ODOM-locked
+                                  # entirely (matcher position pulls are noise on an unbuilt map)
     # Parked = skip: when odom yaw AND translation both say the robot hasn't moved since
     # the last processed scan, skip the scan-match + map-integrate (the bulk of parked
     # idle CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
@@ -703,6 +710,9 @@ web_control:
     vision_approach_band: 0.25           # AND motion centred within +-this of frame centre
     # Named colour-target palette (persisted; a calibration now survives restarts).
     vision_targets_path: ""              # "" = ~/.local/state/nanobot/vision_targets.json
+    # Master camera switch (POST /vision/camera_enable in the web UI): persisted here so
+    # a "camera off" survives a reboot. "" = ~/.local/state/nanobot/vision.json
+    vision_settings_path: ""             # "" = ~/.local/state/nanobot/vision.json
     # Named locations ("go to the kitchen"): name -> pose map for the map panel's waypoint
     # layer / go-to skill. Persisted like the vision palette (NOT ROS params).
     locations_path: ""                    # "" = ~/.local/state/nanobot/locations.json

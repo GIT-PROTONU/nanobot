@@ -481,9 +481,16 @@ class GridMap:
         gc, gr = w2c(*goal)
         if not (0 <= sc < m and 0 <= sr < m and 0 <= gc < m and 0 <= gr < m):
             return None
+        gc0, gr0 = gc, gr                       # pre-snap goal cell (see the snap-collapse check)
         gc, gr = self._nearest_free(blocked, gc, gr, m)     # snap goal off any wall
         sc, sr = self._nearest_free(blocked, sc, sr, m)     # snap start out of inflation
         if gc is None or sc is None:
+            return None
+        if (sc == gc and sr == gr) and (gc0 != sc or gr0 != sr):
+            # The goal's cell was BLOCKED and its nearest free neighbour is the robot's own
+            # cell (tight pocket / goal under a wall): the only "path" would be the start
+            # itself, which the follower would chase by spinning in place forever. Report
+            # unreachable instead of emitting that degenerate single-point plan.
             return None
 
         # Straight-line fast path: if the whole segment is clear on the coarse
@@ -501,8 +508,14 @@ class GridMap:
             if blocked[rr, cc]:
                 break
         else:
-            return [(self.origin + (sc + 0.5) * res_c, self.origin + (sr + 0.5) * res_c),
-                    (self.origin + (gc + 0.5) * res_c, self.origin + (gr + 0.5) * res_c)]
+            p0 = (self.origin + (sc + 0.5) * res_c, self.origin + (sr + 0.5) * res_c)
+            p1 = (self.origin + (gc + 0.5) * res_c, self.origin + (gr + 0.5) * res_c)
+            # start and goal collapsed onto the same coarse cell (e.g. a goal clicked
+            # inside the robot's own inflation, or a ~0.2 m hop) — return the bare goal
+            # instead of a degenerate two-identical-points path the follower would chase.
+            if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) < res_c * 0.5:
+                return [p1]
+            return [p0, p1]
 
         BIG = np.float32(1e9)
         dist = np.full((m, m), BIG, dtype=np.float32)
