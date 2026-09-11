@@ -99,6 +99,7 @@
             <button id="mapTest" class="btn">🔧 Self-test</button>
           </div>
           <div id="wallCtl" class="chiprow">
+            <label class="switch"><input type="checkbox" id="mapShade" checked><span class="track"></span> Sharp walls</label>
             <label class="switch"><input type="checkbox" id="mapWallGuard"><span class="track"></span> Wall guard</label>
             <label class="wall-dist">Keep-away <span id="mapWallDistV">0.25</span> m
               <input id="mapWallDist" type="range" min="0.05" max="0.80" step="0.01" value="0.25"></label>
@@ -3256,12 +3257,17 @@ connect();   // auto-connect on load
   const dec=new TextDecoder();
   let timer=null, lastMeta=null;
   let mapCanvas=null, img=null;        // offscreen grid-res canvas holding the occupancy grid
+  let lastGrid=null;                   // last raw occupancy bytes, for immediate re-shade on toggle
+  let sharpShade=true;                 // wall shading: sqrt gamma (crisp) vs linear (soft)
 
   // ---- zoom / pan: the display canvas is sized to the wrap (× devicePixelRatio) and
-  //      every frame re-renders it in SCREEN pixels. The occupancy grid is upscaled
-  //      from grid resolution with high-quality smoothing (so zooming in interpolates
-  //      instead of showing chunky cells) while the vector overlays are drawn at full
-  //      display resolution, keeping them razor sharp at any zoom. ----
+  //      every frame re-renders it in SCREEN pixels. Smoothed drawImage is only used
+  //      when MAGNIFIED past native grid res (zooming in interpolates instead of
+  //      showing chunky cells); at the fit/zoomed-out scale the map is downscaled
+  //      (e.g. 1200px -> ~500px at fit), where bilinear smoothing smears walls into a
+  //      soft grey blur — nearest-neighbour keeps 2 cm cells crisp (= sharp walls) so
+  //      the map reads as clearly as the raw lidar view. Vector overlays are always
+  //      drawn at full display resolution, razor sharp at any zoom. ----
   const wrap=$("mapWrap");
   let gw=0, gh=0, zoom=0, panX=0, panY=0;   // zoom 0 = auto-fit to the wrap
   const dpr=()=>window.devicePixelRatio||1;
@@ -3277,7 +3283,8 @@ connect();   // auto-connect on load
     sizeCv(); ctx.setTransform(dpr(),0,0,dpr(),0,0);
     ctx.clearRect(0,0,wrap.clientWidth,wrap.clientHeight);
     const z=zoom||fitZoom(), [x0,y0]=origin(z);
-    ctx.imageSmoothingEnabled=true;
+    // crisp when at/under native res, interpolated only when magnified past 1:1
+    ctx.imageSmoothingEnabled = z > 1;
     if("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality="high";
     ctx.drawImage(mapCanvas,x0,y0,gw*z,gh*z);
     ctx.imageSmoothingEnabled=false;
@@ -3394,6 +3401,24 @@ connect();   // auto-connect on load
     }catch(e){ /* transient: keep polling */ }
   }
 
+  function shadeMap(){
+    if(!img || !lastGrid || !lastMeta) return;
+    const w=lastMeta.w, h=lastMeta.h, d=img.data;
+    for(let row=0;row<h;row++){
+      const cy=h-1-row, base=row*w;            // grid row 0 = bottom -> flip for canvas
+      for(let c=0;c<w;c++){
+        let v=lastGrid[base+c]; if(v>127) v-=256;  // byte -> signed int8
+        const o=(cy*w+c)*4;
+        // unknown grey; 0 white..100 black. Sharp: sqrt gamma pushes mid-grey cell
+        // fringes toward solid black so walls read crisp; off = the flat linear ramp.
+        const s=v<0?44:(sharpShade ? 255-Math.round(255*Math.sqrt(v/100))
+                                   : 255-Math.round(v*2.55));
+        d[o]=d[o+1]=d[o+2]=s; d[o+3]=255;
+      }
+    }
+    mapCanvas.getContext("2d").putImageData(img,0,0);
+  }
+
   function render(m, grid){
     const w=m.w, h=m.h; gw=w; gh=h;
     if(!mapCanvas || mapCanvas.width!==w || mapCanvas.height!==h){
@@ -3401,18 +3426,8 @@ connect();   // auto-connect on load
       mapCanvas.width=w; mapCanvas.height=h;
       img=mapCanvas.getContext("2d").createImageData(w,h);
     }
-    const d=img.data;
-    for(let row=0;row<h;row++){
-      const cy=h-1-row, base=row*w;            // grid row 0 = bottom -> flip for canvas
-      for(let c=0;c<w;c++){
-        let v=grid[base+c]; if(v>127) v-=256;  // byte -> signed int8
-        const o=(cy*w+c)*4;
-        const s=v<0?44:(255-Math.round(v*2.55)); // unknown grey; 0 white..100 black
-        d[o]=d[o+1]=d[o+2]=s; d[o+3]=255;
-      }
-    }
-    mapCanvas.getContext("2d").putImageData(img,0,0);
-    lastMeta=m;
+    lastGrid=grid; lastMeta=m;
+    shadeMap();
     $("mapWait").style.display="none";    // got a real frame: drop the placeholder
     cv.style.cursor="crosshair";          // ...and arm click-to-go only now
     repaint();
@@ -3465,6 +3480,7 @@ connect();   // auto-connect on load
   // wall guard: the toggle flips web_control's guard; the Keep-away slider sets BOTH
   // slam_nav's stop_distance (autonomous keep-away) and web_control's
   // wall_guard_distance (manual guard) so one control drives the whole bubble.
+  $("mapShade").addEventListener("change",e=>{ sharpShade=e.target.checked; shadeMap(); repaint(); });
   $("mapWallGuard").addEventListener("change",e=>setParam("web_control","wall_guard_enable",e.target.checked));
   $("mapWallDist").addEventListener("input",()=>{
     $("mapWallDistV").textContent=Number($("mapWallDist").value).toFixed(2);

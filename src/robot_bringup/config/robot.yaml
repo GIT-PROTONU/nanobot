@@ -90,15 +90,18 @@ motor_control:
 # on sharp spins, and the matcher corrects that every scan), so the IMU/EKF now
 # feed the web/OLED display + RViz only. Writes /dev/shm/nano_map.bin for the web
 # UI map panel.
-# All sizes/RAM scale with map_size_m / map_resolution: 24 m @ 0.05 m = 480x480
-# cells (~0.9 MB grid).
+# All sizes/RAM scale with map_size_m / map_resolution: 24 m @ 0.02 m = 1200x1200
+# cells (~8.6 MB grid: log + seen + no-go). 2 cm/cell matches the raw 1° lidar
+# point spacing (~1.7 cm at 1 m, ~3.5 cm at 2 m), so the occupancy map renders
+# with at least as much wall/feature detail as the lidar hero view. Fine enough
+# on the board's ~1 GB RAM; the blob is 1.44 MB/map-write at map_write_rate.
 slam_nav:
   ros__parameters:
     scan_topic: "scan"
     odom_topic: "odom"                 # raw wheel-encoder odometry (EKF/IMU not in the chain)
     euler_topic: "imu/euler"           # display + vision-tracking damping only (unused for pose)
     map_size_m: 24.0                 # square map side, metres (whole-floor)
-    map_resolution: 0.05           # metres/cell
+    map_resolution: 0.02           # metres/cell
     range_min: 0.12
     range_max: 6.0
     match_lin: 0.22                # scan-match search half-window (m)
@@ -159,7 +162,9 @@ slam_nav:
                                    # Flip live from the web UI "enable motion" toggle.
     robot_radius: 0.16             # obstacle inflation for the planner (m). Live-tunable:
                                    # web UI Sensors -> Navigation (slam_nav).
-    plan_downsample: 4             # plan on a 1/N grid (CPU/RAM); 4 = 0.20 m cells
+    plan_downsample: 10             # plan on a 1/N grid (CPU/RAM); 10 = 0.20 m cells
+                                    # at 2 cm map resolution (same coarse cell as the
+                                    # old 4 @ 5 cm, so planner behaviour is unchanged)
     allow_unknown: true            # let the global plan cross unmapped cells
     control_rate: 10.0             # Hz pursuit/controller loop
     replan_period: 0.5             # s between global replans while a goal is active
@@ -254,7 +259,8 @@ slam_nav:
                                    # a saved map) — nav_node gates it on the recovery being marked
                                    # as a kidnap. A driving loss keeps the local window search, so
                                    # a far spurious global "better" peak can't teleport the pose.
-    recover_global_step: 4         # grid-cell step of the global search (4 = 20 cm cells)
+    recover_global_step: 10        # grid-cell step of the global search (10 = 20 cm at 2 cm res,
+                                   # same physical spacing as the old 4 @ 5 cm, keeps the search cheap)
     recover_global_period: 2.0     # min s between full-grid searches while recovering
     # --- personality -> motion (the behaviour layer's `caution` trait) ---
     # OFF by default (it touches motion). When on, slam_nav subscribes /cognition/traits and

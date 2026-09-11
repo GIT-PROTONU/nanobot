@@ -94,7 +94,7 @@ class NavNode(Node):
             ("odom_topic", "odom"),
             ("euler_topic", "imu/euler"),
             ("map_size_m", 24.0),
-            ("map_resolution", 0.05),
+            ("map_resolution", 0.02),
             ("range_min", 0.12),
             ("range_max", 6.0),
             ("match_lin", 0.10),         # scan-match search half-window, metres
@@ -150,7 +150,8 @@ class NavNode(Node):
             # --- navigation (Stages 2/3) ---
             ("enable_motion", False),    # SAFETY: when false, plan+show path but DON'T drive
             ("robot_radius", 0.16),      # obstacle inflation for the planner (m)
-            ("plan_downsample", 4),      # plan on a 1/N grid (CPU/RAM); 4 -> 0.20 m cells
+            ("plan_downsample", 10),     # plan on a 1/N grid (CPU/RAM); 10 -> 0.20 m cells at
+                                         # 2 cm map res (same coarse cell as 4 @ 5 cm)
             ("allow_unknown", True),     # let the global plan cross unmapped cells
             ("control_rate", 10.0),      # Hz controller / pursuit loop
             ("replan_period", 1.0),      # s between global replans while a goal is active
@@ -226,7 +227,8 @@ class NavNode(Node):
             ("recover_spin", 0.6),        # rad/s in-place spin while relocalizing (needs motion)
             ("recover_timeout", 12.0),    # s before giving up the active relocalize search
             ("recover_global", True),     # also run a full-grid relocalize search while lost
-            ("recover_global_step", 4),   # grid-cell step of the global search (4 = 20 cm)
+            ("recover_global_step", 10),      # grid-cell step of the global search (10 = 20 cm at
+                                           # 2 cm res — same physical spacing as 4 @ 5 cm)
             ("recover_global_period", 2.0),  # min s between global searches while recovering
             # --- personality -> motion (the behaviour layer's `caution` trait, clamped
             #     REFLEXIVELY here so the cognitive layer can never push motion unsafe) ---

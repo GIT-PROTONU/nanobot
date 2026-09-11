@@ -6,9 +6,11 @@ against the accumulated MAP (not the previous scan) is the lightweight stand-in 
 loop closure: when you re-enter an already-mapped area the match snaps the pose back
 onto it, which is what keeps a whole-floor map from drifting without a heavy pose graph.
 
-Memory: one float32 grid + one bool 'seen' mask. At 24 m / 5 cm that's 480x480 =
-~0.9 MB + 0.23 MB. CPU: integration is O(hit cells); matching is a small coarse-to-fine
-search over a subsampled scan (caller decimates), vectorised per candidate angle.
+Memory: one float32 grid + one bool 'seen' mask (+ a bool no-go mask). At
+24 m / 2 cm that's 1200x1200 = ~5.8 MB + 1.4 MB + 1.4 MB. (24 m / 5 cm =
+480x480 is the cheap fallback.) CPU: integration is O(hit cells); matching is a
+small coarse-to-fine search over a subsampled scan (caller decimates),
+vectorised per candidate angle.
 """
 import math
 import os

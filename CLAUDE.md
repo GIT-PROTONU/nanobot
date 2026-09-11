@@ -66,6 +66,10 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   predictive lead for a moving target), and **confidence-scaled authority**
   (`track_conf_scale`, weak lock = cautious output). All five are live-tunable from the
   Camera tab's "▸ Tracking tuning" expandable.)
+  **Occupancy grid is 2 cm/cell (1200×1200 @ 24 m)** — `robot.yaml
+  map_resolution: 0.02` (was 5 cm), with `plan_downsample`/`recover_global_step`
+  bumped 4→10 to keep the planner + relocalize coarse cells at the same 0.20 m
+  (nav behaviour unchanged); a saved 5 cm `.npz` will not load (geometry mismatch).
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
   `imu_driver` also wires the **WitMotion accel/mag calibration** (2026-07-16, not
   hw-verified: `/imu_calibrate` String cmds `accel|mag_start|mag_stop|save` executed
@@ -395,6 +399,12 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   external scripts, no rosbridge/ROSLIB. Do NOT reintroduce external `<script src>`
   loading of the old split files (`app.js`, `map.js`, `oled.js`, `chrome.js`, `sim.js`,
   `devtools.js` — now orphaned).
+  The Map panel renders the raw `/map` blob as-is: **nearest-neighbour downscale**
+  (`imageSmoothingEnabled` only when magnified past 1:1) so fit-view walls don't smear
+  into a bilinear blur, plus a **"Sharp walls" toggle** (`#mapShade`, default on) that
+  switches the wall shading between a crisp √-gamma curve (mid-grey fringes → solid
+  black) and the flat linear ramp — toggling re-shades the last grid in place via
+  `shadeMap()` (no re-poll).
   `/stream.mjpg` is a zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`);
   `/snapshot.jpg` is one still frame (📸 button); `/audio.pcm` is the webcam
   mic as raw PCM via `arecord` (`mic_audio.py`). Both streams are ref-counted (only
