@@ -523,18 +523,18 @@
               a reading; the line above persists after it moves again so you don't have to
               watch it live.</p>
             <p class="hint"><b>Margins for good SLAM</b> (colour-graded live, derived from
-              slam_nav's actual tuning): the scan matcher corrects the IMU heading by up to
-              <b>±6.9° every scan</b> (<b>match_ang</b>) and a parked robot re-matches after just
-              ~0.3° of drift, so <em>slow</em> drift is absorbed continuously — what actually
-              loses localization is a sudden yaw <em>jump</em> past ~7° between scans, i.e.
-              magnetometer interference. <span style="color:var(--green)">green</span> = well
-              within margin, <span style="color:var(--amber)">amber</span> = SLAM still fine but
-              recalibrate (accel/mag cal above, or move the IMU), <span
-              style="color:var(--red)">red</span> = map-corrupting. Parked targets:
-              <b>yaw rate</b> ≤ 1°/min (amber to 6, red above — interference territory, the
-              prime suspect for the erratic self-test SPIN check), <b>roll/pitch drift</b>
-              ≤ 0.3° (red past 1°), <b>|accel|</b> 9.81 ± 0.3 m/s², <b>|gyro|</b> ≤ 1°/s,
-              <b>mag noise</b> ≤ 2% of the field (~0.6° heading wobble per 1%).</p>
+              slam_nav's actual tuning): the scan matcher corrects the odometry heading by up
+              to <b>±20° every scan</b> (<b>match_ang</b>); the pose chain runs on wheel
+              odometry + the lidar (IMU display-only since 2026-09-11), so this card is about
+              IMU health, not navigation. <span style="color:var(--green)">green</span> = good,
+              <span style="color:var(--amber)">amber</span> = IMU rebuild/check,
+              <span style="color:var(--red)">red</span> = the IMU itself is drifting/badly
+              disturbed (won't break SLAM, but the display/EKF/RViz will be wrong). Parked
+              targets: <b>yaw rate</b> ≤ 1°/min (amber to 6, red above — interference
+              territory, the prime suspect for the erratic self-test SPIN check),
+              <b>roll/pitch drift</b> ≤ 0.3° (red past 1°), <b>|accel|</b> 9.81 ± 0.3 m/s²,
+              <b>|gyro|</b> ≤ 1°/s, <b>mag noise</b> ≤ 2% of the field (~0.6° heading
+              wobble per 1%).</p>
             <div class="field inline">mount offset (mm) x <input id="imuOffX" type="number" value="0" step="1">
               y <input id="imuOffY" type="number" value="0" step="1">
               z <input id="imuOffZ" type="number" value="0" step="1"></div>
@@ -2171,16 +2171,16 @@ const HINTS = {
   visionTargetName: "Name this calibration ('ball', 'dock marker', ...) -- every pick is saved to a persistent palette under this name.",
   visionOledMask: "Mirror the tracking mask to the robot's physical OLED (128x64) -- the face yields while it's on.",
   // IMU card -- SLAM error margins. Grounded in slam_nav's params: the scan matcher
-  // corrects heading by up to ±6.9° per scan (match_ang 0.12 rad); a parked robot
-  // re-matches after ~0.3° drift (still_ang), so slow bias is continuously absorbed.
-  imuA: "Total acceleration magnitude. Parked it must read gravity: 9.81 ±0.3 green, ±1.0 amber, worse red -- off means the accel needs calibrating (tilts the fused roll/pitch/yaw SLAM leans on). Colour-graded only while stationary; driving legitimately moves it.",
+  // corrects heading by up to ±20° per scan (match_ang 0.35 rad); the IMU is out of the
+  // pose chain (2026-09-11) so these grade IMU health for the display/EKF/RViz only.
+  imuA: "Total acceleration magnitude. Parked it must read gravity: 9.81 ±0.3 green, ±1.0 amber, worse red -- off means the accel needs calibrating (tilts the fused roll/pitch/yaw shown elsewhere). Colour-graded only while stationary; driving legitimately moves it.",
   imuG: "Gyro magnitude. Parked it should be ~0: ≤1°/s green, ≤3 amber, above red (uncorrected bias or vibration). Graded only while stationary.",
-  imuMagNoise: "Peak-to-peak wobble of the mag field magnitude over 2s, plus that wobble as a % of the field -- ~0.6° of heading error per 1%. ≤2% green (≤~1° wobble), ≤6% amber, above red: eats half+ of the scan matcher's ±6.9°/scan correction window.",
+  imuMagNoise: "Peak-to-peak wobble of the mag field magnitude over 2s, plus that wobble as a % of the field -- ~0.6° of heading error per 1%. ≤2% green (≤~1° wobble), ≤6% amber, above red: the IMU's fused yaw (display/EKF/RViz) is badly disturbed.",
   imuMagWorst: "Biggest 2s mag wobble since the last reset (raw counts) -- peak-hold for walking the loose IMU around candidate mounting spots.",
   driftStill: "How long the robot has been provably stationary (not commanded, wheels grounded). The drift numbers below only accumulate -- and only get colour-graded -- during this.",
   driftRoll: "Roll change while parked. Should be ~0: ≤0.3° green, ≤1° amber, above red. 2D SLAM ignores roll directly, but real movement here means bad accel cal or vibration tilting the scan plane.",
   driftPitch: "Pitch change while parked. Same margins as roll: ≤0.3° green, ≤1° amber, above red.",
-  driftYaw: "Total yaw change this still period. Graded against the scan matcher's ±6.9°/scan correction budget: ≤1° green, ≤3.5° (half window) amber, above red. Slow drift is auto-corrected (SLAM re-matches after ~0.3°); a sudden JUMP past ~7° between scans is what actually loses localization.",
+  driftYaw: "Total yaw change this still period. The SLAM pose no longer depends on the IMU (wheel odom + lidar since 2026-09-11); this grades the IMU's own fused yaw health: ≤1° green, ≤3.5° amber, above red -- display/EKF/RViz would be wrong, not navigation.",
   driftRate: "Yaw drift normalized to °/min -- the IMU heading-health number. ≤1°/min green (a real gyro-bias level); 1-6 amber (SLAM still corrects it, but run the mag cal / check mounting); ≥6 red -- that's magnetometer interference territory, the prime suspect for the erratic self-test SPIN check and map corruption.",
   imuAxis6: "Switch the BWT901CL to 6-axis fusion: yaw becomes gyro-only, no magnetometer. Trades mag interference JUMPS (which the scan matcher can't absorb) for slow gyro DRIFT (which it's built to absorb). Try this if the mag-noise/drift-rate numbers above keep reading red. Save (above) to persist to flash.",
   imuAxis9: "Switch back to the BWT901CL's default 9-axis fusion (magnetometer fused into yaw). Save (above) to persist to flash.",
@@ -2536,13 +2536,11 @@ setInterval(()=>{
 
 // SLAM error margins -- what "within margin" means for the IMU numbers below.
 // Grounded in slam_nav's actual parameters, not guesses: the scan matcher corrects
-// the IMU/odom heading prior by up to match_ang (0.12 rad = ±6.9°) EVERY scan, and
-// the parked still-skip resumes matching after only ~0.3° of accumulated drift
-// (still_ang) -- so slow gyro bias is continuously absorbed. What actually loses
-// localization is a heading error bigger than that window between two scans, i.e.
-// a sudden magnetometer jump (interference), not slow drift. Colours: green = well
-// inside the budget, amber = SLAM still fine but worth recalibrating, red = bad
-// enough to corrupt the map / the likely SPIN-check culprit.
+// the odometry heading prior by up to match_ang (0.35 rad = ±20°) EVERY scan. The
+// IMU is out of the pose chain (2026-09-11) -- the rotation prior is wheel-odometer
+// yaw -- so these grades flag IMU health for what still reads it (display/EKF/RViz),
+// not navigation. Colours: green = good, amber = worth recalibrating, red = the IMU
+// is badly disturbed/drifting.
 function slamGrade(el, v, warn, bad){
   el.style.color = v>=bad ? "var(--red)" : v>=warn ? "var(--amber)" : "var(--green)";
 }
@@ -2597,9 +2595,10 @@ function onImuDrift(d){
   $("driftRate").textContent=d.still_s>0 ? d.yaw_per_min.toFixed(2)+"°/min" : "–";
   if(d.still_s>0){
     // Roll/pitch: 2D SLAM never reads them, but real movement here = bad accel cal
-    // or vibration tilting the scan plane. Yaw is graded against the scan-matcher's
-    // ±6.9°/scan correction window (amber at half of it); the RATE is the health
-    // number -- ≥6°/min is interference-grade, not normal gyro bias.
+    // or vibration tilting the scan plane. Yaw grades the IMU's own fused yaw health
+    // (the SLAM pose runs on wheel odom + lidar since 2026-09-11 — this no longer
+    // affects navigation); the RATE is the health number -- ≥6°/min is interference-
+    // grade, not normal gyro bias.
     slamGrade($("driftRoll"),  Math.abs(d.roll),  0.3, 1.0);
     slamGrade($("driftPitch"), Math.abs(d.pitch), 0.3, 1.0);
     slamGrade($("driftYaw"),   Math.abs(d.yaw),   1.0, 3.5);
@@ -2625,7 +2624,8 @@ function onImuMag(xyz){
   const noise=Math.max(...vals)-Math.min(...vals);
   // Raw counts are only comparable spot-to-spot, but noise as a % OF the field is an
   // absolute health number: a transverse wobble of x% of the field is ~0.6x° of
-  // heading wobble, so 6% ≈ 3.4° -- half the scan-matcher's ±6.9° correction window.
+  // heading wobble, so 6% ≈ 3.4°. Only affects the display/EKF/RViz -- the SLAM pose
+  // no longer reads the IMU (wheel odom + lidar since 2026-09-11).
   const pct=mag>1 ? noise/mag*100 : 0;
   const nEl=$("imuMagNoise");
   nEl.textContent=noise.toFixed(1)+(mag>1 ? ` (${pct.toFixed(1)}%)` : "");
@@ -3254,28 +3254,91 @@ connect();   // auto-connect on load
   const $=id=>document.getElementById(id);
   const cv=$("mapcv"), ctx=cv.getContext("2d");
   const dec=new TextDecoder();
-  let timer=null, img=null, lastMeta=null;
+  let timer=null, lastMeta=null;
+  let mapCanvas=null, img=null;        // offscreen grid-res canvas holding the occupancy grid
 
-  // ---- zoom / pan: the canvas keeps its full grid resolution and is scaled with a
-  //      CSS transform, so draw() stays cheap and overlays stay pixel-accurate. ----
+  // ---- zoom / pan: the display canvas is sized to the wrap (× devicePixelRatio) and
+  //      every frame re-renders it in SCREEN pixels. The occupancy grid is upscaled
+  //      from grid resolution with high-quality smoothing (so zooming in interpolates
+  //      instead of showing chunky cells) while the vector overlays are drawn at full
+  //      display resolution, keeping them razor sharp at any zoom. ----
   const wrap=$("mapWrap");
-  let zoom=0, panX=0, panY=0;                       // zoom 0 = auto-fit to the wrap
-  const fitZoom=()=>Math.min(wrap.clientWidth/cv.width, wrap.clientHeight/cv.height)||1;
-  const cX=z=>((wrap.clientWidth-cv.width*z)/2), cY=z=>((wrap.clientHeight-cv.height*z)/2);
-  function applyTf(){
-    const z=zoom||fitZoom();
-    cv.style.transformOrigin="0 0";
-    cv.style.transform=`translate(${cX(z)+panX}px, ${cY(z)+panY}px) scale(${z})`;
+  let gw=0, gh=0, zoom=0, panX=0, panY=0;   // zoom 0 = auto-fit to the wrap
+  const dpr=()=>window.devicePixelRatio||1;
+  const fitZoom=()=> gw? Math.min(wrap.clientWidth/gw, wrap.clientHeight/gh)||1 : 1;
+  const cX=z=>((wrap.clientWidth-gw*z)/2), cY=z=>((wrap.clientHeight-gh*z)/2);
+  const origin=z=>[cX(z)+panX, cY(z)+panY]; // top-left of the map in screen px
+  function sizeCv(){
+    const d=dpr(), w=Math.max(1,Math.round(wrap.clientWidth*d)), h=Math.max(1,Math.round(wrap.clientHeight*d));
+    if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; }
   }
-  function fitMap(){ zoom=0; panX=0; panY=0; applyTf(); }
+  function repaint(){
+    if(!lastMeta||!mapCanvas) return;
+    sizeCv(); ctx.setTransform(dpr(),0,0,dpr(),0,0);
+    ctx.clearRect(0,0,wrap.clientWidth,wrap.clientHeight);
+    const z=zoom||fitZoom(), [x0,y0]=origin(z);
+    ctx.imageSmoothingEnabled=true;
+    if("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality="high";
+    ctx.drawImage(mapCanvas,x0,y0,gw*z,gh*z);
+    ctx.imageSmoothingEnabled=false;
+    const m=lastMeta;
+    const W2P=(x,y)=>[x0+((x-m.ox)/m.res)*z, y0+((gh-1)-(y-m.oy)/m.res)*z]; // world -> screen px
+    // breadcrumb trail (cyan polyline) — where the robot has been
+    if(m.trail && m.trail.length>1){
+      ctx.strokeStyle="#22d3ee"; ctx.lineWidth=1; ctx.globalAlpha=0.7; ctx.beginPath();
+      m.trail.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+      ctx.stroke(); ctx.globalAlpha=1;
+    }
+    // planned path (green polyline)
+    if(mapPlan && mapPlan.length>1){
+      ctx.strokeStyle="#34c759"; ctx.lineWidth=2; ctx.beginPath();
+      mapPlan.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+      ctx.stroke();
+    }
+    // home marker (origin) — small magenta square
+    if(m.hx!==undefined){
+      const [hx,hy]=W2P(m.hx,m.hy), hs=3;
+      ctx.strokeStyle="#c084fc"; ctx.lineWidth=1; ctx.strokeRect(hx-hs,hy-hs,2*hs,2*hs);
+    }
+    // goal marker (yellow ring)
+    if(mapGoal){
+      const [gx,gy]=W2P(mapGoal[0],mapGoal[1]);
+      ctx.strokeStyle="#ffd60a"; ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.arc(gx,gy,5,0,6.2832); ctx.stroke();
+    }
+    // robot pose: a small, crisp dot + heading line, drawn at full display resolution
+    // so it stays sharp (and constant-sized on screen) at any zoom.
+    const [rx,ry]=W2P(m.px,m.py), R=3.5;
+    ctx.fillStyle="#ff3b30";
+    ctx.strokeStyle="rgba(10,10,14,0.6)"; ctx.lineWidth=1;   // thin dark halo on light map
+    ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
+    ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.fill();
+    ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2; ctx.lineCap="round";
+    ctx.beginPath(); ctx.moveTo(rx,ry);
+    ctx.lineTo(rx+9*Math.cos(m.pth), ry-9*Math.sin(m.pth)); ctx.stroke();
+    ctx.lineCap="butt";
+    // wall keep-away bubble: the distance the robot keeps from walls (stop_distance,
+    // in the map header as `wd`), drawn as a dashed circle around the robot. Grey =
+    // the autonomous-navigation distance; blue = the manual wall-guard is on; orange
+    // = the guard is actively refusing a drive into a wall right now.
+    if(m.wd!==undefined && m.wd>0){
+      const Rb=(m.wd/m.res)*z;
+      ctx.strokeStyle=wallGuardBlocked?"#ff9500":(wallGuardActive?"#0a84ff":"#63666b");
+      ctx.lineWidth=wallGuardBlocked?2.5:1.5;
+      ctx.setLineDash([5,4]);
+      ctx.beginPath(); ctx.arc(rx,ry,Rb,0,6.2832); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  function fitMap(){ zoom=0; panX=0; panY=0; repaint(); }
   function zoomAt(factor,mx,my){
     const z=zoom||fitZoom();
     const z1=Math.min(20,Math.max(fitZoom()*0.5, z*factor));
     if(z1===z) return;
-    const tx=cX(z)+panX, ty=cY(z)+panY;
-    const x0=(mx-tx)/z, y0=(my-ty)/z;               // map pixel under cursor / pinch centre
-    zoom=z1; panX=mx-x0*z1-cX(z1); panY=my-y0*z1-cY(z1);
-    applyTf();
+    const [tx,ty]=origin(z);
+    const gx=(mx-tx)/z, gy=(my-ty)/z;               // grid pixel under cursor / pinch centre
+    zoom=z1; panX=mx-gx*z1-cX(z1); panY=my-gy*z1-cY(z1);
+    repaint();
   }
   wrap.addEventListener("wheel",e=>{
     e.preventDefault();
@@ -3304,7 +3367,7 @@ connect();   // auto-connect on load
       pinch={d, mx, my};
     } else if(panDrag){
       if(Math.hypot(e.clientX-pdsx,e.clientY-pdsy)>4) panMoved=true;
-      panX=pdpx+(e.clientX-pdsx); panY=pdpy+(e.clientY-pdsy); applyTf();
+      panX=pdpx+(e.clientX-pdsx); panY=pdpy+(e.clientY-pdsy); repaint();
     }
   });
   const upPtr=e=>{
@@ -3317,7 +3380,7 @@ connect();   // auto-connect on load
   $("mapFit").onclick=fitMap;
   $("mapZoomIn").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1.5, r.width/2, r.height/2); };
   $("mapZoomOut").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1/1.5, r.width/2, r.height/2); };
-  window.addEventListener("resize",applyTf);
+  window.addEventListener("resize",repaint);
 
   async function poll(){
     try{
@@ -3327,14 +3390,17 @@ connect();   // auto-connect on load
       const nl=buf.indexOf(10);                // end of the JSON header line
       if(nl<0) return;
       const meta=JSON.parse(dec.decode(buf.subarray(0,nl)));
-      draw(meta, buf.subarray(nl+1));
+      render(meta, buf.subarray(nl+1));
     }catch(e){ /* transient: keep polling */ }
   }
 
-  function draw(m, grid){
-    const w=m.w, h=m.h;
-    if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; img=ctx.createImageData(w,h); }
-    applyTf();
+  function render(m, grid){
+    const w=m.w, h=m.h; gw=w; gh=h;
+    if(!mapCanvas || mapCanvas.width!==w || mapCanvas.height!==h){
+      mapCanvas=document.createElement("canvas");
+      mapCanvas.width=w; mapCanvas.height=h;
+      img=mapCanvas.getContext("2d").createImageData(w,h);
+    }
     const d=img.data;
     for(let row=0;row<h;row++){
       const cy=h-1-row, base=row*w;            // grid row 0 = bottom -> flip for canvas
@@ -3345,52 +3411,11 @@ connect();   // auto-connect on load
         d[o]=d[o+1]=d[o+2]=s; d[o+3]=255;
       }
     }
-    ctx.putImageData(img,0,0);
+    mapCanvas.getContext("2d").putImageData(img,0,0);
     lastMeta=m;
     $("mapWait").style.display="none";    // got a real frame: drop the placeholder
     cv.style.cursor="crosshair";          // ...and arm click-to-go only now
-    const W2P=(x,y)=>[(x-m.ox)/m.res, h-1-(y-m.oy)/m.res];  // world -> canvas px
-    // breadcrumb trail (cyan polyline) — where the robot has been
-    if(m.trail && m.trail.length>1){
-      ctx.strokeStyle="#22d3ee"; ctx.lineWidth=1; ctx.globalAlpha=0.7; ctx.beginPath();
-      m.trail.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
-      ctx.stroke(); ctx.globalAlpha=1;
-    }
-    // planned path (green polyline)
-    if(mapPlan && mapPlan.length>1){
-      ctx.strokeStyle="#34c759"; ctx.lineWidth=2; ctx.beginPath();
-      mapPlan.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
-      ctx.stroke();
-    }
-    // home marker (origin) — small magenta square
-    if(m.hx!==undefined){
-      const [hx,hy]=W2P(m.hx,m.hy);
-      ctx.strokeStyle="#c084fc"; ctx.lineWidth=2; ctx.strokeRect(hx-4,hy-4,8,8);
-    }
-    // goal marker (yellow ring)
-    if(mapGoal){
-      const [gx,gy]=W2P(mapGoal[0],mapGoal[1]);
-      ctx.strokeStyle="#ffd60a"; ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(gx,gy,5,0,6.2832); ctx.stroke();
-    }
-    // robot pose: red dot + heading tick
-    const [rx,ry]=W2P(m.px,m.py);
-    ctx.fillStyle=ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.arc(rx,ry,4,0,6.2832); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(rx,ry);
-    ctx.lineTo(rx+9*Math.cos(m.pth), ry-9*Math.sin(m.pth)); ctx.stroke();
-    // wall keep-away bubble: the distance the robot keeps from walls (stop_distance,
-    // in the map header as `wd`), drawn as a dashed circle around the robot. Grey =
-    // the autonomous-navigation distance; blue = the manual wall-guard is on; orange
-    // = the guard is actively refusing a drive into a wall right now.
-    if(m.wd!==undefined && m.wd>0){
-      const R=m.wd/m.res;
-      ctx.strokeStyle=wallGuardBlocked?"#ff9500":(wallGuardActive?"#0a84ff":"#63666b");
-      ctx.lineWidth=wallGuardBlocked?2.5:1.5;
-      ctx.setLineDash([5,4]);
-      ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
-      ctx.setLineDash([]);
-    }
+    repaint();
     // telemetry line (coverage + localization health + mode)
     if(m.seen!==undefined){
       const q = m.score>=8?"good":(m.score>=2?"ok":"weak");
@@ -3424,15 +3449,16 @@ connect();   // auto-connect on load
     } else { clearInterval(timer); timer=null; }
   });
 
-  // click the map -> goal in world metres (account for CSS zoom/pan + the y-flip)
+  // click the map -> goal in world metres (account for zoom/pan + the y-flip)
   cv.addEventListener("click",e=>{
     if(!lastMeta) return;
     if(panMoved){ panMoved=false; return; }   // a pan just ended, not a goal tap
     const rect=cv.getBoundingClientRect();
-    const cx=(e.clientX-rect.left)*cv.width/rect.width;
-    const cy=(e.clientY-rect.top)*cv.height/rect.height;
+    const z=zoom||fitZoom(), [x0,y0]=origin(z);
+    const gcx=(e.clientX-rect.left-x0)/z;      // grid px
+    const gcy=(e.clientY-rect.top-y0)/z;
     const m=lastMeta;
-    mapSetGoal(m.ox+cx*m.res, m.oy+(cv.height-1-cy)*m.res);
+    mapSetGoal(m.ox+gcx*m.res, m.oy+(m.h-1-gcy)*m.res);
   });
   $("mapMotion").addEventListener("change",e=>setNavMotion(e.target.checked));
   $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));

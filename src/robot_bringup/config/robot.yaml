@@ -77,26 +77,43 @@ motor_control:
     lds_motor_duty: 0.55
 
 # ---- 2D occupancy-grid SLAM (slam_nav) --------------------------------------
-# Builds a map from /scan with the pose = EKF-filtered odometry
-# (/odometry/filtered) + raw IMU yaw for the rotation prior, refined by a
-# correlative scan-to-map matcher. The EKF (robot_localization ekf_node,
-# config/ekf.yaml) fuses wheel odometry + IMU into a single filtered state.
-# Writes /dev/shm/nano_map.bin for the web UI map panel.
+# Builds a map from /scan with the pose = WHEEL-ODOMETRY dead-reckoning
+# (/odom), refined every scan by a robust scan-to-map matcher.
+#
+# 2026-09-11 retune ("rock-solid cheap SLAM"): the IMU and the EKF are OUT of the
+# pose chain. The BWT901CL's heading (device-fused or pure gyro-z) drifts with gyro
+# bias / magnetometer interference, and the EKF simply re-packages that heading —
+# feeding /odometry/filtered + use_imu_yaw:true meant the 5 Hz scan-matcher was
+# forever chasing a drifting rotation prior inside its tiny ±0.12 rad window, which
+# is what stormed "localization lost", smeared the map and made goals unreachable.
+# The wheel-encoder yaw is stable over the ~0.2 s between scans (slip only bites
+# on sharp spins, and the matcher corrects that every scan), so the IMU/EKF now
+# feed the web/OLED display + RViz only. Writes /dev/shm/nano_map.bin for the web
+# UI map panel.
 # All sizes/RAM scale with map_size_m / map_resolution: 24 m @ 0.05 m = 480x480
 # cells (~0.9 MB grid).
 slam_nav:
   ros__parameters:
     scan_topic: "scan"
-    odom_topic: "odometry/filtered"  # EKF-fused wheel odometry + IMU
-    euler_topic: "imu/euler"         # /imu/euler vector.z = yaw in degrees
+    odom_topic: "odom"                 # raw wheel-encoder odometry (EKF/IMU not in the chain)
+    euler_topic: "imu/euler"           # display + vision-tracking damping only (unused for pose)
     map_size_m: 24.0                 # square map side, metres (whole-floor)
     map_resolution: 0.05           # metres/cell
     range_min: 0.12
     range_max: 6.0
-    match_lin: 0.10                # scan-match search half-window (m)
-    match_ang: 0.12                # scan-match search half-window (rad)
-    match_points: 90               # scan beams used for matching (decimated)
+    match_lin: 0.22                # scan-match search half-window (m)
+    match_ang: 0.35                # scan-match search half-window (rad = ±20°) — wide
+                                   # enough to absorb a drifted/imperfect heading prior
+                                   # between scans (the old ±0.12 rad could NOT recover
+                                   # once the prior was off, which stormed "lost")
+    match_points: 120              # scan beams used for matching (decimated)
     min_match_score: 1.0           # reject matches with no real map overlap
+    # PRIMARY trust gate (2026-09-11): trust a match when it scores at least this much
+    # BETTER than the odometry-predicted pose. The absolute score is dominated by
+    # free-space cells in open rooms, so a pure `score >= min_match_score` bar rejected
+    # EVERY scan on a sparse map and froze it. Improvement is scale-invariant — free
+    # space only lowers it, so a positive delta means beams snapped onto real walls.
+    min_improve: 4.0
     # Inlier gate: a scan is only TRUSTED (pose snapped + integrated) when at least
     # this fraction of its beams land on already-seen map cells. Catches the "good
     # score, no real overlap" bad scan (a few overlapping beams in front of undegraded
@@ -107,23 +124,24 @@ slam_nav:
     # until the driver's intensity range is checked on hardware — far returns have
     # legitimately lower signal). Live-tunable.
     qual_min: -1.0
-    use_imu_yaw: true             # IMU yaw delta for the rotation prior. With the EKF
-                                # providing an IMU-corrected baseline yaw in /odometry/
-                                # filtered, the raw IMU delta from /imu/euler is more
-                                # reliable than ever — the scan matcher's yaw window
-                                # (match_ang: 0.12 rad) could potentially be tightened
-                                # (e.g. 0.08) once yaw tracking is verified on hardware.
+    use_imu_yaw: false            # IMU yaw delta for the rotation prior. FALSE (2026-09-11):
+                                   # the BWT901CL heading drifts (gyro bias / magnetometer
+                                   # interference) and the EKF re-packages that drift, so
+                                   # rotating on IMU delta made the scan matcher chase a
+                                   # moving target. Wheel-odometer yaw is stable between
+                                   # scans and the matcher fixes slip every scan. The IMU
+                                   # is still published for the web IMU card / OLED / RViz.
     imu_yaw_sign: 1.0                 # +1/-1. IF "IMU yaw and wheel yaw rotate OPPOSITE
                                       # signs", flip to -1 (IMU mounted rotated).
     # Rotate the sensor heading frame 180° so map "front" = the robot's PHYSICAL drive
     # front. ON for this unit: the sensor head (LDS + IMU) is mounted facing the back, so
     # autonomous nav was driving the wrong way and the map icon's front tick pointed at the
-    # physical back (manual driving is unaffected). Applied to all three heading references
-    # (IMU yaw, EKF/odom yaw, lidar beams) in slam_nav. Restart-only.
+    # physical back (manual driving is unaffected). Applied to the two heading references
+    # slam_nav actually consumes (odom yaw + lidar beam angles) together. Restart-only.
     heading_flip: true
-    # Parked = skip: when odom AND IMU both say the robot hasn't moved since the last
-    # processed scan, skip the scan-match + map-integrate (the bulk of parked idle
-    # CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
+    # Parked = skip: when odom yaw AND translation both say the robot hasn't moved since
+    # the last processed scan, skip the scan-match + map-integrate (the bulk of parked
+    # idle CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
     # fires via the yaw delta. Never skips while seeding/recovering/self-testing.
     still_skip: true
     still_lin: 0.005               # m: odom translation that counts as "moved"
@@ -137,13 +155,13 @@ slam_nav:
     plan_downsample: 4             # plan on a 1/N grid (CPU/RAM); 4 = 0.20 m cells
     allow_unknown: true            # let the global plan cross unmapped cells
     control_rate: 10.0             # Hz pursuit/controller loop
-    replan_period: 1.0             # s between global replans while a goal is active
-    max_lin: 0.15                  # m/s pursuit speed cap (start gentle). Live-tunable.
-    max_ang: 1.0                   # rad/s turn-rate cap. Live-tunable.
-    lookahead: 0.30                # m pure-pursuit lookahead
-    goal_tol: 0.12                 # m: within this of the goal = arrived
-    stop_distance: 0.25            # m: obstacle this close ahead = stop + replan. Live-tunable.
-    front_angle: 0.6               # rad: half-width of the reactive front cone
+    replan_period: 0.5             # s between global replans while a goal is active
+    max_lin: 0.32                  # m/s pursuit speed cap. Live-tunable.
+    max_ang: 1.5                   # rad/s turn-rate cap. Live-tunable.
+    lookahead: 0.45                # m pure-pursuit lookahead
+    goal_tol: 0.15                 # m: within this of the goal = arrived
+    stop_distance: 0.20            # m: obstacle this close ahead = stop + replan. Live-tunable.
+    front_angle: 0.5               # rad: half-width of the reactive front cone
     # --- extras (each independently toggleable; behaviour-changers default OFF for
     #     easy/safe testing — flip them on one at a time) ---
     # No-go zones: paint them on the web Map view (No-go brush/erase). They're stored
@@ -161,8 +179,10 @@ slam_nav:
                                    # off it just shows where it *would* explore.
     explore_period: 4.0            # s between frontier picks while exploring
     trail_max: 400                 # breadcrumb ring-buffer length (where it's been); 0 = off
-    stuck_timeout: 0.0             # s of commanded-but-no-motion before aborting goal; 0 = off.
-                                   # Live-tunable.
+    stuck_timeout: 3.0             # s of commanded-but-no-motion before aborting goal; 0 = off.
+                                   # Live-tunable. Was 0 (off) — with a reliable pose a
+                                   # 3 s no-progress abort beats grinding forever into a
+                                   # wedged wheel / unsensed collision.
     stuck_eps: 0.04                # m: movement below this counts as "not moving"
     goal_no_path_timeout: 20.0     # s with zero path found before giving up on the goal;
                                    # 0 = off (never give up). Without this an unreachable
@@ -191,6 +211,11 @@ slam_nav:
     recover_patience: 5            # consecutive unmatched scans before declaring "lost"
     recover_min_beams: 40          # need this many in-range beams to trust a "mismatch"
     recover_exit_score: 20.0       # scan-match score that ends recovery (relocalized)
+    recover_exit_improve: 8.0      # OR: end recovery when the match improves this much
+                                   # over the odometry prior (scale-invariant escape
+                                   # hatch — on a sparse/bleached map the absolute score
+                                   # bar can be unreachable, but a scan that snaps
+                                   # strongly onto structure is a solid lock)
     recover_overlap: 0.30          # recovery must ALSO pass this overlap inlier gate before a
                                    # candidate can be trusted. min_overlap_ratio (0.10) is tuned
                                    # for building and is far too permissive to TRUST a recovered

@@ -11,14 +11,19 @@
 #     (forward velocity). Its yaw/vyaw are deliberately NOT used — the single-channel
 #     encoders sign ticks by commanded direction, so heading drifts from wheel slip,
 #     and feeding that into the filter would fight the IMU.
-#   IMU provides absolute yaw (from orientation quaternion), yaw velocity (gyro Z),
-#     and linear acceleration X, Y (helps the filter predict between odom updates).
+#   IMU provides Z-rotation VELOCITY (gyro-z / "vyaw") and linear acceleration X, Y
+#     (helps the filter predict between odom updates). The IMU's ABSOLUTE yaw is
+#     deliberately NOT fused: the BWT901CL's fused heading develops a decaying bias
+#     transient for a minute+ after any real motion (measured: +450° in 76 s post-drive
+#     while raw gyro-z stayed ~0), so fusing it dragged the heading for a minute after
+#     every drive. Heading = gyro-z integration from 0 at boot. NOTE (2026-09-11):
+#     slam_nav no longer consumes this topic at all (it runs on raw /odom + the lidar
+#     scan matcher), so this file is only for RViz / the web motion-chain display.
 #   IMU's roll/pitch are NOT used (2D mode zeros them); Z, Vz, Az are not used.
-#   Yaw is dominated by the IMU (more reliable than wheel-slip-prone odometry heading).
 #
 # Process noise: X/Y position noise (0.05) is moderate — the encoders are decent
 # over short distances. Yaw noise (0.06) is deliberately higher so the filter
-# weights the IMU's yaw over the prediction model. Velocity/acceleration noise
+# weights the IMU's gyro over the prediction model. Velocity/acceleration noise
 # (0.01) is tight; the filter should trust the integrated IMU gyro between updates.
 #
 # Frequency: 15 Hz — matches the wheel odometry rate exactly, so EVERY EKF
@@ -61,13 +66,13 @@ ekf_node:
     odom0_relative: false
 
     # ---- IMU input (/imu/data from imu_driver) -------------------
-    # Provides: absolute yaw (from orientation quat), yaw velocity (gyro Z),
-    #           linear acceleration X, Y (for smooth prediction between odom ticks)
+    # Provides: yaw VELOCITY (gyro Z), linear acceleration X, Y (for smooth prediction
+    # between odom ticks). Absolute yaw is NOT fused (bias-transient drift, see header).
     imu0: /imu/data
     imu0_config: [false, false, false,   # X, Y, Z
-                  false, false, true,    # roll, pitch, yaw
+                  false, false, false,   # roll, pitch, yaw — NOT fused (bias transients)
                   false, false, false,   # Vx, Vy, Vz
-                  false, false, true,    # Vroll, Vpitch, Vyaw
+                  false, false, true,    # Vroll, Vpitch, Vyaw — gyro-z = the heading source
                   true,  true,  false]   # Ax, Ay, Az
     imu0_queue_size: 10
     imu0_nodelay: true

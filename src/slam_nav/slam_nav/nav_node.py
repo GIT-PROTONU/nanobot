@@ -51,6 +51,21 @@ def _wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
+# --- pursuit controller geometry (see _pursuit) -------------------------------
+# These interact with the ESP32's motor remap (MOTOR_DEADZONE 0.02 / MIN_DUTY 0.55):
+# below ~0.25 rad/s of commanded turn with v=0 the wheels get stuck in the deadzone,
+# so the controller keeps a forward crawl whenever the heading can still make progress.
+
+_ARC_FULL_RAD = 1.0        # rad heading error (~58°): at/inside this, drive at cos-tapered speed
+_FACE_AWAY_RAD = 2.62      # rad (~150°): beyond this the front can't reach the goal — spin in place
+_CREEP_SPEED = 0.10        # m/s stiction-safe crawl floor (differential drive must keep steering);
+                           # fades to 0 as the heading goes abeam so the full-stop is reserved for
+                           # the genuine >150° spin
+_TURN_DEAD_RAD = 0.05      # rad (~2.9°): go straight inside this (don't command the micro-turn
+                           # the hardware can't produce; let v carry us to the goal)
+_TURN_SETTLE_RAD = 0.7     # rad (~40°): heading error that earns FULL turn authority (w = max_ang)
+
+
 def _sd_notify(msg):
     """Best-effort systemd notification (Type=notify units): READY on start, then
     WATCHDOG pets from an executor timer — if a callback wedges the executor the pets
@@ -86,11 +101,27 @@ class NavNode(Node):
             ("match_ang", 0.12),         # scan-match search half-window, radians
             ("match_points", 90),        # scan points used for matching (decimated)
             ("min_match_score", 1.0),    # below this, keep the prior (no good overlap)
+            # Improvement gate (the PRIMARY trust gate since 2026-09-11): trust a match
+            # when it scores at least `min_improve` better than the ODOMETRY-PREDICTED
+            # pose (no scan correction applied). This is scale-invariant and immune to
+            # free-space domination: score() sums log-odds over beam endpoints, so in a
+            # room with lots of open floor every beam that ends in free space pushes the
+            # ABSOLUTE score negative — the old `score >= min_match_score` bar was then
+            # unattainable and rejected EVERY scan (map froze, robot "relocalizing"
+            # forever; seen <153 on the board 2026-09-11). Free-space cells only ever
+            # LOWER improvement (they subtract), and unknown cells contribute 0, so a
+            # positive improvement can only come from beams snapping onto OCCUPIED
+            # structure — exactly the signature of a correct match.
+            ("min_improve", 4.0),
             # Inlier gate: a scan may only be TRUSTED (pose snapped + integrated) when
             # at least this FRACTION of its beams land on cells the map has already seen.
             # Raw log-odds can pass min_match_score on a few overlapping beams while the
             # scan otherwise points at unmapped void (blind rays / carried elsewhere) —
-            # that's exactly the bad scan we refuse to fold in. 0 = disabled.
+            # that's exactly the bad scan we refuse to fold in. 0 = disabled. NOTE this
+            # counts SEEN cells (which includes free space), so on a sparse map it is far
+            # too strict to be the primary gate — kept as a backstop for "we saw mapped
+            # area but nothing fits" (the lost-detector uses it to tell a true loss from
+            # ordinary exploration of fresh space).
             ("min_overlap_ratio", 0.10),
             # Beam signal-quality floor read from /scan.intensities (the lidar's raw
             # signal strength). Beams below it are dropped before match + integrate.
@@ -151,6 +182,12 @@ class NavNode(Node):
             ("recover_patience", 5),      # consecutive unmatched scans before declaring "lost"
             ("recover_min_beams", 40),    # need this many in-range beams to trust a "mismatch"
             ("recover_exit_score", 20.0), # match score that ends recovery (= relocalized)
+            ("recover_exit_improve", 8.0), # OR: end recovery when the match improves this
+                                           # much over the odometry prior (scale-invariant
+                                           # escape hatch: on a sparse/bleached map the
+                                           # absolute score bar can be unreachable, but a
+                                           # scan that snaps strongly onto structure is a
+                                           # solid lock)
             ("recover_overlap", 0.30),    # recovery must also pass THIS overlap inlier gate
                                           # (min_overlap_ratio is tuned for building maps and
                                           # is far too permissive to TRUST a recovered pose on
@@ -286,6 +323,7 @@ class NavNode(Node):
         self.match_ang = float(g("match_ang").value)
         self.match_pts = int(g("match_points").value)
         self.min_score = float(g("min_match_score").value)
+        self.min_improve = float(g("min_improve").value)
         self.min_overlap = float(g("min_overlap_ratio").value)
         self.qual_min = float(g("qual_min").value)
         self.use_imu = bool(g("use_imu_yaw").value)
@@ -404,6 +442,7 @@ class NavNode(Node):
         self.recover_patience = int(g("recover_patience").value)
         self.recover_min_beams = int(g("recover_min_beams").value)
         self.recover_exit_score = float(g("recover_exit_score").value)
+        self.recover_exit_improve = float(g("recover_exit_improve").value)
         self.recover_overlap = float(g("recover_overlap").value)
         self.recover_confirm = max(1, int(g("recover_confirm").value))
         self.recover_min_seen = float(g("recover_min_seen").value)
@@ -422,6 +461,12 @@ class NavNode(Node):
         self.px = self.py = self.pth = 0.0
         self.home = (0.0, 0.0)       # where the robot booted = map origin; "go home" target
         self._have_map = False
+        # Fixed yaw offset between the map frame and the odom frame (radians). The map
+        # frame is set up once at seed time to align with the odom yaw (or +π for the
+        # heading_flip back-mount), so — short of a clear_map/reseed — the map↔odom
+        # rotation is a CONSTANT, and _predict rotates the odom displacement with it
+        # instead of the mutable (pth - oth) that smeared the map (2026-09-11).
+        self.rot_from = 0.0
         # Motion-prior trackers (last odom pose + last IMU yaw consumed by a scan).
         self._odom = None
         self._imu_yaw = None
@@ -634,6 +679,8 @@ class NavNode(Node):
                     self._recovering = False
             elif p.name == "recover_exit_score":
                 self.recover_exit_score = float(p.value)
+            elif p.name == "recover_exit_improve":
+                self.recover_exit_improve = float(p.value)
             elif p.name == "recover_overlap":
                 self.recover_overlap = float(p.value)
             elif p.name == "recover_confirm":
@@ -760,6 +807,8 @@ class NavNode(Node):
                 self.slip_cooldown = float(p.value)
             elif p.name == "min_overlap_ratio":
                 self.min_overlap = float(p.value)
+            elif p.name == "min_improve":
+                self.min_improve = float(p.value)
             elif p.name == "qual_min":
                 self.qual_min = float(p.value)
         return SetParametersResult(successful=True)
@@ -849,8 +898,9 @@ class NavNode(Node):
         if now - self._started < 15.0:
             return                                # grace: feeds may take a while
         expected = {
-            "odom_topic": (self._odom_stamp, "EKF output — is ekf_node (nano-ekf.service)"
-                           " up? check config/ekf.yaml"),
+            "odom_topic": (self._odom_stamp, "wheel odometry — is encoder_node "
+                           "(sensor_hub) up + ESP32 /wheel_ticks flowing? check the "
+                           "coprocessor link"),
             "euler_topic": (self._imu_stamp,
                                 "IMU yaw — is imu_driver up? check /dev/imu (BWT901CL CH340)"),
             "scan_topic": (self._scan_stamp,
@@ -911,14 +961,17 @@ class NavNode(Node):
 
         if not self._have_map:
             # Seed: drop the first scan straight in at the origin and prime trackers.
-            # Align the map frame's yaw with the *current* odometry (or IMU) yaw so the
-            # map starts oriented the same as the odom frame — otherwise a non-zero seed
-            # yaw leaves a constant (pth - oth) rotation that flings every subsequent
-            # scan sideways the moment the robot moves.
+            # We align the map frame to the robot's CURRENT yaw (odom or IMU), so the
+            # map frame's X == odom frame's X rotated by that seed yaw. rot_from
+            # records that seed yaw ONCE; _predict uses this FIXED map↔odom rotation
+            # to translate odom deltas — never the mutable pose (the (pth−oth) that
+            # smeared the map 2026-09-11). On a heading_flip mount the seed yaw
+            # already carries π (via _on_odom), so the flip folds in automatically.
             if self.use_imu and self._imu_yaw is not None:
                 self.pth = self._imu_yaw
             elif self._odom is not None:
                 self.pth = self._odom[2]
+            self.rot_from = self.pth
             self.grid.integrate((0.0, 0.0, self.pth), angles, ranges)
             self._have_map = True
             self._ever_trusted = True      # the origin scan is accepted (map seeded)
@@ -983,6 +1036,16 @@ class NavNode(Node):
         # the lost-countdown, or after a relocalize timeout) smears obstacles around a
         # wrong pose and permanently corrupts the map.
         trusted = False
+        # `improve` = how much the refined match beats the ODOMETRY-PREDICTED pose
+        # (no scan correction). The absolute score is dominated by free-space cells in
+        # open rooms (every beam endpoint in open floor subtracts log-odds), so an
+        # absolute bar alone rejected EVERY scan on a sparse/fresh map and froze it
+        # (the 2026-09-11 board bug: score -100...+ overlap 0.56+, nothing trusted).
+        # Improvement is immune: free-space only lowers it, unknown cells contribute
+        # zero, so a positive delta can only come from beams snapping onto OCCUPIED
+        # structure — the correct-match signature. The absolute score + overlap stay as
+        # backstops for dense maps / carried-somewhere protection.
+        score_prior = self.grid.score((px, py, pth), va, vr)
 
         if self._recovering:
             # A recovery candidate may only be adopted/confirmed once the robot has
@@ -1009,11 +1072,14 @@ class NavNode(Node):
                                        refine=self.recover_refine)
                 score = self.grid.score(cand, va, vr)
                 overlap = self.grid.overlap_ratio(cand, va, vr)
+                improve = score - score_prior
                 self._last_score, self._last_overlap = score, overlap
-                if score >= self.min_score and overlap >= self.min_overlap:
+                if ((score >= self.min_score or improve >= self.min_improve)
+                        and overlap >= self.min_overlap):
                     if self._recover_moved:
                         px, py, pth = cand   # refine the prior; keep searching
-                recovered = (score >= self.recover_exit_score
+                recovered = ((score >= self.recover_exit_score
+                              or improve >= self.recover_exit_improve)
                              and overlap >= self.recover_overlap)
                 if recovered:
                     # Candidate must be REPRODUCED by a later scan before it's trusted +
@@ -1064,7 +1130,8 @@ class NavNode(Node):
                         # hit is a CANDIDATE, not a verdict. Adopt it as a tighter prior
                         # (better than the drifted local one) but don't exit until a
                         # follow-up scan reproduces it within tolerance.
-                        if (gscore >= self.recover_exit_score
+                        if ((gscore >= self.recover_exit_score
+                             or (gscore - score_prior) >= self.recover_exit_improve)
                                 and overlap >= self.recover_overlap):
                             if (self._recover_conf is None
                                     or math.hypot(gx - self._recover_conf[0],
@@ -1091,31 +1158,52 @@ class NavNode(Node):
         elif len(vr) > 10:
             cand = self.grid.match((px, py, pth), va, vr,
                                    lin=self.match_lin, ang=self.match_ang)
-            # Reject a match with no real overlap (e.g. wide-open space) — trust the
-            # prior. Trust additionally needs the OVERLAP inlier gate: a raw log-odds
-            # sum can clear min_match_score on a handful of beams while the rest of the
-            # scan hangs over unmapped void (bad rays, or the robot looking at a fresh
-            # area it hasn't mapped) — folding that in smears the map at a wrong pose,
-            # so the fraction of beams on *seen* cells must clear min_overlap_ratio too.
+            # Trust whichever strong signal is available:
+            #   1. improve >= min_improve — the matcher found a pose that snaps
+            #      significantly better onto structure than the odometry prediction.
+            #      THE primary gate since 2026-09-11: scale-invariant, immune to the
+            #      free-space-dominated absolute score that froze a sparse map.
+            #   2. score >= min_match_score — absolute backstop (dense maps).
+            #   3. overlap >= min_overlap_ratio AND the map is still sparse — the scan
+            #      rests on previously-mapped SEEN cells at the refined pose. This is
+            #      the rebuild ladder: on a sparse/bleached map the absolute score is
+            #      dominated by free-space beams and can NEVER clear the bar, so every
+            #      scan is rejected and the map can never grow (the 2026-09-11 freeze:
+            #      score −100…−130, overlap 0.56+, nothing trusted). Overlap-only trust
+            #      is deliberately restricted to SPARSE maps — on a well-built map a
+            #      wrong-but-lucky overlapping pose must NOT be folded in (real
+            #      alignment is required there, and a scan that sees only fresh space
+            #      in a built map is drifted/lost, not "rebuilding").
             score = self.grid.score(cand, va, vr)
             overlap = self.grid.overlap_ratio(cand, va, vr)
+            improve = score - score_prior
             self._last_score, self._last_overlap = score, overlap
-            if score >= self.min_score and overlap >= self.min_overlap:
+            coverage = self.grid.coverage()[0]
+            if (improve >= self.min_improve or score >= self.min_score
+                    or (overlap >= self.min_overlap and coverage < self.recover_min_seen)):
                 px, py, pth = cand
                 trusted = True
                 self._lost_count = 0
                 self._ever_trusted = True
             elif (self.relocalize and not self._test_active
                   and len(vr) >= self.recover_min_beams):
-                # plenty of structure in view but it doesn't match the map -> we're drifting
-                self._lost_count += 1
+                # NOT trusted here means overlap < min_overlap too (or the map is
+                # dense enough that overlap alone doesn't count): really this scan
+                # does not meaningfully rest on mapped area. That's either normal
+                # exploration of fresh space (do NOT panic), or the map is too empty
+                # to be lost FROM at all (coverage below recover_min_seen — there is
+                # nothing to mislocalize against yet, the map is still just being
+                # built). Only when the map is well-built and a scan STILL sees
+                # nothing we recognize is it a genuine loss.
+                if self.grid.coverage()[0] >= self.recover_min_seen:
+                    self._lost_count += 1
                 if self._lost_count >= self.recover_patience:
                     # lost WHILE DRIVING: the robot is within recover_lin of the true pose.
                     # Mark this as a non-kidnap loss so the full-grid search stays disabled.
                     self._enter_recovery(kidnap=False)
                     self.get_logger().warning(
                         f"localization lost (score {score:.1f}, overlap "
-                        f"{overlap:.2f}) — relocalizing")
+                        f"{overlap:.2f}, improve {improve:.1f}) — relocalizing")
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
         if trusted:
@@ -1260,17 +1348,27 @@ class NavNode(Node):
                     }
 
         pth = _wrap(pth + dth)
-        # Express the odom-frame displacement in the map frame. The map frame is rotated
-        # relative to the odom frame by (pth - oth): pth is the robot's *map* yaw (after
-        # this update) and oth is its *odom* yaw. Rotating the full (dx,dy) delta by that
-        # offset — rather than re-projecting it onto pth, which dropped the cross-track
-        # component — keeps scans aligned through turns. Using the CURRENT odom yaw (oth),
-        # not the previous one (poth), is what matters: if IMU and wheel-odom disagree on
-        # a small extra bit of yaw, (pth - oth) stays the true live map-vs-odom offset
-        # instead of accumulating drift scan-over-scan (which used to fling the map
-        # sideways into a constant y offset).
+        # Express the odom-frame displacement in the map frame.
+        #
+        # 2026-09-11 FIX (map smear): the frame rotation used to be (pth - oth) —
+        # the angle between the PRE-MATCH map pose and the odom yaw. But pth drifts on
+        # every scan once the matcher starts correcting it, so `pth - oth` rotates the
+        # SAME physical displacement by a different angle each scan, flinging walls
+        # outward while the pose stayed in a 1 m box (the ±5.7 m bloom).
+        #
+        # Frames: the *odom frame* is a fixed world frame (X = boot heading, it does
+        # NOT rotate with the robot); oth is the robot's yaw within it, and an odom
+        # delta (dx,dy) = (ox-po_x, oy-po_y) is already in that fixed frame. To get it
+        # into the *map frame* we only need the FIXED rotation between the two world
+        # frames. The map was seeded aligned to the robot's odom-frame yaw at seed
+        # time (seed_oth); the map's X points along odom-X rotated by seed_oth, so the
+        # fixed map-vs-odom rotation is R(seed_oth) — a CONSTANT. Using the current
+        # odom yaw `oth` would rotate the delta again as if the odom frame moved with
+        # the robot (double-rotation) — exactly as bad as the old (pth-oth), which is
+        # why the old code smeared.
+        #     world_delta_in_map = R(rot_from) * (dx, dy),  rot_from = seed_oth
+        c, s = math.cos(self.rot_from), math.sin(self.rot_from)
         dx, dy = (ox - pox), (oy - poy)
-        c, s = math.cos(pth - oth), math.sin(pth - oth)
         wx, wy = c * dx - s * dy, s * dx + c * dy
         # Fold in the accumulated loop-closure offset (drift the odom/IMU chain has
         # accumulated vs the map). This re-anchors the whole pose chain onto the corrected
@@ -1411,6 +1509,9 @@ class NavNode(Node):
         self._last_score = 0.0
         # re-seed the yaw on the next scan so the fresh map aligns with odom/IMU again
         self.pth = 0.0
+        # rot_from is reset by the next seed path (it captures the seed yaw); leaving
+        # it at the old value would rotate deltas with a stale seed until re-seed.
+        self.rot_from = 0.0
         self._prev_odom = None
         self._prev_imu = None
         self._loop_off = (0.0, 0.0, 0.0)   # fresh map -> no accumulated drift
@@ -1483,16 +1584,28 @@ class NavNode(Node):
             else:
                 # Empty-map guard: on a near-empty grid there is nothing for the scan
                 # matcher to lock onto, so a persistent low score is EXPECTED (fresh map /
-                # just cleared) rather than evidence of drift — and the in-place spin only
-                # smears the grid and drains the battery. Hold pose instead; the recovery
-                # matching in _on_scan keeps running, and once the map fills in (coverage
-                # clears recover_min_seen) the spin resumes automatically.
+                # just cleared) rather than evidence of drift. Holding the robot hostage
+                # in the recovery state was a DEADLOCK: recovery never integrates scans
+                # (trusted only on exit), so the map could never grow to reach
+                # recover_min_seen — "build the map first" while every scan is rejected
+                # on a 6%-seen bleached map (2026-09-11). Instead: DROP recovery on a
+                # sparse map and let the normal path fall through — with the overlap/
+                # improvement trust gates the scan integrates at the refined pose, the
+                # map builds, and localization is re-found mid-build. Recovery only
+                # makes sense once there IS a map to localize against.
                 seen = self.grid.coverage()[0]
                 if seen < self.recover_min_seen:
-                    self._send(0.0, 0.0)
+                    self._recovering = False
+                    self._lost_count = 0
+                    self._recover_conf = None
+                    self._recover_conf_hits = 0
+                    self._recover_odom = None
+                    self._recover_moved = False
                     self.get_logger().warning(
-                        f"map too empty (seen {seen:.0%}) to relocalize — holding pose, "
-                        f"not spinning; build the map first", throttle_duration_sec=5.0)
+                        f"map too empty (seen {seen:.0%}) to relocalize — dropping "
+                        f"recovery; remapping from the current pose",
+                        throttle_duration_sec=5.0)
+                    # the normal nav path takes over from the NEXT tick (no recovery spin)
                 else:
                     self._send(0.0, self.recover_spin)  # slow in-place spin (only if motion on)
             return
@@ -2068,6 +2181,25 @@ class NavNode(Node):
         return r.size > 0 and float(r.min()) < self.stop_distance
 
     def _pursuit(self):
+        """Pure-pursuit controller for click-to-goal / explore. Returns the (v, w) to
+        command this tick.
+
+        2026-09-11 rewrite: the old law (v=0 whenever |heading error|>0.6 rad, then
+        w=1.5·err capped at max_ang) was a bang-bang limit cycle ON THE HARDWARE. The
+        ESP32's stiction remap (MOTOR_DEADZONE 0.02 / MOTOR_MIN_DUTY 0.55) sets every
+        |duty|>=0.02 to >=0.55, so with v=0 a commanded w<0.25 rad/s puts both wheels
+        inside the deadzone -> the robot is *commanded to correct* but does nothing,
+        and once w is big enough to move it spins at full rate, overshoots, flips
+        sign, and hunts (observed: `v 0.00 w ±1.50` swapping every ~2 s at the goal).
+
+        New law: NEVER stop mid-path. While the front can make progress toward the
+        target (heading error < 150°), always command v>0 — a modest forward crawl
+        keeps the differential (vl≠vr) above the stiction floor, so small corrections
+        actually steer instead of stalling. Pure in-place rotation is reserved for a
+        genuinely reversed heading (> 150°). Turn authority saturates smoothly over a
+        ~40° window, with a deadband at the setpoint so we never command the micro-turn
+        the wheels can't produce (we go straight inside it and let v carry us in).
+        """
         if not self._path:
             return 0.0, 0.0
         # Start from the NEAREST waypoint so a point we've already driven past isn't
@@ -2086,11 +2218,32 @@ class NavNode(Node):
                 tx, ty = x, y
                 break
         err = _wrap(math.atan2(ty - self.py, tx - self.px) - self.pth)
+        aerr = abs(err)
         dgoal = math.hypot(self._goal[0] - self.px, self._goal[1] - self.py)
-        v = 0.0 if abs(err) > 0.6 else self.max_lin    # rotate in place if facing away
-        v = min(v, self.max_lin * max(0.25, dgoal / 0.5))   # ease off near the goal
-        w = max(-self.max_ang, min(self.max_ang, 1.5 * err))
-        return v, w
+
+        # --- linear speed: continuous in heading error (no step at any threshold) ---
+        # Forward component tapers with cos(heading error); a stiction-safe crawl floors
+        # it so the differential keeps steering, then fades out as the heading goes
+        # abeam/reversed. The only remaining hard stop is the >150° in-place spin, which
+        # genuinely needs v=0 — everywhere else v moves continuously, so the old
+        # 0.17->0.10 step at 58° and the 0.10->0.0 drop at 150° are gone (that drop is
+        # what made cornering look like stop-start).
+        if aerr < _FACE_AWAY_RAD:
+            v = self.max_lin * max(0.0, math.cos(err))
+            creep = _CREEP_SPEED * max(0.0, 1.0 - (aerr - _ARC_FULL_RAD)
+                                       / (_FACE_AWAY_RAD - _ARC_FULL_RAD))
+            v = max(v, creep)
+        else:
+            v = 0.0                                       # >150°: rotate in place
+        # ease off as the goal approaches so we don't slam into it at max_lin.
+        v *= min(1.0, max(0.25, dgoal / 0.5))
+
+        # --- angular: smooth saturating P + deadband (no hunting at the setpoint). ---
+        if aerr < _TURN_DEAD_RAD:
+            w = 0.0
+        else:
+            w = math.copysign(self.max_ang, err) * min(1.0, aerr / _TURN_SETTLE_RAD)
+        return float(v), float(w)
 
     def _send(self, v, w):
         if not self.enable_motion:               # view/plan-only mode: never drive

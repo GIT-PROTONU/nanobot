@@ -17,9 +17,14 @@ import numpy as np
 
 # Inverse-sensor-model log-odds increments, and the clamp that bounds how "certain"
 # a cell can get — clamping keeps the map responsive to a moved chair / opened door.
-L_FREE = 0.40
+# L_FREE is deliberately small vs L_OCC: a wall cell is ONLY ever hit by its own beam's
+# endpoint (it's occluded for every other ray), so it climbs to L_CLAMP and stays; the
+# free-space decay only bleaches a cell when many beams RAILY pass through it. The old
+# L_FREE=0.40 could bleach a real wall after a few bad poses or a passed-by corner —
+# keeping it at ~1/5 of L_OCC makes maps crisp without letting empty space "stick".
+L_FREE = 0.18
 L_OCC = 0.85
-L_CLAMP = 4.0
+L_CLAMP = 3.0
 
 
 class GridMap:
@@ -250,14 +255,24 @@ class GridMap:
 
     # --- export --------------------------------------------------------------
     def occupancy_int8(self):
-        """ROS-style occupancy: -1 unknown, 0 free .. 100 occupied. Row 0 = origin_y
+        """ROS-style occupancy: -1 unknown, 0 = FREE, 100 = OCCUPIED. Row 0 = origin_y
         (bottom). Returned row-major as int8, ready to dump to the web map file. Only
-        cells that have been seen get a probability (exp over the ~mostly-unmapped grid
-        dominates the map-write cost early on); unseen cells are -1 directly."""
+        cells that have been seen get a probability; unseen cells are -1 directly.
+
+        Free-space cells MUST export as 0: the old `p = 1/(1+exp(log))` mapped log-odds
+        0 -> P=0.5 -> int8 50, so free-space dust rendered as "walls" and the map looked
+        like a two-tone wall everywhere (the 2026-09-11 "map all over the place" report).
+        Clamping the sigmoid so log<=0 snaps to 0 (free) and log>0 ramps to 100 keeps the
+        walls/floor separation unambiguous. Box-Muller-free: threshold-free piecewise."""
         out = np.full(self.log.shape, -1, dtype=np.int8)
         s = self.seen
         if s.any():
-            p = 1.0 - 1.0 / (1.0 + np.exp(self.log[s]))      # P(occupied) on seen cells
+            L = self.log[s]
+            p = np.zeros(L.shape, dtype=np.float64)
+            pos = L > 0.0
+            if pos.any():
+                pl = L[pos]
+                p[pos] = 1.0 - 1.0 / (1.0 + np.exp(np.minimum(pl, 30.0)))
             out[s] = (p * 100.0).astype(np.int8)
         return out
 
@@ -470,6 +485,24 @@ class GridMap:
         sc, sr = self._nearest_free(blocked, sc, sr, m)     # snap start out of inflation
         if gc is None or sc is None:
             return None
+
+        # Straight-line fast path: if the whole segment is clear on the coarse
+        # (robot-inflated) grid, a straight shot beats the axis-aligned staircase
+        # the wavefront descent produces. A staircase hides most in a SMALL room
+        # where every leg is ~0.2 m: the follower turns 90° per cell (often within
+        # stop_distance of a wall -> stop/replan churn) and, once the lookahead
+        # overshoots a short leg, the next waypoint sits >150° behind -> a full
+        # in-place spin. Same clearance guarantee as the wavefront path: every cell
+        # the line crosses is a non-blocked cell (already inflated by robot_radius).
+        dc, dr = gc - sc, gr - sr
+        for i in range(max(abs(dc), abs(dr)) + 1):
+            cc = sc + round(dc * i / max(1, abs(dc)))
+            rr = sr + round(dr * i / max(1, abs(dr)))
+            if blocked[rr, cc]:
+                break
+        else:
+            return [(self.origin + (sc + 0.5) * res_c, self.origin + (sr + 0.5) * res_c),
+                    (self.origin + (gc + 0.5) * res_c, self.origin + (gr + 0.5) * res_c)]
 
         BIG = np.float32(1e9)
         dist = np.full((m, m), BIG, dtype=np.float32)
