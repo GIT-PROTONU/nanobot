@@ -10,7 +10,7 @@
 //   sub  motor_trim            std_msgs/Float32 (-0.3..0.3) -> manual L/R trim set/reset
 //   sub  motor_accel           std_msgs/Float32 (0.3..8.0)  -> accel-ramp rate (duty/s)
 //   sub  reset_ticks           std_msgs/Bool (true)      -> zero wheel_ticks + wheel_stray_ticks
-//   sub  laser_pwm             std_msgs/Int32MultiArray  [v1,v2,v3] 0..255 -> line laser PWM 1-3
+//   sub  laser_pwm             std_msgs/Int32MultiArray  [v1,v2] 0..255 -> line laser PWM 1-2
 //   pub  wheel_ticks           std_msgs/Int64MultiArray  [L,R] raw cumulative counts
 //   pub  wheel_stray_ticks     std_msgs/Int64MultiArray  [L,R] cumulative ticks seen while the
 //                                                         wheel was commanded+settled stopped

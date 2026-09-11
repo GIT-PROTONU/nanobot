@@ -103,6 +103,13 @@ class NavNode(Node):
             ("still_lin", 0.005),        # m translation since last processed scan = "moved"
             ("still_ang", 0.005),        # rad (~0.3 deg) yaw delta = "moved" (fires on pure rotation)
             ("imu_yaw_sign", 1.0),       # +1/-1: flip if the IMU yaw rotates opposite the wheels
+            # 180° rotate the sensor heading frame so map "front" = the robot's PHYSICAL drive
+            # front. Flip when the sensor head (LDS + IMU) is mounted facing the robot's back:
+            # the map, pose and icon are then internally consistent but the icon's front tick
+            # points at the physical back and autonomous nav drives the wrong way. The flip is
+            # applied uniformly to the three heading references (IMU yaw, EKF/odom yaw, lidar
+            # beam angles) so every downstream difference stays identical (see __init__).
+            ("heading_flip", False),
             ("map_write_rate", 2.0),     # Hz to (re)write the /dev/shm map file
             # --- navigation (Stages 2/3) ---
             ("enable_motion", False),    # SAFETY: when false, plan+show path but DON'T drive
@@ -286,6 +293,17 @@ class NavNode(Node):
         self.still_lin = float(g("still_lin").value)
         self.still_ang = float(g("still_ang").value)
         self.imu_sign = -1.0 if float(g("imu_yaw_sign").value) < 0 else 1.0
+        # Sensor-frame vs drive-frame heading reference. When the sensor head (LDS + IMU) is
+        # mounted facing the robot's BACK, every heading input — IMU yaw, EKF/odom yaw, and the
+        # lidar beam angles — shares one coherent 180° rotation: the relative geometry is
+        # identical but the global "which way is the front" anchor is off, so the map icon's
+        # front tick points at the physical back and autonomous nav drives the wrong way (manual
+        # driving is unaffected — it never consults the map). Rotating all three references
+        # together preserves every downstream DIFFERENCE (yaw deltas, the (pth - oth) map-vs-odom
+        # rotation, the scan-match/integrate geometry) while making pth mean the PHYSICAL front
+        # heading — hence one knob, three ingest points (_on_odom, _on_euler, _on_scan).
+        # Restart-only: a live flip would re-anchor a live map by 180°.
+        self.heading_flip = math.pi if bool(g("heading_flip").value) else 0.0
         # Motion-prior freshness: if /odom or /imu/euler goes silent longer than this while
         # the robot behaves, _predict must not keep trusting the stale value (it would smear
         # the map / spurious "lost"). Odom = 15 Hz, euler = 25 Hz, so 0.35 s ~ 4-8 periods.
@@ -750,11 +768,14 @@ class NavNode(Node):
     def _on_odom(self, msg):
         q = msg.pose.pose.orientation
         th = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
-        self._odom = (msg.pose.pose.position.x, msg.pose.pose.position.y, th)
+        self._odom = (msg.pose.pose.position.x, msg.pose.pose.position.y,
+                      _wrap(th + self.heading_flip))
         self._odom_stamp = time.monotonic()
 
     def _on_euler(self, msg):
-        self._imu_yaw = math.radians(msg.vector.z)   # /imu/euler vector.z = yaw (deg)
+        # /imu/euler vector.z = yaw (deg). heading_flip: rotate the heading reference so
+        # yaw 0 = the robot's PHYSICAL front (see __init__).
+        self._imu_yaw = _wrap(math.radians(msg.vector.z) + self.heading_flip)
         self._imu_stamp = time.monotonic()
 
     def _on_susp_l(self, msg):
@@ -875,7 +896,12 @@ class NavNode(Node):
         # if the driver ever reconfigures.
         key = (n, msg.angle_min, msg.angle_increment)
         if key != self._ang_key:
-            angles = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
+            # heading_flip: rotate the beam zero so beam 0 = the robot's PHYSICAL front
+            # (matches the yaw-reference flip; see __init__). _ang_abs below is derived
+            # from the same rotated vector, so the reactive front-stop cone ends up on
+            # the physical front too.
+            angles = (msg.angle_min + self.heading_flip
+                      + np.arange(n, dtype=np.float32) * msg.angle_increment)
             self._ang_cache = angles
             self._ang_abs = np.abs(np.arctan2(np.sin(angles), np.cos(angles)))
             self._ang_key = key

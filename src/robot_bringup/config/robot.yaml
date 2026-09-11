@@ -115,6 +115,12 @@ slam_nav:
                                 # (e.g. 0.08) once yaw tracking is verified on hardware.
     imu_yaw_sign: 1.0                 # +1/-1. IF "IMU yaw and wheel yaw rotate OPPOSITE
                                       # signs", flip to -1 (IMU mounted rotated).
+    # Rotate the sensor heading frame 180° so map "front" = the robot's PHYSICAL drive
+    # front. ON for this unit: the sensor head (LDS + IMU) is mounted facing the back, so
+    # autonomous nav was driving the wrong way and the map icon's front tick pointed at the
+    # physical back (manual driving is unaffected). Applied to all three heading references
+    # (IMU yaw, EKF/odom yaw, lidar beams) in slam_nav. Restart-only.
+    heading_flip: true
     # Parked = skip: when odom AND IMU both say the robot hasn't moved since the last
     # processed scan, skip the scan-match + map-integrate (the bulk of parked idle
     # CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
