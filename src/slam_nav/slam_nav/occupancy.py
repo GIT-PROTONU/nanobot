@@ -222,6 +222,20 @@ class GridMap:
         # restricted zones). Untouched by scan integration; persisted + web overlay.
         self.forbidden = np.zeros((self.n, self.n), dtype=bool)
         self.forb_rev = 0
+        # Fixed yaw offset between the map frame and the odom frame (radians), set
+        # once at seed time by the nav node. PERSISTED with the grid so that a later
+        # boot that loads the saved map re-adopts the same map-frame-vs-odom rotation
+        # instead of treating the loaded cell layout as if it were drawn in this run's
+        # odom frame (which silently rotates/shifts every wall -> the "map shifted and
+        # rotated over each other" mismatch, 2026-09-12). nav_node owns the live value.
+        self.rot_from = 0.0
+        # Seed tuple persisted alongside rot_from (see nav_node): the odom pose
+        # (x, y, yaw) at the instant the map frame was anchored, plus the map-frame
+        # position/heading that pose mapped to. With these two the nav node can rebuild
+        # the exact map<->odom rigid frame on a reload (R(rot_from) about the OPENED
+        # seed), instead of guessing the frame from this run's odom origin.
+        self.seed_odom_x = self.seed_odom_y = self.seed_odom_t = 0.0
+        self.seed_dx = self.seed_dy = self.seed_pth = 0.0
         self._coarse_cache = None   # (key, (blocked, seen_c, m, res_c)) memo
         # --- integer trigonometry LUTs (built once; fixed at 4096 bins each) -----
         qq = np.arange(ANG_NQ, dtype=np.float64)
@@ -636,6 +650,13 @@ class GridMap:
                 float((st == STATE_FREE).sum()) * cell_a,
                 float((st == STATE_OCC).sum()) * cell_a)
 
+    def occ_count(self):
+        """Number of occupied (wall/obstacle) cells — a LOCAL structure measure that
+        stays meaningful on a small-room map whose GLOBAL coverage fraction is tiny
+        (recover_min_seen compares against the whole 24 m grid and a 1.5 m² room can
+        never approach it). Zero structure = nothing to localize against."""
+        return int((self.state_view() == STATE_OCC).sum())
+
     # --- no-go zones (human edits) -------------------------------------------
     def nogo_count(self):
         """Number of marked no-go cells (for map telemetry)."""
@@ -676,10 +697,16 @@ class GridMap:
 
     # --- persistence ---------------------------------------------------------
     def save(self, path):
-        """Persist the packed ternary grid + no-go mask. Atomic .tmp + rename."""
+        """Persist the packed ternary grid + no-go mask + the map-frame anchors
+        (rot_from + the seed odom/map-pose tuple, so a reload re-anchors the exact
+        odom-frame the grid was drawn in). Atomic .tmp + rename."""
         tmp = path + ".tmp"
         np.savez_compressed(tmp, cells=self.cells, forb=self.forbidden,
-                            n=np.int32(self.n), res=np.float32(self.res))
+                            n=np.int32(self.n), res=np.float32(self.res),
+                            rot=np.float32(self.rot_from),
+                            s0=np.float32(self.seed_odom_x), s1=np.float32(self.seed_odom_y),
+                            s2=np.float32(self.seed_odom_t), s3=np.float32(self.seed_dx),
+                            s4=np.float32(self.seed_dy), s5=np.float32(self.seed_pth))
         os.replace(tmp + ".npz" if not tmp.endswith(".npz") else tmp, path)
 
     def load(self, path):
@@ -713,6 +740,16 @@ class GridMap:
             return False
         self.cells = cells
         self.forbidden = np.ascontiguousarray(forb, dtype=bool)
+        # Restore the map-frame anchors (older saves lack them -> all zero, meaning
+        # "drawn in the odom frame with seed at odom (0,0,0)" — the old default; the
+        # nav node re-anchors from the loaded layout regardless).
+        self.rot_from = float(z["rot"]) if "rot" in z else 0.0
+        self.seed_odom_x = float(z["s0"]) if "s0" in z else 0.0
+        self.seed_odom_y = float(z["s1"]) if "s1" in z else 0.0
+        self.seed_odom_t = float(z["s2"]) if "s2" in z else 0.0
+        self.seed_dx = float(z["s3"]) if "s3" in z else 0.0
+        self.seed_dy = float(z["s4"]) if "s4" in z else 0.0
+        self.seed_pth = float(z["s5"]) if "s5" in z else 0.0
         self._state = None
         self._state_rev = -1
         self._dt = None

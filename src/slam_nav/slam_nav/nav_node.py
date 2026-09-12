@@ -521,6 +521,18 @@ class NavNode(Node):
         # wheels +0.09 m; pth −4.9 rad vs wheels +0.96 rad).
         self._seed_pth = 0.0
         self._seed_odom = None          # (ox, oy, oth) in the odom frame at seed
+        # Map-frame position of the robot at the instant `_seed_odom` was captured.
+        # For a FRESH map that's (0,0) (the map origin IS the seed pose). After a
+        # relocalize / boot-into-saved-map, the seed is re-based onto the recovered
+        # pose, so the wheel-anchored reference becomes
+        #   (seed_px,seed_py) + R(rot_from) * (odom - seed_odom)
+        # — otherwise the anchor would always compute the pose relative to map origin
+        # and a robot that recovered/loaded away from it would be clamped to a stale
+        # origin (the "map shifted vs the room after a drive" mismatch, 2026-09-12).
+        self._seed_px = 0.0
+        self._seed_py = 0.0
+        self._loaded_map = False        # grid came from disk this boot (pose unknown)
+        self._boot_reanchored = False   # loaded-map frame re-anchored to this run's odom
         # Motion-prior trackers (last odom pose + last IMU yaw consumed by a scan).
         self._odom = None
         self._imu_yaw = None
@@ -649,12 +661,45 @@ class NavNode(Node):
         self._calib = {}
 
         # Optionally reload a previously-saved map (relocalize into it from the origin).
+        # The loaded grid's CELLS are in the odom frame the OLD session seeded them in,
+        # so adopt that session's map-frame-vs-odom rotation (persisted since
+        # 2026-09-12) — otherwise every odom delta is rotated by 0 (this run's default)
+        # while the cell layout was drawn rotated by the old seed yaw, and the matcher
+        # fights a constant ~0.3 rad / decimetre disagreement forever (the "map shifted
+        # and rotated over each other" mismatch). The quasi-odom seed below is applied
+        # when the first odom sample arrives (see _on_scan's boot-into-saved-map path).
         if self.map_store:
             self.map_store = os.path.expanduser(self.map_store)
             if self.grid.load(self.map_store):
                 self._have_map = True
                 self._nogo_dirty = True
-                self.get_logger().info(f"loaded saved map from {self.map_store}")
+                self.rot_from = self.grid.rot_from
+                self._loaded_map = True
+                # A saved map with NO structure is worse than none: the (empty) cell
+                # layout can never produce a trustable match, the pose dead-locks in a
+                # "never trusted" state, and the map cannot grow (observed 2026-09-12:
+                # a 0.3 %-seen npz left the robot permanently odom-locked at t=0 with
+                # coverage frozen). Structure means OCCUPIED cells — judged LOCALLY, not
+                # by global coverage fraction (recover_min_seen compares the whole 24 m
+                # grid, so even a real small-room map reads ~0.3 % and must NOT be
+                # discarded). Keep any map with actual walls and let the boot-locate /
+                # frame re-anchor in _on_scan sort the pose; discard only a truly empty
+                # grid and let the fresh-seed path build from here.
+                if self.grid.occ_count() < 4:
+                    size_m = self.grid.n * self.grid.res
+                    res = self.grid.res
+                    rmin, rmax = self.grid.rmin, self.grid.rmax
+                    self.grid = GridMap(size_m=size_m, res=res, rmin=rmin, rmax=rmax)
+                    self._have_map = False
+                    self._loaded_map = False
+                    self.get_logger().warning(
+                        "saved map has no structure (0 occupied cells) — "
+                        "discarding; building a fresh map from here")
+                else:
+                    self.get_logger().info(
+                        f"loaded saved map from {self.map_store} "
+                        f"({self.grid.occ_count()} wall cells, "
+                        f"seen {self.grid.coverage()[0]:.1%})")
 
         self.pose_pub = self.create_publisher(PoseStamped, "slam_pose", 10)
         # Compact JSON health/diagnostics for the web diagnostics card (2 Hz): the
@@ -1019,6 +1064,23 @@ class NavNode(Node):
         self._recover_odom = (self._odom[0], self._odom[1]) if self._odom is not None else None
         self._recover_moved = False
 
+    def _rebase_seed(self, px, py, pth):
+        """Re-anchor the wheel-pose reference onto a (possibly corrected) map pose.
+
+        Called when a relocalize/loop-correction event lands the pose somewhere the odom
+        chain does not imply (recovery confirm, kidnap release): from that instant the
+        anchor reference `(seed_px, seed_py) + R(rot_from)·(odom − seed_odom)` must be
+        recomputed so subsequent wheel deltas continue to measure from the NEW pose, not
+        the boot seed. Without this the anchor keeps pointing at the stale origin even
+        after the matcher relocated the robot (observed 2026-09-12: pose recovered to
+        (−0.16, 0.09) while the anchor stayed at (0,0) — the gates then refused to ever
+        trust a correction)."""
+        self._seed_odom = (self._odom[0], self._odom[1], self._odom[2]) \
+            if self._odom is not None else self._seed_odom
+        self._seed_pth = pth
+        self._seed_px = px
+        self._seed_py = py
+
     def _on_scan(self, msg):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
         n = len(ranges)
@@ -1057,6 +1119,7 @@ class NavNode(Node):
             elif self._odom is not None:
                 self.pth = self._odom[2]
             self.rot_from = self.pth
+            self.grid.rot_from = self.rot_from
             self._seed_pth = self.pth
             self._seed_odom = (self._odom[0], self._odom[1], self._odom[2]) \
                 if self._odom is not None else None
@@ -1066,6 +1129,51 @@ class NavNode(Node):
             self._prev_odom, self._prev_imu = self._odom, self._imu_yaw
             self._write_map()
             return
+
+        # Boot-into-saved-map (first scan after a saved map was loaded): the grid came
+        # in already `_have_map` and the decode/coverage chains are warm, so the seed
+        # branch above correctly did NOT run — but the map frame must be RE-anchored to
+        # THIS run's odom all the same. The 2026-09-12 bug: without re-seeding,
+        # rot_from stayed 0 (its boot default) while the loaded grid's walls were drawn
+        # in the PREVIOUS run's odom frame (R(old_rot_from)), so every scan's best
+        # match sat a fixed ~0.3 rad / decimetre away from the wheel pose; the sparse
+        # map refused the correction (pos_tol_sparse 0.12 / head_tol_sparse 0.15), and
+        # because coverage (0.003) < recover_min_seen (0.25) the lost-counter never
+        # fired -> no recovery -> permanently "map shifted+rotated over itself".
+        # Fix: (1) restore the persisted frame rotation (done at load, self.rot_from =
+        # grid.rot_from), (2) re-anchor the wheel seed to the current odom so _predict
+        # and the anchor reference measure deltas in the correct frame, (3) drop into
+        # recovery so the scan matcher can CORRECT the initial pose offset with full
+        # windows (a booted robot is genuinely unlocalized, unlike a fresh seeded one).
+        if self._loaded_map and not self._boot_reanchored and self._odom is not None:
+            self._boot_reanchored = True
+            # Reconstruct the map frame exactly as the LAST session laid it down: the
+            # map's cells are in a fixed world frame anchored at (seed_odom, rot_from)
+            # with the origin map pose (seed_dx, seed_dy, seed_pth). The wheel frame is
+            # CONTINUOUS across a nav-only restart (the sensor hub keeps publishing
+            # /odom), so the robot's current map pose follows the same affine map as
+            # every other scan's:
+            #     pose = (seed_dx, seed_dy) + R(rot_from)·(odom − seed_odom)
+            #     pth  = seed_pth + (odom_yaw − seed_odom_yaw)          (use_imu_yaw=false)
+            cog0 = self.grid
+            sx, sy, st = cog0.seed_odom_x, cog0.seed_odom_y, cog0.seed_odom_t
+            dx, dy = self._odom[0] - sx, self._odom[1] - sy
+            c, s = math.cos(self.rot_from), math.sin(self.rot_from)
+            self.px = cog0.seed_dx + c * dx - s * dy
+            self.py = cog0.seed_dy + s * dx + c * dy
+            self.pth = _wrap(cog0.seed_pth + (self._odom[2] - st))
+            self._seed_odom = (self._odom[0], self._odom[1], self._odom[2])
+            self._seed_pth = self.pth
+            self._seed_px = self.px
+            self._seed_py = self.py
+            self._loop_off = (0.0, 0.0, 0.0)
+            self._enter_recovery(kidnap=True)
+            self.get_logger().info(
+                "booted into saved map — re-anchored frame to current odom "
+                f"(rot_from={self.rot_from:.3f}), pose seed "
+                f"({self.px:.2f},{self.py:.2f},{self.pth:.2f}), relocalizing")
+            self._write_map()
+            # fall through: recovery matching runs on this scan
 
         # Pick-up freeze: while lifted off the ground, scans are garbage (being carried),
         # so don't predict / match / integrate. Just keep the web map status fresh so it's
@@ -1160,6 +1268,16 @@ class NavNode(Node):
         # the lost-countdown, or after a relocalize timeout) smears obstacles around a
         # wrong pose and permanently corrupts the map.
         trusted = False
+        # Per-scan matcher telemetry (the "which scan moved the pose" breadcrumb, see
+        # the 2026-09-11 map-skew TODO). Filled where the candidate/anchor exist; the
+        # throttled log at the end of _on_scan (1 Hz) dumps it with the wheel-anchored
+        # pose so a pose walk is attributable to a specific scan/correction.
+        _dbg_cand = (px, py, pth)
+        _dbg_ax = _dbg_ay = _dbg_px = _dbg_py = float("nan")
+        _dbg_ath = _dbg_pth = float("nan")
+        _dbg_dpos = _dbg_dhead = float("nan")
+        _dbg_cov = self.grid.coverage()[0]
+        _dbg_imp = _dbg_sc = _dbg_ov = 0.0
         # `improve` = how much the refined match beats the ODOMETRY-PREDICTED pose
         # (no scan correction). With the DT-support kernel, free space scores ~0 and
         # only beams actually resting on (or within SUPPORT of) mapped structure score
@@ -1193,6 +1311,7 @@ class NavNode(Node):
                 score = self.grid.score(cand, ma, mr)
                 overlap = self.grid.overlap_ratio(cand, ma, mr)
                 improve = score - score_prior
+                _dbg_cand, _dbg_imp, _dbg_sc, _dbg_ov = cand, improve, score, overlap
                 self._last_score, self._last_overlap = score, overlap
                 if ((score >= self.min_score or improve >= self.min_improve)
                         and overlap >= self.min_overlap):
@@ -1229,6 +1348,7 @@ class NavNode(Node):
                         trusted = True
                         self._ever_trusted = True
                         px, py, pth = cand
+                        self._rebase_seed(px, py, pth)
                         self.get_logger().info(
                             f"relocalized (score {score:.1f}, overlap {overlap:.2f})")
                 elif (self.recover_global and (self._recover_kidnap or not self._ever_trusted)
@@ -1272,6 +1392,7 @@ class NavNode(Node):
                                 self._recover_conf_hits = 0
                                 trusted = True
                                 self._ever_trusted = True
+                                self._rebase_seed(gx, gy, gth)
                                 self.get_logger().info(
                                     f"relocalized globally (score {gscore:.1f}, "
                                     f"overlap {overlap:.2f})")
@@ -1301,6 +1422,7 @@ class NavNode(Node):
             score = self.grid.score(cand, ma, mr)
             overlap = self.grid.overlap_ratio(cand, ma, mr)
             improve = score - score_prior
+            _dbg_cand, _dbg_imp, _dbg_sc, _dbg_ov = cand, improve, score, overlap
             self._last_score, self._last_overlap = score, overlap
             coverage = self.grid.coverage()[0]
             # Velocity-scaled pose tolerance (dynamic search window, the authority-gate
@@ -1324,7 +1446,8 @@ class NavNode(Node):
                 sx, sy, st = self._seed_odom
                 c, s = math.cos(self.rot_from), math.sin(self.rot_from)
                 dx, dy = self._odom[0] - sx, self._odom[1] - sy
-                ax, ay = c * dx - s * dy, s * dx + c * dy
+                ax = self._seed_px + c * dx - s * dy
+                ay = self._seed_py + s * dx + c * dy
                 ath = _wrap(self._seed_pth + (self._odom[2] - st))
             if (improve >= self.min_improve or score >= self.min_score
                     or (overlap >= self.min_overlap and coverage < self.recover_min_seen)):
@@ -1347,6 +1470,8 @@ class NavNode(Node):
                 # converges from the first revisit on.
                 dhead = abs(_wrap(cand[2] - ath))
                 dpos = math.hypot(cand[0] - ax, cand[1] - ay)
+                _dbg_ax, _dbg_ay, _dbg_ath = ax, ay, ath
+                _dbg_dpos, _dbg_dhead = dpos, dhead
                 if coverage >= self.recover_min_seen:
                     if dhead > head_tol_eff or dpos > pos_tol_eff:
                         trusted = False
@@ -1406,8 +1531,15 @@ class NavNode(Node):
                 # to be lost FROM at all (coverage below recover_min_seen — there is
                 # nothing to mislocalize against yet, the map is still just being
                 # built). Only when the map is well-built and a scan STILL sees
-                # nothing we recognize is it a genuine loss.
-                if self.grid.coverage()[0] >= self.recover_min_seen:
+                # nothing we recognize is it a genuine loss. A LOADED saved map
+                # counts as well-built regardless of its coverage FRACTION (a real
+                # small-room map reads ~0.3 % against the whole 24 m grid yet has
+                # hundreds of wall cells — without this, a boot-into-saved-map that
+                # failed to lock could never re-enter recovery and stayed frozen,
+                # the 2026-09-12 map-mismatch deadlock after a full stack restart
+                # re-zeroed /odom).
+                if (self.grid.coverage()[0] >= self.recover_min_seen
+                        or (self._loaded_map and self.grid.occ_count() >= 4)):
                     self._lost_count += 1
                 if self._lost_count >= self.recover_patience:
                     # lost WHILE DRIVING: the robot is within recover_lin of the true pose.
@@ -1418,6 +1550,26 @@ class NavNode(Node):
                         f"{overlap:.2f}, improve {improve:.1f}) — relocalizing")
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
+        # Per-scan matcher breadcrumb (1 Hz throttle): the pose just consumed by THIS
+        # scan (px/py/pth), the wheel-anchored pose it SHOULD agree with (ax/ay/ath),
+        # the refined candidate the matcher preferred, and the trust breakdown. This is
+        # how a pose-walk/map-skew gets attributed to a specific scan + decision.
+        if math.isnan(_dbg_ax) and self._seed_odom is not None and self._odom is not None:
+            sx, sy, st = self._seed_odom
+            c, s = math.cos(self.rot_from), math.sin(self.rot_from)
+            dx, dy = self._odom[0] - sx, self._odom[1] - sy
+            _dbg_ax = self._seed_px + c * dx - s * dy
+            _dbg_ay = self._seed_py + s * dx + c * dy
+            _dbg_ath = _wrap(self._seed_pth + (self._odom[2] - st))
+        if math.isnan(_dbg_ax):
+            _dbg_ax, _dbg_ay, _dbg_ath = px, py, pth
+        self.get_logger().info(
+            f"scan->cov {_dbg_cov:.3f} | t {int(trusted)} | pose "
+            f"({px:.2f},{py:.2f},{pth:.2f}) | anch ({_dbg_ax:.2f},{_dbg_ay:.2f},"
+            f"{_dbg_ath:.2f}) | cand ({_dbg_cand[0]:.2f},{_dbg_cand[1]:.2f},"
+            f"{_dbg_cand[2]:.2f}) | sc {_dbg_sc:.1f} imp {_dbg_imp:+.1f} "
+            f"ov {_dbg_ov:.3f} | dpos {_dbg_dpos:.3f} dhead {_dbg_dhead:.3f}",
+            throttle_duration_sec=1.0)
         if trusted:
             # Gated rasterization: while the robot is actively rotating, integrate()
             # locks the grid out entirely (the spinning sweep would smear walls).
@@ -1751,6 +1903,10 @@ class NavNode(Node):
         self.rot_from = 0.0
         self._seed_pth = 0.0
         self._seed_odom = None
+        self._seed_px = 0.0
+        self._seed_py = 0.0
+        self._loaded_map = False      # a cleared map reseeds fresh next scan
+        self._boot_reanchored = False
         self._prev_odom = None
         self._prev_imu = None
         self._loop_off = (0.0, 0.0, 0.0)   # fresh map -> no accumulated drift
@@ -1780,6 +1936,13 @@ class NavNode(Node):
             d = os.path.dirname(self.map_store)
             if d:
                 os.makedirs(d, exist_ok=True)          # persist into a fresh dir on boot
+            self.grid.rot_from = self.rot_from      # persist the map-frame yaw constant
+            self.grid.seed_odom_x = self._seed_odom[0] if self._seed_odom else 0.0
+            self.grid.seed_odom_y = self._seed_odom[1] if self._seed_odom else 0.0
+            self.grid.seed_odom_t = self._seed_odom[2] if self._seed_odom else 0.0
+            self.grid.seed_dx = self._seed_px
+            self.grid.seed_dy = self._seed_py
+            self.grid.seed_pth = self._seed_pth
             self.grid.save(self.map_store)
             if not quiet:
                 self.get_logger().info(f"map saved to {self.map_store}")
@@ -1821,19 +1984,21 @@ class NavNode(Node):
                 self._send(0.0, 0.0)
                 self.get_logger().warning("relocalize timed out; using best estimate")
             else:
-                # Empty-map guard: on a near-empty grid there is nothing for the scan
-                # matcher to lock onto, so a persistent low score is EXPECTED (fresh map /
-                # just cleared) rather than evidence of drift. Holding the robot hostage
-                # in the recovery state was a DEADLOCK: recovery never integrates scans
-                # (trusted only on exit), so the map could never grow to reach
-                # recover_min_seen — "build the map first" while every scan is rejected
-                # on a 6%-seen bleached map (2026-09-11). Instead: DROP recovery on a
-                # sparse map and let the normal path fall through — with the overlap/
-                # improvement trust gates the scan integrates at the refined pose, the
-                # map builds, and localization is re-found mid-build. Recovery only
-                # makes sense once there IS a map to localize against.
-                seen = self.grid.coverage()[0]
-                if seen < self.recover_min_seen:
+                # Empty-map guard: with NO structure there is nothing for the scan
+                # matcher to lock onto, so a persistent low score is EXPECTED (fresh map
+                # / just cleared) rather than evidence of drift. Holding the robot
+                # hostage in the recovery state was a DEADLOCK: recovery never integrates
+                # scans (trusted only on exit), so a structure-less map could never grow
+                # — "build the map first" while every scan is rejected (2026-09-11).
+                # Instead: DROP recovery when there is no structure to localize against
+                # and let the normal path fall through — with the overlap/improvement
+                # trust gates the scan integrates at the refined pose, the map builds,
+                # and localization is re-found mid-build. Judged by OCCUPIED cells
+                # (local, room-size-independent), not the global coverage fraction:
+                # recover_min_seen compares against the whole 24 m grid, so a real
+                # 1.5 m²-room map reads ~0.3 % seen and MUST stay in recovery when its
+                # few hundred wall cells are enough to lock onto.
+                if self.grid.occ_count() < 4:
                     self._recovering = False
                     self._lost_count = 0
                     self._recover_conf = None
@@ -1841,8 +2006,8 @@ class NavNode(Node):
                     self._recover_odom = None
                     self._recover_moved = False
                     self.get_logger().warning(
-                        f"map too empty (seen {seen:.0%}) to relocalize — dropping "
-                        f"recovery; remapping from the current pose",
+                        "map has no structure (0 occupied cells) to relocalize "
+                        "against — dropping recovery; remapping from the current pose",
                         throttle_duration_sec=5.0)
                     # the normal nav path takes over from the NEXT tick (no recovery spin)
                 else:
