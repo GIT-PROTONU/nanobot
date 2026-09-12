@@ -32,7 +32,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String, Int8, Int64MultiArray, Float32
 from tf2_ros import TransformBroadcaster
 
-from .occupancy import GridMap
+from .occupancy import (GridMap, reject_dynamic, deskew, decimate_points)
 from . import calibrate
 
 MAP_FILE = "/dev/shm/nano_map.bin"
@@ -129,6 +129,17 @@ class NavNode(Node):
             # driver's actual intensity range on hardware, since real returns at range
             # legitimately have lower signal.
             ("qual_min", -1.0),
+            # Opt-in dynamic-obstacle scan filtering. When on, every scan goes through
+            # reject_dynamic() (1-D range-jump clustering drops short 'near' beam
+            # clusters — moving legs — that are 0.05-0.2 m wide) AND GridMap's
+            # conflict_mask() (beams whose endpoint lands in CONFIRMED free space are
+            # dropped before matching + integrate, so a moving/ghost return can't paint
+            # a phantom wall inside an open corridor). Default OFF: a 0.1 m wide static
+            # pillar is indistinguishable from a leg to the range-jump test, and a wall
+            # that genuinely moved INTO free space is erased until re-verified, so this
+            # is left off until the environment is known to be clean of tripods/legs
+            # (the old 100%-pass-through pipeline). Live-tunable.
+            ("dynamic_reject", False),
             ("use_imu_yaw", True),       # IMU yaw delta for rotation (else wheel odom)
             ("still_skip", True),        # parked (odom+IMU unchanged) -> skip match+integrate
             ("still_lin", 0.005),        # m translation since last processed scan = "moved"
@@ -144,6 +155,13 @@ class NavNode(Node):
             ("head_tol", 0.6),            # rad: max trusted heading correction per scan vs the
                                           # wheel-anchored prior (see _on_scan authority gate)
             ("pos_tol", 0.35),            # m: same idea for POSITION — a trusted scan match
+                                          # on a BUILT map may move the pose this far from the
+                                          # wheel anchor per scan (slip/drift correction). On a
+                                          # sparse/building map the bound is TIGHT
+                                          # (pos_tol_sparse) so overlapping wall fragments can't
+                                          # pull the whole pose chain off the wheels (observed
+                                          # 2026-09-11: parked pose ~0.35 m / 0.6 rad off odom
+                                          # after a short drive = map skewed from reality).
                                           # may land at most this far from the odom-anchored
                                           # pose, else the wheels win (see _on_scan)
             ("map_write_rate", 2.0),     # Hz to (re)write the /dev/shm map file
@@ -333,6 +351,7 @@ class NavNode(Node):
         self.min_improve = float(g("min_improve").value)
         self.min_overlap = float(g("min_overlap_ratio").value)
         self.qual_min = float(g("qual_min").value)
+        self.dynamic_reject = bool(g("dynamic_reject").value)
         self.use_imu = bool(g("use_imu_yaw").value)
         self.still_skip = bool(g("still_skip").value)
         self.still_lin = float(g("still_lin").value)
@@ -362,6 +381,13 @@ class NavNode(Node):
         # lock there is TIGHT — only genuine per-scan wheel-slip corrections (~0.15 rad)
         # pass; everything else stays on the wheel-anchored heading (see _on_scan).
         self.head_tol_sparse = min(self.head_tol, 0.15)
+        # Same for POSITION on a sparse/building map: an overlapping wall fragment may pull
+        # the pose up to pos_tol (0.35) per scan on a built map, but on a partly-mapped grid
+        # that generous a bound lets fragments accumulate a persistent offset from the wheel
+        # chain (observed 2026-09-11: parked pose 0.35 m off odom after a ~0.5 m goal drive
+        # = the map "not mathing" the room). Cap it small — a few cells — enough to absorb
+        # the 5-15 cm second-lap shift while keeping the pose anchored to the wheels.
+        self.pos_tol_sparse = min(float(g("pos_tol").value), 0.12)
         # Motion-prior freshness: if /odom or /imu/euler goes silent longer than this while
         # the robot behaves, _predict must not keep trusting the stale value (it would smear
         # the map / spurious "lost"). Odom = 15 Hz, euler = 25 Hz, so 0.35 s ~ 4-8 periods.
@@ -500,6 +526,15 @@ class NavNode(Node):
         self._imu_yaw = None
         self._prev_odom = None
         self._prev_imu = None
+        # Wheel-velocity estimate (EMA, updated by _predict from the odom deltas) for
+        # the velocity-scaled match window / authority gates and the rasterization
+        # gate (see _on_scan). m/s and rad/s.
+        self._vel_lin = 0.0
+        self._vel_ang = 0.0
+        self._last_pred_t = None
+        # True while the robot is actively rotating -> grid rasterization LOCKED (the
+        # matcher may still run, but the map can't absorb the spinning sweep).
+        self._rotating = False
         # Whether the last rotated-yaw delta came from the wheel-odom fallback (IMU stale).
         # On IMU recovery, the first fresh delta is measured from a baseline predating the
         # outage whose rotation was already folded in via the odom fallback — that recovery
@@ -686,6 +721,14 @@ class NavNode(Node):
                 # with trait_motion on (else the next /cognition/traits tick would
                 # recompute max_lin from the stale _base_max_lin and stomp this).
                 self.max_lin = self._base_max_lin = float(p.value)
+            elif p.name == "qual_min":
+                self.qual_min = float(p.value)
+            elif p.name == "dynamic_reject":
+                self.dynamic_reject = bool(p.value)
+                was_mode = "ON (leg/ghost filtering)" if self.dynamic_reject else "OFF (raw scans)"
+                self.get_logger().warning(
+                    f"dynamic_reject -> {was_mode} — filtering applies from the NEXT scan",
+                    throttle_duration_sec=0.0)
             elif p.name == "max_ang":
                 self.max_ang = float(p.value)
             elif p.name == "stop_distance":
@@ -837,6 +880,8 @@ class NavNode(Node):
                 self.min_overlap = float(p.value)
             elif p.name == "min_improve":
                 self.min_improve = float(p.value)
+            elif p.name == "pos_tol_sparse":
+                self.pos_tol_sparse = max(0.02, min(float(p.value), self.pos_tol))
             elif p.name == "qual_min":
                 self.qual_min = float(p.value)
         return SetParametersResult(successful=True)
@@ -1056,9 +1101,22 @@ class NavNode(Node):
                     self._write_map()
                 return
 
-        px, py, pth = self._predict(self.px, self.py, self.pth)
+        bx, by, bt = self.px, self.py, self.pth
+        px, py, pth = self._predict(bx, by, bt)
 
-        # Refine against the map with a decimated set of valid beams.
+        # Rasterization gate (gated rasterization): a scan taken while the robot is
+        # actively ROTATING paints the mirror sweep as an arc of beams and would smear
+        # walls into the map. Pose refinement via the matcher may keep running, but the
+        # grid itself is locked out until the spin stops (integrate() early-returns).
+        self._rotating = abs(self._vel_ang) > 0.20
+
+        # --- scan-preparation pipeline (BEFORE matching) -------------------------
+        # Beams flow through: valid-mask -> dynamic-obstacle rejection -> motion
+        # deskew (odometry interpolated per beam) -> map-conflict filtering -> spatial
+        # decimation. Matching uses the DECIMATED subset (`ma`, `mr`); integration of
+        # trusted scans uses the full filtered+deskewed set (`va`, `vr`) so wall detail
+        # is preserved. Dynamic rejection + conflict filtering are gated on
+        # `dynamic_reject` (opt-in, default OFF).
         v = (np.isfinite(ranges) & (ranges >= self.grid.rmin) & (ranges <= self.grid.rmax))
         if (self.qual_min > 0.0 and msg.intensities is not None
                 and len(msg.intensities) == n):
@@ -1066,13 +1124,36 @@ class NavNode(Node):
             # n-vector before decimation so the match sample reflects good beams only.
             v &= (np.asarray(msg.intensities, dtype=np.float32) >= self.qual_min)
         va, vr = angles[v], ranges[v]
-        if len(vr) > self.match_pts:
-            nt = len(vr)
-            idx = self._decim_cache.get(nt)
-            if idx is None:
-                idx = np.linspace(0, nt - 1, self.match_pts).astype(int)
-                self._decim_cache[nt] = idx
-            va, vr = va[idx], vr[idx]
+        if self.dynamic_reject and len(vr) >= 6:
+            # 1-D range-jump clustering: drop short 'near' clusters (moving legs),
+            # 0.05-0.2 m of wall arc, before any geometry is assumed.
+            kd = reject_dynamic(vr, float(msg.angle_increment))
+            va, vr = va[kd], vr[kd]
+        # Motion deskew: the mirror spins continuously, so each beam i was acquired at
+        # a slightly different robot pose. Interpolate the odometry across the sweep
+        # (ddx, ddy, ddth = map-frame motion during THIS frame) and re-express every
+        # beam relative to the END pose predicted above.
+        ddx, ddy, ddth = px - bx, py - by, _wrap(pth - bt)
+        if len(vr) and (abs(ddx) > 1e-4 or abs(ddy) > 1e-4 or abs(ddth) > 1e-3):
+            va, vr = deskew(va, vr, ddx, ddy, ddth)
+        if self.dynamic_reject and len(vr):
+            # Map-conflict filtering: drop beams whose endpoint lands in CONFIRMED free
+            # space (a transparent/ghost return, not a real structure change).
+            okc = self.grid.conflict_mask((px, py, pth), va, vr)
+            va, vr = va[okc], vr[okc]
+        # Spatial decimation for MATCHING: keep hits ~0.05 m apart in wall space so
+        # flat walls shed redundant beams while corners survive.
+        ma, mr = va, vr
+        if len(mr):
+            dm = decimate_points(ma, mr, spacing=0.05)
+            ma, mr = ma[dm], mr[dm]
+            if len(mr) > self.match_pts:      # safety cap (huge perimeters)
+                nt = len(mr)
+                idx = self._decim_cache.get(nt)
+                if idx is None:
+                    idx = np.linspace(0, nt - 1, self.match_pts).astype(int)
+                    self._decim_cache[nt] = idx
+                ma, mr = ma[idx], mr[idx]
 
         # A scan may only be folded into the map when the pose is TRUSTED — i.e. the
         # scan actually matched the existing map. Integrating an unmatched pose (during
@@ -1080,15 +1161,11 @@ class NavNode(Node):
         # wrong pose and permanently corrupts the map.
         trusted = False
         # `improve` = how much the refined match beats the ODOMETRY-PREDICTED pose
-        # (no scan correction). The absolute score is dominated by free-space cells in
-        # open rooms (every beam endpoint in open floor subtracts log-odds), so an
-        # absolute bar alone rejected EVERY scan on a sparse/fresh map and froze it
-        # (the 2026-09-11 board bug: score -100...+ overlap 0.56+, nothing trusted).
-        # Improvement is immune: free-space only lowers it, unknown cells contribute
-        # zero, so a positive delta can only come from beams snapping onto OCCUPIED
-        # structure — the correct-match signature. The absolute score + overlap stay as
-        # backstops for dense maps / carried-somewhere protection.
-        score_prior = self.grid.score((px, py, pth), va, vr)
+        # (no scan correction). With the DT-support kernel, free space scores ~0 and
+        # only beams actually resting on (or within SUPPORT of) mapped structure score
+        # positive, so a positive improvement is the 'snapped onto real walls'
+        # signature. The absolute score + overlap stay as backstops.
+        score_prior = self.grid.score((px, py, pth), ma, mr)
 
         if self._recovering:
             # A recovery candidate may only be adopted/confirmed once the robot has
@@ -1109,12 +1186,12 @@ class NavNode(Node):
             # boot-locate (the robot moved or woke into a saved map) — NEVER on a driving
             # loss, where the robot cannot possibly be across the room (that's what used
             # to snap the map pose to a wrong far spot mid-drive).
-            if len(vr) > 10:
-                cand = self.grid.match((px, py, pth), va, vr, lin=self.recover_lin,
+            if len(mr) > 10:
+                cand = self.grid.match((px, py, pth), ma, mr, lin=self.recover_lin,
                                        ang=self.recover_ang, half=self.recover_half,
                                        refine=self.recover_refine)
-                score = self.grid.score(cand, va, vr)
-                overlap = self.grid.overlap_ratio(cand, va, vr)
+                score = self.grid.score(cand, ma, mr)
+                overlap = self.grid.overlap_ratio(cand, ma, mr)
                 improve = score - score_prior
                 self._last_score, self._last_overlap = score, overlap
                 if ((score >= self.min_score or improve >= self.min_improve)
@@ -1164,10 +1241,10 @@ class NavNode(Node):
                     # spurious far peak — refusing it here is what stops the map-pose
                     # teleport while the user drives.
                     self._next_global_scan = time.monotonic() + self.recover_global_period
-                    g = self.grid.relocalize(va, vr, step=self.recover_global_step)
+                    g = self.grid.relocalize(ma, mr, step=self.recover_global_step)
                     if g is not None:
                         gx, gy, gth, gscore = g
-                        overlap = self.grid.overlap_ratio((gx, gy, gth), va, vr)
+                        overlap = self.grid.overlap_ratio((gx, gy, gth), ma, mr)
                         self._last_score, self._last_overlap = gscore, overlap
                         # Same hide-behind-confirmation rule as the local path: a global
                         # hit is a CANDIDATE, not a verdict. Adopt it as a tighter prior
@@ -1198,9 +1275,13 @@ class NavNode(Node):
                                 self.get_logger().info(
                                     f"relocalized globally (score {gscore:.1f}, "
                                     f"overlap {overlap:.2f})")
-        elif len(vr) > 10:
-            cand = self.grid.match((px, py, pth), va, vr,
-                                   lin=self.match_lin, ang=self.match_ang)
+        elif len(mr) > 10:
+            # Velocity-scaled search window: faster travel between scans = a wider
+            # odometry-prediction uncertainty, so the matcher gets to look further
+            # before the wheel-authority gates clamp it (see _predict's EMA).
+            win_lin, win_ang = self.grid.search_window(
+                self._vel_lin, self._vel_ang, self.match_lin, self.match_ang)
+            cand = self.grid.match((px, py, pth), ma, mr, lin=win_lin, ang=win_ang)
             # Trust whichever strong signal is available:
             #   1. improve >= min_improve — the matcher found a pose that snaps
             #      significantly better onto structure than the odometry prediction.
@@ -1217,11 +1298,21 @@ class NavNode(Node):
             #      wrong-but-lucky overlapping pose must NOT be folded in (real
             #      alignment is required there, and a scan that sees only fresh space
             #      in a built map is drifted/lost, not "rebuilding").
-            score = self.grid.score(cand, va, vr)
-            overlap = self.grid.overlap_ratio(cand, va, vr)
+            score = self.grid.score(cand, ma, mr)
+            overlap = self.grid.overlap_ratio(cand, ma, mr)
             improve = score - score_prior
             self._last_score, self._last_overlap = score, overlap
             coverage = self.grid.coverage()[0]
+            # Velocity-scaled pose tolerance (dynamic search window, the authority-gate
+            # side): wheel-slip/odometry error grows with the distance+rotation since
+            # the last scan, so a fast-moving robot is allowed a proportionally wider
+            # clamp before the wheels win. 1.0 when parked (behaviour identical to the
+            # configured tols).
+            s_vel = self.grid.vel_scale(self._vel_lin, self._vel_ang)
+            head_tol_eff = min(self.head_tol * s_vel, 1.5)
+            pos_tol_eff = min(self.pos_tol * s_vel, 1.0)
+            head_tol_sparse = min(self.head_tol_sparse * s_vel, 1.0)
+            pos_tol_sparse = min(self.pos_tol_sparse * s_vel, 0.5)
             # Absolute wheel-anchored pose reference (2026-09-11): the odom frame is a fixed
             # world frame and the map is a CONSTANT rotation R(rot_from) of it, so the pose
             # the WHEELS alone imply is recomputable every scan from the seed pose + the odom
@@ -1237,35 +1328,72 @@ class NavNode(Node):
                 ath = _wrap(self._seed_pth + (self._odom[2] - st))
             if (improve >= self.min_improve or score >= self.min_score
                     or (overlap >= self.min_overlap and coverage < self.recover_min_seen)):
-                # Wheel-authority gates. Below recover_min_seen the map is too sparse to
-                # LOCALIZE against (a just-cleared grid, or a tight symmetric pocket): the
-                # matcher's cand is noise and trusting it made the pose run acres ahead of
-                # the wheels (the "map is shifting" + premature "goal reached"). So the
-                # ODOM pose IS the location: keep the predicted position, only take small
-                # heading corrections (head_tol — real wheel-slip fixes), and STILL integrate
-                # so the map keeps building, anchored to the wheels. Above the threshold real
-                # structure exists: the matcher gets position+heading authority, but never
-                # farther from the wheel chain than pos_tol / head_tol in one scan, so a
-                # well bias can't accumulate across scans.
+                # Wheel-authority gates. On an EMPTY map (a just-cleared grid, or a tight
+                # symmetric pocket) the matcher's cand is noise: trusting it made the pose
+                # run acres ahead of the wheels ("map is shifting" + premature "goal
+                # reached"), so scans over UNMAPPED VOID stay tight — the ODOM pose IS the
+                # location, only small heading slip-fixes pass (head_tol_sparse), and the
+                # map keeps building anchored to the wheels. But a scan that genuinely
+                # REVISITS already-mapped structure (overlap >= min_overlap) IS a second
+                # sighting of the same walls: locking its position to the wheels too lets a
+                # drifted wheel chain paint a SHIFTED COPY of those walls instead of snapping
+                # onto them (the "map doubles / drifts when I loop" symptom). So a genuine
+                # REVISIT on a sparse map gets SMALL matcher authority — position snaps up to
+                # pos_tol_sparse (a few cells) and heading up to head_tol_sparse (wheel-slip
+                # only) — so the second lap REINFORCES the first lap's walls at the right
+                # offset while neither heading nor position can walk off the wheels. This is
+                # what "snap into the old map while building" means: coverage no longer has
+                # to cross recover_min_seen for the map to converge as you drive laps — it
+                # converges from the first revisit on.
                 dhead = abs(_wrap(cand[2] - ath))
                 dpos = math.hypot(cand[0] - ax, cand[1] - ay)
-                if coverage < self.recover_min_seen:
-                    # TIGHT heading lock while unbuilt: the pocket matcher has a broad
-                    # flat heading well, so even head_tol (0.6) let the map heading sit
-                    # ~0.5 rad off the wheels (nav then turns the wrong way again). Only
-                    # small real slip-fixes pass; otherwise the WHEELS OWN the heading.
-                    if dhead > self.head_tol_sparse:
+                if coverage >= self.recover_min_seen:
+                    if dhead > head_tol_eff or dpos > pos_tol_eff:
                         trusted = False
                     else:
-                        pth = cand[2]                   # small wheel-slip-fix only
+                        px, py, pth = cand
+                        trusted = True
+                        self._lost_count = 0
+                        self._ever_trusted = True
+                elif overlap >= self.min_overlap:
+                    # Sparse map + strong geometry overlap: the scan's beams rest on the
+                    # already-mapped structure, so the matcher's POSITION is a real
+                    # alignment, not the flat-well noise the VOID lock guards against.
+                    # `improve` (match-beats-wheels) is NOT required here: on a revisit the
+                    # wheel prior is already close, so a well-snapped match barely beats it
+                    # and the scan would otherwise fall through to the pure odom-lock and
+                    # paint a SECOND wall 5-15 cm off (the "map doubles / drifts when I
+                    # loop" symptom, 2026-09-11).
+                    # CAUTION: on a sparse map the HEADING well is broad and nearly flat
+                    # (a symmetric box re-scores similarly at many headings), so allowing the
+                    # full dense-map head_tol (0.6) here lets a subtly-better-but-wrong
+                    # heading walk pth off the physical heading (observed 2026-09-11: parked
+                    # pth 0.60 rad off the wheels after a short drive = walls painted as a
+                    # rotated 2-6-cell smear instead of crisp). Heading therefore stays on
+                    # the tight sparse lock (head_tol_sparse, ~wheel-slip fixes only);
+                    # position snaps only up to pos_tol_sparse (a few cells — absorbs the
+                    # 5-15 cm second-lap shift without letting wall fragments accumulate a
+                    # persistent offset from the wheels: observed parked pose 0.35 m off
+                    # odom after a 0.5 m goal drive = "map not mathing" the room). On the
+                    # dense path above the geometry constrains heading, so head_tol/pos_tol
+                    # apply there.
+                    if dhead > head_tol_sparse or dpos > pos_tol_sparse:
+                        trusted = False
+                    else:
+                        px, py, pth = cand
                         trusted = True
                         self._lost_count = 0
                         self._ever_trusted = True
                 else:
-                    if dhead > self.head_tol or dpos > self.pos_tol:
+                    # Unmapped-void scan (or an unconvincing overlap on a sparse map):
+                    # the WHEELS own the position. TIGHT heading lock while unbuilt: the
+                    # pocket matcher has a broad flat heading well, so even head_tol (0.6)
+                    # let the map heading sit ~0.5 rad off the wheels (nav then turns the
+                    # wrong way again). Only small real slip-fixes pass.
+                    if dhead > head_tol_sparse:
                         trusted = False
                     else:
-                        px, py, pth = cand
+                        pth = cand[2]                   # small wheel-slip-fix only
                         trusted = True
                         self._lost_count = 0
                         self._ever_trusted = True
@@ -1291,7 +1419,10 @@ class NavNode(Node):
 
         self.px, self.py, self.pth = px, py, _wrap(pth)
         if trusted:
-            self.grid.integrate((self.px, self.py, self.pth), angles, ranges)
+            # Gated rasterization: while the robot is actively rotating, integrate()
+            # locks the grid out entirely (the spinning sweep would smear walls).
+            self.grid.integrate((self.px, self.py, self.pth), va, vr,
+                                rotating=self._rotating)
         self._publish_pose()
         # True loop closure: periodically re-match the scan against the map centered on
         # the odometry-predicted (possibly drifted) pose with a WIDE window. A strong
@@ -1299,11 +1430,11 @@ class NavNode(Node):
         # accumulated global offset, which we bleed off smoothly. Skipped while seeding,
         # recovering (pose uncertain), or self-testing.
         if (self.loop_closure and not self._recovering and not self._test_active
-                and len(vr) > 10):
+                and len(mr) > 10):
             self._scan_count += 1
             if self._scan_count >= self.loop_probe_every:
                 self._scan_count = 0
-                self._maybe_loop_close(va, vr)
+                self._maybe_loop_close(ma, mr)
 
         # breadcrumb trail: append only when the robot has actually moved a bit (keeps the
         # ring buffer meaningful and the JSON header small).
@@ -1431,6 +1562,18 @@ class NavNode(Node):
                         "kind": kind,
                     }
 
+        # Wheel-velocity estimate (EMA, alpha 0.5) from the per-scan odom deltas and
+        # the inter-scan dt: feeds the velocity-scaled match search window / authority
+        # gates and the rotating rasterization gate (see search_window/vel_scale).
+        if self._last_pred_t is not None:
+            dtv = now - self._last_pred_t
+            if dtv > 1e-4:
+                vl = math.hypot(ox - pox, oy - poy) / dtv
+                va = abs(dth) / dtv
+                self._vel_lin = (1.0 - 0.5) * self._vel_lin + 0.5 * min(vl, 5.0)
+                self._vel_ang = (1.0 - 0.5) * self._vel_ang + 0.5 * min(va, 12.0)
+        self._last_pred_t = now
+
         pth = _wrap(pth + dth)
         # Express the odom-frame displacement in the map frame.
         #
@@ -1467,7 +1610,7 @@ class NavNode(Node):
             px, py, pth = px + ox_off, py + oy_off, _wrap(pth + oth_off)
         return px + wx, py + wy, pth
 
-    def _maybe_loop_close(self, va, vr):
+    def _maybe_loop_close(self, angles, ranges):
         """Detect a far re-visit and bleed off the accumulated global drift.
 
         Re-matches the current scan against the map centered on the *offset-free*
@@ -1488,10 +1631,20 @@ class NavNode(Node):
         ox_off, oy_off, oth_off = self._loop_off
         prior = self._predict(self.px - ox_off, self.py - oy_off,
                               _wrap(self.pth - oth_off), off=(0.0, 0.0, 0.0))
-        cand = self.grid.match(prior, va, vr, lin=self.loop_lin, ang=self.loop_ang)
-        score = self.grid.score(cand, va, vr)
+        cand = self.grid.match(prior, angles, ranges, lin=self.loop_lin, ang=self.loop_ang)
+        score = self.grid.score(cand, angles, ranges)
+        # Accept the match if it either clears the absolute floor (dense maps) OR clearly
+        # beats the offset-free wheel-odom prior (scale-invariant, the same test the
+        # per-scan trust gate uses). The absolute floor alone never fires while the map is
+        # still being built — a mostly-unmapped grid scores low even when the wide match
+        # has genuinely snapped onto the first-lap wall — so loop closure sat silently and
+        # the drift it should have bled off accumulated into a shifted second copy of the
+        # room. Improvement is immune to free-space: it can only rise from beams hitting
+        # occupied structure, which is exactly the loopy-revisit signature.
         if score < self.loop_score:
-            return
+            prior_sc = self.grid.score(prior, angles, ranges)
+            if score - prior_sc < self.min_improve:
+                return
         # Where the corrected chain currently believes we are (already includes _loop_off).
         cur = (self.px, self.py, self.pth)
         dpos = math.hypot(cand[0] - cur[0], cand[1] - cur[1])

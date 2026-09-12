@@ -127,6 +127,14 @@ slam_nav:
     # until the driver's intensity range is checked on hardware — far returns have
     # legitimately lower signal). Live-tunable.
     qual_min: -1.0
+    # Opt-in dynamic-obstacle scan filtering (default OFF): 1-D range-jump clustering
+    # drops short 'near' beam clusters (moving legs, 0.05-0.2 m of wall arc) before
+    # matching, and map-conflict filtering drops beams whose endpoint lands in
+    # CONFIRMED free space (ghost/transient returns) so they can't paint phantom walls
+    # inside an open corridor. A 0.1 m wide STATIC pillar looks identical to a leg to
+    # the range-jump test, and a wall that genuinely moved into free space is dropped
+    # until re-verified — so this stays off until the environment is known clean.
+    dynamic_reject: false
     use_imu_yaw: false            # IMU yaw delta for the rotation prior. FALSE (2026-09-11):
                                    # the BWT901CL heading drifts (gyro bias / magnetometer
                                    # interference) and the EKF re-packages that drift, so
@@ -147,8 +155,11 @@ slam_nav:
                                   # anchor (see nav_node) — stops the map heading slowly walking
                                   # away from the physical heading on sparse/symmetric maps
     pos_tol: 0.35                 # m: per-scan POSITION-correction trust bound vs the wheel
-                                  # anchor — below recover_min_seen the pose is ODOM-locked
-                                  # entirely (matcher position pulls are noise on an unbuilt map)
+                                  # anchor on a BUILT map. Below recover_min_seen the pose is
+                                  # ODOM-locked EXCEPT on a genuine revisit (overlap >=
+                                  # min_overlap_ratio), which snaps position up to
+                                  # pos_tol_sparse (a few cells) + heading up to head_tol_sparse
+                                  # so laps reinforce instead of stacking shifted copies.
     # Parked = skip: when odom yaw AND translation both say the robot hasn't moved since
     # the last processed scan, skip the scan-match + map-integrate (the bulk of parked
     # idle CPU). Full SLAM resumes on the first scan past either threshold; pure rotation

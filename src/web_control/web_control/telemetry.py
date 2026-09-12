@@ -81,7 +81,7 @@ PARAM_WHITELIST = {
                  "slip_cooldown",
                  "qual_min", "min_overlap_ratio", "min_improve",
                  "recover_exit_improve", "recover_min_seen", "recover_min_move",
-                 "head_tol", "pos_tol"},
+                 "head_tol", "pos_tol", "pos_tol_sparse", "dynamic_reject"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
                     "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",

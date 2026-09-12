@@ -79,3 +79,22 @@ window; a strong match landing >`loop_min_shift` (0.3 m) from the corrected pose
 re-visit = accumulated global drift, which is SMOOTHED into a persistent `_loop_off` (and the
 grid warped only once the per-event step exceeds `loop_apply_thresh`). On by default. Deployed
 + verified live (params confirmed via `ros2 param get`); HW drift-removal not yet driven.)
+
+**2026-09-12 (low-compute occupancy rewrite, DEPLOYED + live-verified):** `occupancy.py` is no
+longer a float32 log-odds grid. The permanent map is now a **2-bit packed ternary grid**
+(00=Unknown/01=Free/10=Occupied, 4 cells per byte) — 360 KB for the 1200×1200 @2 cm map,
+~6.2 MB total RAM with the int8 working caches (was ~8.6 MB). Scoring = **integer chamfer
+distance-transform gather** (0.15 m support kernel, exact within radius, cached per `rev`);
+the matcher is **integer-only** (4096-bin cos/sin fixed-point LUT, `r_cells·lut >> 16`), with a
+**Hessian-degeneracy lock** (flat score-surface axes lock to the odometry prior) and **gated
+rasterization** (rotating → map locked, matcher still runs). Scan prep = `reject_dynamic`
+(range-jump leg clusters, OPT-IN `dynamic_reject`), `deskew` (per-beam odometry interpolation),
+`decimate_points` (0.05 m wall spacing), `conflict_mask` (free-space ghost drops). Velocity-scaled
+search/tolerances (`vel_scale`/`search_window` + EMA in `_predict`). Scores normalised so old
+gates keep meaning — no threshold changes. Save/load use packed `cells`; old float32 `.npz`
+imported automatically. Board-verified 2026-09-12: parked pose-vs-odom drift 0.000 m over 90 s,
+zero lost-storms + crisp single-cell walls through a self-test drive (fwd/back/spin), and the
+spin left the map clean (rasterization lock). Caveat found live: the robot is tested in a
+confined ~1×1.5 m area (walls ~0.6-1 m out on the fresh map), so the forward/back+360° self-test
+verbs are physically constrained there and full-drive/loop-closure validation is still pending
+open floor (per the map-skew TODO in AGENTS.md).

@@ -3409,10 +3409,14 @@ connect();   // auto-connect on load
       for(let c=0;c<w;c++){
         let v=lastGrid[base+c]; if(v>127) v-=256;  // byte -> signed int8
         const o=(cy*w+c)*4;
-        // unknown grey; 0 white..100 black. Sharp: sqrt gamma pushes mid-grey cell
-        // fringes toward solid black so walls read crisp; off = the flat linear ramp.
-        const s=v<0?44:(sharpShade ? 255-Math.round(255*Math.sqrt(v/100))
-                                   : 255-Math.round(v*2.55));
+        // unknown grey; 0 white..100 black. Sharp: hard posterize — cells at/above a
+        // single lidar hit (~70) snap to SOLID black with NO transition band, so walls
+        // read as crisp hard-edged 1-2 cell lines against the white floor (the old 45-69
+        // band smeared a grey gradient fringe along every edge; below 70 is the plain
+        // free-space ramp). Off = the flat linear ramp.
+        const s=v<0?44:(sharpShade
+          ? (v>=70?0 : 255-Math.round(v*2.4))
+          : 255-Math.round(v*2.55));
         d[o]=d[o+1]=d[o+2]=s; d[o+3]=255;
       }
     }

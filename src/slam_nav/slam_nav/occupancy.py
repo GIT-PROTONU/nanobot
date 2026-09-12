@@ -1,32 +1,192 @@
 """Tiny 2D occupancy-grid SLAM core — pure numpy, no ROS deps (stays cheap + testable).
 
-Holds a log-odds occupancy grid, integrates LaserScan hits with an inverse sensor
-model, and refines the robot pose with a *correlative scan-to-map matcher*. Matching
-against the accumulated MAP (not the previous scan) is the lightweight stand-in for
-loop closure: when you re-enter an already-mapped area the match snaps the pose back
-onto it, which is what keeps a whole-floor map from drifting without a heavy pose graph.
+Low-compute scan-matching architecture (2026-09):
 
-Memory: one float32 grid + one bool 'seen' mask (+ a bool no-go mask). At
-24 m / 2 cm that's 1200x1200 = ~5.8 MB + 1.4 MB + 1.4 MB. (24 m / 5 cm =
-480x480 is the cheap fallback.) CPU: integration is O(hit cells); matching is a
-small coarse-to-fine search over a subsampled scan (caller decimates),
-vectorised per candidate angle.
+* The PERMANENT occupancy map is a 2-bit packed ternary grid (00=Unknown, 01=Free,
+  10=Occupied) — one uint8 holds four cells, so a 1200x1200 @ 2 cm whole-floor map
+  persists/serves in ~360 KB instead of ~5.8 MB of float32 log-odds. Ephemeral
+  working caches (decoded state, an int8 distance transform, a small bleach counter)
+  live alongside it but are never persisted.
+
+* Scoring no longer ray-casts log-odds. A pre-computed integer DISTANCE TRANSFORM of
+  the occupied mask is rebuilt (cached per `rev`) with a pure-numpy int8 chamfer that
+  is exact out to the support radius; `score()` is a rapid array gather of the scan's
+  endpoint cells into that DT.
+
+* The matcher's inner loop is integer-only: beam angles and candidate headings are
+  quantised to a 4096-bin table (0.088°/bin) and cos/sin come from pre-tabulated
+  fixed-point LUTs (2^16 scale), so a per-candidate heading is just a shift of the
+  angle index plus a multiply-and-shift — no fp trig, no float ops in the hot path.
+
+* A Hessian-degeneracy check measures the score-surface variance on each axis of the
+  final coarse-to-fine pass and LOCKS any flat axis back to the odometry prior (a
+  corridor or symmetric pocket can't pull the pose along a direction the map doesn't
+  constrain). The wheels own every unobservable axis.
+
+* The scan PREPARATION pipeline (module-level functions) runs before matching:
+  `reject_dynamic` (1-D range-jump clustering drops moving-leg clusters 0.05-0.2 m
+  wide), `deskew` (per-beam odometry interpolation across the mirror sweep), and
+  `decimate_points` (keeps hits ~0.05 m apart in wall space, preserving corners).
+  `GridMap.conflict_mask` additionally drops beams whose endpoint lands in CONFIRMED
+  free space — the second dynamic-obstacle stage.
+
+* `integrate()` honours GATED RASTERIZATION: while the robot is actively rotating the
+  map is locked out entirely (a spinning mirror paints arcs of beams and would smear
+  walls); pose refinement keeps running, only the grid freezes.
+
+Memory at 24 m / 2 cm (1200x1200): packed cells 360 KB + state 1.44 MB + bleach
+1.44 MB + DT 1.44 MB (int8) + no-go 1.44 MB ≈ 6.2 MB (was ~9 MB for float32+bool).
 """
 import math
 import os
 
 import numpy as np
 
-# Inverse-sensor-model log-odds increments, and the clamp that bounds how "certain"
-# a cell can get — clamping keeps the map responsive to a moved chair / opened door.
-# L_FREE is deliberately small vs L_OCC: a wall cell is ONLY ever hit by its own beam's
-# endpoint (it's occluded for every other ray), so it climbs to L_CLAMP and stays; the
-# free-space decay only bleaches a cell when many beams RAILY pass through it. The old
-# L_FREE=0.40 could bleach a real wall after a few bad poses or a passed-by corner —
-# keeping it at ~1/5 of L_OCC makes maps crisp without letting empty space "stick".
-L_FREE = 0.18
-L_OCC = 0.85
-L_CLAMP = 3.0
+# --- fixed-point trigonometry -------------------------------------------------
+# LUT size is a power of two so the wrap (angle mod 2pi) is a cheap bitmask. All
+# angles are converted to bin indices NQ*(angle/2pi); cos/sin for a bin are stored in
+# fixed point scaled by COS_SCALE=2^16, so `distance_cells * cos_lut >> 16` is the
+# axis projection in grid cells, rounded half-up, with zero float arithmetic.
+ANG_NQ = 4096                        # LUT bins per full turn (0.0879 deg/bin)
+ANG2Q = ANG_NQ / (2.0 * math.pi)     # radians -> bin index
+ANG_STEP = 2.0 * math.pi / ANG_NQ     # bin index -> radians
+COS_SCALE = 1 << 16                   # fixed-point scale for the cos/sin tables
+COS_HALF = 1 << 15                    # half = round-half-up constant for the shift
+COS_SHIFT = 16
+
+# --- occupancy states (2 bits per cell) --------------------------------------
+STATE_UNKNOWN = 0                    # 00: never swept by a beam
+STATE_FREE = 1                       # 01: beams have confirmed empty here
+STATE_OCC = 2                        # 10: a beam endpoint (wall/obstacle)
+
+SUPPORT_RADIUS_M = 0.15              # m: scoring kernel radius (DT support basin)
+EXACT_B = 2                          # extra points for a beam endpoint EXACTLY on an
+                                     # occupied cell: the old log-odds 'wall spike' on
+                                     # top of the DT basin, so the peak stays sharp
+                                     # (without it a 1-2 cell plateau lets a scan park
+                                     # 10-15 cm off and match just as well)
+BLEACH_N = 16                        # beam passes through an OCC cell before it's
+                                     # freed again (moved chair / opened door)
+
+
+def _pack_cells(state):
+    """2-bit pack an (n,n) uint8 state array (0/1/2) into ceil(n*n/4) uint8 bytes.
+    4 cells per byte, LSB-first: cell index k -> bits [2k, 2k+1] of byte k//4."""
+    flat = np.ascontiguousarray(state, dtype=np.uint8).ravel()
+    pad = (-flat.size) & 3                       # pad to a whole number of bytes
+    if pad:
+        flat = np.concatenate([flat, np.zeros(pad, dtype=np.uint8)])
+    f = flat.reshape(-1, 4)
+    return (f[:, 0] | (f[:, 1] << 2) | (f[:, 2] << 4) | (f[:, 3] << 6)).astype(np.uint8)
+
+
+def _unpack_cells(packed, n):
+    """Inverse of _pack_cells -> (n,n) uint8 states. Each byte splits back into its
+    4 cells by bit-slicing (offset 0/2/4/6 bits), then the padded tail is dropped."""
+    p = np.ascontiguousarray(packed, dtype=np.uint8).astype(np.uint16)
+    flat = np.empty(p.size * 4, dtype=np.uint8)
+    flat[::4] = (p & 0x03).astype(np.uint8)          # cells 0,4,8,..  (bits 0-1)
+    flat[1::4] = ((p >> 2) & 0x03).astype(np.uint8)  # cells 1,5,9,..  (bits 2-3)
+    flat[2::4] = ((p >> 4) & 0x03).astype(np.uint8)  # cells 2,6,10,.. (bits 4-5)
+    flat[3::4] = ((p >> 6) & 0x03).astype(np.uint8)  # cells 3,7,11,.. (bits 6-7)
+    return flat[: n * n].reshape(n, n)
+
+
+# --- scan preparation (module-level; caller runs these before match/integrate) --
+
+def reject_dynamic(ranges, angle_inc, rmin_w=0.05, rmax_w=0.20,
+                   rmin_range=0.35, jump=0.25):
+    """Return a bool KEEP mask over beams for DYNAMIC-OBJECT REJECTION.
+
+    1-D range-jump clustering along the beam sweep: a moving occluder (a person's
+    legs) appears as a short 'near' cluster — the range drops a step below the
+    background wall, holds a few beams, then jumps back up. We detect every such
+    cluster, measure its wall-arc width `mean_range * beams * angle_inc`, and drop
+    clusters whose width falls in [rmin_w, rmax_w] m (a leg is 0.05-0.2 m wide). A
+    real wall makes a wide (or full-sweep) near region and is kept. `rmin_range`
+    guards the robot's own nearby mount/floor from being mistaken for a leg. The
+    sweep is treated circularly (a cluster straddling the angle-0 seam is resolved by
+    scanning a tripled copy of the range array)."""
+    n = ranges.size
+    keep = np.ones(n, dtype=bool)
+    if n < 6 or not (angle_inc > 0.0):
+        return keep
+    rr = np.asarray(ranges, dtype=np.float64)
+    r3 = np.concatenate([rr, rr, rr])                 # tripled: circular cluster scan
+    d = np.diff(r3)                                    # along-sweep range derivative
+    starts = np.flatnonzero(d[:-1] < -jump) + 1        # beam after a drop (near begins)
+    ends = np.flatnonzero(d[:-1] > jump) + 1           # first beam back at the far range
+    for s0 in starts:
+        s = int(s0)
+        if s >= n:                                     # clusters must begin in [0, n)
+            continue
+        k = int(np.searchsorted(ends, s, side="right"))
+        if k >= ends.size:
+            continue
+        e = int(ends[k])                               # first end strictly after s
+        if e - s >= n:                                 # spans >half the sweep: a wall
+            continue
+        span = e - s
+        idx = np.arange(s, s + span) % n
+        rmid = float(rr[idx].mean())
+        arc = rmid * span * angle_inc                  # perpendicular wall-arc (m)
+        if rmin_w <= arc <= rmax_w and rmid >= rmin_range:
+            keep[idx] = False
+    return keep
+
+
+def deskew(angles, ranges, dx, dy, dth):
+    """MOTION DESKEW: interpolate the odometry across the mirror sweep.
+
+    The LDS spins continuously, so beam i was acquired at sweep fraction f = i/(n-1)
+    while the robot was still moving. The acquisition pose is `end + (f-1)*(dx,dy,dth)`
+    where (dx,dy,dth) is the map-frame motion over the WHOLE sweep (end - start). Each
+    beam's endpoint is pushed by that interpolated pose and re-expressed as a fresh
+    (angle, range) relative to the END pose, so everything downstream keeps a single
+    robot pose. Returns (a2, r2) float32. Exact identity when d = 0."""
+    n = ranges.size
+    if n == 0:
+        return angles, ranges
+    f = np.arange(n, dtype=np.float32) / max(1, n - 1)
+    ox = (f - 1.0) * dx                               # pose offset vs END pose (map)
+    oy = (f - 1.0) * dy
+    brg = np.asarray(angles, dtype=np.float32) + (f - 1.0) * dth
+    ex = ox + np.asarray(ranges, dtype=np.float32) * np.cos(brg)
+    ey = oy + np.asarray(ranges, dtype=np.float32) * np.sin(brg)
+    a2 = np.arctan2(ey, ex)
+    r2 = np.maximum(np.hypot(ex, ey), 0.0)
+    return a2.astype(np.float32), r2.astype(np.float32)
+
+
+def decimate_points(angles, ranges, spacing=0.05, corner_m=0.15):
+    """SPATIAL DECIMATION for matching: keep beams so consecutive kept HIT POINTS are
+    ~`spacing` metres apart in wall space (dropping redundant flat-wall beams) while
+    FORCING corners — a sharp range jump between neighbours — to survive. Returns a
+    bool KEEP mask."""
+    n = ranges.size
+    if n < 3:
+        return np.ones(n, dtype=bool)
+    a = np.asarray(angles, dtype=np.float64)
+    r = np.asarray(ranges, dtype=np.float64)
+    x = r * np.cos(a)
+    y = r * np.sin(a)
+    step = np.empty(n)
+    step[1:] = np.hypot(x[1:] - x[:-1], y[1:] - y[:-1])
+    step[0] = step[1] if n > 1 else 0.0
+    dr = np.empty(n)
+    dr[1:] = np.abs(r[1:] - r[:-1])
+    dr[0] = 0.0
+    keep = np.zeros(n, dtype=bool)
+    keep[0] = True
+    acc = 0.0
+    for i in range(1, n - 1):
+        acc += step[i]
+        # keep when the 0.05 m tick is reached, OR a corner (range cliff) lands here
+        if acc >= spacing or dr[i] > corner_m or dr[i + 1] > corner_m:
+            keep[i] = True
+            acc = 0.0
+    keep[-1] = True
+    return keep
 
 
 class GridMap:
@@ -37,21 +197,36 @@ class GridMap:
         # World coordinate of cell [0,0] (lower-left). The robot starts at the centre,
         # so the map can grow outward in every direction from the origin.
         self.origin = -0.5 * self.n * self.res
-        self.log = np.zeros((self.n, self.n), dtype=np.float32)   # [row=y, col=x]
-        self.seen = np.zeros((self.n, self.n), dtype=bool)
-        # Bumped on every content mutation (integrate/load) so callers can cache
-        # derived exports (occupancy_int8/coverage) instead of recomputing a full-grid
-        # np.exp at the map-write rate while nothing is changing.
+        # --- PERMANENT 2-bit packed occupancy grid (persisted + served) ----------
+        self.cells = _pack_cells(np.zeros((self.n, self.n), dtype=np.uint8))
+        # --- ephemeral working caches, rebuilt when `rev` moves -----------------
+        self._state = None            # (n,n) uint8 decoded 0/1/2
+        self._state_rev = -1
+        self._dt = None               # (n,n) int8 distance-to-occupied, in cells
+        self._dt_rev = -1
+        # The old log-odds map's "bleach" effect (a wall fades after beams sweep
+        # through it) in integer form: an OCCUPIED cell counts free-space passes and
+        # flips to FREE after BLEACH_N of them. Ephemeral, never persisted.
+        self._bleach = np.zeros((self.n, self.n), dtype=np.uint8)
         self.rev = 0
-        # No-go mask: cells the PLANNER must never route through / treat as an obstacle.
-        # Unlike log-odds it is NOT touched by scan integration (a lidar beam through it
-        # won't slowly "free" it back), so a human-marked restricted zone stays put. It's
-        # persistence, exposed to the web UI as an overlay, and folded into _coarse().
+        # DT-support kernel radius in cells + the free-space 'confirmed' margin for
+        # the map-conflict filter (a wall return needs to be this far inside a free
+        # area before it counts as transient).
+        self.SUPPORT = max(3, int(round(SUPPORT_RADIUS_M / self.res)))
+        self.CONFIRM = max(2, self.SUPPORT // 2)
+        # Max score value one beam can contribute = SUPPORT + EXACT_B; scores are
+        # NORMALISED by this so '1.0' means one perfectly-aligned beam regardless of
+        # map resolution (keeps the nav absolute thresholds meaningful).
+        self.SCORE_MAX = self.SUPPORT + EXACT_B
+        # No-go mask: cells the PLANNER must never route through (human-marked
+        # restricted zones). Untouched by scan integration; persisted + web overlay.
         self.forbidden = np.zeros((self.n, self.n), dtype=bool)
-        # No-go edit revision — served with `rev` as the invalidation key for the
-        # memoized _coarse() (unlike scan content, forbidden edits DON'T bump rev).
         self.forb_rev = 0
         self._coarse_cache = None   # (key, (blocked, seen_c, m, res_c)) memo
+        # --- integer trigonometry LUTs (built once; fixed at 4096 bins each) -----
+        qq = np.arange(ANG_NQ, dtype=np.float64)
+        self.cosq = np.rint(np.cos(qq * ANG_STEP) * COS_SCALE).astype(np.int32)
+        self.sinq = np.rint(np.sin(qq * ANG_STEP) * COS_SCALE).astype(np.int32)
 
     # --- world <-> grid ------------------------------------------------------
     def w2g(self, x, y):
@@ -67,176 +242,359 @@ class GridMap:
     def _valid(ranges, rmin, rmax):
         return np.isfinite(ranges) & (ranges >= rmin) & (ranges <= rmax)
 
-    # --- scan-to-map matching ------------------------------------------------
+    # --- integer fixed-point helpers (the only trig the matcher ever does) -----
+    @staticmethod
+    def _quant(angles):
+        """Radians -> (int32) LUT bin index. ANG_NQ is a power of two, so the wrap is
+        a `& (NQ-1)` bitmask instead of a modulo; rint does round-half-even, plenty."""
+        return (np.rint(np.asarray(angles, dtype=np.float64) * ANG2Q).astype(np.int64)
+                & (ANG_NQ - 1)).astype(np.int32)
+
+    def _rcell(self, ranges):
+        """Metres -> integer cell distance from the robot (banker's rounding)."""
+        return np.rint(np.asarray(ranges, dtype=np.float64) / self.res).astype(np.int32)
+
+    @staticmethod
+    def _off(rc, lut):
+        """Fixed-point axis projection: `rc * lut >> 16` with round-half-up.
+        rc is a cell distance (int32), lut a 2^16-scaled cos/sin table entry; the
+        int64 intermediate keeps the product exact, the shift returns cells. This one
+        helper is the ENTIRE trigonometry the hot loops need."""
+        return ((rc.astype(np.int64) * lut.astype(np.int64) + COS_HALF)
+                >> COS_SHIFT).astype(np.int32)
+
+    @staticmethod
+    def _kval(d, support, bonus):
+        """Map DT distances -> per-beam score values. Graded as the old log-odds did:
+        the DT basin (linear support) makes the surface climb smoothly toward walls,
+        and an EXACT wall hit (dt == 0) earns an extra `bonus` — the sharp "wall
+        spike" that keeps the peak one cell wide instead of a plateau. All integer."""
+        dd = d.astype(np.int32)
+        return np.where(dd == 0, support + bonus, np.maximum(0, support - dd))
+
+    def _endpoints(self, xc0, yc0, q, rc):
+        """(col, row) endpoint cells for a scan at integer pose cell (xc0, yc0)."""
+        co = self.cosq[q]
+        si = self.sinq[q]
+        return xc0 + self._off(rc, co), yc0 + self._off(rc, si)
+
+    def state_view(self):
+        """Decoded (n,n) uint8 0/1/2 working copy, cached per rev (kept in sync by
+        integrate/transform/load so the cache is what every consumer reads)."""
+        if self._state is None or self._state_rev != self.rev:
+            self._state = _unpack_cells(self.cells, self.n)
+            self._state_rev = self.rev
+        return self._state
+
+    # --- distance transform (pre-computed compute saver) ----------------------
+    def _dt_map(self):
+        """Integer chamfer DT of the occupied mask, in CELLS, cached per rev. Pure
+        numpy int8: each sweep rolls the field along the 4 axes and takes the minimum
+        (city-block distance +1 per move), so after SUPPORT+2 sweeps every cell within
+        the support radius carries its EXACT L1 distance and the rest saturate at
+        SUPPORT. The scoring kernel below is then a pure array gather."""
+        if self._dt is not None and self._dt_rev == self.rev:
+            return self._dt
+        st = self.state_view()
+        n = self.n
+        cap = self.SUPPORT
+        big = cap + 4                                     # unreachable filler
+        dt = np.full((n, n), big, dtype=np.int8)
+        dt[st == STATE_OCC] = 0
+        for _ in range(cap + 2):
+            u = np.roll(dt, -1, axis=0); u[-1, :] = big
+            d = np.roll(dt, 1, axis=0); d[0, :] = big
+            l = np.roll(dt, -1, axis=1); l[:, -1] = big
+            r = np.roll(dt, 1, axis=1); r[:, 0] = big
+            dt = np.minimum(dt, np.minimum(np.minimum(u + 1, d + 1),
+                                            np.minimum(l + 1, r + 1)))
+        self._dt = np.minimum(dt, cap)
+        self._dt_rev = self.rev
+        return self._dt
+
+    # --- scan-to-map matching -------------------------------------------------
     def score(self, pose, angles, ranges):
-        """Sum of map log-odds at the scan's hit cells (higher = better aligned)."""
+        """DT-support score: sum of max(0, SUPPORT - dt_cells) over in-bounds scan
+        endpoints, NORMALISED by SUPPORT. The value is ~'how many beams rest on (or
+        within 0.15 m of) structure', so it is res-independent and the existing
+        nav thresholds (min_match_score=1.., recover_exit_score=20.) keep their
+        meaning. Hot path is integer; the single divide happens at the end."""
+        if ranges.size == 0:
+            return 0.0
         px, py, pth = pose
-        a = angles + pth
-        c, r = self.w2g(px + ranges * np.cos(a), py + ranges * np.sin(a))
-        m = self._inb(c, r)
-        if not m.any():
-            return -1e18
-        return float(self.log[r[m], c[m]].sum())
+        q = self._quant(np.asarray(angles, dtype=np.float64) + pth)
+        rc = self._rcell(ranges)
+        xc0 = int(round((px - self.origin) / self.res))
+        yc0 = int(round((py - self.origin) / self.res))
+        cxp, cyp = self._endpoints(xc0, yc0, q, rc)
+        n = self.n
+        ok = (cxp >= 0) & (cxp < n) & (cyp >= 0) & (cyp < n)
+        if not ok.any():
+            return 0.0
+        dt = self._dt_map()
+        cs = np.clip(cxp, 0, n - 1)
+        rs = np.clip(cyp, 0, n - 1)
+        v = dt[rs, cs]
+        vals = self._kval(v, self.SUPPORT, EXACT_B)
+        total = int(np.where(ok, vals, 0).sum())
+        return total / float(self.SCORE_MAX)
 
     def overlap_ratio(self, pose, angles, ranges):
-        """Fraction of in-bounds beams that land on a cell the map has actually SEEN.
-
-        The inlier complement of score(): a raw log-odds sum can clear a threshold on
-        the strength of a handful of overlapping beams even when the scan is mostly
-        pointing at unmapped void (carried to a different spot, or a scan whose rays
-        are blind/parked at distance). This ratio says how much of the scan is truly
-        anchored on previously-seen structure, so a "good score / no real overlap"
-        scan gets caught instead of corrupting the map. 1.0 = every beam on a seen
-        cell; 0.0 = nothing overlaps."""
-        px, py, pth = pose
-        a = angles + pth
-        c, r = self.w2g(px + ranges * np.cos(a), py + ranges * np.sin(a))
-        m = self._inb(c, r)
-        if not m.any():
+        """Fraction of in-bounds beams that land on a cell the map has SEEN (free or
+        occupied). The inlier complement of score(): says how much of the scan rests
+        on previously-mapped area, so a 'good score / no real overlap' scan gets
+        caught. 1.0 = every beam on a seen cell; 0.0 = nothing overlaps."""
+        if ranges.size == 0:
             return 0.0
-        return float(self.seen[r[m], c[m]].mean())
+        px, py, pth = pose
+        q = self._quant(np.asarray(angles, dtype=np.float64) + pth)
+        rc = self._rcell(ranges)
+        xc0 = int(round((px - self.origin) / self.res))
+        yc0 = int(round((py - self.origin) / self.res))
+        cxp, cyp = self._endpoints(xc0, yc0, q, rc)
+        n = self.n
+        ok = (cxp >= 0) & (cxp < n) & (cyp >= 0) & (cyp < n)
+        if not ok.any():
+            return 0.0
+        st = self.state_view()
+        cs = np.clip(cxp, 0, n - 1)
+        rs = np.clip(cyp, 0, n - 1)
+        seen = st[rs, cs] != STATE_UNKNOWN
+        return float(seen[ok].mean())
 
-    def match(self, prior, angles, ranges, lin=0.10, ang=0.12, half=4, refine=2):
+    def match(self, prior, angles, ranges, lin=0.10, ang=0.12, half=4, refine=2,
+              lock_degenerate=True):
         """Correlative scan-to-map match: coarse-to-fine search around `prior` for the
-        (x, y, theta) that maximises score. `half` = candidates each side per axis;
-        `refine` shrinks the window and re-centres. Caller passes a decimated scan."""
+        (x, y, theta) that maximises the DT-support score. Every per-candidate op is
+        integer (LUT trig + fixed-point offsets + DT gather); floats appear only in
+        window setup and the returned pose. `lock_degenerate` measures the score
+        surface's variance along each axis of the final pass and, wherever it is flat,
+        locks that axis entirely to the odometry prior (Hessian-degeneracy lock)."""
         bx, by, bth = prior
+        if ranges.size == 0:
+            return bx, by, bth
+        anq = self._quant(angles)
+        rc = self._rcell(ranges)
+        n = self.n
+        dt = self._dt_map()
+        best_s, best_pose = -1, (bx, by, bth)
         for it in range(refine):
-            scale = 0.35 ** it                       # shrink the window each pass
-            xs = bx + np.linspace(-lin * scale, lin * scale, 2 * half + 1)
-            ys = by + np.linspace(-lin * scale, lin * scale, 2 * half + 1)
-            ths = bth + np.linspace(-ang * scale, ang * scale, 2 * half + 1)
-            best_s, best = -1e18, (bx, by, bth)
-            for th in ths:
-                a = angles + th
-                hx = ranges * np.cos(a)              # hit offsets for this heading
-                hy = ranges * np.sin(a)
-                # cell cols depend only on x, rows only on y -> compute each 2D then
-                # broadcast to (Nx, Ny, npts) for a single fancy-indexed lookup.
-                cx = np.floor((xs[:, None] + hx[None, :] - self.origin) / self.res).astype(np.int32)
-                ry = np.floor((ys[:, None] + hy[None, :] - self.origin) / self.res).astype(np.int32)
-                inx = (cx >= 0) & (cx < self.n)
-                iny = (ry >= 0) & (ry < self.n)
-                cxc = np.clip(cx, 0, self.n - 1)
-                ryc = np.clip(ry, 0, self.n - 1)
-                vals = self.log[ryc[None, :, :], cxc[:, None, :]]      # (Nx, Ny, npts)
-                mask = inx[:, None, :] & iny[None, :, :]
-                s = np.where(mask, vals, 0.0).sum(axis=2)              # (Nx, Ny)
+            sc = 0.35 ** it                               # shrink the window each pass
+            xs = bx + np.linspace(-lin * sc, lin * sc, 2 * half + 1)
+            ys = by + np.linspace(-lin * sc, lin * sc, 2 * half + 1)
+            ths = bth + np.linspace(-ang * sc, ang * sc, 2 * half + 1)
+            xc = np.rint((xs - self.origin) / self.res).astype(np.int32)
+            yc = np.rint((ys - self.origin) / self.res).astype(np.int32)
+            tq = self._quant(ths)
+            final_pass = it == refine - 1
+            mats = [] if final_pass else None
+            for k, t in enumerate(tq):
+                # one heading: shift the beam angle LUT indices by the heading bin, so
+                # cos/sin for EVERY beam is a table gather + one fixed-point multiply.
+                q = (anq + t) & (ANG_NQ - 1)
+                co = self.cosq[q]
+                si = self.sinq[q]
+                hxc = self._off(rc, co)                   # per-beam offset (cells)
+                hyc = self._off(rc, si)
+                cx = xc[:, None] + hxc[None, :]           # (Nx, P) candidate cols
+                cy = yc[:, None] + hyc[None, :]           # (Ny, P) candidate rows
+                okx = (cx >= 0) & (cx < n)
+                oky = (cy >= 0) & (cy < n)
+                cxc = np.clip(cx, 0, n - 1)
+                cyc = np.clip(cy, 0, n - 1)
+                # gather DT over the (Nx, Ny, P) lattice, convert to the score kernel,
+                # mask out-of-bounds, sum per (x,y) candidate: all ints, no floats.
+                vals = self._kval(dt[cyc[None, :, :], cxc[:, None, :]],
+                                  self.SUPPORT, EXACT_B)
+                s = np.where(okx[:, None, :] & oky[None, :, :], vals, 0).sum(axis=2)
                 i, j = np.unravel_index(int(np.argmax(s)), s.shape)
-                if s[i, j] > best_s:
-                    best_s, best = float(s[i, j]), (float(xs[i]), float(ys[j]), float(th))
-            bx, by, bth = best
-        return bx, by, bth
+                sv = int(s[i, j])
+                if sv > best_s:
+                    best_s, best_pose = sv, (float(xs[i]), float(ys[j]), float(ths[k]))
+                if final_pass:
+                    mats.append(s)
+            if final_pass and mats:
+                # --- Hessian-degeneracy lock ----------------------------------
+                # Var(scores) along the x/y/heading strips of the final surface: a
+                # flat strip means the map doesn't constrain that axis here (long
+                # corridor, symmetric pocket) -> let the ODOMETRY PRIOR own it.
+                S = np.stack(mats)                        # (Nt, Nx, Ny) int
+                ii = int(np.argmax(S))
+                kth, i1, j1 = np.unravel_index(ii, S.shape)
+                vx = float(S[kth, :, j1].var())
+                vy = float(S[kth, i1, :].var())
+                vt = float(S[:, i1, j1].var())
+                denom = max(vx + vy, 1e-9)
+                eps = 0.03
+                xo, yo, to = best_pose
+                if vx < eps * denom:
+                    xo = bx                                # x unobservable -> lock
+                if vy < eps * denom:
+                    yo = by                                # y unobservable -> lock
+                if vt < eps * denom:
+                    to = bth                               # heading unobservable
+                best_pose = (xo, yo, to)
+        return best_pose
 
     def relocalize(self, angles, ranges, step=4, n_headings=16, npts=90, keep=6):
-        """Global scan-to-map search (kidnap recovery). Scores a decimated scan against
-        EVERY grid candidate at `step`-cell spacing across `n_headings` yaw steps, then
-        coarse-to-fine refines the top `keep` candidates with the local matcher and keeps
-        the best-scoring one. Keeping several hypotheses matters: at a slightly-wrong
-        coarse heading even the true location scores poorly, so the true pose can rank
-        below a spurious rotated one — refining the top K rescues it. Unlike match(),
-        which only hunts around the current pose, this can snap back after the robot is
-        carried far away (or boots inside an already-loaded map). Returns
-        (x, y, theta, score) or None when the map has little structure and no pose scored
-        above the free-space floor. Compatible with the caller's min_score / exit check."""
-        if len(ranges) > npts:                       # decimate: keeps the big lookup small
+        """Global scan-to-map search (kidnap recovery): scores a decimated scan at
+        EVERY grid cell on a `step`-cell lattice across `n_headings` yaw steps, then
+        coarse-to-fine refines the top `keep` candidates. Returns
+        (x, y, theta, score) or None when nothing above the free-space floor scored.
+        Same integer DT machinery as match()."""
+        if ranges.size == 0:
+            return None
+        if len(ranges) > npts:
             idx = np.linspace(0, len(ranges) - 1, npts).astype(int)
             angles, ranges = angles[idx], ranges[idx]
-        xs = self.origin + (np.arange(0, self.n, step) + 0.5) * self.res
-        ys = self.origin + (np.arange(0, self.n, step) + 0.5) * self.res
+        anq = self._quant(angles)
+        rc = self._rcell(ranges)
+        n = self.n
+        dt = self._dt_map()
+        xc = np.arange(0, n, max(1, int(step))).astype(np.int32)
+        yc = xc
         ths = np.linspace(-np.pi, np.pi, n_headings, endpoint=False)
-
-        cands = []                                   # (coarse_score, th, x, y)
-        for th in ths:                               # per-heading (Nx, Ny, npts) broadcast
-            a = angles + th
-            hx = ranges * np.cos(a)                  # hit offsets for this heading
-            hy = ranges * np.sin(a)
-            cx = np.floor((xs[:, None] + hx[None, :] - self.origin) / self.res).astype(np.int32)
-            ry = np.floor((ys[:, None] + hy[None, :] - self.origin) / self.res).astype(np.int32)
-            inx = (cx >= 0) & (cx < self.n)
-            iny = (ry >= 0) & (ry < self.n)
-            cxc = np.clip(cx, 0, self.n - 1)
-            ryc = np.clip(ry, 0, self.n - 1)
-            vals = self.log[ryc[None, :, :], cxc[:, None, :]]     # (Nx, Ny, npts)
-            mask = inx[:, None, :] & iny[None, :, :]
-            s = np.where(mask, vals, 0.0).sum(axis=2)             # (Nx, Ny)
-            # keep the top-2 (x, y) per heading too, so a spurious peak at the true
-            # heading doesn't mask the right location for this heading. (Guard the
-            # argpartition kth bound: it must stay < size, else tiny maps crash.)
-            k2 = min(2, s.size)
+        tq = self._quant(ths)
+        cands = []
+        for ki, t in enumerate(tq):
+            q = (anq + t) & (ANG_NQ - 1)
+            co = self.cosq[q]
+            si = self.sinq[q]
+            hxc = self._off(rc, co)
+            hyc = self._off(rc, si)
+            cx = xc[:, None] + hxc[None, :]
+            cy = yc[:, None] + hyc[None, :]
+            okx = (cx >= 0) & (cx < n)
+            oky = (cy >= 0) & (cy < n)
+            cxc = np.clip(cx, 0, n - 1)
+            cyc = np.clip(cy, 0, n - 1)
+            vals = self._kval(dt[cyc[None, :, :], cxc[:, None, :]], self.SUPPORT, EXACT_B)
+            s = np.where(okx[:, None, :] & oky[None, :, :], vals, 0).sum(axis=2)
+            k2 = min(2, int(s.size))
             if k2 >= 1:
+                th0 = float(ths[ki])
                 for fi in np.argpartition(s.ravel(), -k2)[-k2:]:
                     i, j = np.unravel_index(int(fi), s.shape)
-                    cands.append((float(s[i, j]), float(th), float(xs[i]), float(ys[j])))
+                    cands.append((int(s[i, j]), th0,
+                                  self.origin + (xc[i] + 0.5) * self.res,
+                                  self.origin + (yc[j] + 0.5) * self.res))
         cands.sort(key=lambda c: -c[0])
-
         best = None
         for _, th, x, y in cands[:keep]:
-            # 3 refine passes: a 2-pass climb can trap in a neighbouring basin when the
-            # coarse heading is a few degrees off, leaving the true peak unreached.
             cand = self.match((x, y, th), angles, ranges,
                               lin=2 * step * self.res, ang=0.35, half=4, refine=3)
             sc = self.score(cand, angles, ranges)
             if best is None or sc > best[3]:
                 best = (cand[0], cand[1], cand[2], sc)
         if best is None or best[3] <= 0.0:
-            # Free-space cells carry negative log-odds, so a pose that actually hits
-            # occupied structure scores positive; anything at/below zero found no match.
             return None
         return best
 
+    def conflict_mask(self, pose, angles, ranges, confirm=None):
+        """Map-conflict filtering (2nd dynamic-obstacle stage): return a bool KEEP mask
+        over beams. A 'wall' beam whose endpoint lands on a cell the map has CONFIRMED
+        as free space (state FREE and at least `confirm` cells from any occupied cell)
+        is a transient return — a moving obstacle or a ghost — not a structure change,
+        so it is dropped before matching and integration to stop phantom walls from
+        appearing inside an open floor."""
+        n = ranges.size
+        keep = np.ones(n, dtype=bool)
+        if n == 0:
+            return keep
+        px, py, pth = pose
+        q = self._quant(np.asarray(angles, dtype=np.float64) + pth)
+        rc = self._rcell(ranges)
+        xc0 = int(round((px - self.origin) / self.res))
+        yc0 = int(round((py - self.origin) / self.res))
+        cxp, cyp = self._endpoints(xc0, yc0, q, rc)
+        n2 = self.n
+        ok = (cxp >= 0) & (cxp < n2) & (cyp >= 0) & (cyp < n2)
+        if not ok.any():
+            return keep
+        st = self.state_view()
+        dt = self._dt_map()
+        conf = self.CONFIRM if confirm is None else int(confirm)
+        cs = np.clip(cxp, 0, n2 - 1)
+        rs = np.clip(cyp, 0, n2 - 1)
+        confirmed_free = (st[rs, cs] == STATE_FREE) & (dt[rs, cs] >= conf)
+        keep &= ~(confirmed_free & ok)
+        return keep
+
     # --- map update ----------------------------------------------------------
-    def integrate(self, pose, angles, ranges):
-        """Ray-cast every valid beam: decrement free cells along it, bump the endpoint."""
+    def integrate(self, pose, angles, ranges, rotating=False):
+        """Rasterize a scan into the ternary grid (endpoint -> Occupied, ray cells ->
+        Free, occupied cells bleached after BLEACH_N passes). GATED RASTERIZATION:
+        when `rotating` is True (the robot is spinning), the map is locked out
+        completely — a rotating mirror paints each beam as an arc and would smear the
+        walls — so we return WITHOUT mutating anything (pose refinement via match()
+        may keep running). Returns True if content changed."""
+        if rotating:
+            return False
         px, py, pth = pose
         v = self._valid(ranges, self.rmin, self.rmax)
-        a = (angles + pth)[v]
-        rr = ranges[v]
+        a = np.asarray(angles, dtype=np.float64)[v] + pth
+        rr = np.asarray(ranges, dtype=np.float64)[v]
         if rr.size == 0:
-            return
-        cos, sin = np.cos(a), np.sin(a)
+            return False
+        st = self.state_view()
+        n = self.n
+        q = self._quant(a)
+        co = self.cosq[q]
+        si = self.sinq[q]
+        rc = self._rcell(rr)
+        xc0 = int(round((px - self.origin) / self.res))
+        yc0 = int(round((py - self.origin) / self.res))
 
-        # occupied endpoints (np.add.at handles repeated cells correctly)
-        ec, er = self.w2g(px + rr * cos, py + rr * sin)
-        m = self._inb(ec, er)
-        np.add.at(self.log, (er[m], ec[m]), L_OCC)
-        self.seen[er[m], ec[m]] = True
+        # occupied endpoints: mark occupied (reset any pending bleach).
+        ec, er = self._endpoints(xc0, yc0, q, rc)
+        m = (ec >= 0) & (ec < n) & (er >= 0) & (er < n)
+        if m.any():
+            ecm = ec[m]
+            erm = er[m]
+            st[erm, ecm] = STATE_OCC
+            self._bleach[erm, ecm] = 0
 
-        # free space: sample each ray at the grid pitch from the robot up to one cell shy of
-        # the hit. Vectorised over ALL beams at once — no per-beam Python loop. Each beam
-        # contributes `per[b]` samples; we build the ragged step indices (0..per-1 per beam)
-        # with a repeat/cumsum trick, so we only ever allocate exactly the kept samples.
-        per = np.maximum(0, (rr / self.res).astype(np.int32) - 1)   # samples per beam
+        # free space: sample every ray at the grid pitch from the robot up to one cell
+        # shy of the hit. Per sample the cell offset is `k * dir >> 16` in cells —
+        # integer fixed point, no float ops. Cells that are OCCUPIED only accumulate a
+        # bleach count instead of flipping; free/unknown become FREE immediately.
+        per = np.maximum(0, rc - 1)                       # samples per beam
         total = int(per.sum())
         if total:
-            bi = np.repeat(np.arange(rr.size), per)                 # beam index per sample
-            si = np.arange(total) - np.repeat(np.cumsum(per) - per, per)   # 0..per[b]-1
-            tt = si * self.res                                      # distance along the ray (f64)
-            fc, fr = self.w2g(px + tt * cos[bi], py + tt * sin[bi])
-            mf = self._inb(fc, fr)
-            # Repeated free-space cells are folded into per-cell counts and applied as
-            # ONE grouped float32 delta each. np.add.at's generic unbuffered scatter
-            # over up to ~50k samples dominates the per-scan ray-cast cost; summing
-            # exact integer counts first is mathematically identical and ~2-4x faster.
-            flat = fr[mf] * self.n + fc[mf]           # row-major cell id; n^2 < 2^31
-            uniq, cnt = np.unique(flat, return_counts=True)
-            np.ravel(self.log)[uniq] -= np.float32(L_FREE) * cnt.astype(np.float32)
-            self.seen[fr[mf], fc[mf]] = True
+            bi = np.repeat(np.arange(rr.size, dtype=np.int64), per)
+            k = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(per) - per, per)
+            sox = self._off(k, co[bi])
+            soy = self._off(k, si[bi])
+            fc = xc0 + sox
+            fr = yc0 + soy
+            mf = (fc >= 0) & (fc < n) & (fr >= 0) & (fr < n)
+            if mf.any():
+                fcm = fc[mf].astype(np.int64)
+                frm = fr[mf].astype(np.int64)
+                flat = frm * n + fcm
+                uniq, cnt = np.unique(flat, return_counts=True)
+                ur, uc = np.divmod(uniq, n)
+                occ = st[ur, uc] == STATE_OCC
+                nb = np.minimum(self._bleach[ur, uc].astype(np.int32) + cnt, 255)
+                self._bleach[ur, uc] = nb.astype(np.uint8)
+                flip = occ & (nb >= BLEACH_N)
+                st[ur, uc] = np.where(occ & ~flip, STATE_OCC, STATE_FREE).astype(np.uint8)
 
-        np.clip(self.log, -L_CLAMP, L_CLAMP, out=self.log)
+        # write the mutated state back into the permanent 2-bit store.
+        self.cells = _pack_cells(st)
         self.rev += 1
+        self._state_rev = self.rev       # _state already matches cells
+        self._dt_rev = -1                # occupancy changed -> DT must rebuild
+        return True
 
     # --- loop closure: rigid map transform ----------------------------------
     def transform(self, dx, dy, dth):
         """Rigidly shift/rotate the whole grid by (dx, dy, dth) in world metres/rad.
-        Used by loop closure to bleed off accumulated global drift: the correction
-        found against a far-away re-visited area is applied as a small rotation +
-        translation of the accumulated map. Pure-numpy, no scipy. Only called on a
-        loop event (rare), so the temporary copy cost (~1.1 MB) is irrelevant."""
+        Used by loop closure to bleed off accumulated global drift. Rare (loop events
+        only), so the resample cost is irrelevant. Bleach counters reset (they
+        re-learn in a few scans)."""
         c, s = math.cos(dth), math.sin(dth)
-        # world centre of every cell (row r, col c) -> source world point before the
-        # transform, then sample the OLD grids there. Inverse of the forward motion:
-        # a point that ends up at (wx, wy) came from (R^{-1} ((wx-dx, wy-dy))).
+        st = self.state_view()
         ys, xs = np.mgrid[0:self.n, 0:self.n].astype(np.float64)
         wy = self.origin + (ys + 0.5) * self.res
         wx = self.origin + (xs + 0.5) * self.res
@@ -248,44 +606,35 @@ class GridMap:
         sir = sr[m].astype(np.int64)
         tic = xs[m].astype(np.int64)
         tir = ys[m].astype(np.int64)
-        new_log = self.log.copy()
-        new_seen = self.seen.copy()
-        new_log[tir, tic] = self.log[sir, sic]
-        new_seen[tir, tic] = self.seen[sir, sic]
-        self.log, self.seen = new_log, new_seen
+        new = st.copy()
+        new[tir, tic] = st[sir, sic]
+        self.cells = _pack_cells(new)
+        self._state = new
+        self._bleach[:] = 0
         self.rev += 1
+        self._state_rev = self.rev
+        self._dt_rev = -1
 
     # --- export --------------------------------------------------------------
     def occupancy_int8(self):
-        """ROS-style occupancy: -1 unknown, 0 = FREE, 100 = OCCUPIED. Row 0 = origin_y
-        (bottom). Returned row-major as int8, ready to dump to the web map file. Only
-        cells that have been seen get a probability; unseen cells are -1 directly.
-
-        Free-space cells MUST export as 0: the old `p = 1/(1+exp(log))` mapped log-odds
-        0 -> P=0.5 -> int8 50, so free-space dust rendered as "walls" and the map looked
-        like a two-tone wall everywhere (the 2026-09-11 "map all over the place" report).
-        Clamping the sigmoid so log<=0 snaps to 0 (free) and log>0 ramps to 100 keeps the
-        walls/floor separation unambiguous. Box-Muller-free: threshold-free piecewise."""
-        out = np.full(self.log.shape, -1, dtype=np.int8)
-        s = self.seen
-        if s.any():
-            L = self.log[s]
-            p = np.zeros(L.shape, dtype=np.float64)
-            pos = L > 0.0
-            if pos.any():
-                pl = L[pos]
-                p[pos] = 1.0 - 1.0 / (1.0 + np.exp(np.minimum(pl, 30.0)))
-            out[s] = (p * 100.0).astype(np.int8)
+        """ROS-style occupancy: -1 unknown, 0 = FREE, 100 = OCCUPIED. Row 0 =
+        origin_y (bottom). Free MUST export as 0 (or free-space dust renders as
+        'walls'); 100 = solid black under the web 'sharp walls' posterize (>=70)."""
+        st = self.state_view()
+        out = np.full(st.shape, -1, dtype=np.int8)
+        out[st == STATE_FREE] = 0
+        out[st == STATE_OCC] = 100
         return out
 
     def coverage(self):
-        """(seen_fraction, free_m2, occ_m2) — cheap mapping telemetry (two boolean sums
-        over the grid). Cheap enough to call at the map-write rate."""
-        seen = int(self.seen.sum())
-        free = int(((self.log < 0.0) & self.seen).sum())
-        occ = int(((self.log > 0.0) & self.seen).sum())
+        """(seen_fraction, free_m2, occ_m2) — cheap mapping telemetry (two boolean
+        sums over the grid)."""
+        st = self.state_view()
+        seen = st != STATE_UNKNOWN
         cell_a = self.res * self.res
-        return seen / float(self.n * self.n), free * cell_a, occ * cell_a
+        return (float(seen.sum()) / float(self.n * self.n),
+                float((st == STATE_FREE).sum()) * cell_a,
+                float((st == STATE_OCC).sum()) * cell_a)
 
     # --- no-go zones (human edits) -------------------------------------------
     def nogo_count(self):
@@ -293,8 +642,6 @@ class GridMap:
         return int(self.forbidden.sum())
 
     def _brush(self, c, r, radius, val):
-        """Mark the disk of coarse radius `radius` (cells) around (c, r) as val (on/off).
-        Vectorised over the disk bounding box so a web stroke costs ~nothing."""
         y0, y1 = max(0, r - radius), min(self.n - 1, r + radius)
         x0, x1 = max(0, c - radius), min(self.n - 1, c + radius)
         yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
@@ -302,26 +649,19 @@ class GridMap:
         self.forbidden[yy[disk], xx[disk]] = val
 
     def apply_stroke(self, x0, y0, x1, y1, brush_cells, erase=False):
-        """Paint a no-go (or erase) stroke from world (x0,y0) to (x1,y1) with a brush of
-        `brush_cells` radius. Walks the line at the grid pitch so a fast drag has no gaps.
-        Returns the number of cells changed."""
         c0, r0 = self.w2g(x0, y0)
         c1, r1 = self.w2g(x1, y1)
         dc, dr = float(c1 - c0), float(r1 - r0)
         steps = int(math.hypot(dc, dr) / 2) + 1
-        val = False if erase else True              # erase => clear forbidden
+        val = False if erase else True
         for i in range(steps + 1):
             t = i / max(1, steps)
             c, r = int(round(c0 + dc * t)), int(round(r0 + dr * t))
             self._brush(c, r, brush_cells, val)
-        self.forb_rev += 1                              # invalidate the _coarse memo
+        self.forb_rev += 1
         return int(self.forbidden.sum())
 
     def apply_action(self, action):
-        """Apply a single human edit dict (painted by the web map editor). Actions:
-          {"action":"stroke","x0":y?,"y0","x1","y1","brush":n,"erase":bool}
-          {"action":"clear"}               -> wipe ALL no-go zones
-        Any missing/first key -> no-op returning {"nogo": count}. Returns a status dict."""
         act = (action or {}).get("action")
         if act == "stroke":
             x0 = float(action.get("x0", 0.0)); y0 = float(action.get("y0", 0.0))
@@ -331,25 +671,20 @@ class GridMap:
             self.apply_stroke(x0, y0, x1, y1, brush, erase)
         elif act == "clear":
             self.forbidden[:] = False
-            self.forb_rev += 1                           # invalidate the _coarse memo
+            self.forb_rev += 1
         return {"nogo": self.nogo_count()}
 
     # --- persistence ---------------------------------------------------------
     def save(self, path):
-        """Persist the grid (log-odds + seen) compressed. A mostly-empty floor map is a
-        few tens of KB — the uniform regions zlib-compress hard. Atomic via a .tmp + rename
-        so a reader (or a crash mid-write) never sees a torn file."""
+        """Persist the packed ternary grid + no-go mask. Atomic .tmp + rename."""
         tmp = path + ".tmp"
-        np.savez_compressed(tmp, log=self.log, seen=self.seen,
-                            forb=self.forbidden,
+        np.savez_compressed(tmp, cells=self.cells, forb=self.forbidden,
                             n=np.int32(self.n), res=np.float32(self.res))
-        # np.savez appends .npz to a str path; normalise then rename onto the target.
         os.replace(tmp + ".npz" if not tmp.endswith(".npz") else tmp, path)
 
     def load(self, path):
-        """Load a grid written by save(). Returns True on success; False if the file is
-        missing/corrupt or its geometry (size/res) doesn't match this map (never load a
-        mismatched grid — the indices wouldn't line up)."""
+        """Load a grid written by save(); also imports the legacy float32 log-odds
+        format (log+seen) by collapsing it to ternary. Geometry mismatch -> False."""
         try:
             z = np.load(path, allow_pickle=False)
         except (OSError, ValueError, EOFError):
@@ -357,24 +692,39 @@ class GridMap:
         try:
             if int(z["n"]) != self.n or abs(float(z["res"]) - self.res) > 1e-9:
                 return False
-            self.log = np.ascontiguousarray(z["log"], dtype=np.float32)
-            self.seen = np.ascontiguousarray(z["seen"], dtype=bool)
-            # Older maps won't have the forb key — default to an empty mask rather
-            # than failing to load (no-go zones are opt-in edits).
-            forb = z["forb"] if "forb" in z else np.zeros(self.seen.shape, dtype=bool)
-            self.forbidden = np.ascontiguousarray(forb, dtype=bool)
+            if "cells" in z:
+                cells = np.ascontiguousarray(z["cells"], dtype=np.uint8)
+                if cells.size * 4 < self.n * self.n:
+                    return False
+            elif "log" in z and "seen" in z:
+                log = np.asarray(z["log"], dtype=np.float32)
+                seen = np.asarray(z["seen"], dtype=bool)
+                if log.shape != (self.n, self.n) or seen.shape != (self.n, self.n):
+                    return False
+                # legacy: seen & positive log-odds = occupied, seen & negative = free
+                st = np.where(seen,
+                              np.where(log > 0.0, STATE_OCC, STATE_FREE),
+                              STATE_UNKNOWN).astype(np.uint8)
+                cells = _pack_cells(st)
+            else:
+                return False
+            forb = z["forb"] if "forb" in z else np.zeros((self.n, self.n), dtype=bool)
         except (KeyError, ValueError):
             return False
+        self.cells = cells
+        self.forbidden = np.ascontiguousarray(forb, dtype=bool)
+        self._state = None
+        self._state_rev = -1
+        self._dt = None
+        self._dt_rev = -1
+        self._bleach[:] = 0
         self.rev += 1
-        self.forb_rev += 1                              # loaded content invalidates _coarse
+        self.forb_rev += 1
         return True
 
     # --- global planner (Stage 2) -------------------------------------------
-    OBST_L = 0.62        # log-odds threshold counted as an obstacle (~P>0.65)
-
     @staticmethod
     def _nearest_free(blocked, c, r, m, maxrad=6):
-        """Nearest non-blocked coarse cell to (c, r) in a small spiral (cols, rows)."""
         if 0 <= r < m and 0 <= c < m and not blocked[r, c]:
             return c, r
         for rad in range(1, maxrad + 1):
@@ -387,47 +737,39 @@ class GridMap:
 
     @staticmethod
     def _simplify(path):
-        """Drop collinear waypoints so the follower gets corners, not every cell."""
         if len(path) < 3:
             return path
         out = [path[0]]
         for i in range(1, len(path) - 1):
             ax, ay = path[i][0] - out[-1][0], path[i][1] - out[-1][1]
             bx, by = path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]
-            if abs(ax * by - ay * bx) > 1e-6:      # turn here -> keep it
+            if abs(ax * by - ay * bx) > 1e-6:
                 out.append(path[i])
         out.append(path[-1])
         return out
 
     def _coarse(self, downsample, radius_m, allow_unknown):
-        """Build the downsampled obstacle grid shared by plan() and frontiers(): coarse
-        occupied/seen masks + a robot-radius-inflated `blocked` mask. Returns
-        (blocked, seen_c, m, res_c). Memoized: the grid is immutable between map edits,
-        so frontier loops (many plan() calls per explore step) and idle replans reuse
-        the previous build instead of re-dilating it each time."""
+        """Downsampled obstacle grid shared by plan()/frontiers() (memoised by key
+        incl. rev/forb_rev). Occupancy now reads the ternary state directly."""
         key = (downsample, radius_m, allow_unknown, self.rev, self.forb_rev)
         c = self._coarse_cache
         if c is not None and c[0] == key:
             return c[1]
+        st = self.state_view()
         ds = max(1, int(downsample))
         m = self.n // ds
         res_c = self.res * ds
         k = m * ds
-        occ_c = (self.log[:k, :k] > self.OBST_L).reshape(m, ds, m, ds).any(axis=(1, 3))
-        seen_c = self.seen[:k, :k].reshape(m, ds, m, ds).any(axis=(1, 3))
+        occ_c = (st[:k, :k] == STATE_OCC).reshape(m, ds, m, ds).any(axis=(1, 3))
+        seen_c = (st[:k, :k] != STATE_UNKNOWN).reshape(m, ds, m, ds).any(axis=(1, 3))
         forb_c = self.forbidden[:k, :k].reshape(m, ds, m, ds).any(axis=(1, 3))
 
-        # inflate obstacles by the robot radius (L1 / diamond dilation, a few passes)
         blocked = occ_c.copy()
         for _ in range(max(1, int(round(radius_m / res_c)))):
             b = blocked.copy()
             b[1:, :] |= blocked[:-1, :]; b[:-1, :] |= blocked[1:, :]
             b[:, 1:] |= blocked[:, :-1]; b[:, :-1] |= blocked[:, 1:]
             blocked = b
-        # no-go zones: NEVER navigable, regardless of allow_unknown (they only cover a few
-        # cells each, so they get the same robot-radius inflation as obstacles). If a
-        # forbidden cell is reachable it's plannable around; if it walls a corridor the
-        # planner has to route around it like any obstacle.
         if forb_c.any():
             forb = forb_c.copy()
             for _ in range(max(1, int(round(radius_m / res_c)))):
@@ -442,18 +784,13 @@ class GridMap:
         return blocked, seen_c, m, res_c
 
     def frontiers(self, start, radius_m=0.16, downsample=4, k=8):
-        """Nearest-first list of up to `k` *frontier* points (world m): free coarse cells
-        that border still-unknown space — the classic autonomous-exploration target ("go
-        map the edge of what you know"). Vectorised on the same coarse grid as the planner,
-        so it's a handful of boolean ops on the 120x120 grid. Caller plans to the first
-        reachable one. Returns [] when the map is fully explored / no frontier exists."""
         blocked, seen_c, m, res_c = self._coarse(downsample, radius_m, True)
         free = seen_c & ~blocked
         unknown = ~seen_c
-        fr = np.zeros_like(free)                      # free cell 4-adjacent to unknown
-        fr[1:, :]  |= free[1:, :]  & unknown[:-1, :]
+        fr = np.zeros_like(free)
+        fr[1:, :] |= free[1:, :] & unknown[:-1, :]
         fr[:-1, :] |= free[:-1, :] & unknown[1:, :]
-        fr[:, 1:]  |= free[:, 1:]  & unknown[:, :-1]
+        fr[:, 1:] |= free[:, 1:] & unknown[:, :-1]
         fr[:, :-1] |= free[:, :-1] & unknown[:, 1:]
         if not fr.any():
             return []
@@ -466,16 +803,9 @@ class GridMap:
 
     def plan(self, start, goal, radius_m=0.16, downsample=4, allow_unknown=True,
              max_iter=1000):
-        """Plan a path from `start` to `goal` (world m) over a *downsampled* copy of the
-        grid (keeps CPU/RAM tiny: 24 m @ 5 cm / ds=4 -> 120x120 cells). Obstacles are
-        inflated by the robot radius; a vectorised wavefront from the goal gives a
-        distance field, then we descend it from the start. Returns world waypoints or
-        None if unreachable. Cheap enough to re-run ~1 Hz."""
         blocked, seen_c, m, res_c = self._coarse(downsample, radius_m, allow_unknown)
 
         def w2c(x, y):
-            # floor() (not int()) so negative coordinates map like w2g — int() truncates
-            # toward zero and would snap a point just below the origin onto cell 0.
             return (int(math.floor((x - self.origin) / res_c)),
                     int(math.floor((y - self.origin) / res_c)))
 
@@ -483,26 +813,14 @@ class GridMap:
         gc, gr = w2c(*goal)
         if not (0 <= sc < m and 0 <= sr < m and 0 <= gc < m and 0 <= gr < m):
             return None
-        gc0, gr0 = gc, gr                       # pre-snap goal cell (see the snap-collapse check)
-        gc, gr = self._nearest_free(blocked, gc, gr, m)     # snap goal off any wall
-        sc, sr = self._nearest_free(blocked, sc, sr, m)     # snap start out of inflation
+        gc0, gr0 = gc, gr
+        gc, gr = self._nearest_free(blocked, gc, gr, m)
+        sc, sr = self._nearest_free(blocked, sc, sr, m)
         if gc is None or sc is None:
             return None
         if (sc == gc and sr == gr) and (gc0 != sc or gr0 != sr):
-            # The goal's cell was BLOCKED and its nearest free neighbour is the robot's own
-            # cell (tight pocket / goal under a wall): the only "path" would be the start
-            # itself, which the follower would chase by spinning in place forever. Report
-            # unreachable instead of emitting that degenerate single-point plan.
             return None
 
-        # Straight-line fast path: if the whole segment is clear on the coarse
-        # (robot-inflated) grid, a straight shot beats the axis-aligned staircase
-        # the wavefront descent produces. A staircase hides most in a SMALL room
-        # where every leg is ~0.2 m: the follower turns 90° per cell (often within
-        # stop_distance of a wall -> stop/replan churn) and, once the lookahead
-        # overshoots a short leg, the next waypoint sits >150° behind -> a full
-        # in-place spin. Same clearance guarantee as the wavefront path: every cell
-        # the line crosses is a non-blocked cell (already inflated by robot_radius).
         dc, dr = gc - sc, gr - sr
         for i in range(max(abs(dc), abs(dr)) + 1):
             cc = sc + round(dc * i / max(1, abs(dc)))
@@ -512,9 +830,6 @@ class GridMap:
         else:
             p0 = (self.origin + (sc + 0.5) * res_c, self.origin + (sr + 0.5) * res_c)
             p1 = (self.origin + (gc + 0.5) * res_c, self.origin + (gr + 0.5) * res_c)
-            # start and goal collapsed onto the same coarse cell (e.g. a goal clicked
-            # inside the robot's own inflation, or a ~0.2 m hop) — return the bare goal
-            # instead of a degenerate two-identical-points path the follower would chase.
             if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) < res_c * 0.5:
                 return [p1]
             return [p0, p1]
@@ -532,13 +847,12 @@ class GridMap:
             cand[blocked] = BIG
             cand[gr, gc] = 0.0
             newd = np.minimum(dist, cand)
-            if np.array_equal(newd, dist):       # wavefront filled all reachable cells
+            if np.array_equal(newd, dist):
                 break
             dist = newd
         if dist[sr, sc] >= BIG:
-            return None                          # goal not reachable from start
+            return None
 
-        # descend the distance field start -> goal (greedy 4-neighbour steepest)
         path, r, c, limit = [], sr, sc, m * m
         for _ in range(limit):
             path.append((self.origin + (c + 0.5) * res_c, self.origin + (r + 0.5) * res_c))
@@ -553,3 +867,19 @@ class GridMap:
                 break
             r, c = nr, nc
         return self._simplify(path)
+
+    # --- dynamic tolerance helpers (velocity-scaled search / authority gates) ---
+    def vel_scale(self, vlin, vang):
+        """Velocity-dependent multiplier for match tolerance: expected wheel slip and
+        odometry error grow with the distance/rotation between scans. 1.0 when
+        parked; capped at 4x. Used by both the search window and the pose-trust gates
+        (slow driving = tighter trust, fast driving = more forgiveness)."""
+        s = 1.0 + 4.0 * max(0.0, float(vlin)) + 1.5 * abs(float(vang))
+        return min(4.0, max(1.0, s))
+
+    def search_window(self, vlin, vang, base_lin, base_ang):
+        """Scale the match (lin, ang) half-windows up with wheel velocity (vel_scale):
+        a faster-moving prior is less certain, so the matcher must be allowed to look
+        further before the wheels win."""
+        s = self.vel_scale(vlin, vang)
+        return base_lin * s, base_ang * s
