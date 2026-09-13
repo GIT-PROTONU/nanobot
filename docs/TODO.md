@@ -1,5 +1,10 @@
 # Improvements TODO
 
+> **NAV2 MIGRATION PLANNED** — see `docs/nav2-migration.md` for the checked, ready-to-build
+> plan replacing the custom `slam_nav` stack with Nav2 + slam_toolbox in a single
+> ComponentContainer process (planner + controller + bt_navigator + behavior + lifecycle
+> manager + slam_toolbox), incl. dropping nano-ekf/nano-map and deleting `src/slam_nav`.
+
 Findings from the 2026-07-16 full-code review. Items here are *code/robustness
 improvements spotted in review* — the separate feature backlog lives in
 `.claude/memory/software-features-todo.md`, and open investigations in the other
