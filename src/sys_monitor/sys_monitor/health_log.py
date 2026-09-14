@@ -28,11 +28,11 @@ PROGRESS_SECS = 60.0     # during an outage, snapshot counters this often
 MAX_BYTES = 512 * 1024   # rotate health.log -> health.log.1 past this
 
 # Localization-pipeline feed staleness (see FeedWatch below). These feeds publish
-# continuously (raw /odom ~15 Hz, EKF /odometry/filtered ~15 Hz, /imu/euler ~50 Hz),
-# but a STALE feed tells you the publisher (or an intermediate process like the EKF)
-# died without necessarily tripping the ESP32/LDS watchers above — so we watch each
-# one's age independently.
-PIPE_FEEDS = ("odom", "ekf", "imu")   # the three feeds tracked per-launch
+# continuously (raw /odom ~15 Hz, /imu/euler ~50 Hz), but a STALE feed tells you the
+# publisher died without necessarily tripping the ESP32/LDS watchers above — so we
+# watch each one's age independently. (The third feed used to be the robot_localization
+# EKF's /odometry/filtered; that node is gone since the Nav2/slam_toolbox migration.)
+PIPE_FEEDS = ("odom", "imu")   # the feeds tracked per-launch
 FEED_TIMEOUT = 3.0         # s without a message before a feed is declared DOWN
 FEED_GRACE = 20.0          # s of boot grace before "never seen" counts as DOWN
 

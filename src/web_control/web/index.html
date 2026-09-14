@@ -46,25 +46,11 @@
     </aside>
     <section id="left">
       <!-- shown only while the hero is collapsed away (#app.hero-hidden, mobile) -->
-      <button id="heroReveal">▾ Show lidar / map / camera view</button>
+      <button id="heroReveal">▾ Show lidar / camera view</button>
       <div id="hero">
         <div id="view-lidar" class="view on">
           <div id="wrap"><canvas id="cv"></canvas></div>
           <button id="fit" class="overlay-btn">⤢ Fit</button>
-        </div>
-        <div id="view-map" class="view">
-          <div id="mapWrap">
-            <canvas id="mapcv"></canvas>
-            <!-- single <span> child: #mapWait is a flex centerer, and bare inline
-                 children would each become their own flex item and reflow -->
-            <div id="mapWait"><span>waiting for map… is the lidar spinning?<br>
-              (set <b>Spin target</b> &gt; 0 rpm in <b>Sensors</b> → Lidar (LDS))</span></div>
-          </div>
-          <div id="mapZoomBtns" class="map-zoom overlay-btn">
-            <button id="mapZoomOut" title="Zoom out">−</button>
-            <button id="mapZoomIn" title="Zoom in">+</button>
-          </div>
-          <button id="mapFit" class="overlay-btn">⤢ Fit</button>
         </div>
         <div id="view-cam" class="view">
           <img id="cam" alt="">
@@ -77,7 +63,6 @@
         </div>
         <div id="viewSwitch">
           <button data-view="lidar" class="active">Lidar</button>
-          <button data-view="map">Map</button>
           <button data-view="cam">Camera</button>
           <button data-view="oled">OLED</button>
         </div>
@@ -86,39 +71,6 @@
       </div>
 
       <div id="heroCtl">
-        <div id="ctlMap">
-          <!-- hidden checkbox driven by the view switcher; keeps the old map handler -->
-          <input type="checkbox" id="mapOn" hidden>
-          <div id="mapCtl" class="chiprow">
-            <label class="switch"><input type="checkbox" id="mapMotion"><span class="track"></span> Motion</label>
-            <label class="switch"><input type="checkbox" id="mapExplore"><span class="track"></span> Auto-explore</label>
-            <button id="mapStop" class="btn danger">■ Stop</button>
-            <button id="mapHome" class="btn">⌂ Go home</button>
-            <button id="mapSave" class="btn">💾 Save map</button>
-            <button id="mapClear" class="btn danger">🗑 Clear map</button>
-            <button id="mapTest" class="btn">🔧 Self-test</button>
-          </div>
-          <div id="wallCtl" class="chiprow">
-            <label class="switch"><input type="checkbox" id="mapShade" checked><span class="track"></span> Sharp walls</label>
-            <label class="switch"><input type="checkbox" id="mapWallGuard"><span class="track"></span> Wall guard</label>
-            <label class="wall-dist">Keep-away <span id="mapWallDistV">0.25</span> m
-              <input id="mapWallDist" type="range" min="0.05" max="0.80" step="0.01" value="0.25"></label>
-          </div>
-          <div id="mapStats"></div>
-          <pre id="mapTestOut" style="display:none"></pre>
-          <p class="hint" id="mapHint" style="display:none">2D occupancy map from
-            <b>slam_nav</b>, served raw from <b>/dev/shm</b>. Scroll / pinch to zoom, drag to
-            pan, <b>⤢ Fit</b> recentres. <b>Tap the map to set a goal</b> —
-            the green line is the plan. It only drives when <b>Motion</b> is on (else it just
-            plans). Red = robot, yellow = goal, cyan = trail, ⌂ = home, dashed circle =
-            the <b>keep-away distance</b> the robot keeps from walls. <b>Wall guard</b> applies
-            that same distance to <b>manual driving</b> (the robot won't drive into a wall,
-            only turn away). <b>Auto-explore</b>
-            drives to unmapped frontiers; <b>Save map</b> persists it. <b>Clear map</b> wipes
-            the current grid and starts fresh from wherever the robot is standing right now
-            (like a reboot) — use it to recover from a corrupted/smeared map without
-            restarting anything. Cannot be undone.</p>
-        </div>
         <div id="ctlCam">
           <!-- hidden checkbox driven by the view switcher; keeps the old camera handler -->
           <input type="checkbox" id="camOn" hidden>
@@ -354,7 +306,7 @@
               make the brain perform it more often — the count weights the skill-beat lottery;
               shift-click a 👍 to take one back. <b>Action</b> skills (move / LED) run only when
               <code>skills_allow_actions</code> is enabled in <code>robot.yaml</code>; motion
-              stays clamped by <code>slam_nav</code>.</p>
+              speeds are clamped in <code>web_server</code> itself.</p>
             <h2 style="margin-top:10px">🧪 Workshop · skills on trial</h2>
             <p class="hint" id="workshopStatus">loading…</p>
             <div id="workshopList" class="skills"></div>
@@ -614,59 +566,8 @@
             </div>
             <div class="field"><label>Publish rate <span id="odoRateV">15</span> Hz</label>
               <input id="odoRate" type="range" min="1" max="50" step="1" value="15"></div>
-            <p class="hint"><b>/odom</b> + TF from <b>wheel_odometry</b>. Lower rate = less CPU.</p>
-          </div>
-          <div class="card">
-            <h2>Motion chain (wheels → EKF → SLAM)</h2>
-            <div class="kv">
-              <span>wheels /odom θ</span><b id="mcWheel">–</b>
-              <span>EKF θ</span><b id="mcEkf">–</b>
-              <span>IMU θ</span><b id="mcImu">–</b>
-              <span>SLAM map θ</span><b id="mcSlam">–</b>
-            </div>
-            <div class="kv">
-              <span>θ rate wheels</span><b id="mcRotW">–</b>
-              <span>θ rate IMU</span><b id="mcRotI">–</b>
-              <span>wheel↔IMU</span><b id="mcSign">–</b>
-              <span>slip</span><b id="mcSlip">–</b>
-            </div>
-            <div class="kv">
-              <span>match score</span><b id="mcScore">–</b>
-              <span>overlap</span><b id="mcOverlap">–</b>
-              <span>lost</span><b id="mcLost">–</b>
-              <span>loop drift</span><b id="mcLoop">–</b>
-            </div>
-            <div class="kv">
-              <span>feed odom</span><b id="mcFOdo">–</b>
-              <span>feed EKF</span><b id="mcFEkf">–</b>
-              <span>feed IMU</span><b id="mcFImu">–</b>
-              <span>feed lidar</span><b id="mcFScan">–</b>
-            </div>
-            <p class="kv-status" id="mcVerdict">waiting for telemetry…</p>
-          </div>
-          <div class="card">
-            <h2>EKF (robot_localization)</h2>
-            <div class="kv">
-              <span>output rate</span><b id="ekfHz">–</b>
-              <span>feed age</span><b id="ekfAge">–</b>
-              <span>config file</span><b id="ekfPath">–</b>
-              <span>writable</span><b id="ekfWr">–</b>
-            </div>
-            <div class="field"><label>Rate <span id="ekfFreqV">–</span> Hz</label>
-              <input id="ekfFreq" type="range" min="2" max="30" step="1"></div>
-            <div class="field"><label>Sensor timeout <span id="ekfTOV">–</span> s</label>
-              <input id="ekfTO" type="range" min="0.05" max="2.0" step="0.05"></div>
-            <div class="field"><label>Pos-noise X <span id="ekfPnXV">–</span></label>
-              <input id="ekfPnX" type="range" min="0.005" max="0.5" step="0.005"></div>
-            <div class="field"><label>Pos-noise Y <span id="ekfPnYV">–</span></label>
-              <input id="ekfPnY" type="range" min="0.005" max="0.5" step="0.005"></div>
-            <div class="field"><label>Yaw-noise <span id="ekfPnYawV">–</span></label>
-              <input id="ekfPnYaw" type="range" min="0.01" max="1.0" step="0.01"></div>
-            <div class="row" style="margin-top:8px">
-              <button class="btn" id="ekfSave">Save to config</button>
-              <button class="btn primary" id="ekfApply">Restart EKF (apply)</button>
-            </div>
-            <p class="kv-status" id="ekfStatus">loading…</p>
+            <p class="hint"><b>/odom</b> + odom→base_link TF from <b>wheel_odometry</b>
+              (the pose chain slam_toolbox + Nav2 build on). Lower rate = less CPU.</p>
           </div>
           <div class="card">
             <h2>Lidar (LDS)</h2>
@@ -683,20 +584,15 @@
               <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
             <div class="field"><label>Spin target <span id="ldsTgtV">300</span> rpm</label>
               <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
-            <label class="switch"><input type="checkbox" id="navLdsIdleEnable" checked><span class="track"></span>
-              Idle spin-down</label>
-            <div class="field"><label>Spin down after <span id="navLdsIdleV">60</span>s idle</label>
-              <input id="navLdsIdle" type="range" min="0" max="300" step="10" value="60"></div>
             <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
               <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
               bad-checksum packets since start (climbing fast = degraded serial RX wiring).
               When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
               UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.
-              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets the
-              rpm to resume to (applied immediately while spinning, else at the next wake).
-              <b>Idle spin-down</b> parks the spin motor (0 rpm) after this long with no
-              motion/goal/exploring, and wakes instantly on a new goal, exploring, teleop
-              motion, pickup, or relocalizing — untick to keep the lidar always spinning.</p>
+              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets
+              the rpm the ESP32 spins at (published straight to <b>/lds_target_rpm</b>).
+              0 = park the spin motor (the old idle auto-spin-down died with slam_nav —
+              use this manually if you want the lidar quiet).</p>
           </div>
           <div class="card">
             <h2>Camera (GPU vision)</h2>
@@ -733,33 +629,6 @@
                 <button id="visTargetUse" class="btn">✓ Track</button>
                 <button id="visTargetDel" class="btn danger">🗑</button>
               </div>
-            </div>
-            <label class="switch"><input type="checkbox" id="navTrackEnable"><span class="track"></span>
-              🎯 Track target (turn to keep centered)</label>
-            <p class="exp" id="trackTuneToggle">▸ Tracking tuning</p>
-            <div id="trackTune" style="display:none">
-              <div class="field"><label>Turn gain <span id="trackKpV">2.0</span></label>
-                <input id="trackKp" type="range" min="0.5" max="6" step="0.1" value="2.0"></div>
-              <div class="field"><label>Braking <span id="trackKdV">0.5</span></label>
-                <input id="trackKd" type="range" min="0" max="2" step="0.05" value="0.5"></div>
-              <div class="field"><label>Max turn rate <span id="trackMaxAngV">2.0</span> rad/s</label>
-                <input id="trackMaxAng" type="range" min="0.2" max="3" step="0.1" value="2.0"></div>
-              <div class="field"><label>Min effective turn rate <span id="trackMinEffAngV">0.2</span> rad/s</label>
-                <input id="trackMinEffAng" type="range" min="0.1" max="0.5" step="0.01" value="0.2"></div>
-              <div class="field"><label>Center deadband <span id="trackDeadbandV">4</span>%</label>
-                <input id="trackDeadband" type="range" min="0" max="20" step="1" value="4"></div>
-              <div class="field"><label>Min confidence to trust <span id="trackConfMinV">2</span>%</label>
-                <input id="trackConfMin" type="range" min="0" max="30" step="1" value="2"></div>
-              <div class="field"><label>Soft deadband edge <span id="trackDeadbandSoftV">4</span>%</label>
-                <input id="trackDeadbandSoft" type="range" min="0" max="20" step="1" value="4"></div>
-              <div class="field"><label>Full-authority confidence <span id="trackConfScaleV">10</span>%</label>
-                <input id="trackConfScale" type="range" min="0" max="50" step="1" value="10"></div>
-              <div class="field"><label>Coast on loss <span id="trackCoastV">0.20</span> s</label>
-                <input id="trackCoast" type="range" min="0" max="1" step="0.05" value="0.2"></div>
-              <div class="field"><label>Integral gain <span id="trackKiV">0.0</span></label>
-                <input id="trackKi" type="range" min="0" max="2" step="0.05" value="0"></div>
-              <div class="field"><label>Target feedforward <span id="trackKffV">0.5</span></label>
-                <input id="trackKff" type="range" min="0" max="2" step="0.05" value="0.5"></div>
             </div>
             <label class="switch"><input type="checkbox" id="visDarkAuto"><span class="track"></span>
               Dark reflex (auto-LED)</label>
@@ -962,8 +831,8 @@
               </select></div>
             <p class="hint">Live from the ESP32 (zenoh-pico over UART). LDS spin telemetry
               + target rpm moved to the <b>Lidar (LDS)</b> card above. The override publishes
-              <b>/pickup_override</b> so pick-up-gated behaviour (SLAM freeze, mood reflex)
-              can be tested off the ground; the L/R rows keep showing the real switches.
+              <b>/pickup_override</b> so pick-up-gated behaviour (mood reflex) can be tested
+              off the ground; the L/R rows keep showing the real switches.
               Resets to auto on page reload. <b>Stray ticks</b> = ticks the ESP32 counted
               while that wheel was commanded (and settled) stopped — should stay at 0;
               a rising count with the robot motionless means encoder-line noise
@@ -974,57 +843,6 @@
               units/sec) instead of stepping straight to it — lower is smoother/gentler
               but laggier, higher is snappier but jerkier. A dead-man stop (lost link/cmd)
               always cuts power immediately, ignoring this ramp.</p>
-          </div>
-          <div class="card">
-            <h2>Navigation (slam_nav)</h2>
-            <div class="field"><label>Max speed <span id="navMaxLinV">0.15</span> m/s</label>
-              <input id="navMaxLin" type="range" min="0.05" max="0.4" step="0.01" value="0.15"></div>
-            <div class="field"><label>Max turn <span id="navMaxAngV">1.0</span> rad/s</label>
-              <input id="navMaxAng" type="range" min="0.2" max="3.0" step="0.1" value="1.0"></div>
-            <div class="field"><label>Stop distance <span id="navStopDistV">0.25</span> m</label>
-              <input id="navStopDist" type="range" min="0.10" max="0.60" step="0.01" value="0.25"></div>
-            <div class="field"><label>Robot radius <span id="navRadiusV">0.16</span> m</label>
-              <input id="navRadius" type="range" min="0.05" max="0.30" step="0.01" value="0.16"></div>
-            <div class="field"><label>Stuck timeout <span id="navStuckV">off</span></label>
-              <input id="navStuck" type="range" min="0" max="10" step="0.5" value="0"></div>
-            <label class="switch"><input type="checkbox" id="navRelocalize" checked><span class="track"></span>
-              Auto-relocalize when lost</label>
-            <label class="switch"><input type="checkbox" id="navPickupPause" checked><span class="track"></span>
-              Pause SLAM when picked up</label>
-            <details class="hint" open>
-              <summary class="row-label">SLAM scan-matching (alignment gates)</summary>
-              <div class="field"><label>Min map overlap <span id="navOverlapV">10</span>%</label>
-                <input id="navOverlap" type="range" min="0" max="50" step="1" value="10"></div>
-              <div class="field inline">Beam quality floor <span id="navQualV">off</span>
-                <input id="navQual" type="number" min="0" max="65535" value="0"></div>
-              <div class="field"><label>Loop-closure min score <span id="navLoopScoreV">4.0</span></label>
-                <input id="navLoopScore" type="range" min="1" max="10" step="0.5" value="4"></div>
-              <div class="field"><label>Loop re-probe every <span id="navLoopProbeV">50</span> scans</label>
-                <input id="navLoopProbe" type="range" min="10" max="200" step="5" value="50"></div>
-              <label class="switch"><input type="checkbox" id="navLoop" checked><span class="track"></span>
-                True loop closure</label>
-              <p class="hint"><b>Min map overlap</b> = the fraction of beams that must land
-                on already-mapped cells before a scan is trusted (inlier gate). Raising it
-                rejects more garbage/degenerate scans at the cost of refusing to extend the
-                map in freshly-seen areas. <b>Beam quality floor</b> drops
-                /scan.intensities below this value before match+integrate (0 = off — tune
-                after checking the driver's intensity range on hardware). <b>Loop-closure
-                score/probe</b> drive the wide-window far-revisit re-match that bleeds off
-                accumulated odometry drift.</p>
-            </details>
-            <p class="hint"><b>Max speed/turn</b> cap the pursuit controller (also used by
-              <b>Motion</b> in the Map view). <b>Stop distance</b> = obstacle range ahead that
-              triggers a reactive stop+replan; <b>Robot radius</b> = obstacle inflation used by
-              the planner. <b>Stuck timeout</b> aborts a goal if commanded but not actually
-              moving for that long ("off" = never). A goal with NO path at all (unreachable
-              on the current map) is separately given up on after
-              <b>goal_no_path_timeout</b> (20 s default, settable via <b>/param</b>) — without
-              this an unreachable goal sat latched forever, which also silently kept the LDS
-              idle spin-down from ever kicking in (a set goal counts as "still needs scans").
-              <b>Auto-relocalize</b> is the local
-              lost-robot recovery (wide scan-match + spin); <b>Pause SLAM when picked up</b>
-              freezes mapping while both wheels are off the ground. All apply live, no
-              restart. LDS idle spin-down moved to the <b>Lidar (LDS)</b> card above.</p>
           </div>
         </section>
 
@@ -1484,13 +1302,11 @@ let scale=40, panX=0, panY=0;            // px per metre
 let dragging=false,dsx=0,dsy=0,dpx=0,dpy=0;
 let frame=[];                            // [{x,y}] metres, latest scan
 let scanCount=0, lastHzT=performance.now(), scanHz=0;
-// wall-guard state from the telemetry frame (f.wall_guard) — the map draw() uses it
-// to colour the keep-away bubble; onFrame keeps it in sync with the server.
-let wallGuardActive=false, wallGuardBlocked=false;
 
 // ---- server link state (SSE /telemetry — there is no rosbridge anymore) ----
 let connected=false;                     // the /telemetry stream is live
-// slam_nav view+plan state (read by the map panel script)
+// sim view+goal state (kept for the in-browser simulator; goals publish to
+// /goal_pose, which Nav2's bt_navigator consumes)
 let mapPlan=[], mapGoal=null;
 
 $("connect").onclick=()=>connected?disconnect():connect();
@@ -1561,38 +1377,14 @@ $("ldsRate").oninput=()=>$("ldsRateV").textContent=$("ldsRate").value;
 $("ldsRate").onchange=()=>setNodeRate("lds_driver",Number($("ldsRate").value));
 $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
 $("odoRate").onchange=()=>setNodeRate("wheel_odometry",Number($("odoRate").value));
-// publish a navigation goal in the map frame; slam_nav plans a path toward it.
+// publish a navigation goal in the map frame (Nav2's bt_navigator navigates to it).
 function mapSetGoal(wx,wy){ pub("/goal_pose",{x:wx,y:wy}); mapGoal=[wx,wy]; }
-const setNavMotion=on=>setParam("slam_nav","enable_motion",on);
-const setNavExplore=on=>setParam("slam_nav","auto_explore",on);
-// slam_nav navigation tuning (Sensors tab) — all whitelisted + live, no restart needed.
-$("navMaxLin").oninput=()=>$("navMaxLinV").textContent=$("navMaxLin").value;
-$("navMaxLin").onchange=()=>setParam("slam_nav","max_lin",Number($("navMaxLin").value));
-$("navMaxAng").oninput=()=>$("navMaxAngV").textContent=$("navMaxAng").value;
-$("navMaxAng").onchange=()=>setParam("slam_nav","max_ang",Number($("navMaxAng").value));
-$("navStopDist").oninput=()=>$("navStopDistV").textContent=$("navStopDist").value;
-$("navStopDist").onchange=()=>{
-  setParam("slam_nav","stop_distance",Number($("navStopDist").value));
-  setParam("web_control","wall_guard_distance",Number($("navStopDist").value));
-};
-$("navRadius").oninput=()=>$("navRadiusV").textContent=$("navRadius").value;
-$("navRadius").onchange=()=>setParam("slam_nav","robot_radius",Number($("navRadius").value));
-$("navStuck").oninput=()=>$("navStuckV").textContent=Number($("navStuck").value)===0?"off":$("navStuck").value+" s";
-$("navStuck").onchange=()=>setParam("slam_nav","stuck_timeout",Number($("navStuck").value));
-$("navRelocalize").onchange=e=>setParam("slam_nav","relocalize",e.target.checked);
-$("navPickupPause").onchange=e=>setParam("slam_nav","pickup_pause",e.target.checked);
-$("navLdsIdleEnable").onchange=e=>setParam("slam_nav","lds_idle_enable",e.target.checked);
-$("navLdsIdle").oninput=()=>$("navLdsIdleV").textContent=Number($("navLdsIdle").value)===0?"off":$("navLdsIdle").value;
-$("navLdsIdle").onchange=()=>setParam("slam_nav","lds_idle_timeout",Number($("navLdsIdle").value));
-// LDS spin-speed setpoint -> slam_nav's lds_active_rpm param (the rpm to resume to).
-// NOT a direct /lds_target_rpm publish: slam_nav owns that topic (idle spin-down
-// toggles it between active/idle), and publishing over it here would win on every
-// browser (re)connect and fight the parked state -- which is why spin-down was never
-// observed. slam_nav applies the new rpm immediately if currently spinning, or at the
-// next wake if currently parked.
+// Lidar spin-speed setpoint -> /lds_target_rpm (Float32) on the ESP32. The old
+// slam_nav-owned param path (lds_active_rpm + idle spin-down) is gone with
+// slam_nav; this publishes the topic directly.
 $("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
 $("ldsTgt").onchange=()=>publishLdsTgt();
-function publishLdsTgt(){ setParam("slam_nav","lds_active_rpm",Number($("ldsTgt").value)); }
+function publishLdsTgt(){ pub("/lds_target_rpm",Number($("ldsTgt").value)); }
 // Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
 $("pickupOv").onchange=()=>publishPickupOv();
 function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value)); }
@@ -1648,9 +1440,8 @@ $("fanSmooth").oninput=()=>$("fanSmoothV").textContent=$("fanSmooth").value;
 $("fanSmooth").onchange=()=>setParam("sys_monitor","fan_smooth_alpha",Number($("fanSmooth").value)/100);
 // On (re)connect, push the current Auto/override state once so the node matches the UI.
 function syncFan(){ setFanOverride($("fanAuto").checked?-1:Number($("fanOv").value)/100); }
-// On (re)connect, push the slider's current value once so slam_nav's active-rpm param
-// matches the UI without a manual drag. Safe to call on every reconnect now that this
-// only sets the param slam_nav reads, not the /lds_target_rpm topic it owns.
+// On (re)connect, push the slider's current value once so the ESP32's spin target
+// matches the UI without a manual drag.
 function syncLdsTgt(){ publishLdsTgt(); }
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
@@ -2020,7 +1811,7 @@ function setConn(ok){
 }
 
 // ---- telemetry frame fan-out: one frame updates every readout ----------------
-let rawPurpose="", rawTask="", rawExp="", rawSelftest="", rawSchedule="", rawImuCal="", rawMountSettings="";
+let rawPurpose="", rawTask="", rawExp="", rawSchedule="", rawImuCal="", rawMountSettings="";
 function onFrame(f){
   if(f.odom) onOdom(f.odom);
   if(f.imu) onImu(f.imu);
@@ -2029,23 +1820,7 @@ function onFrame(f){
   onEsp(f.esp||{}, f.susp||[]);
   onLds(f.lds||{});
   if(f.fan!==undefined) $("fanDuty").textContent=(f.fan*100).toFixed(0)+"%";
-  if(f.plan) mapPlan=f.plan;
-  // wall-guard state -> Map card toggle + slider + the keep-away bubble colour. Only
-  // re-apply on an actual change so it never fights the user mid-drag.
-  if(f.wall_guard){
-    const wg=f.wall_guard;
-    const tg=$("mapWallGuard");
-    if(tg && tg.checked!==!!wg.enable) tg.checked=!!wg.enable;
-    const sd=$("mapWallDist");
-    if(sd && Math.abs(Number(sd.value)-wg.distance)>0.005){
-      sd.value=wg.distance; $("mapWallDistV").textContent=wg.distance.toFixed(2);
-    }
-    wallGuardActive=!!wg.enable;
-    wallGuardBlocked=!!wg.blocked;
-  }
   onVision(f.vision);
-  if(f.selftest && f.selftest!==rawSelftest){ rawSelftest=f.selftest;
-    const el=$("mapTestOut"); el.style.display="block"; el.textContent=f.selftest; }
   // IMU mag readout for eyeballing calibration quality (see the IMU card's hint) +
   // the async status line from imu_driver._publish_cal_status.
   if(f.imuMag) onImuMag(f.imuMag);
@@ -2363,37 +2138,6 @@ $("visDarkOn").oninput=()=>$("visDarkOnV").textContent=$("visDarkOn").value;
 $("visDarkOff").oninput=()=>$("visDarkOffV").textContent=$("visDarkOff").value;
 $("visDarkOn").onchange=syncDarkReflex;
 $("visDarkOff").onchange=syncDarkReflex;
-
-// Vision target tracking (pan-only visual servoing, owned by slam_nav — see
-// track_* params/robot.yaml). Turning it on WINS over any active goal/auto-explore.
-$("navTrackEnable").onchange=e=>setParam("slam_nav","track_enable",e.target.checked);
-$("trackTuneToggle").onclick=()=>{
-  const box=$("trackTune"), open=box.style.display!=="block";
-  box.style.display=open?"block":"none";
-  $("trackTuneToggle").textContent=(open?"▾":"▸")+" Tracking tuning";
-};
-$("trackKp").oninput=()=>$("trackKpV").textContent=$("trackKp").value;
-$("trackKp").onchange=()=>setParam("slam_nav","track_kp",Number($("trackKp").value));
-$("trackKd").oninput=()=>$("trackKdV").textContent=$("trackKd").value;
-$("trackKd").onchange=()=>setParam("slam_nav","track_kd",Number($("trackKd").value));
-$("trackMaxAng").oninput=()=>$("trackMaxAngV").textContent=$("trackMaxAng").value;
-$("trackMaxAng").onchange=()=>setParam("slam_nav","track_max_ang",Number($("trackMaxAng").value));
-$("trackMinEffAng").oninput=()=>$("trackMinEffAngV").textContent=$("trackMinEffAng").value;
-$("trackMinEffAng").onchange=()=>setParam("slam_nav","track_min_eff_ang",Number($("trackMinEffAng").value));
-$("trackDeadband").oninput=()=>$("trackDeadbandV").textContent=$("trackDeadband").value;
-$("trackDeadband").onchange=()=>setParam("slam_nav","track_deadband",Number($("trackDeadband").value)/100);
-$("trackConfMin").oninput=()=>$("trackConfMinV").textContent=$("trackConfMin").value;
-$("trackConfMin").onchange=()=>setParam("slam_nav","track_conf_min",Number($("trackConfMin").value)/100);
-$("trackDeadbandSoft").oninput=()=>$("trackDeadbandSoftV").textContent=$("trackDeadbandSoft").value;
-$("trackDeadbandSoft").onchange=()=>setParam("slam_nav","track_deadband_soft",Number($("trackDeadbandSoft").value)/100);
-$("trackConfScale").oninput=()=>$("trackConfScaleV").textContent=$("trackConfScale").value;
-$("trackConfScale").onchange=()=>setParam("slam_nav","track_conf_scale",Number($("trackConfScale").value)/100);
-$("trackCoast").oninput=()=>$("trackCoastV").textContent=Number($("trackCoast").value).toFixed(2);
-$("trackCoast").onchange=()=>setParam("slam_nav","track_coast",Number($("trackCoast").value));
-$("trackKi").oninput=()=>$("trackKiV").textContent=Number($("trackKi").value).toFixed(1);
-$("trackKi").onchange=()=>setParam("slam_nav","track_ki",Number($("trackKi").value));
-$("trackKff").oninput=()=>$("trackKffV").textContent=Number($("trackKff").value).toFixed(2);
-$("trackKff").onchange=()=>setParam("slam_nav","track_kff",Number($("trackKff").value));
 
 $("visionAlertsToggle").onclick=()=>{
   const box=$("visionAlertsTune"), open=box.style.display!=="block";
@@ -3245,277 +2989,6 @@ connect();   // auto-connect on load
 </script>
 
 <script>
-// ---- SLAM map panel ----------------------------------------------------------
-// Self-contained, pure HTTP: poll the raw occupancy map from /map (same-origin,
-// written by slam_nav to /dev/shm) and render it — no rosbridge involved. The map
-// file is a JSON metadata line, '\n', then raw int8 occupancy (-1 unknown, 0 free ..
-// 100 occupied; row 0 = origin_y). Canvas clicks -> /goal_pose.
-(function(){
-  "use strict";
-  const $=id=>document.getElementById(id);
-  const cv=$("mapcv"), ctx=cv.getContext("2d");
-  const dec=new TextDecoder();
-  let timer=null, lastMeta=null;
-  let mapCanvas=null, img=null;        // offscreen grid-res canvas holding the occupancy grid
-  let lastGrid=null;                   // last raw occupancy bytes, for immediate re-shade on toggle
-  let sharpShade=true;                 // wall shading: sqrt gamma (crisp) vs linear (soft)
-
-  // ---- zoom / pan: the display canvas is sized to the wrap (× devicePixelRatio) and
-  //      every frame re-renders it in SCREEN pixels. Smoothed drawImage is only used
-  //      when MAGNIFIED past native grid res (zooming in interpolates instead of
-  //      showing chunky cells); at the fit/zoomed-out scale the map is downscaled
-  //      (e.g. 1200px -> ~500px at fit), where bilinear smoothing smears walls into a
-  //      soft grey blur — nearest-neighbour keeps 2 cm cells crisp (= sharp walls) so
-  //      the map reads as clearly as the raw lidar view. Vector overlays are always
-  //      drawn at full display resolution, razor sharp at any zoom. ----
-  const wrap=$("mapWrap");
-  let gw=0, gh=0, zoom=0, panX=0, panY=0;   // zoom 0 = auto-fit to the wrap
-  const dpr=()=>window.devicePixelRatio||1;
-  const fitZoom=()=> gw? Math.min(wrap.clientWidth/gw, wrap.clientHeight/gh)||1 : 1;
-  const cX=z=>((wrap.clientWidth-gw*z)/2), cY=z=>((wrap.clientHeight-gh*z)/2);
-  const origin=z=>[cX(z)+panX, cY(z)+panY]; // top-left of the map in screen px
-  function sizeCv(){
-    const d=dpr(), w=Math.max(1,Math.round(wrap.clientWidth*d)), h=Math.max(1,Math.round(wrap.clientHeight*d));
-    if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; }
-  }
-  function repaint(){
-    if(!lastMeta||!mapCanvas) return;
-    sizeCv(); ctx.setTransform(dpr(),0,0,dpr(),0,0);
-    ctx.clearRect(0,0,wrap.clientWidth,wrap.clientHeight);
-    const z=zoom||fitZoom(), [x0,y0]=origin(z);
-    // crisp when at/under native res, interpolated only when magnified past 1:1
-    ctx.imageSmoothingEnabled = z > 1;
-    if("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality="high";
-    ctx.drawImage(mapCanvas,x0,y0,gw*z,gh*z);
-    ctx.imageSmoothingEnabled=false;
-    const m=lastMeta;
-    const W2P=(x,y)=>[x0+((x-m.ox)/m.res)*z, y0+((gh-1)-(y-m.oy)/m.res)*z]; // world -> screen px
-    // breadcrumb trail (cyan polyline) — where the robot has been
-    if(m.trail && m.trail.length>1){
-      ctx.strokeStyle="#22d3ee"; ctx.lineWidth=1; ctx.globalAlpha=0.7; ctx.beginPath();
-      m.trail.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
-      ctx.stroke(); ctx.globalAlpha=1;
-    }
-    // planned path (green polyline)
-    if(mapPlan && mapPlan.length>1){
-      ctx.strokeStyle="#34c759"; ctx.lineWidth=2; ctx.beginPath();
-      mapPlan.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
-      ctx.stroke();
-    }
-    // home marker (origin) — small magenta square
-    if(m.hx!==undefined){
-      const [hx,hy]=W2P(m.hx,m.hy), hs=3;
-      ctx.strokeStyle="#c084fc"; ctx.lineWidth=1; ctx.strokeRect(hx-hs,hy-hs,2*hs,2*hs);
-    }
-    // goal marker (yellow ring)
-    if(mapGoal){
-      const [gx,gy]=W2P(mapGoal[0],mapGoal[1]);
-      ctx.strokeStyle="#ffd60a"; ctx.lineWidth=1.5;
-      ctx.beginPath(); ctx.arc(gx,gy,5,0,6.2832); ctx.stroke();
-    }
-    // robot pose: a small, crisp dot + heading line, drawn at full display resolution
-    // so it stays sharp (and constant-sized on screen) at any zoom.
-    const [rx,ry]=W2P(m.px,m.py), R=3.5;
-    ctx.fillStyle="#ff3b30";
-    ctx.strokeStyle="rgba(10,10,14,0.6)"; ctx.lineWidth=1;   // thin dark halo on light map
-    ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
-    ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.fill();
-    ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2; ctx.lineCap="round";
-    ctx.beginPath(); ctx.moveTo(rx,ry);
-    ctx.lineTo(rx+9*Math.cos(m.pth), ry-9*Math.sin(m.pth)); ctx.stroke();
-    ctx.lineCap="butt";
-    // wall keep-away bubble: the distance the robot keeps from walls (stop_distance,
-    // in the map header as `wd`), drawn as a dashed circle around the robot. Grey =
-    // the autonomous-navigation distance; blue = the manual wall-guard is on; orange
-    // = the guard is actively refusing a drive into a wall right now.
-    if(m.wd!==undefined && m.wd>0){
-      const Rb=(m.wd/m.res)*z;
-      ctx.strokeStyle=wallGuardBlocked?"#ff9500":(wallGuardActive?"#0a84ff":"#63666b");
-      ctx.lineWidth=wallGuardBlocked?2.5:1.5;
-      ctx.setLineDash([5,4]);
-      ctx.beginPath(); ctx.arc(rx,ry,Rb,0,6.2832); ctx.stroke();
-      ctx.setLineDash([]);
-    }
-  }
-  function fitMap(){ zoom=0; panX=0; panY=0; repaint(); }
-  function zoomAt(factor,mx,my){
-    const z=zoom||fitZoom();
-    const z1=Math.min(20,Math.max(fitZoom()*0.5, z*factor));
-    if(z1===z) return;
-    const [tx,ty]=origin(z);
-    const gx=(mx-tx)/z, gy=(my-ty)/z;               // grid pixel under cursor / pinch centre
-    zoom=z1; panX=mx-gx*z1-cX(z1); panY=my-gy*z1-cY(z1);
-    repaint();
-  }
-  wrap.addEventListener("wheel",e=>{
-    e.preventDefault();
-    const r=wrap.getBoundingClientRect();
-    zoomAt(e.deltaY<0?1.15:1/1.15, e.clientX-r.left, e.clientY-r.top);
-  },{passive:false});
-  // pan with one pointer, pinch-zoom with two. Capture on the canvas so the
-  // subsequent click still targets cv (click-to-goal), not the wrap container.
-  let panDrag=false, panMoved=false, pdsx=0,pdsy=0,pdpx=0,pdpy=0, pinch=null;
-  const pointers=new Map();
-  cv.addEventListener("pointerdown",e=>{
-    pointers.set(e.pointerId,[e.clientX,e.clientY]);
-    if(pointers.size===2){
-      const [[ax,ay],[bx,by]]=[...pointers.values()];
-      pinch={d:Math.hypot(bx-ax,by-ay), mx:(ax+bx)/2, my:(ay+by)/2};
-    } else { panDrag=true; panMoved=false; pdsx=e.clientX; pdsy=e.clientY; pdpx=panX; pdpy=panY; }
-    cv.setPointerCapture(e.pointerId);
-  });
-  cv.addEventListener("pointermove",e=>{
-    if(pointers.has(e.pointerId)) pointers.set(e.pointerId,[e.clientX,e.clientY]);
-    if(pointers.size===2 && pinch){
-      const [[ax,ay],[bx,by]]=[...pointers.values()];
-      const d=Math.hypot(bx-ax,by-ay), mx=(ax+bx)/2, my=(ay+by)/2;
-      const r=wrap.getBoundingClientRect();
-      zoomAt(d/pinch.d, mx-r.left, my-r.top);
-      pinch={d, mx, my};
-    } else if(panDrag){
-      if(Math.hypot(e.clientX-pdsx,e.clientY-pdsy)>4) panMoved=true;
-      panX=pdpx+(e.clientX-pdsx); panY=pdpy+(e.clientY-pdsy); repaint();
-    }
-  });
-  const upPtr=e=>{
-    pointers.delete(e.pointerId);
-    if(pointers.size<2) pinch=null;
-    if(pointers.size===0) panDrag=false;
-  };
-  cv.addEventListener("pointerup",upPtr);
-  cv.addEventListener("pointercancel",upPtr);
-  $("mapFit").onclick=fitMap;
-  $("mapZoomIn").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1.5, r.width/2, r.height/2); };
-  $("mapZoomOut").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1/1.5, r.width/2, r.height/2); };
-  window.addEventListener("resize",repaint);
-
-  async function poll(){
-    try{
-      const r=await fetch("/map?t="+Date.now());
-      if(!r.ok) return;                        // 503 until the first map is written
-      const buf=new Uint8Array(await r.arrayBuffer());
-      const nl=buf.indexOf(10);                // end of the JSON header line
-      if(nl<0) return;
-      const meta=JSON.parse(dec.decode(buf.subarray(0,nl)));
-      render(meta, buf.subarray(nl+1));
-    }catch(e){ /* transient: keep polling */ }
-  }
-
-  function shadeMap(){
-    if(!img || !lastGrid || !lastMeta) return;
-    const w=lastMeta.w, h=lastMeta.h, d=img.data;
-    for(let row=0;row<h;row++){
-      const cy=h-1-row, base=row*w;            // grid row 0 = bottom -> flip for canvas
-      for(let c=0;c<w;c++){
-        let v=lastGrid[base+c]; if(v>127) v-=256;  // byte -> signed int8
-        const o=(cy*w+c)*4;
-        // unknown grey; 0 white..100 black. Sharp: hard posterize — cells at/above a
-        // single lidar hit (~70) snap to SOLID black with NO transition band, so walls
-        // read as crisp hard-edged 1-2 cell lines against the white floor (the old 45-69
-        // band smeared a grey gradient fringe along every edge; below 70 is the plain
-        // free-space ramp). Off = the flat linear ramp.
-        const s=v<0?44:(sharpShade
-          ? (v>=70?0 : 255-Math.round(v*2.4))
-          : 255-Math.round(v*2.55));
-        d[o]=d[o+1]=d[o+2]=s; d[o+3]=255;
-      }
-    }
-    mapCanvas.getContext("2d").putImageData(img,0,0);
-  }
-
-  function render(m, grid){
-    const w=m.w, h=m.h; gw=w; gh=h;
-    if(!mapCanvas || mapCanvas.width!==w || mapCanvas.height!==h){
-      mapCanvas=document.createElement("canvas");
-      mapCanvas.width=w; mapCanvas.height=h;
-      img=mapCanvas.getContext("2d").createImageData(w,h);
-    }
-    lastGrid=grid; lastMeta=m;
-    shadeMap();
-    $("mapWait").style.display="none";    // got a real frame: drop the placeholder
-    cv.style.cursor="crosshair";          // ...and arm click-to-go only now
-    repaint();
-    // telemetry line (coverage + localization health + mode)
-    if(m.seen!==undefined){
-      const q = m.score>=8?"good":(m.score>=2?"ok":"weak");
-      const loc = m.loc && m.loc!=="ok" ? ` · ⚠ ${m.loc}` : "";
-      // feed staleness: which motion-prior source is dead (odom/EKF, IMU, LDS)?
-      // Ages are stored as-of the map write (m.t); add the elapsed since that write
-      // so a frozen map file keeps aging each feed at READ time (a dead lidar stops
-      // the map writes themselves, so header ages would otherwise never grow).
-      let feeds="";
-      if(m.feeds){
-        const sinceWrite=Math.max(0,(Date.now()/1000)-(m.t||Date.now()/1000));
-        const fstale=Object.entries(m.feeds).map(([k,v])=>
-          [k, v<0? -1 : v+sinceWrite]).filter(([,v])=>v<0||v>1.5);
-        if(fstale.length) feeds=" · ⚠ feeds: "+fstale.map(([k,v])=>
-          `${k}:${v<0?"none":v.toFixed(0)+"s"}`).join(" ");
-      }
-      $("mapStats").textContent =
-        `mode: ${m.mode||"—"} · explored ${(m.seen*100).toFixed(0)}% `
-        + `(${(m.free_m2||0).toFixed(1)} m² free) · match ${q} (${(m.score||0).toFixed(0)})`
-        + ` · motion ${m.motion?"ON":"off"}${loc}${feeds}`;
-    }
-  }
-
-  $("mapOn").addEventListener("change",e=>{
-    const on=e.target.checked;
-    $("mapStats").style.display=on?"block":"none";
-    $("mapHint").style.display=on?"block":"none";
-    if(on){
-      $("mapWait").style.display="flex"; cv.style.cursor="default"; // until a frame lands
-      poll(); timer=setInterval(poll,500);
-    } else { clearInterval(timer); timer=null; }
-  });
-
-  // click the map -> goal in world metres (account for zoom/pan + the y-flip)
-  cv.addEventListener("click",e=>{
-    if(!lastMeta) return;
-    if(panMoved){ panMoved=false; return; }   // a pan just ended, not a goal tap
-    const rect=cv.getBoundingClientRect();
-    const z=zoom||fitZoom(), [x0,y0]=origin(z);
-    const gcx=(e.clientX-rect.left-x0)/z;      // grid px
-    const gcy=(e.clientY-rect.top-y0)/z;
-    const m=lastMeta;
-    mapSetGoal(m.ox+gcx*m.res, m.oy+(m.h-1-gcy)*m.res);
-  });
-  $("mapMotion").addEventListener("change",e=>setNavMotion(e.target.checked));
-  $("mapExplore").addEventListener("change",e=>setNavExplore(e.target.checked));
-  // wall guard: the toggle flips web_control's guard; the Keep-away slider sets BOTH
-  // slam_nav's stop_distance (autonomous keep-away) and web_control's
-  // wall_guard_distance (manual guard) so one control drives the whole bubble.
-  $("mapShade").addEventListener("change",e=>{ sharpShade=e.target.checked; shadeMap(); repaint(); });
-  $("mapWallGuard").addEventListener("change",e=>setParam("web_control","wall_guard_enable",e.target.checked));
-  $("mapWallDist").addEventListener("input",()=>{
-    $("mapWallDistV").textContent=Number($("mapWallDist").value).toFixed(2);
-  });
-  $("mapWallDist").addEventListener("change",()=>{
-    const v=Number($("mapWallDist").value);
-    setParam("slam_nav","stop_distance",v);
-    setParam("web_control","wall_guard_distance",v);
-  });
-  $("mapHome").addEventListener("click",()=>pub("/slam_nav/go_home",true));
-  $("mapSave").addEventListener("click",()=>pub("/slam_nav/save_map",true));
-  $("mapClear").addEventListener("click",()=>{
-    if(!confirm("Clear the map? This wipes the current SLAM grid and cannot be undone.")) return;
-    pub("/slam_nav/clear_map",true);
-    mapGoal=null; mapPlan=[];              // drop the stale goal ring + plan on the canvas
-  });
-  $("mapTest").addEventListener("click",()=>{
-    if(!$("mapMotion").checked){ alert("Enable Motion first — the self-test drives the robot."); return; }
-    if(!confirm("Run the calibration self-test?\nThe robot will drive forward, back, then spin in place.")) return;
-    const el=$("mapTestOut"); el.style.display="block"; el.textContent="running self-test…";
-    pub("/selftest",true);
-  });
-  $("mapStop").addEventListener("click",()=>{
-    $("mapMotion").checked=false; setNavMotion(false);
-    $("mapExplore").checked=false; setNavExplore(false);   // also halt auto-exploration
-    sendDrive(0,0);                                        // belt-and-braces halt
-  });
-})();
-</script>
-
-<script>
 // ---- UI chrome: bottom tabs, hero view switcher, tips, virtual joystick ------
 (function(){
   "use strict";
@@ -3529,17 +3002,14 @@ connect();   // auto-connect on load
   document.querySelectorAll("#tabbar button").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
   $("statusChip").onclick=()=>showTab("system");
 
-  // hero view switcher: Lidar / Map / Camera. Reuses the existing (now hidden)
-  // mapOn / camOn checkboxes — flipping them runs the original start/stop handlers.
+  // hero view switcher: Lidar / Camera. Reuses the existing (now hidden)
+  // camOn checkbox — flipping it runs the original start/stop handler.
   function setChk(id,val){ const el=$(id); if(el && el.checked!==val){ el.checked=val; el.dispatchEvent(new Event("change")); } }
   function showView(name){
     document.querySelectorAll("#viewSwitch button").forEach(b=>b.classList.toggle("active",b.dataset.view===name));
     $("view-lidar").classList.toggle("on",name==="lidar");
-    $("view-map").classList.toggle("on",name==="map");
     $("view-cam").classList.toggle("on",name==="cam");
-    $("ctlMap").classList.toggle("on",name==="map");
     $("ctlCam").classList.toggle("on",name==="cam");
-    setChk("mapOn",name==="map");
     setChk("camOn",name==="cam");
   }
   document.querySelectorAll("#viewSwitch button").forEach(b=>b.onclick=()=>showView(b.dataset.view));
@@ -3893,263 +3363,30 @@ connect();   // auto-connect on load
 })();
 </script>
 <script>
-// ---- live slam_nav / track tuning (same-origin HTTP /param; no rosbridge) ----
-// The nav + tracking sliders in the Sensors panels have no inline wiring (the split
-// app.js file that once held it isn't referenced), so bind them here. Self-contained
-// IIFE: no globals, won't clash with the panel scripts above.
-(function(){
-  "use strict";
-  const el=id=>document.getElementById(id);
-  // POST /param -> telemetry.py PARAM_WHITELIST["slam_nav"], calls the node's
-  // /slam_nav/set_parameters service. 2-arg form: (param name, value).
-  const setParam=(name,value)=>
-    fetch("/param",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({node:"slam_nav",name,value})}).catch(()=>{});
-  // slider (label span id = elId+"V"): show value on input, send on change.
-  // `scale` multiplies the raw slider value before sending (%-sliders use 1/100).
-  const bindSlider=(id,param,opts)=>{
-    const {fmt=v=>v,scale=1}=opts||{};
-    const i=el(id); if(!i) return;
-    const v=el(id+"V");
-    v && i.addEventListener("input",()=>v.textContent=String(fmt(Number(i.value))));
-    i.addEventListener("change",()=>setParam(param,Number(i.value)*scale));
-  };
-  // checkbox -> param bool.
-  const bindToggle=(id,param)=>{
-    const i=el(id); if(!i) return;
-    i.addEventListener("change",e=>setParam(param,e.target.checked));
-  };
-  const sec=v=>(v==="0"||v===0?"off":v+" s");
-  const pct=v=>(v+"%");
-
-  bindSlider("navMaxLin",     "max_lin",         {fmt:v=>v+" m/s"});
-  bindSlider("navMaxAng",     "max_ang",         {fmt:v=>v+" rad/s"});
-  bindSlider("navStopDist",   "stop_distance",   {fmt:v=>v+" m"});
-  bindSlider("navRadius",     "robot_radius",    {fmt:v=>v+" m"});
-  bindSlider("navStuck",      "stuck_timeout",   {fmt:sec});
-  bindSlider("navLdsIdle",    "lds_idle_timeout",{fmt:sec});
-  bindSlider("navOverlap",    "min_overlap_ratio",{fmt:pct,scale:1/100});
-  bindSlider("navLoopScore",  "loop_score",      {fmt:v=>v});
-  bindSlider("navLoopProbe",  "loop_probe_every",{fmt:v=>v});
-  bindToggle("navRelocalize", "relocalize");
-  bindToggle("navPickupPause","pickup_pause");
-  bindToggle("navLdsIdleEnable","lds_idle_enable");
-  bindToggle("navLoop",       "loop_closure");
-  // map-panel motion toggles (the old rosbridge path they were wired to is dead, so
-  // rebind over it — both listeners fire; the legacy one no-ops without a service).
-  bindToggle("mapMotion",     "enable_motion");
-  bindToggle("mapExplore",    "auto_explore");
-  // LDS spin setpoint -> slam_nav's lds_active_rpm (slam_nav owns /lds_target_rpm and
-  // respects active/idle spin-down).
-  bindSlider("ldsTgt",        "lds_active_rpm",  {fmt:v=>v});
-  // beam quality floor: number input, 0 = "off" -> qual-min param (raw intensity).
-  const nq=el("navQual");
-  if (nq){
-    const nqv=el("navQualV");
-    nq.addEventListener("change",()=>{ const v=Number(nq.value)||0;
-      nqv.textContent=v>0?String(v):"off"; setParam("qual_min",v); });
-  }
-  // vision target tracking sliders -> track_* (deadband/conf are % on the page; the
-  // params are fractions, so scale by 1/100).
-  bindSlider("trackKp",           "track_kp");
-  bindSlider("trackKd",           "track_kd");
-  bindSlider("trackMaxAng",       "track_max_ang");
-  bindSlider("trackMinEffAng",    "track_min_eff_ang");
-  bindSlider("trackDeadband",     "track_deadband",      {fmt:pct,scale:1/100});
-  bindSlider("trackConfMin",      "track_conf_min",      {fmt:pct,scale:1/100});
-  bindSlider("trackDeadbandSoft", "track_deadband_soft", {fmt:pct,scale:1/100});
-  bindSlider("trackConfScale",    "track_conf_scale",    {fmt:pct,scale:1/100});
-  bindSlider("trackCoast",        "track_coast");
-  bindSlider("trackKi",           "track_ki");
-  bindSlider("trackKff",          "track_kff");
-  bindToggle("navTrackEnable",    "track_enable");
-})();
-</script>
-<script>
-// ---- Live motion-chain diagnostics (SSE /telemetry, no rosbridge) ----
-// Watches the four raw yaw sources — wheels (/odom), the EKF (/odometry/filtered),
-// the IMU (/imu/euler) and SLAM's scan-matched map pose (/slam_pose) — plus slam_nav's
-// own diagnostics JSON (/slam_nav/diag, surfaced as f.slam_diag) and reports where the
-// odom→EKF→SLAM chain actually breaks: a dead feed, a wheel-vs-IMU direction mismatch,
-// slip/drag, or a SLAM lost/recovery. The sensors pane has no other live wiring for
-// these (the rosbridge path it was written against is gone), so this is the one reader.
+// ---- Live readouts (SSE /telemetry, no rosbridge) ----
+// The Odometry + IMU cards' raw readouts (their old per-node rosbridge wiring is
+// long dead). Was the full "motion chain (wheels -> EKF -> SLAM)" diagnostics card;
+// the EKF and slam_nav died in the Nav2/slam_toolbox migration
+// (docs/nav2-migration.md), so only the surviving sources are rendered here.
 // Read-only: never publishes or moves the robot.
 (function(){
   "use strict";
   const el=id=>document.getElementById(id);
-  if(!el("mcVerdict")) return;                        // card absent → leave the page as-is
   const DEG=180/Math.PI;
-  const CHK={ok:"#3ddc84", warn:"#f5b83d", err:"#ff5c72"};
-  const set=(id,v,cls)=>{ const e=el(id); if(!e) return;
-    e.textContent=v; if(cls) e.style.color=CHK[cls]||cls; };
-
-  // Per-source state: last yaw sample + smoothed angular speed (deg/s), tracked
-  // client-side so the card stays alive even if one backend field disappears.
-  const srcs={wheel:{},ekf:{},imu:{},slam:{}};
-  const feedLast={};                        // monotonic s of the last sample, for staleness
-  const push=(key,yawDeg,t)=>{
-    if(yawDeg==null||!isFinite(yawDeg)) return;
-    const s=srcs[key]; s.yaw=yawDeg; s.t=t; feedLast[key]=t;
-    const dt=s.pT!=null?(s.t-s.pT):null;
-    if(dt!=null&&dt>=0.25&&dt<=2.5){
-      let d=s.yaw-s.pYaw; d-=Math.round(d/360)*360;   // wrap to [-180,180]
-      const inst=d/dt;
-      s.sp=s.sp==null?inst:s.sp*0.75+inst*0.25;       // EMA the turn rate
-    }
-    s.pT=s.t; s.pYaw=s.yaw;
-  };
-  const ageOf=src=>{ const a=feedLast[src]; return a==null?null:Math.max(0,(latest-a)); };
-  const fmtDeg=v=>v==null?"–":Math.round(v*10)/10+"°";
-  const fmtRate=v=>{ if(v==null||!isFinite(v)) return "–";
-    return (v>=0?"+":"−")+Math.round(Math.abs(v)*10)/10+"°/s"; };
-  const fmtSec=v=>v==null?"–":(v<0?"never":v.toFixed(1)+"s");
-
-  const now=()=>performance.now()/1000;
-  let latest=now(), f={t:latest}, verdictEl=el("mcVerdict");
-
-  function verdict(sd){
-    const die=(src,th)=>{ const a=ageOf(src); return a!=null&&a>th; };
-    if(f.odom==null&&feedLast.wheel==null)     return {cls:"err",text:"wheels /odom missing — encoder chain dead (ESP32 → /wheel_ticks)?"};
-    if(die("wheel",2.0))                        return {cls:"err",text:"wheels /odom silent "+ageOf("wheel").toFixed(1)+"s — encoder feed stalled"};
-    if(feedLast.ekf==null&&feedLast.wheel==null) return {cls:"warn",text:"EKF not streaming yet — robot_localization warming up?"};
-    if(die("ekf",2.0))                          return {cls:"warn",text:"EKF /odometry/filtered stale — robot_localization step lost"};
-    if(die("imu",1.5))                          return {cls:"warn",text:"IMU euler feed silent — check imu_driver / USB"};
-    if(sd&&sd.feeds&&(sd.feeds.scan<0||sd.feeds.scan>3))
-                                                return {cls:"warn",text:"lidar scan feed silent — SLAM cannot localize"};
-    const w=srcs.wheel.sp, i=srcs.imu.sp;
-    if(sd&&sd.sign&&sd.sign_fail)                return {cls:"err",text:"IMU vs wheel: OPPOSITE rotation — set imu_yaw_sign: -1"};
-    if(sd&&sd.slip&&sd.slip.kind==="slip")      return {cls:"err",text:"WHEEL SLIP (r"+sd.slip.ratio+") — odom spins faster than the IMU feels"};
-    if(sd&&sd.slip&&sd.slip.kind==="drag")      return {cls:"warn",text:"wheel drag/stall (r"+sd.slip.ratio+") — blocked wheel?"};
-    if(sd&&sd.recovering)                        return {cls:"warn",text:"SLAM relocalizing (lost "+sd.lost+") — holding the previous pose"};
-    if(w!=null&&i!=null&&Math.abs(w)>15&&Math.abs(i)>15&&Math.abs(w-i)>Math.max(Math.abs(w),Math.abs(i))*0.35)
-                                                return {cls:"warn",text:"wheel & IMU rotation disagree Δ"+(Math.round((w-i)*10)/10).toFixed(1)+"°/s"};
-    if(w!=null&&i!=null&&Math.abs(w)<2&&Math.abs(i)<2)
-                                                return {cls:"ok",text:"all four rotation sources agree — no fault flagged"};
-    return {cls:"ok",text:"rotation sources agree — watch the rate rows while the robot turns"};
-  }
-
+  let f=null;
   function render(){
-    const t=latest;
-    push("wheel", f.odom&&f.odom[2]!=null?f.odom[2]*DEG:null, t);
-    push("ekf",   f.ekf&&f.ekf.yaw!=null?f.ekf.yaw*DEG:null, t);
-    push("imu",   f.eul?f.eul.y:null, t);
-    push("slam",  f.slam_pose&&f.slam_pose.yaw!=null?f.slam_pose.yaw*DEG:null, t);
-    set("mcWheel", fmtDeg(srcs.wheel.yaw)); set("mcRotW", fmtRate(srcs.wheel.sp));
-    set("mcEkf",   fmtDeg(srcs.ekf.yaw));
-    set("mcImu",   fmtDeg(srcs.imu.yaw));    set("mcRotI", fmtRate(srcs.imu.sp));
-    set("mcSlam",  fmtDeg(srcs.slam.yaw));
-
-    const sd=f.slam_diag;
-    if(sd){
-      set("mcSign", sd.sign? (sd.sign_fail?"MISMATCH":"agree") : "–",
-          sd.sign? (sd.sign_fail?"err":"ok") : null);
-      const sl=sd.slip;
-      set("mcSlip", sl? ("r"+sl.ratio.toFixed(2))+(sl.kind?" ("+sl.kind+")":""):"–",
-          sl&&sl.kind? (sl.kind==="slip"?"err":"warn") : (sl?"ok":null));
-      set("mcScore",   sd.score!=null?sd.score.toFixed(1):"–");
-      set("mcOverlap", sd.overlap!=null?sd.overlap.toFixed(2):"–");
-      set("mcLost",    sd.lost>0?String(sd.lost):"0", sd.lost>0?"err":null);
-      const l=sd.loop;
-      if(l) set("mcLoop", "x"+l[0].toFixed(2)+" y"+l[1].toFixed(2)+
-                          (Math.abs(l[2])>0.005?" θ"+(l[2]*DEG).toFixed(0)+"°":""));
-    }
-    // Odometry card (its ROSLIB wiring is dead) — reuse the raw /odom sample.
-    if(f.odom){ set("odoX", f.odom[0].toFixed(2)+" m"); set("odoY", f.odom[1].toFixed(2)+" m");
-                set("odoTh", (f.odom[2]*DEG).toFixed(0)+"°"); }
-    // IMU card (same dead wiring) — roll/pitch/yaw straight from /imu/euler.
-    if(f.eul){ set("imuR", f.eul.r.toFixed(1)+"°"); set("imuP", f.eul.p.toFixed(1)+"°");
-               set("imuY", f.eul.y.toFixed(1)+"°"); }
-    // EKF card's live readouts (config itself loads separately via /ekf/config).
-    if(f.ekf_hz!=null) set("ekfHz", f.ekf_hz.toFixed(1)+" Hz",
-        (f.ekf&&f.ekf.age>2.0?"err":"ok"));
-    if(f.ekf) set("ekfAge", f.ekf.age.toFixed(1)+"s",
-        (f.ekf.age>2.0?"err":"ok"));
-    // Feed staleness (client-side ages; lidar age comes from slam_nav's own diag).
-    set("mcFOdo", fmtSec(ageOf("wheel")), ageOf("wheel")==null||ageOf("wheel")>2.0?"err":"ok");
-    set("mcFEkf", fmtSec(ageOf("ekf")),   ageOf("ekf")==null||ageOf("ekf")>2.0?"err":"ok");
-    set("mcFImu", fmtSec(ageOf("imu")),   ageOf("imu")==null||ageOf("imu")>1.5?"err":"ok");
-    set("mcFScan", sd&&sd.feeds? fmtSec(sd.feeds.scan) : "–",
-        sd&&sd.feeds? (sd.feeds.scan<0||sd.feeds.scan>3?"err":"ok") : null);
-
-    const v=verdict(sd);
-    verdictEl.className="kv-status"+(v.cls?" "+v.cls:"");
-    verdictEl.textContent=v.text;
+    if(!f) return;
+    // Odometry card — the raw /odom sample (the pose chain Nav2 builds on).
+    if(f.odom){ el("odoX").textContent=f.odom[0].toFixed(2)+" m";
+                el("odoY").textContent=f.odom[1].toFixed(2)+" m";
+                el("odoTh").textContent=(f.odom[2]*DEG).toFixed(0)+"°"; }
+    // IMU card — roll/pitch/yaw straight from /imu/euler.
+    if(f.eul){ el("imuR").textContent=f.eul.r.toFixed(1)+"°";
+               el("imuP").textContent=f.eul.p.toFixed(1)+"°";
+               el("imuY").textContent=f.eul.y.toFixed(1)+"°"; }
   }
-
   const es=new EventSource("/telemetry");
-  es.onmessage=e=>{ try{ const d=JSON.parse(e.data); latest=now(); f=d; render();
-      }catch(_x){} };
-  es.onerror=()=>{ // SSE dropped (no browser on the server side) — show it's offline.
-    const big=performance.now()/1000-latest;
-    if(big>5){ verdictEl.className="kv-status err"; verdictEl.textContent="telemetry link lost — server/browser subscribe broke"; }
-  };
-})();
-</script>
-<script>
-// ---- EKF tuning (robot_localization) ----
-// robot_localization reads its params once at startup (no live set-service), so
-// tuning here = Save sliders to eskf.yaml + apply by restarting just the EKF unit.
-// The live rate/age rows are fed by the motion-chain SSE block above; this block
-// only handles loading + persisting the config.
-(function(){
-  "use strict";
-  const el=id=>document.getElementById(id);
-  if(!el("ekfFreq")) return;            // card absent → skip
-  const fmtV=(id,fmt)=>el(id)&&(el(id).textContent=fmt);
-  const statusEl=el("ekfStatus");
-  const say=(msg,cls)=>{ statusEl.className="kv-status"+(cls?" "+cls:"");
-    statusEl.textContent=msg; };
-  const post=(url,body)=>fetch(url,{method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body||{})}).then(r=>{ try{return r.json();}catch(_x){return {ok:false,error:"bad reply"};} });
-
-  let cfg=null;
-  const showVal=(input,label,fmt)=>input.addEventListener("input",()=>
-    fmtV(label,fmt(Number(input.value))));
-  const bindSlider=(id,key,fmt,range)=>{
-    const i=el(id); if(!i) return;
-    showVal(i,id+"V",fmt);
-    i.addEventListener("change",async()=>{
-      const body={}; body[key]=Number(i.value);
-      const d=await post("/ekf/config",body);
-      if(d&&d.ok) say("saved "+key+" → "+fmt(Number(i.value))+" (restart EKF to apply)","ok");
-      else say("save failed: "+((d&&d.error)||"?"),"err");
-    });
-  };
-  bindSlider("ekfFreq","frequency", v=>Math.round(v)+" Hz");
-  bindSlider("ekfTO","sensor_timeout", v=>v.toFixed(2)+" s");
-  bindSlider("ekfPnX","pn_x", v=>v.toFixed(3));
-  bindSlider("ekfPnY","pn_y", v=>v.toFixed(3));
-  bindSlider("ekfPnYaw","pn_yaw", v=>v.toFixed(3));
-  el("ekfApply").addEventListener("click",()=>{
-    if(!cfg){ say("load config first","err"); return; }
-    if(!cfg.writable){ say("config file isn't writable — check path","err"); return; }
-    if(!confirm("Apply saved EKF settings? This restarts the EKF (brief pose-hold)."))return;
-    post("/ekf/apply").then(d=>say(
-      d&&d.ok?"EKF restarting…":("restart failed: "+(d&&(d.error||d.hint)||"?")),
-      d&&d.ok?"ok":"err"));
-  });
-
-  function load(){
-    fetch("/ekf/config").then(r=>r.ok?r.json():null).then(d=>{
-      if(!d||!d.ok){ say((d&&d.error)||"config unavailable","err"); return; }
-      cfg=d;
-      el("ekfPath").textContent=d.path;
-      el("ekfWr").textContent=d.writable?"yes":"no";
-      const setI=(id,v)=>{ const i=el(id); if(i) i.value=v; };
-      const fmt=(e,f)=>el(e)&&(el(e).textContent=f);
-      setI("ekfFreq",d.frequency);  fmt("ekfFreqV", d.frequency.toFixed(0)+" Hz");
-      setI("ekfTO",d.sensor_timeout); fmt("ekfTOV", d.sensor_timeout.toFixed(2)+" s");
-      if(d.pn){ setI("ekfPnX",d.pn.x); fmt("ekfPnXV", d.pn.x.toFixed(3));
-                setI("ekfPnY",d.pn.y); fmt("ekfPnYV", d.pn.y.toFixed(3));
-                setI("ekfPnYaw",d.pn.yaw); fmt("ekfPnYawV", d.pn.yaw.toFixed(3)); }
-      say(d.writable?
-        "loaded from config — edit, Save, then Restart EKF to apply":
-        "loaded read-only — deploy a writable ekf.yaml to tune",
-        d.writable?"ok":null);
-    }).catch(()=>say("error reading /ekf/config","err"));
-  }
-  load();
+  es.onmessage=e=>{ try{ f=JSON.parse(e.data); render(); }catch(_x){} };
 })();
 </script>
 </body>

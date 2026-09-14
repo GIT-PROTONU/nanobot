@@ -2,7 +2,8 @@
 
 Nodes that run identically either way (real robot hardware or Gazebo): web_control
 (the browser's telemetry/control gateway — no rosbridge), oled_display, behavior
-(mood_node), sys_monitor, wheel_odometry, slam_nav,
+(mood_node), sys_monitor, wheel_odometry, nav2 (ONE container: planner/controller/
+bt_navigator/behavior_server/lifecycle managers/slam_toolbox — see nav2.launch.py),
 robot_state_publisher. Only the lowest hardware-transducer layer is swapped by `sim`:
 
     sim:=false (default) -- the real LDS02RR (lds_driver_py) + BWT901CL IMU (imu_driver).
@@ -25,7 +26,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -36,7 +37,6 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     bringup_share = get_package_share_directory("robot_bringup")
     params = os.path.join(bringup_share, "config", "robot.yaml")
-    ekf_params = os.path.join(bringup_share, "config", "ekf.yaml")
     xacro_path = os.path.join(bringup_share, "urdf", "nano.urdf.xacro")
     world_path = os.path.join(bringup_share, "worlds", "nano_room.sdf")
     bridge_config = os.path.join(bringup_share, "config", "gz_bridge.yaml")
@@ -45,7 +45,6 @@ def generate_launch_description():
     sim = LaunchConfiguration("sim")
     rviz = LaunchConfiguration("rviz")
     web = LaunchConfiguration("web")
-    ekf = LaunchConfiguration("ekf")
 
     robot_description = ParameterValue(Command(["xacro ", xacro_path]), value_type=str)
 
@@ -57,10 +56,6 @@ def generate_launch_description():
                               description="Also start RViz2 with the checked-in config."),
         DeclareLaunchArgument("web", default_value="true",
                               description="Also start the web control page/gateway."),
-        DeclareLaunchArgument("ekf", default_value="true",
-                               description="true = robot_localization EKF fuses wheel "
-                                           "odometry + IMU (standard, always-on on the robot); "
-                                           "false = raw wheel odometry only (debug)."),
 
         # ---- always: the shared node graph -----------------------------------------
         Node(package="wheel_odometry", executable="encoder_node",
@@ -71,27 +66,20 @@ def generate_launch_description():
              name="sys_monitor", parameters=[params], output="screen"),
         Node(package="behavior", executable="mood_node",
              name="behavior", parameters=[params], output="screen"),
-        Node(package="slam_nav", executable="nav_node",
-             name="slam_nav", parameters=[params], output="screen"),
         Node(package="robot_state_publisher", executable="robot_state_publisher",
              name="robot_state_publisher",
              parameters=[{"robot_description": robot_description}], output="screen"),
-        # Republishes slam_nav's /dev/shm/nano_map.bin as nav_msgs/OccupancyGrid for RViz
-        # (the web UI keeps reading the blob directly) -- useful on the real robot too.
-        Node(package="sim_hardware", executable="map_bridge_node",
-             name="map_bridge", output="screen"),
 
-        # ---- robot_localization EKF: sensor fusion between wheel odometry and IMU ----
-        # Fuses /odom (wheel encoders) + /imu/data (IMU orientation/gyro/accel) into a
-        # single filtered state on /odometry/filtered. The EKF also publishes the
-        # odom -> base_link TF, replacing wheel_odometry's own TF broadcast
-        # (wheel_odometry.publish_tf is set to false in robot.yaml when EKF is active).
-        # Standalone config in config/ekf.yaml.
-        Node(package="robot_localization", executable="ekf_node",
-             name="ekf_node",
-             parameters=[ekf_params],
-             output="screen",
-             condition=IfCondition(LaunchConfiguration("ekf"))),
+        # ---- Nav2 + slam_toolbox in ONE component container ---------------------------
+        # Replaces the old slam_nav / robot_localization EKF / map_bridge trio:
+        # slam_toolbox owns map->odom TF + /map, the Nav2 servers plan/drive to
+        # /goal_pose, controller publishes /cmd_vel directly (ESP32 contract).
+        # wheel_odometry.publish_tf must be TRUE in robot.yaml (it owns
+        # odom -> base_link now; see nav2.launch.py for the full lifecycle split).
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(PathJoinSubstitution([
+                FindPackageShare("robot_bringup"), "launch", "nav2.launch.py"])),
+        ),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([

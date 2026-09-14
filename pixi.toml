@@ -23,9 +23,23 @@ CMAKE_GENERATOR = "Ninja"
 # --- ROS 2 Humble core (ros-base = no Rviz/Gazebo/GUI, keeps the footprint small) ---
 ros-humble-ros-base = "*"
 ros-humble-rmw-zenoh-cpp = "*"
-# robot_localization provides the EKF/UKF sensor-fusion filter that fuses wheel
-# odometry + IMU into a single filtered pose on /odometry/filtered.
-ros-humble-robot-localization = "*"
+# Navigation: Nav2 (individual sub-packages, NOT the `navigation2` meta — that
+# pulls AMCL/map_server/etc. we never run) + slam_toolbox (mapping + map->odom
+# TF + /map), replacing the custom slam_nav / robot_localization EKF stack.
+# All verified to resolve on linux-aarch64 (robostack-staging, 2026-09-14).
+ros-humble-nav2-msgs = "*"
+ros-humble-nav2-util = "*"
+ros-humble-nav2-core = "*"
+ros-humble-nav2-costmap-2d = "*"
+ros-humble-nav2-behavior-tree = "*"
+ros-humble-nav2-planner = "*"
+ros-humble-nav2-controller = "*"
+ros-humble-nav2-bt-navigator = "*"
+ros-humble-nav2-behaviors = "*"
+ros-humble-nav2-lifecycle-manager = "*"
+ros-humble-nav2-regulated-pure-pursuit-controller = "*"
+ros-humble-nav2-navfn-planner = "*"
+ros-humble-slam-toolbox = "*"
 # NOTE: rosbridge is GONE. The browser talks only to web_control's own HTTP server
 # (SSE /telemetry + POST /publish|/param|/drive) — see web_control/telemetry.py.
 # common_interfaces (sensor_msgs/nav_msgs/geometry_msgs) + tf2 ship with ros-base.
@@ -52,6 +66,7 @@ pkg-config = "*"
 
 # --- Python hardware libraries (pure-python, available on conda-forge) ---
 pyserial = "*"          # serial access for the LDS (lds_driver_py) + IMU (imu_driver)
+pip = ">=26.2.1,<27"
 
 # --- Dev-PC-only: Gazebo simulation + RViz (see scripts/sim_run.sh) ---------------
 # linux-64 ONLY (a [target.*] section, not [dependencies]) so none of this ever

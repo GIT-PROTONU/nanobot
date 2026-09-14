@@ -1,0 +1,24 @@
+[Unit]
+Description=Nano SLAM mapper (slam_toolbox 2.6.10: /map + map->odom TF)
+# slam_toolbox 2.6.10 is a PLAIN rclcpp::Node (its executable configures
+# itself; no lifecycle services), so it runs as its own process and is NOT in
+# any nav2 lifecycle manager. Needs the odom chain + the static base_link ->
+# laser TF (published by nano-nav's ExecStartPost) only lazily, per scan.
+After=nano-router.service nano-sensors.service nano-nav.service
+Wants=nano-router.service
+PartOf=nano-robot.target
+
+[Service]
+Type=simple
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh slam
+Restart=on-failure
+RestartSec=3
+# Same Ceres guard rationale as nano-nav.service (hardcoded 50-thread solver
+# spike + pose-graph growth on the 1 GB H5).
+CPUAffinity=2 3
+Nice=10
+MemoryMax=400M
+
+[Install]
+WantedBy=nano-robot.target

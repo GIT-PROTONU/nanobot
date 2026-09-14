@@ -1,19 +1,28 @@
 [Unit]
-Description=Nano SLAM/navigation (slam_nav)
-# After ekf so /odometry/filtered is flowing when the matcher starts.
-After=nano-router.service nano-sensors.service nano-ekf.service
+Description=Nano navigation (ONE container: Nav2 servers + lifecycle manager)
+# After sensors so /odom + /scan are flowing before the container loads the
+# components (the component attach itself is the nav-loader unit's job, below).
+After=nano-router.service nano-sensors.service
 Wants=nano-router.service
 PartOf=nano-robot.target
 
 [Service]
-# Type=notify + watchdog: executor-liveness pets from a 5 s timer (see nav_node.main).
-Type=notify
-WatchdogSec=90
+Type=simple
 User=ibster
 ExecStart=/home/ibster/Nano/scripts/unit_exec.sh nav
+# The static base_link -> laser transform (yaw pi: this unit's sensor head
+# faces back). A supervised part of THIS unit — if the container dies, systemd
+# kills the whole cgroup and both come back together on restart.
+ExecStartPost=/home/ibster/Nano/scripts/unit_exec.sh tf
 Restart=on-failure
 RestartSec=3
-MemoryMax=300M
+# CPU/RAM guard for Ceres's HARDCODED 50-thread spike (no ceres_num_threads
+# param exists upstream) + pose-graph growth on the 1 GB H5: keep nav off the
+# cores the sensor/app hubs live on and deprioritise it under contention.
+# MALLOC_ARENA_MAX=2 is already set inside unit_exec.sh.
+CPUAffinity=2 3
+Nice=10
+MemoryMax=400M
 
 [Install]
 WantedBy=nano-robot.target

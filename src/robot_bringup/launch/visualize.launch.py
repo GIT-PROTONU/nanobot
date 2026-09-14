@@ -5,13 +5,12 @@ real one live over the shared rmw_zenoh graph.
 
 Starts ONLY `robot_state_publisher` (for the URDF mesh + static TF, e.g. base_link ->
 laser_link/imu_link) and `rviz2`. It deliberately does NOT relaunch wheel_odometry,
-slam_nav, sensor_hub, etc. -- the robot is already publishing all of that; a second copy
-on the dev PC would just be a second, redundant publisher of the same topics.
+the nav2 container, sensor_hub, etc. -- the robot is already publishing all of that; a
+second copy on the dev PC would just be a second, redundant publisher of the same topics.
 
 Prerequisites (see CLAUDE.md "Remote RViz"):
-  - the robot is up (`stack.sh up`, which now also runs `sim_hardware.map_bridge_node`
-    so /map exists as a real topic -- /dev/shm is per-machine RAM, so that node MUST run
-    on the board, not here)
+  - the robot is up (`stack.sh up` -- slam_toolbox publishes /map as a real
+    transient-local topic, so remote RViz gets it over the zenoh graph)
   - the dev PC's rmw_zenoh session can reach the robot's zenohd-serial router (same
     ROS_DOMAIN_ID -- already guaranteed by this repo's shared pixi.toml activation env --
     and either the same LAN with multicast scouting working, or an explicit

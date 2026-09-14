@@ -3,7 +3,7 @@
 #   systemctl {start|stop|restart} nano-robot.target   drives everything
 # (scripts/stack.sh wraps exactly that). Enabled at boot by deploy/sbc-setup.sh.
 [Unit]
-Description=Nano robot stack (zenoh router + node hubs + web UI)
+Description=Nano robot stack (zenoh router + node hubs + nav container + web UI)
 
 [Install]
 WantedBy=multi-user.target

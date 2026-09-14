@@ -12,7 +12,6 @@
   <exec_depend>web_control</exec_depend>
   <exec_depend>sys_monitor</exec_depend>
   <exec_depend>behavior</exec_depend>
-  <exec_depend>slam_nav</exec_depend>
   <exec_depend>lds_driver_py</exec_depend>
   <exec_depend>imu_driver</exec_depend>
   <exec_depend>robot_msgs</exec_depend>
@@ -20,8 +19,22 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>xacro</exec_depend>
-  <!-- robot_localization EKF sensor fusion (wheel odometry + IMU). -->
-  <exec_depend>robot_localization</exec_depend>
+  <!-- Nav2 + slam_toolbox (ONE component container, see launch/nav2.launch.py).
+       Sub-package set mirrors pixi.toml — NOT the navigation2 meta (pulls AMCL). -->
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>nav2_util</exec_depend>
+  <exec_depend>nav2_core</exec_depend>
+  <exec_depend>nav2_costmap_2d</exec_depend>
+  <exec_depend>nav2_behavior_tree</exec_depend>
+  <exec_depend>nav2_planner</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>
+  <exec_depend>nav2_bt_navigator</exec_depend>
+  <exec_depend>nav2_behaviors</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_regulated_pure_pursuit_controller</exec_depend>
+  <exec_depend>nav2_navfn_planner</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
   <!-- Dev-PC-only (sim:=true); not installed/available on the board (linux-aarch64);
        see pixi.toml's [target.linux-64.dependencies]. -->
   <exec_depend>sim_hardware</exec_depend>

@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!--
+  Minimal Nav2 Humble behavior tree for the Nano: ComputePathToPose + FollowPath
+  in a PipelineSequence, wrapped in a RecoveryNode with number_of_retries="1".
+
+  Semantics (verified against Humble recovery_node.cpp): run Navigate; on
+  FAILURE run the Recovery sequence ONCE (clear local + global costmaps, back
+  up 0.15 m, spin 90 deg), then retry Navigate; on a second failure abort.
+
+  The ClearEntireCostmap service_name values MUST match the costmap node
+  namespaces ("local_costmap/clear_entirely_local_costmap" /
+  "global_costmap/clear_entirely_global_costmap"). BackUp/Spin actions are
+  served by behavior_server's spin/backup plugins (nav2_params.yaml).
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="1" name="NavigateRecovery">
+      <PipelineSequence name="Navigate">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        <FollowPath path="{path}" controller_id="FollowPath"/>
+      </PipelineSequence>
+      <Sequence name="Recovery">
+        <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
+        <ClearEntireCostmap name="ClearGlobal" service_name="global_costmap/clear_entirely_global_costmap"/>
+        <BackUp backup_dist="0.15" backup_speed="0.1"/>
+        <Spin spin_dist="1.57"/>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

@@ -27,24 +27,25 @@ nodes run packed into three single-process "hubs" matching the three fault domai
 (each hub = one executor = one interpreter's RAM, supervised by its own systemd unit):
 
 ```
-nano-router    zenohd-serial — the rmw_zenoh graph + the ESP32's UART link
-nano-sensors   sensor_hub:  imu_driver + sys_monitor + wheel_odometry + lds_driver_py
-nano-nav       slam_nav:    super-light 2D SLAM + click-to-go navigation
-nano-app       app_hub:     web_control + oled_display + behavior (the personality)
-nano-map       map_bridge:  /dev/shm map blob -> /map OccupancyGrid (for remote RViz)
+nano-router      zenohd-serial — the rmw_zenoh graph + the ESP32's UART link
+nano-sensors     sensor_hub:  imu_driver + sys_monitor + wheel_odometry + lds_driver_py
+nano-nav         ONE rclcpp component container: the Nav2 Humble servers
+                 (planner + controller + bt_navigator + behaviors + lifecycle
+                 manager); components attached by nano-nav-loader, static
+                 base_link->laser TF as the unit's ExecStartPost
+nano-slam        slam_toolbox 2.6.10: /map + map->odom TF (plain node, own process)
+nano-app         app_hub:     web_control + oled_display + behavior (the personality)
 ```
 
 Packages under `src/`:
 
 ```
 robot_msgs        custom interfaces                                       [ament_cmake]
-robot_bringup     launch files + the single config/robot.yaml             [ament_python]
+robot_bringup     launch files + the single config/robot.yaml + nav2/     [ament_python]
 lds_driver_py     serial LDS02RR -> /scan + /dev/shm scan blob            [rclpy]
 imu_driver        BWT901CL IMU -> /imu/data, /imu/euler, /imu/web         [rclpy]
 wheel_odometry    /wheel_ticks (from ESP32) -> /odom + TF                 [rclpy]
 sys_monitor       /diagnostics + fan curve + health log + vitals blob     [rclpy]
-slam_nav          scan-matching SLAM, planner, pure-pursuit control,
-                  pickup/relocalize, self-test, vision target tracking    [rclpy]
 oled_display      SSD1306 dashboard + animated-eyes faces                 [rclpy]
 behavior          Sismic presence statechart + purpose/A-B "brain"        [rclpy]
 web_control       static control page + the browser's telemetry/control
@@ -52,20 +53,28 @@ web_control       static control page + the browser's telemetry/control
                   TTS, camera/mic, the LLM cognition core + skill library [rclpy]
 sensor_hub        single-process host for the four sensor nodes           [rclpy]
 app_hub           single-process host for web+oled+behavior               [rclpy]
-sim_hardware      dev-PC Gazebo stand-ins + the map bridge                [rclpy]
+sim_hardware      dev-PC Gazebo stand-in                                  [rclpy]
 ```
+
+Navigation runs on **Nav2 + slam_toolbox** (the custom `slam_nav` /
+robot_localization EKF stack was retired — see
+[`docs/nav2-migration.md`](docs/nav2-migration.md)): slam_toolbox turns `/scan`
++ `/odom` into `/map` + the `map→odom` TF, and the Nav2 servers plan/drive to
+`/goal_pose` (PoseStamped, frame `map`), publishing `/cmd_vel` straight to the
+ESP32 contract.
 
 Data flows over **two planes**: the typed ROS/zenoh graph carries the small control
 messages (incl. the ESP32 via zenoh-pico), while heavy/browser data rides `/dev/shm`
-blobs + HTTP — the scan and map blobs are polled by the page, one SSE stream
+blobs + HTTP — the scan blob is polled by the page, one SSE stream
 (`/telemetry`) carries every light readout, and `sys_monitor`'s vitals blob feeds the
 OLED dashboard + the cognition body snapshot without any fast subscriptions.
 
 ```
- lds_driver_py ─/scan──> slam_nav ─/dev/shm map─┐            ┌─> browser
- wheel_odometry ─/odom─> slam_nav   scan blob ──┼─ web_control┤   (one origin:
-        ▲                           vitals blob─┘  (HTTP+SSE) │    page + telemetry
-        └/wheel_ticks── ESP32 <──/cmd_vel── teleop POST /drive┘    + media + control)
+ lds_driver_py ─/scan──> slam_toolbox ─/map + map→odom─┐        ┌─> browser
+ wheel_odometry ─/odom─>      |          scan blob ────┼─ web_control┤   (one origin:
+                        Nav2 ──┘                vitals blob─┘  (HTTP+SSE) │  page + telemetry
+         ▲             goals /goal_pose                                   + media + control)
+         └/wheel_ticks── ESP32 <──/cmd_vel── teleop POST /drive┘
 ```
 
 ## 1. Prepare Armbian (enable the buses)
@@ -169,11 +178,10 @@ UI's **Sensors → Camera (GPU vision)** card — hover any reading or slider th
 explanation (toggle off with **💡 Show hints** if you don't want them). The 12 alert
 signals (obstructed/clutter/looming/vibration/…) are informational, but some vision
 signals now *do* feed behaviour: the personality layer greets someone walking up,
-gets cautious around visual clutter or something looming (which throttles speed when
-`trait_motion` is on), tints its idle mood with the room's colour warmth — and
-`slam_nav` can **turn in place to follow the calibrated colour target**
-(`track_enable`, the map panel's 🎯 Track toggle; pan-only, gated by the same
-`enable_motion` safety switch as navigation).
+gets cautious around visual clutter or something looming, and tints its idle mood
+with the room's colour warmth. (The old slam_nav-based turn-to-track colour targets
+went away with the Nav2 migration; the GPU vision palette is still there for
+calibration + the OLED mask.)
 
 ## 4. Run
 
@@ -182,7 +190,7 @@ auto-started on boot). `scripts/stack.sh` is the day-to-day wrapper:
 
 ```bash
 bash scripts/stack.sh up|down|restart|status   # = systemctl ... nano-robot.target
-journalctl -u nano-app -f                       # logs (also nano-sensors/nav/router/map)
+journalctl -u nano-app -f                       # logs (also nano-sensors/nav/slam/router)
 ```
 
 Crashes restart via `Restart=on-failure`; hangs via the systemd watchdog (each hub

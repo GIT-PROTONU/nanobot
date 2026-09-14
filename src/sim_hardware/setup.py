@@ -19,7 +19,6 @@ setup(
     entry_points={
         "console_scripts": [
             "sim_bridge_node = sim_hardware.sim_bridge_node:main",
-            "map_bridge_node = sim_hardware.map_bridge_node:main",
         ],
     },
 )

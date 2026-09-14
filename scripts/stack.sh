@@ -3,13 +3,18 @@
 #
 #   bash scripts/stack.sh {up|down|restart|status}     (no pixi env needed)
 #
-# The stack runs as six systemd units (installed by deploy/sbc-setup.sh):
+# The stack runs as five systemd units (installed by deploy/sbc-setup.sh):
 #   nano-router    serial-capable zenohd (rmw_zenoh graph + the ESP32 UART link)
 #   nano-app       app_hub: web_control + oled_display + behavior in ONE process
 #   nano-sensors   sensor_hub: imu + sys_monitor + wheel_odometry + lds in ONE process
-#   nano-ekf       robot_localization EKF: /odom + /imu/data -> /odometry/filtered
-#   nano-nav       slam_nav
-#   nano-map       map_bridge_node (/dev/shm map blob -> /map for remote RViz)
+#   nano-nav       ONE rclcpp component container (Nav2 servers + their
+#                  lifecycle manager); components attached by the loader unit
+#                  below, static base_link->laser TF as ExecStartPost
+#   nano-slam      slam_toolbox 2.6.10 (plain node, self-configuring; /map +
+#                  map->odom TF)
+#   nano-nav-loader oneshot: `nav2.launch.py load_only:=true` against nano-nav
+#                  (the old nano-ekf/nano-map units died with the slam_nav
+#                  migration — see docs/nav2-migration.md)
 # grouped under nano-robot.target. What each unit execs lives in ONE place:
 # scripts/unit_exec.sh (env activation + the installed-executable command table).
 #
@@ -24,7 +29,7 @@
 set -u
 
 TARGET="nano-robot.target"
-UNITS=(nano-router nano-app nano-sensors nano-ekf nano-nav nano-map)
+UNITS=(nano-router nano-app nano-sensors nano-nav nano-slam nano-nav-loader)
 SYSTEMCTL="/usr/bin/systemctl"
 
 installed() { "$SYSTEMCTL" list-unit-files "$TARGET" --no-legend 2>/dev/null | grep -q nano-robot; }
@@ -46,8 +51,8 @@ ctl() {  # ctl <verb> — root runs it directly; the stack user goes through sud
 }
 
 status() {
-  # One systemctl call for all six units (it prints one line per unit, in order)
-  # instead of six separate subprocess forks — status() runs after every up/down/restart.
+  # One systemctl call for all five units (it prints one line per unit, in order)
+  # instead of five separate subprocess forks — status() runs after every up/down/restart.
   local i=0 st line
   while read -r st; do
     printf '  %s: %s\n' "${UNITS[$i]}" "$([ "$st" = "active" ] && echo UP || echo down)"

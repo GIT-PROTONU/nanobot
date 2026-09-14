@@ -180,7 +180,8 @@ capability — *no code change*. `web_control/skills.py` just parses + indexes t
 
 An action skill runs **only** when it sets `enabled: true` **and** the node's
 `skills_allow_actions` master switch is on (**off by default**). Even then the value is clamped
-in `web_server`, and motion is clamped *again* reflexively by `slam_nav` — so a skill can never
+in `web_server` (the SKILL_MOTION_* caps — the old slam_nav reflexive clamp went away with
+the Nav2 migration) — so a skill can never
 push the robot into an unsafe state. That's the same principle as traits-as-guards: the brain
 can reach for a capability, but physics/safety always wins.
 
@@ -251,9 +252,9 @@ These aren't cosmetic; the statechart's guards *read* them:
 
 - **curiosity** gates the camera beat (not curious enough → no `looking`).
 - **extraversion** scales how often it acts (idle cadence).
-- **caution** is published (latched on `/cognition/traits`) to the navigation layer, which
-  maps it to stop-distance / max-speed — but **slam_nav clamps it reflexively**, so the
-  brain can *never* push motion into an unsafe range (gated by `trait_motion`).
+- **caution** is published (latched on `/cognition/traits`) for expression-level influence.
+  (The old mapping into slam_nav's stop-distance / max-speed clamps went away with the
+  Nav2 migration; caution now shapes behaviour only — never motion directly.)
 
 Alongside traits there's a **registry** — per-beat knobs (priority / enabled / gates) the
 brain can tune. Both are seeded from `personality.json` (created by
@@ -307,9 +308,9 @@ path**:
   greet-face + a `greeting` beat (rate-limited, idle-only).
 - **Looming / clutter → caution** — something closing on the lens startles caution up
   (edge-triggered); a visually busy floor *holds* caution at `clutter_caution` and
-  releases to the remembered pre-clutter value after. With slam_nav's `trait_motion`
-  opt-in this doubles as the **clutter velocity throttle**, through the one existing
-  clamped caution→max_lin mapping.
+  releases to the remembered pre-clutter value after. (It used to double as a
+  velocity throttle through slam_nav's caution→max_lin mapping; that mapping died
+  with slam_nav, so caution is expression-level only now.)
 - **Ambient colour mood** — scene warmth (R−B) tints the chart's `feeling` face; the
   LLM's `drives.mood` always wins.
 - **Novelty boost** — a transient lottery-weight multiplier on the `looking` beat
@@ -317,13 +318,10 @@ path**:
 - **Visual diary** — scene scalars sampled every 10 min; the trend ("the room has got
   darker and calmer") is folded into the reflection prompts like the trait trajectory.
 
-(Separately — and *not* part of the brain — `slam_nav` can visually servo on the
-calibrated colour target: `track_enable` turns the robot in place to keep the blob
-centered, pan-only, gated by `enable_motion` like all motion. The controller is a
-PD + age-taper + stiction-dither loop refined 2026-07-21 with a smooth deadband,
-coast-on-loss, an opt-in integral, a target-velocity feedforward, and
-confidence-scaled authority — all `track_*` params are live-tunable from the Camera
-tab's "▸ Tracking tuning".)
+(The slam_nav visual servoing on colour targets — the `track_*` PD/stiction loop —
+went away with the Nav2 migration. The GPU-vision colour palette survives for
+calibration + the OLED mask; autonomous tracking could later be rebuilt on top of
+Nav2's rotation control if wanted.)
 
 ## Purpose & goals (the "why" layer)
 

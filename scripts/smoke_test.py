@@ -152,6 +152,7 @@ def main():
         check("non-whitelisted topic refused", b"not whitelisted" in body, body[:80])
         st, body = req("POST", "/publish", {"topic": "/goal_pose", "value": {"a": 1}})
         check("bad goal body refused", b"bad value" in body, body[:80])
+        # slam_nav is long gone (nav2 migration) — a non-whitelisted node must refuse.
         st, body = req("POST", "/param",
                        {"node": "slam_nav", "name": "match_lin", "value": 0})
         check("non-whitelisted param refused", b"not whitelisted" in body, body[:80])

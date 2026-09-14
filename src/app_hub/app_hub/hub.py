@@ -6,7 +6,8 @@ sensor layer. On the 1 GB H5 each separate rclpy process carries a full interpre
 rmw baseline (tens of MB each); merging the three reclaims that RAM with NO change to
 node names, topics, params or behaviour (params still load per-name from
 `--ros-args --params-file robot.yaml`). The stack is now three fault domains =
-three hubs: sensor_hub (the body), slam_nav (spatial), app_hub (expression/web/brain).
+three hubs: sensor_hub (the body), the nav2 container (spatial), app_hub
+(expression/web/brain).
 
 Trade-off (same as sensor_hub, accepted): the three no longer crash/restart
 independently. In practice web_server dying always took the face's *content* with it

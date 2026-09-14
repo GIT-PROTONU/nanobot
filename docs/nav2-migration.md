@@ -1,6 +1,9 @@
 # Nav2 Migration Plan — replace custom `slam_nav` with Nav2 + slam_toolbox
 
-Status: PLANNED (checked against upstream Nav2 Humble 1.1.20 + slam_toolbox `ros2` source).
+Status: **EXECUTED 2026-09-14** (see "Execution notes" at the bottom for the four
+deviations found while running it live). The checked-in facts below were verified
+against upstream Nav2 Humble 1.1.20 + the slam_toolbox `ros2` source and held,
+except where corrected in the notes.
 Goal: single-process Nav2 stack (planner_server + controller_server + bt_navigator +
 behavior_server + lifecycle_manager + slam_toolbox in ONE ComponentContainer), lean RAM/CPU.
 
@@ -173,3 +176,45 @@ works via `/goal_pose`.
   confirm pixi packages on linux-aarch64; `pixi run build`.
 - Board bring-up: measure RSS/CPU — container < 150 MB RSS; idle CPU ≈ 0; BT tick ≤10 Hz
   only while navigating. Run `scripts/stack.sh` clean down→verify→up.
+## Execution notes (2026-09-14 — what actually got built, and why it differs)
+
+Deliverables 1-3 landed as `config/nav2/nav2_params.yaml`, `config/nav2/recovery_bt.xml`,
+`launch/nav2.launch.py`; the wiring/cleanup section was executed in full (systemd units,
+`unit_exec.sh`, `stack.sh`, `sbc-setup.sh`, bringup.launch.py, robot.yaml, slam_nav deleted,
+pixi/package.xml deps, web-UI scrap, AGENTS.md TODO). Live verification on the dev PC
+(fresh zenoh router + separately-started container + `load_only:=true` attach + fake
+odom/TF/scan sources) confirmed: 5/5 components load, all four Nav2 servers CONFIGURE +
+ACTIVATE with bonds ("Managed nodes are active"), slam_toolbox publishes `/map` +
+`map→odom` TF, and a `/goal_pose` streams `/cmd_vel` at the RPP cap through the minimal
+recovery BT. Four deviations from the plan as written:
+
+1. **Container variant: `component_container_isolated`, not plain `component_container`.**
+   Upstream nav2 Humble uses the isolated variant for a reason: on the plain (single-
+   threaded) container, one component's construction/long callback blocks the ONE
+   executor thread that serves every other component's services — the lifecycle
+   manager's 2 s service deadlines lose that race and bringup aborts (live-verified
+   failure, then verified fixed by switching).
+2. **Managers load LAST.** A composed `nav2_lifecycle_manager` self-starts via an
+   internal ~0 s timer (verified in nav2 1.1.x lifecycle_manager.cpp); loading it before
+   the nodes it manages races the next component's construction. Order is now
+   planner → controller → behavior → bt_navigator → lifecycle_manager.
+3. **slam_toolbox is a SEPARATE process, not composed.** The plan's lifecycle design
+   (second manager, bond gotcha, OnStateTransition autostart) describes slam_toolbox
+   ≥2.7. The only robostack build for either platform is **2.6.10**, where SlamToolbox is
+   a PLAIN `rclcpp::Node` whose executable main calls `configure()` itself — no lifecycle
+   services, and the registered component is inert when composed (nothing calls
+   configure; verified against the installed binaries). So it runs as `nano-slam.service`
+   (`unit_exec.sh slam` → `async_slam_toolbox_node` + nav2_params.yaml). RAM cost is one
+   extra rclcpp process; revisit composition if robostack ever ships ≥2.7.
+4. **Two extra BT/behavior bits the default through-poses tree forced**: bt_navigator
+   also loads and VALIDATES the upstream default `navigate_through_poses` tree at
+   activation, so the plugin list gained `rate_controller`/`goal_updated`/`wait`, and
+   behavior_server hosts the `wait` plugin — otherwise activation fails with
+   "'wait' action server not available" even though we never publish
+   `/navigate_through_poses`.
+
+Env notes: all 13 conda packages resolve on linux-aarch64 (robostack-staging, verified
+via the anaconda API). The dev-PC env was re-resolved for the new deps, which wiped a
+manual `nanobot-brain` editable install — `pip` was added to pixi.toml and the brain
+reinstalled editable; the brain repo was fast-forwarded 2 commits to restore
+`strip_em_dash` (the glue↔brain lockstep gotcha in AGENTS.md, exactly as documented).

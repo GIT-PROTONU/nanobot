@@ -33,7 +33,7 @@ from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import MagneticField
 from diagnostic_msgs.msg import DiagnosticArray
 
@@ -50,14 +50,12 @@ SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the la
 # "read params live, not fixed constants" pattern as the optical bumper) -- so every
 # alert's threshold is a web UI slider from day one, not a hardcoded guess. All are
 # informational only so far; nothing autonomous acts on them yet.
-PLAN_MAX_PTS = 64        # planned-path polyline is downsampled to at most this many points
 LDS_RPM_MAX = 400.0      # clamp on the /lds_target_rpm setpoint a browser may publish
 MOTOR_ACCEL_MIN = 0.3    # clamp on the /motor_accel ramp rate (duty/s) -- matches the
 MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.cpp)
 TRIM_MAX = 0.30          # ESP32 firmware's TRIM_MAX -- |wheel_trim| rebalance range (main.cpp)
-GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- half of slam_nav's default
-                         # map_size_m (24m); a goal outside the map would otherwise sit
-                         # latched until goal_no_path_timeout reaps it ~20s later
+GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- Nav2's global costmap is
+                         # 24x24 m; a goal outside it would just fail to plan
 SCHEDULE_MAX_ENTRIES = 20  # cap on the scheduled-routines list a browser may set
 STALE = -1e9
 
@@ -67,21 +65,6 @@ PARAM_WHITELIST = {
                    "mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg", "bandwidth_hz"},
     "lds_driver": {"publish_rate"},
     "wheel_odometry": {"publish_rate"},
-    "slam_nav": {"enable_motion", "auto_explore", "max_lin", "max_ang", "stop_distance",
-                 "robot_radius", "stuck_timeout", "goal_no_path_timeout", "relocalize",
-                 "pickup_pause",
-                 "lds_idle_enable", "lds_idle_timeout", "lds_idle_rpm", "lds_active_rpm",
-                 "track_enable", "track_kp", "track_kd", "track_max_ang", "track_min_eff_ang",
-                 "track_deadband", "track_deadband_soft", "track_conf_min", "track_conf_scale",
-                 "track_timeout", "track_coast", "track_ki", "track_kff",
-                 "loop_closure", "loop_probe_every", "loop_lin", "loop_ang",
-                 "loop_score", "loop_min_shift", "loop_alpha", "loop_apply_thresh",
-                 "test_lin", "test_ang", "test_dist", "test_turns", "test_settle",
-                 "slip_check", "slip_min_rot", "slip_ratio_hi", "slip_ratio_lo",
-                 "slip_cooldown",
-                 "qual_min", "min_overlap_ratio", "min_improve",
-                 "recover_exit_improve", "recover_min_seen", "recover_min_move",
-                 "head_tol", "pos_tol", "pos_tol_sparse", "dynamic_reject"},
     "sys_monitor": {"fan_override", "fan_temp_min", "fan_min_duty", "fan_smooth_alpha"},
     "web_control": {"vision_dark_reflex_enable", "vision_dark_threshold", "vision_dark_recover",
                     "vision_bumper_cmd_eps", "vision_bumper_motion_floor", "vision_bumper_confirm_secs",
@@ -92,8 +75,7 @@ PARAM_WHITELIST = {
                     "vision_novelty_alert", "vision_camera_stall_secs",
                     "vision_vibration_ratio", "vision_vibration_confirm_secs",
                     "vision_glare_derate", "vision_approach_rate", "vision_approach_band",
-                    "imu_drift_min_secs",
-                    "wall_guard_enable", "wall_guard_distance"},
+                    "imu_drift_min_secs"},
 }
 
 
@@ -113,13 +95,6 @@ class TelemetryHub:
 
         # --- latest-value stores written by the lazy subscriptions -------------
         self._odom = None             # (x, y, yaw_rad)
-        self._ekf = None              # (x, y, yaw_rad, arrival monotonic) -- /odometry/filtered
-        self._ekf_hz = 0.0            # measured /odometry/filtered publish rate (1 s window)
-        self._ekf_cnt = 0             # messages in the current rate window
-        self._ekf_win = (0, time.monotonic())
-        self._slam_pose = None        # (x, y, yaw_rad, arrival monotonic) -- /slam_pose (map frame)
-        self._sld = None        # slam_nav/diag dict + arrival monotonic, for the motion-chain card
-        self._plan = []               # [[x, y], ...] downsampled
         self._diag = ({}, STALE)      # ({key: value}, arrival monotonic)
         self._pipe_diag = None    # (feed dict, arrival, level, message) or None
         self._ticks = None            # (l, r)
@@ -133,7 +108,6 @@ class TelemetryHub:
         self._wheel_trim = None     # live straight-line trim from the ESP32 (/wheel_trim)
         self._lds = {}                # rpm / hz / duty
         self._fan = None
-        self._selftest = ""
         self._mag = None              # (x, y, z) raw counts, for eyeballing IMU cal quality
         self._eul = None              # (roll, pitch, yaw deg, arrival monotonic) -- direct
                                        # /imu/euler sub, NOT the 1 Hz vitals blob (see _on_eul)
@@ -161,7 +135,6 @@ class TelemetryHub:
             "/goal_pose": (pub(PoseStamped, "goal_pose", 5), self._mk_goal),
             "/lds_target_rpm": (pub(Float32, "lds_target_rpm", 5), self._mk_lds_rpm),
             "/pickup_override": (pub(Int8, "pickup_override", latched), self._mk_pickup),
-            "/selftest": (pub(Bool, "selftest", 5), self._mk_bool),
             "/reset_ticks": (pub(Bool, "reset_ticks", 5), self._mk_bool),
             # ESP32 motor accel-ramp rate (duty/s) -- see main.cpp's MOTOR_SLEW_DEFAULT.
             "/motor_accel": (pub(Float32, "motor_accel", 5), self._mk_motor_accel),
@@ -171,15 +144,6 @@ class TelemetryHub:
             "/motor_trim": (pub(Float32, "motor_trim", 5), self._mk_motor_trim),
             # ESP32 line lasers 1-2 (GPIO 23/32): [v1,v2] PWM 0..255 each.
             "/laser_pwm": (pub(Int32MultiArray, "laser_pwm", 5), self._mk_laser),
-            # NOTE: the ROS topic string here is bare ("go_home", not "slam_nav/go_home")
-            # -- nav_node subscribes to the same bare name with no namespace of its own
-            # (neither the systemd unit_exec.sh path nor bringup.launch.py sets one), so
-            # a "slam_nav/"-prefixed publisher topic here would silently talk to nobody.
-            # The "/slam_nav/..." string is only the whitelist KEY (what the browser
-            # POSTs as `topic`) -- kept as-is so map.js doesn't need to change.
-            "/slam_nav/go_home": (pub(Bool, "go_home", 5), self._mk_bool),
-            "/slam_nav/save_map": (pub(Bool, "save_map", 5), self._mk_bool),
-            "/slam_nav/clear_map": (pub(Bool, "clear_map", 5), self._mk_bool),
             "/oled_face": (node._face_pub, self._mk_face),
             "/oled_text": (pub(String, "oled_text", 5), self._mk_text),
             "/oled_dashboard": (pub(Bool, "oled_dashboard", 5), self._mk_bool),
@@ -292,17 +256,15 @@ class TelemetryHub:
         return (now - self._vibration_since) >= g("vision_vibration_confirm_secs").value
 
     def _drift_yaw_deg(self):
-        """Heading source for the yaw-drift numbers: the EKF's /odometry/filtered
-        yaw (radians), NOT the BWT901CL's raw fused 0x53 angle. The device's own
-        fused yaw develops a large decaying bias transient for a minute+ after any
-        real motion (measured 2026-08-11: +450° in 76s post-drive while the raw
-        gyro-z stayed ~0), so it is NOT a trustworthy "is my heading stable at rest"
-        reference even though it looks fine on the 3D display. The EKF yaw is now
-        gyro-z-integrated (imu0 yaw fusion disabled) -- clean at rest, no transient.
-        Falls back to the raw device yaw if the EKF hasn't arrived yet."""
-        if self._ekf is not None:
-            return math.degrees(self._ekf[2])
-        return self._eul[2]           # pre-EKF fallback (raw device yaw, degrees)
+        """Heading source for the yaw-drift numbers: the raw /imu/euler yaw
+        (degrees). The robot_localization EKF this used to prefer is GONE with
+        the slam_nav migration (docs/nav2-migration.md), so the device's own
+        fused yaw is the only heading source again — remember (2026-08-11
+        finding) that it develops a decaying bias transient for a minute+ after
+        any real motion, so a fresh post-drive "drift" reading can be the
+        transient, not real drift. Wait a minute after moving before trusting
+        the numbers below."""
+        return self._eul[2]
 
     def _imu_drift_tick(self, now):
         """IMU drift check: while the robot is provably stationary (not commanded to
@@ -446,25 +408,6 @@ class TelemetryHub:
         f["imu_drift"] = self._imu_drift_tick(now)
         if self._odom:
             f["odom"] = [round(v, 3) for v in self._odom]
-        if self._ekf is not None:
-            x, y, yaw, at = self._ekf
-            f["ekf"] = {"x": round(x, 3), "y": round(y, 3),
-                        "yaw": round(yaw, 3), "age": round(now - at, 2)}
-        if self._ekf_hz:
-            f["ekf_hz"] = round(self._ekf_hz, 1)
-        if self._slam_pose is not None:
-            x, y, yaw, at = self._slam_pose
-            f["slam_pose"] = {"x": round(x, 3), "y": round(y, 3),
-                              "yaw": round(yaw, 3), "age": round(now - at, 2)}
-        # Manual-teleop wall guard: the Map card's toggle + keep-away bubble read this.
-        f["wall_guard"] = getattr(n, "wall_guard_state", lambda: {})()
-        if self._sld is not None:
-            d, at = self._sld
-            if now - at < 5.0:                    # stale diag = the node is gone
-                f["slam_diag"] = d
-                f["slam_diag_age"] = round(now - at, 2)
-        if self._plan:
-            f["plan"] = self._plan
         if diag:
             f["diag"] = diag
             f["diag_age"] = round(now - diag_at, 2)
@@ -475,8 +418,6 @@ class TelemetryHub:
                                  "age": round(now - pd_at, 2)}
         if self._fan is not None:
             f["fan"] = self._fan
-        if self._selftest:
-            f["selftest"] = self._selftest
         if self._mag is not None:
             f["imuMag"] = list(self._mag)
         if self._imu_cal_status:
@@ -562,14 +503,6 @@ class TelemetryHub:
         n, s = self._node, self._subs.append
         sub = n.create_subscription
         s(sub(Odometry, "odom", self._on_odom, 5))
-        # EKF-fused pose (/odometry/filtered, robot_localization output in the odom
-        # frame) and slam_nav's pure scan-match map pose. The motion-chain card compares
-        # the FOUR yaw sources (wheel / EKF / IMU / scan) side by side to isolate which
-        # link of the odom→ECF→SLAM chain is the one disagreeing when the robot drifts.
-        s(sub(Odometry, "odometry/filtered", self._on_ekf, 5))
-        s(sub(PoseStamped, "slam_pose", self._on_slam_pose, 5))
-        s(sub(String, "slam_nav/diag", self._on_sld, 5))
-        s(sub(Path, "plan", self._on_plan, 2))
         s(sub(DiagnosticArray, "diagnostics", self._on_diag, 2))
         s(sub(Int64MultiArray, "wheel_ticks", self._on_ticks, 5))
         s(sub(Int64MultiArray, "wheel_stray_ticks", self._on_stray, 5))
@@ -581,7 +514,6 @@ class TelemetryHub:
         s(sub(Float32, "lds_hz", self._mk_lds("hz"), 2))
         s(sub(Float32, "lds_duty", self._mk_lds("duty"), 2))
         s(sub(Float32, "fan_pwm", self._on_fan, 2))
-        s(sub(String, "selftest_result", self._on_selftest, 2))
         s(sub(MagneticField, "imu/mag", self._on_mag, 2))
         # Direct sub (not the 1 Hz vitals blob) -- the 3D orientation view needs eul
         # fresh every frame, and sys_monitor's own /imu/euler sub only feeds its once-
@@ -617,41 +549,6 @@ class TelemetryHub:
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
         yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
         self._odom = (p.x, p.y, yaw)
-
-    def _on_ekf(self, msg):
-        p, q = msg.pose.pose.position, msg.pose.pose.orientation
-        yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
-        self._ekf = (p.x, p.y, yaw, time.monotonic())
-        # Rolling 1 s window: measured /odometry/filtered rate, shown next to the
-        # configured frequency so a throttled EKF is visible without a ruler.
-        now = time.monotonic()
-        start, _ = self._ekf_win
-        if self._ekf_cnt == 0:
-            start = now
-        self._ekf_cnt += 1
-        if now - start >= 1.0:
-            self._ekf_hz = self._ekf_cnt / (now - start)
-            self._ekf_cnt = 0
-            self._ekf_win = (now, now)
-
-    def _on_slam_pose(self, msg):
-        p, q = msg.pose.position, msg.pose.orientation
-        yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
-        self._slam_pose = (p.x, p.y, yaw, time.monotonic())
-
-    def _on_sld(self, msg):
-        try:
-            self._sld = (json.loads(msg.data), time.monotonic())
-        except ValueError:
-            self._sld = None
-
-    def _on_plan(self, msg):
-        pts = [[round(p.pose.position.x, 3), round(p.pose.position.y, 3)]
-               for p in msg.poses]
-        if len(pts) > PLAN_MAX_PTS:                      # keep ends, thin the middle
-            step = (len(pts) - 1) / (PLAN_MAX_PTS - 1)
-            pts = [pts[int(i * step)] for i in range(PLAN_MAX_PTS - 1)] + [pts[-1]]
-        self._plan = pts
 
     def _on_diag(self, msg):
         st = next((s for s in msg.status if s.name == "system"), None)
@@ -701,9 +598,6 @@ class TelemetryHub:
     def _on_fan(self, msg):
         self._fan = round(msg.data, 3)
 
-    def _on_selftest(self, msg):
-        self._selftest = msg.data
-
     def _on_mag(self, msg):
         m = msg.magnetic_field
         self._mag = (round(m.x, 1), round(m.y, 1), round(m.z, 1))
@@ -744,8 +638,7 @@ class TelemetryHub:
         # Diagnosability: log map-click goals + LDS rpm etc. so "who told the robot to
         # go there / spin" is in the app log. Throttle the chatty spin-down? No — these
         # are discrete user actions, not a hot loop; every one is a meaningful event.
-        if topic in ("/goal_pose", "/slam_nav/go_home", "/slam_nav/save_map",
-                     "/slam_nav/clear_map", "/selftest", "/reset_ticks", "/laser_pwm"):
+        if topic in ("/goal_pose", "/reset_ticks", "/laser_pwm"):
             self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
         return {"status": "ok", "topic": topic}
 

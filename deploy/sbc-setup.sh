@@ -123,14 +123,19 @@ modprobe lima || true    # also load it now, so a reboot isn't required to use t
 apt-get install -y --no-install-recommends libegl1 libgles2 libgbm1 libgl1-mesa-dri
 
 echo "== 6/6  systemd: per-process units under nano-robot.target (Restart=on-failure) =="
-# One unit per stack process (router/app/sensors/nav/map), grouped by nano-robot.target.
-# systemd's own Restart=on-failure replaced the old nano-heal.timer polling (and its
-# heal-vs-restart duplicate-node race); scripts/stack.sh is now a systemctl wrapper.
-systemctl disable --now nano-heal.timer nano-heal.service nano-stack.service 2>/dev/null || true
+# One unit per stack process (router/app/sensors/nav + the nav component loader),
+# grouped by nano-robot.target. systemd's own Restart=on-failure replaced the old
+# nano-heal.timer polling (and its heal-vs-restart duplicate-node race);
+# scripts/stack.sh is now a systemctl wrapper. Also retire the pre-Nav2
+# nano-ekf/nano-map units from an older install so they can't linger.
+systemctl disable --now nano-heal.timer nano-heal.service nano-stack.service \
+                        nano-ekf.service nano-map.service 2>/dev/null || true
 rm -f /etc/systemd/system/nano-heal.timer /etc/systemd/system/nano-heal.service \
-      /etc/systemd/system/nano-stack.service
+      /etc/systemd/system/nano-stack.service \
+      /etc/systemd/system/nano-ekf.service /etc/systemd/system/nano-map.service
 for unit in nano-robot.target nano-router.service nano-app.service \
-            nano-sensors.service nano-ekf.service nano-nav.service nano-map.service; do
+            nano-sensors.service nano-nav.service nano-slam.service \
+            nano-nav-loader.service; do
   install -m 0644 "$HERE/systemd/$unit" "/etc/systemd/system/$unit"
   if [ "$USER_NAME" != ibster ]; then
     sed -i "s|ibster|$USER_NAME|g; s|/home/ibster|$(eval echo "~$USER_NAME")|g" \
@@ -139,7 +144,8 @@ for unit in nano-robot.target nano-router.service nano-app.service \
 done
 systemctl daemon-reload
 systemctl enable nano-robot.target nano-router.service nano-app.service \
-                 nano-sensors.service nano-ekf.service nano-nav.service nano-map.service
+                 nano-sensors.service nano-nav.service nano-slam.service \
+                 nano-nav-loader.service
 
 echo
 echo "Done. The stack auto-starts on boot; a crashed unit restarts itself (Restart=on-failure)."

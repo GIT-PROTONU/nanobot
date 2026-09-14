@@ -1,0 +1,24 @@
+[Unit]
+Description=Nano nav component loader (attaches Nav2 + slam_toolbox to the nav2_container)
+# Runs AFTER the container unit and only if it is up (Requisite): unit_exec.sh
+# nav-loader polls `ros2 node list` for nav2_container (bounded ~30 s), then runs
+# `ros2 launch robot_bringup nav2.launch.py load_only:=true` once — which emits
+# ONLY the LoadComposableNodes action (no container spawn) and exits. The
+# launch's LoadComposableNodes retries the container's load-node service every
+# 1 s, so the container only needs to be alive, not fully settled.
+After=nano-nav.service
+Requisite=nano-nav.service
+Wants=nano-router.service
+PartOf=nano-robot.target
+
+[Service]
+Type=oneshot
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh nav-loader
+# The loader is a one-shot: never restart it (a failed load means the container
+# is wedged — restarting the container unit is the fix, not a loader retry loop).
+RemainAfterExit=yes
+Nice=10
+
+[Install]
+WantedBy=nano-robot.target

@@ -1,9 +1,11 @@
 # Improvements TODO
 
-> **NAV2 MIGRATION PLANNED** — see `docs/nav2-migration.md` for the checked, ready-to-build
-> plan replacing the custom `slam_nav` stack with Nav2 + slam_toolbox in a single
-> ComponentContainer process (planner + controller + bt_navigator + behavior + lifecycle
-> manager + slam_toolbox), incl. dropping nano-ekf/nano-map and deleting `src/slam_nav`.
+> **NAV2 MIGRATION EXECUTED (2026-09-14)** — `docs/nav2-migration.md` was built and
+> live-verified on the dev PC: the custom `slam_nav` stack, the robot_localization EKF
+> and the map blob bridge are DELETED; navigation is now Nav2 Humble servers in one
+> component container + slam_toolbox 2.6.10 as its own process. Deviation notes live at
+> the bottom of that file; the reimplement-later web-UI TODO lives in AGENTS.md. Some
+> slam_nav/EKF-era items below are now MOOT (marked accordingly).
 
 Findings from the 2026-07-16 full-code review. Items here are *code/robustness
 improvements spotted in review* — the separate feature backlog lives in
@@ -17,6 +19,11 @@ left needs the physical robot and can't be closed from a dev host.
 
 - [ ] **Flash the ESP32 stray-tick firmware** (`/wheel_stray_ticks` + `/reset_ticks`,
       built 2026-07-15, not flashed).
+- [ ] **Deploy the Nav2 migration to the board**: build + `sudo bash
+      deploy/sbc-setup.sh` (installs the new unit set, retires nano-ekf/nano-map) +
+      `stack.sh down` → verify → `up`. Also sync the board's `brain/src` copy (the
+      dev-PC brain repo was fast-forwarded 2 commits for `strip_em_dash` — see
+      AGENTS.md's deploy note).
 - [ ] **Deploy to the board**: `goal_no_path_timeout` LDS-idle fix + the TTS
       shutdown-cutoff fix (`TtsEngine.wait`) — both committed 2026-07-15, not deployed.
 - [ ] **Hardware-verify the IMU accel/mag calibration + the new 6-axis mode /
@@ -93,16 +100,16 @@ left needs the physical robot and can't be closed from a dev host.
       rewired from a dead ROSLIB block to the SSE `pub()`/`sendDrive()` gateway;
       `_on_clear_map` drops the goal/path and rewrites the no-go blob to `count:0`.
       See `.claude/memory/web-map-clear-buttons-nogo.md`.
-- [ ] **Update EKF yaw process noise covariance** (increase from 0.06 → 0.12) to
-      improve turn handling in SLAM correlation.
+- [x] ~~Update EKF yaw process noise covariance~~ — MOOT: the robot_localization EKF
+      was deleted in the Nav2 migration (2026-09-14); slam_toolbox owns heading now.
 - [ ] **Wheel calibration**: Test `ticks_per_rev` with a measured 1m distance drive.
       Log discrepancy to debug `wheel_odometry/encoder_node.py` (lines 50-53).
-- [ ] **Add scan-matching logger**: Record residuals to `/scan_matching_queue` for
-      analysis during SLAM failures.
-- [ ] **Implement `/scan_bias` calibration**: Capture scrape noise in lidar data and
-      zero it using raw filter scan offsets.
-- [ ] **Implement `/scan_quality_metrics` pub**: Track correlation score, map drift,
-      and relocalization count during runs.
+- [x] ~~Add scan-matching logger (slam_nav)~~ — MOOT: slam_nav deleted in the Nav2
+      migration; slam_toolbox logs its own matcher diagnostics.
+- [x] ~~Implement `/scan_bias` calibration (slam_nav)~~ — MOOT with slam_nav deleted
+      (Nav2 migration). If lidar bias reappears, address it at the lds_driver_py level.
+- [x] ~~Implement `/scan_quality_metrics` pub (slam_nav)~~ — MOOT with slam_nav deleted
+      (Nav2 migration). Nav2 exposes lifecycle/health diagnostics natively.
 
 # Monitoring scripts to add
 

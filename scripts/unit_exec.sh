@@ -5,13 +5,27 @@
 # relaunches a crashed node natively, which replaced the old nano-heal.timer polling
 # (and its heal-vs-restart duplicate-node race).
 #
-#   scripts/unit_exec.sh {router|app|sensors|ekf|nav|map}
+#   scripts/unit_exec.sh {router|app|sensors|nav|nav-loader|slam|tf}
 #
 # Notes baked in from stack.sh's era:
 #  * Nodes are launched by their INSTALLED EXECUTABLES, not `ros2 run`/`ros2 launch` —
 #    each of those leaves a ~27-40 MB Python CLI wrapper resident per node.
 #  * rmw_zenoh ordering: a node started before the router runs islanded. The units
 #    encode that with After=nano-router.service (+ the router's start-up settle sleep).
+#  * nav = the ONE heavy process: an rclcpp_components/component_container_isolated
+#    hosting the Nav2 servers + their lifecycle manager (see
+#    robot_bringup/launch/nav2.launch.py). The nano-nav-loader unit (After=/
+#    Requisite=nano-nav) attaches the five components to that container via
+#    `nav2.launch.py load_only:=true` — the launch's LoadComposableNodes retries
+#    the container's load-node service every 1 s until it appears. Fallback if
+#    the loader path ever misbehaves: `ros2 launch robot_bringup nav2.launch.py`
+#    (spawns container + components + slam_toolbox + TF itself).
+#  * slam = slam_toolbox 2.6.10 (robostack's only build): a PLAIN rclcpp::Node
+#    whose executable main calls configure() itself — no lifecycle services, so
+#    it must run as its own process (nano-slam unit); composing it is inert.
+#  * tf = the static base_link -> laser transform (yaw π: this unit's sensor
+#    head faces back — slam_nav's old heading_flip, now expressed in TF world).
+#    nano-nav.service runs it as ExecStartPost so both die/restart together.
 set -u
 
 NANO="${NANO:-$HOME/Nano}"
@@ -33,7 +47,7 @@ if [ -f "$NANO/install/setup.bash" ]; then
 fi
 
 PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/robot.yaml"
-EKF_PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/ekf.yaml"
+NAV2_PARAMS="$NANO/install/robot_bringup/share/robot_bringup/config/nav2/nav2_params.yaml"
 OWN="$NANO/install"
 LOGDIR="$NANO/.run"; mkdir -p "$LOGDIR"
 
@@ -76,20 +90,44 @@ PY
   sensors)  # imu + sys_monitor + wheel_odometry + lds in ONE process (see sensor_hub)
     exec "$OWN/sensor_hub/lib/sensor_hub/sensor_hub" --ros-args --params-file "$PARAMS"
     ;;
-  ekf)      # robot_localization EKF: fuses /odom (wheel encoders) + /imu/data (IMU)
-            # into a single filtered pose on /odometry/filtered + odom->base_link TF.
-            # Node name must match ekf.yaml's top-level key (ekf_node).
-    exec "$CONDA_PREFIX/lib/robot_localization/ekf_node" \
-      --ros-args -r __node:=ekf_node --params-file "$EKF_PARAMS"
+  nav)      # ONE heavy C++ process: the rclcpp component container (isolated
+            # executor, upstream nav2's Humble choice) hosting planner_server +
+            # controller_server + bt_navigator + behavior_server + their
+            # lifecycle manager (see nav2.launch.py). Components are attached
+            # by the nano-nav-loader unit (load_only:=true).
+    exec "$CONDA_PREFIX/lib/rclcpp_components/component_container_isolated" \
+      --ros-args -r __node:=nav2_container
     ;;
-  nav)
-    exec "$OWN/slam_nav/lib/slam_nav/nav_node" --ros-args --params-file "$PARAMS"
+  nav-loader)
+    # Wait for the container (up to ~30 s at 0.5 s steps) — the launch's
+    # LoadComposableNodes retries its service for ever, but a bounded poll first
+    # means a dead container surfaces as THIS unit failing (visible in the journal
+    # + systemctl) instead of a silently looping loader.
+    for i in $(seq 1 60); do
+      if ros2 node list --no-daemon 2>/dev/null | grep -q "nav2_container"; then break; fi
+      if [ "$i" = 60 ]; then
+        echo "nav-loader: nav2_container never appeared — is nano-nav.service up?" >&2
+        exit 1
+      fi
+      sleep 0.5
+    done
+    exec "$CONDA_PREFIX/bin/ros2" launch robot_bringup nav2.launch.py load_only:=true
     ;;
-  map)      # republishes /dev/shm/nano_map.bin as /map for a remote RViz
-    exec "$OWN/sim_hardware/bin/map_bridge_node" --ros-args --params-file "$PARAMS"
+  slam)     # slam_toolbox 2.6.10 (the only robostack build): PLAIN rclcpp::Node,
+            # self-configuring executable. Provides /map + the map->odom TF that
+            # Nav2's costmaps/navigator build on.
+    exec "$CONDA_PREFIX/lib/slam_toolbox/async_slam_toolbox_node" \
+      --ros-args --params-file "$NAV2_PARAMS"
+    ;;
+  tf)       # static base_link -> laser, yaw pi (sensor head mounted facing back —
+            # the TF-world replacement for slam_nav's heading_flip; see
+            # nav2.launch.py's heading_flip arg for the launch-side equivalent).
+    exec "$CONDA_PREFIX/lib/tf2_ros/static_transform_publisher" \
+      --x 0 --y 0 --z 0.065 --yaw 3.14159265 \
+      --frame-id base_link --child-frame-id laser
     ;;
   *)
-    echo "usage: $0 {router|app|sensors|ekf|nav|map}" >&2
+    echo "usage: $0 {router|app|sensors|nav|nav-loader|slam|tf}" >&2
     exit 2
     ;;
 esac

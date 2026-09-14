@@ -119,18 +119,18 @@ class MonitorNode(Node):
         self.create_subscription(Float32, "/esp32_temp", self._on_esp_temp, 10)
 
         # Localization-pipeline feed watchers (see FeedWatch in health_log.py). These
-        # track the raw wheel-odometry feed, the EKF-fused output that slam_nav actually
-        # consumes, and the IMU euler feed. Their ages + a DOWN/UP transition in the
-        # durable health.log tell you whether to blame the ESP32, the EKF process, or
-        # the IMU when SLAM stops moving — instead of poking at an empty map.
+        # track the raw wheel-odometry feed (what slam_toolbox's odom->base_link chain
+        # is built on) and the IMU euler feed. Their ages + a DOWN/UP transition in
+        # the durable health.log tell you whether to blame the ESP32 or the IMU when
+        # SLAM stops moving — instead of poking at an empty map. (The third watcher
+        # used to be the robot_localization EKF's /odometry/filtered; that node is
+        # gone since the Nav2/slam_toolbox migration — docs/nav2-migration.md.)
         self._pipe = {}                     # topic -> monotonic time of last message
         self._feeds = {}
-        for topic, name in (("/odom", "odom"), ("/odometry/filtered", "ekf"),
-                            ("/imu/euler", "imu")):
+        for topic, name in (("/odom", "odom"), ("/imu/euler", "imu")):
             self._pipe[topic] = None
             self._feeds[topic] = FeedWatch(name)
         self.create_subscription(Odometry, "/odom", self._on_odom_watch, 10)
-        self.create_subscription(Odometry, "/odometry/filtered", self._on_ekf_watch, 10)
         # Board uptime is captured once (a boot-time value); per-tick `uptime` is then
         # derived from the monotonic delta instead of re-reading /proc/uptime every ~s.
         self._uptime0 = float((_read("/proc/uptime").split() or ["0"])[0] or 0)
@@ -372,9 +372,6 @@ class MonitorNode(Node):
 
     def _on_odom_watch(self, _msg):
         self._pipe["/odom"] = time.monotonic()
-
-    def _on_ekf_watch(self, _msg):
-        self._pipe["/odometry/filtered"] = time.monotonic()
 
     def _on_hb(self, _msg):
         self._hb_at = time.monotonic()

@@ -1,0 +1,247 @@
+# =============================================================================
+# Nav2 + slam_toolbox parameters (Humble) — replaces the custom slam_nav stack.
+# ONE process hosts planner_server · controller_server · bt_navigator ·
+# behavior_server · lifecycle_manager · slam_toolbox (see launch/nav2.launch.py):
+# launch_ros hands this whole file to every ComposableNode and each node picks
+# the section matching its own name. Deliberately ABSENT everywhere: AMCL,
+# velocity_smoother, collision_monitor, map_server, waypoint_follower,
+# smoother_server, voxel/3D/range/keepout costmap layers — lean RAM/CPU on the
+# 1 GB NanoPi NEO Plus2 (H5).
+#
+# Key hardware facts baked in (see docs/nav2-migration.md):
+#   * LDS02RR lidar: 0.12–6.0 m, ~1° beams, frame "laser" (static base_link→laser
+#     TF with yaw π is published by the launch for this unit's reversed head).
+#   * slam_toolbox replaces the old EKF+slam_nav fusion: map→odom comes from
+#     slam_toolbox, odom→base_link from wheel_odometry (publish_tf: true).
+#   * Ceres thread count is NOT configurable upstream (hardcoded 50) — the CPU/RAM
+#     guard is the pose-graph growth gate below + systemd CPUAffinity/Nice, NOT a
+#     YAML knob (there is no ceres_num_threads param; do not "add" one).
+# =============================================================================
+
+# ---- slam_toolbox (online async mapping) ------------------------------------
+# RUNS AS ITS OWN PROCESS (nano-slam systemd unit / async_slam_toolbox_node):
+# the robostack Humble package is slam_toolbox 2.6.10, where SlamToolbox is a
+# PLAIN rclcpp::Node whose executable main calls configure() itself — there is
+# no lifecycle to manage and composing the registered component is inert
+# (nothing calls configure; verified against the installed binaries; robostack
+# has no newer build for either platform). It provides /map + the map->odom TF
+# the costmaps and navigator build on. NOT in any lifecycle manager.
+slam_toolbox:
+  ros__parameters:
+    # Mode: online async mapping (matcher runs per scan, graph grows in background)
+    mode: mapping
+    # Frames: base_frame == Nav2's robot_base_frame so no TF timeout waits.
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    use_map_saver: false
+    # LDS02RR limits (match lds_driver_py: range_min 0.12 / range_max 6.0)
+    min_laser_range: 0.12
+    max_laser_range: 6.0
+    resolution: 0.05
+    # Ceres solver: SPARSE_NORMAL_CHOLESKY like the upstream defaults. NO
+    # ceres_num_threads exists — thread count is hardcoded to 50 upstream.
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_nonlinear_solver: SPARSE_NORMAL_CHOLESKY
+    # Pose-graph growth guard: only add a node when the robot has actually
+    # moved. This is the real CPU/RAM protection on the H5 — every graph node
+    # is a Ceres optimization problem.
+    minimum_travel_distance: 0.1
+    minimum_travel_heading: 0.17
+    minimum_time_interval: 0.5
+    throttle_scans: 1
+    # Map publishing + TF pacing
+    map_update_interval: 5.0
+    transform_publish_period: 0.1
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    enable_interactive_mode: false
+    debug_logging: false
+    # Online-async matcher subset. NOTE: the robostack Humble package is
+    # slam_toolbox 2.6.10 — later keys like minimum_angle_gap /
+    # minimum_match_distance / position_revisit_* do NOT exist there (they are
+    # silently ignored by ROS 2 anyway, so they were removed rather than kept
+    # as misleading tuning knobs).
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    use_scan_matching: true
+    use_scan_barycenter: true
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+# ---- controller_server (Regulated Pure Pursuit) ------------------------------
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0
+    odom_topic: /odom
+    min_x_velocity_threshold: 0.0
+    min_y_velocity_threshold: 0.0
+    min_theta_velocity_threshold: 0.0
+    failure_tolerance: 0.3
+    progress_checker_plugin: progress_checker
+    goal_checker_plugins: ["goal_checker"]
+    progress_checker:
+      plugin: nav2_controller::SimpleProgressChecker
+      required_movement_radius: 0.15
+      movement_time_allowance: 10.0
+    goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      stateful: true
+      xy_goal_tolerance: 0.15
+      yaw_goal_tolerance: 0.25
+    controller_plugins: ["FollowPath"]
+    # RegulatedPurePursuitController. NOTE (Humble): there is NO max_angular_vel
+    # param — rotate_to_heading_angular_vel IS the angular cap. Speed scaling is
+    # the curvature + costmap-proximity pair below (both need
+    # inflation_cost_scaling_factor > 0 to be active).
+    FollowPath:
+      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      desired_linear_vel: 0.25
+      lookahead_dist: 0.6
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.9
+      lookahead_time: 1.5
+      rotate_to_heading_angular_vel: 1.5
+      rotate_to_heading_min_angle: 0.785
+      max_angular_accel: 3.2
+      use_velocity_scaled_lookahead_dist: true
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      inflation_cost_scaling_factor: 3.0
+      regulated_linear_scaling_min_radius: 0.9
+      regulated_linear_scaling_min_speed: 0.25
+      use_rotate_to_heading: true
+      allow_reversing: false
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.6
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      transform_tolerance: 0.1
+
+# ---- planner_server (NavFn, A*) ----------------------------------------------
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: nav2_navfn_planner/NavfnPlanner
+      use_astar: true
+      allow_unknown: true
+      tolerance: 0.0
+      max_planning_time: 1.0
+
+# ---- bt_navigator --------------------------------------------------------------
+# default_nav_to_pose_bt_xml is injected by launch/nav2.launch.py (Humble key;
+# the older default_bt_xml_filename is silently ignored). bt_loop_duration 100
+# = a 10 Hz tick only while a goal is active.
+bt_navigator:
+  ros__parameters:
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 100
+    default_server_timeout: 20
+    transform_tolerance: 0.1
+    # Minimal plugin set for the minimal recovery tree (config/nav2/recovery_bt.xml):
+    # ComputePathToPose, FollowPath, ClearEntireCostmap, BackUp, Spin,
+    # RecoveryNode, PipelineSequence — PLUS rate_controller / goal_updated /
+    # wait: bt_navigator also loads (and validates) the DEFAULT through-poses
+    # tree at activation, and that tree uses those three (we never publish
+    # /navigate_through_poses, but a missing plugin fails the activation).
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_wait_action_bt_node
+
+# ---- behavior_server (recovery behaviors) ------------------------------------
+# Per-plugin C++ types are REQUIRED in Humble (the node crashes without them).
+# Only spin + backup are wanted: the recovery tree's BackUp/Spin live here.
+behavior_server:
+  ros__parameters:
+    # spin + backup serve the minimal recovery tree; `wait` is here because
+    # bt_navigator also loads (and server-checks) the DEFAULT through-poses
+    # tree at activation, and that tree references the wait action server.
+    behavior_plugins: ["spin", "backup", "wait"]
+    spin:
+      plugin: nav2_behaviors/Spin
+    backup:
+      plugin: nav2_behaviors/BackUp
+    wait:
+      plugin: nav2_behaviors/Wait
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    global_frame: map
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+
+# ---- local costmap (rolling window around the robot) --------------------------
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 2.0
+      height: 2.0
+      resolution: 0.05
+      robot_radius: 0.16
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      # behavior_server reads the raw costmap + footprint from here
+      always_send_full_costmap: true
+      transform_tolerance: 0.1
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_subscribe_transient_local: true
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        inflation_radius: 0.25
+        cost_scaling_factor: 3.0
+      plugins: ["static_layer", "inflation_layer"]
+
+# ---- global costmap (static map + inflation) ----------------------------------
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      global_frame: map
+      robot_base_frame: base_link
+      # 24 x 24 m @ 0.05 = 480 x 480 cells (the width/height units are METERS)
+      width: 24.0
+      height: 24.0
+      resolution: 0.05
+      robot_radius: 0.16
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      transform_tolerance: 0.1
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_subscribe_transient_local: true
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        inflation_radius: 0.25
+        cost_scaling_factor: 3.0
+      plugins: ["static_layer", "inflation_layer"]
+
+# ---- lifecycle manager: FOUR Nav2 servers ONLY --------------------------------
+# - bt_navigator must be LAST: CONFIGURE/ACTIVATE iterate node_names FORWARD and
+#   the navigator needs planner/controller up first.
+# - slam_toolbox is not listed at all: it is a plain node in 2.6.10 with no
+#   lifecycle services to drive (see the slam_toolbox section above).
+nav2_lifecycle_manager:
+  ros__parameters:
+    autostart: true
+    bond_timeout: 4.0
+    attempt_respawn_reconnection: true
+    node_names: ['planner_server', 'controller_server', 'behavior_server', 'bt_navigator']

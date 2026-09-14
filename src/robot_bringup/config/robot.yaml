@@ -31,9 +31,10 @@ lds_driver:
 # std_msgs/Int64MultiArray on /wheel_ticks; this node only integrates. Wire/
 # direction fixes are #defines at the top of firmware/nanobot_coprocessor/src/main.cpp.
 #
-# TF is published by the EKF (robot_localization ekf_node, config/ekf.yaml), NOT
-# by this node — publish_tf is false so the EKF owns odom -> base_link. slam_nav
-# consumes the EKF-fused /odometry/filtered (see slam_nav section below).
+# TF: this node OWNS odom -> base_link now (publish_tf: true). The old
+# robot_localization EKF that used to own it is gone — slam_toolbox provides
+# map -> odom on top of this chain, and Nav2 consumes the pair (see
+# config/nav2/nav2_params.yaml + docs/nav2-migration.md).
 wheel_odometry:
   ros__parameters:
     ticks_topic: "wheel_ticks"  # from the ESP32 zenoh-pico coprocessor
@@ -46,305 +47,11 @@ wheel_odometry:
     invert_right: false
     publish_rate: 15.0        # Hz, odom publish rate (retunable live via web UI slider;
                                 # matches the ESP32's ~15 Hz /wheel_ticks cadence.
-                                # 15 Hz gives the EKF a position correction on ~75% of
-                                # filter steps at the default 15 Hz EKF rate.)
-    publish_tf: false           # EKF publishes odom -> base_link TF instead
+                                # 15 Hz keeps slam_toolbox's odom prior fresh between
+                                # the ~5 Hz scans.)
+    publish_tf: true            # odom -> base_link TF: wheel_odometry owns it (EKF is gone)
     odom_frame: "odom"
     base_frame: "base_link"
-
-# ---- 2D occupancy-grid SLAM (slam_nav) --------------------------------------
-# Builds a map from /scan with the pose = WHEEL-ODOMETRY dead-reckoning
-# (/odom), refined every scan by a robust scan-to-map matcher.
-#
-# 2026-09-11 retune ("rock-solid cheap SLAM"): the IMU and the EKF are OUT of the
-# pose chain. The BWT901CL's heading (device-fused or pure gyro-z) drifts with gyro
-# bias / magnetometer interference, and the EKF simply re-packages that heading —
-# feeding /odometry/filtered + use_imu_yaw:true meant the 5 Hz scan-matcher was
-# forever chasing a drifting rotation prior inside its tiny ±0.12 rad window, which
-# is what stormed "localization lost", smeared the map and made goals unreachable.
-# The wheel-encoder yaw is stable over the ~0.2 s between scans (slip only bites
-# on sharp spins, and the matcher corrects that every scan), so the IMU/EKF now
-# feed the web/OLED display + RViz only. Writes /dev/shm/nano_map.bin for the web
-# UI map panel.
-# All sizes/RAM scale with map_size_m / map_resolution: 24 m @ 0.02 m = 1200x1200
-# cells (~8.6 MB grid: log + seen + no-go). 2 cm/cell matches the raw 1° lidar
-# point spacing (~1.7 cm at 1 m, ~3.5 cm at 2 m), so the occupancy map renders
-# with at least as much wall/feature detail as the lidar hero view. Fine enough
-# on the board's ~1 GB RAM; the blob is 1.44 MB/map-write at map_write_rate.
-slam_nav:
-  ros__parameters:
-    scan_topic: "scan"
-    odom_topic: "odom"                 # raw wheel-encoder odometry (EKF/IMU not in the chain)
-    euler_topic: "imu/euler"           # display + vision-tracking damping only (unused for pose)
-    map_size_m: 24.0                 # square map side, metres (whole-floor)
-    map_resolution: 0.02           # metres/cell
-    range_min: 0.12
-    range_max: 6.0
-    match_lin: 0.22                # scan-match search half-window (m)
-    match_ang: 0.35                # scan-match search half-window (rad = ±20°) — wide
-                                   # enough to absorb a drifted/imperfect heading prior
-                                   # between scans (the old ±0.12 rad could NOT recover
-                                   # once the prior was off, which stormed "lost")
-    match_points: 120              # scan beams used for matching (decimated)
-    min_match_score: 1.0           # reject matches with no real map overlap
-    # PRIMARY trust gate (2026-09-11): trust a match when it scores at least this much
-    # BETTER than the odometry-predicted pose. The absolute score is dominated by
-    # free-space cells in open rooms, so a pure `score >= min_match_score` bar rejected
-    # EVERY scan on a sparse map and froze it. Improvement is scale-invariant — free
-    # space only lowers it, so a positive delta means beams snapped onto real walls.
-    min_improve: 4.0
-    # Inlier gate: a scan is only TRUSTED (pose snapped + integrated) when at least
-    # this fraction of its beams land on already-seen map cells. Catches the "good
-    # score, no real overlap" bad scan (a few overlapping beams in front of undegraded
-    # void) without needing any per-beam model. 0 = disabled. Live-tunable.
-    min_overlap_ratio: 0.10
-    # Beam signal-quality floor read from /scan.intensities (the lidar's raw signal
-    # strength); beams below it are dropped before match + integrate. -1 = off (default
-    # until the driver's intensity range is checked on hardware — far returns have
-    # legitimately lower signal). Live-tunable.
-    qual_min: -1.0
-    # Opt-in dynamic-obstacle scan filtering (default OFF): 1-D range-jump clustering
-    # drops short 'near' beam clusters (moving legs, 0.05-0.2 m of wall arc) before
-    # matching, and map-conflict filtering drops beams whose endpoint lands in
-    # CONFIRMED free space (ghost/transient returns) so they can't paint phantom walls
-    # inside an open corridor. A 0.1 m wide STATIC pillar looks identical to a leg to
-    # the range-jump test, and a wall that genuinely moved into free space is dropped
-    # until re-verified — so this stays off until the environment is known clean.
-    dynamic_reject: false
-    use_imu_yaw: false            # IMU yaw delta for the rotation prior. FALSE (2026-09-11):
-                                   # the BWT901CL heading drifts (gyro bias / magnetometer
-                                   # interference) and the EKF re-packages that drift, so
-                                   # rotating on IMU delta made the scan matcher chase a
-                                   # moving target. Wheel-odometer yaw is stable between
-                                   # scans and the matcher fixes slip every scan. The IMU
-                                   # is still published for the web IMU card / OLED / RViz.
-    imu_yaw_sign: 1.0                 # +1/-1. IF "IMU yaw and wheel yaw rotate OPPOSITE
-                                      # signs", flip to -1 (IMU mounted rotated).
-    # Rotate the SENSOR heading references (lidar beam angles + IMU yaw) 180° so the
-    # map's "front" = the robot's PHYSICAL drive front. ON for this unit: the sensor
-    # head (LDS + IMU) is mounted facing the back. The /odom WHEEL yaw is deliberately
-    # NOT rotated — it comes from the wheel encoders and IS the physical drive frame
-    # (a leftover rot-of-all-three harmed the pose when the 2026-09-11 retune moved
-    # the yaw source to raw /odom; see nav_node._on_odom). Restart-only.
-    heading_flip: true
-    head_tol: 0.6                 # rad: per-scan heading-correction trust bound vs the wheel
-                                  # anchor (see nav_node) — stops the map heading slowly walking
-                                  # away from the physical heading on sparse/symmetric maps
-    pos_tol: 0.35                 # m: per-scan POSITION-correction trust bound vs the wheel
-                                  # anchor on a BUILT map. Below recover_min_seen the pose is
-                                  # ODOM-locked EXCEPT on a genuine revisit (overlap >=
-                                  # min_overlap_ratio), which snaps position up to
-                                  # pos_tol_sparse (a few cells) + heading up to head_tol_sparse
-                                  # so laps reinforce instead of stacking shifted copies.
-    # Parked = skip: when odom yaw AND translation both say the robot hasn't moved since
-    # the last processed scan, skip the scan-match + map-integrate (the bulk of parked
-    # idle CPU). Full SLAM resumes on the first scan past either threshold; pure rotation
-    # fires via the yaw delta. Never skips while seeding/recovering/self-testing.
-    still_skip: true
-    still_lin: 0.005               # m: odom translation that counts as "moved"
-    still_ang: 0.005               # rad (~0.3 deg): yaw delta that counts as "moved"
-    map_write_rate: 2.0            # Hz to refresh the /dev/shm map file
-    # --- navigation (click-to-go) ---
-    enable_motion: false           # SAFETY: false = plan + show path but DON'T drive.
-                                   # Flip live from the web UI "enable motion" toggle.
-    robot_radius: 0.16             # obstacle inflation for the planner (m). Live-tunable:
-                                   # web UI Sensors -> Navigation (slam_nav).
-    plan_downsample: 10             # plan on a 1/N grid (CPU/RAM); 10 = 0.20 m cells
-                                    # at 2 cm map resolution (same coarse cell as the
-                                    # old 4 @ 5 cm, so planner behaviour is unchanged)
-    allow_unknown: true            # let the global plan cross unmapped cells
-    control_rate: 10.0             # Hz pursuit/controller loop
-    replan_period: 0.5             # s between global replans while a goal is active
-    max_lin: 0.32                  # m/s pursuit speed cap. Live-tunable.
-    max_ang: 1.5                   # rad/s turn-rate cap. Live-tunable.
-    lookahead: 0.45                # m pure-pursuit lookahead
-    goal_tol: 0.15                 # m: within this of the goal = arrived
-    stop_distance: 0.20            # m: obstacle this close ahead = stop + replan. Live-tunable.
-    front_angle: 0.5               # rad: half-width of the reactive front cone
-    # --- extras (each independently toggleable; behaviour-changers default OFF for
-    #     easy/safe testing — flip them on one at a time) ---
-    # No-go zones: paint them on the web Map view (No-go brush/erase). They're stored
-    # with the map, rendered as a shaded overlay, and the planner NEVER routes through
-    # them — even across un-mapped cells (allow_unknown won't let it). Survives reboot
-    # via map_store. See web_control + /dev/shm/nano_map_edit.json handoff.
-    map_store: ~/nanobot/maps/nano_map.npz   # persist the map (grid + no-go zones) here.
-                                             # Auto-loads on boot, saved on /slam_nav/save_map
-                                             # + every `autosave_period`s. Tilde is expanded;
-                                             # the parent dir is created automatically. Leave
-                                             # "" to disable persistence.
-    autosave_period: 30.0            # s between background map autosaves (0 = manual only)
-    auto_explore: false            # autonomously drive to map frontiers when idle.
-                                   # Still needs enable_motion to actually move; with motion
-                                   # off it just shows where it *would* explore.
-    explore_period: 4.0            # s between frontier picks while exploring
-    trail_max: 400                 # breadcrumb ring-buffer length (where it's been); 0 = off
-    stuck_timeout: 3.0             # s of commanded-but-no-motion before aborting goal; 0 = off.
-                                   # Live-tunable. Was 0 (off) — with a reliable pose a
-                                   # 3 s no-progress abort beats grinding forever into a
-                                   # wedged wheel / unsensed collision.
-    stuck_eps: 0.04                # m: movement below this counts as "not moving"
-    goal_no_path_timeout: 20.0     # s with zero path found before giving up on the goal;
-                                   # 0 = off (never give up). Without this an unreachable
-                                   # goal sits latched forever and -- since a set goal counts
-                                   # as "needs scans" -- also silently blocks LDS idle
-                                   # spin-down forever. Live-tunable.
-    # --- LDS idle spin-down: park the spin motor (power/wear/noise) once there's no
-    #     reason to expect fresh scans soon -- stationary, no goal, not exploring, not
-    #     picked up/relocalizing. Wakes instantly the moment any of those change. ---
-    lds_idle_enable: true          # master on/off for the spin-down behaviour. Live-tunable.
-    lds_idle_timeout: 10.0         # s of no motion/goal/exploring before spin-down; 0 = off.
-                                   # Live-tunable.
-    lds_idle_rpm: 0.0              # target rpm while parked (0 = fully stop). Live-tunable.
-    lds_active_rpm: 300.0          # target rpm to resume; match firmware LDS_TARGET_RPM.
-                                   # Live-tunable.
-    # --- pick-up awareness + lost-robot relocalization (autonomy) ---
-    pickup_pause: false            # both off-ground switches -> halt + freeze SLAM while carried.
-                                    # Default OFF: the off-ground microswitches currently false-trigger
-                                    # (suspension polarity inverted in firmware), which would freeze
-                                    # SLAM and block trim autocal during normal driving. Re-enable via
-                                    # the web UI / set true here once SUSPEND_ACTIVE_HIGH is corrected.
-                                    # Live-tunable.
-    pickup_face: "focused"         # OLED mood shown while lifted ("" = leave the OLED alone)
-    relocalize: true               # auto-recover the pose when scans stop matching the map.
-                                   # Live-tunable.
-    recover_patience: 5            # consecutive unmatched scans before declaring "lost"
-    recover_min_beams: 40          # need this many in-range beams to trust a "mismatch"
-    recover_exit_score: 20.0       # scan-match score that ends recovery (relocalized)
-    recover_exit_improve: 8.0      # OR: end recovery when the match improves this much
-                                   # over the odometry prior (scale-invariant escape
-                                   # hatch — on a sparse/bleached map the absolute score
-                                   # bar can be unreachable, but a scan that snaps
-                                   # strongly onto structure is a solid lock)
-    recover_overlap: 0.30          # recovery must ALSO pass this overlap inlier gate before a
-                                   # candidate can be trusted. min_overlap_ratio (0.10) is tuned
-                                   # for building and is far too permissive to TRUST a recovered
-                                   # pose on a smeared map.
-    recover_confirm: 2             # consecutive scans that must reproduce the same recovery
-                                   # candidate before it's trusted + integrated. A single (esp.
-                                   # global) match can clear the exit bar at a wrong-but-plausible
-                                   # spot (symmetrical room / smeared map); the 2nd agreeing scan
-                                   # costs ~0.2 s and stops both the map-pose teleport and the
-                                   # map-corrupting integration at a wrong pose.
-    recover_min_seen: 0.25         # map coverage fraction below which the relocalize SPIN is
-                                   # suppressed (fresh/cleared map: a low score is expected, not
-                                   # drift; spinning only smears the grid + drains battery). Hold
-                                   # pose and keep matching until the map fills in.
-    recover_min_move: 0.10         # min linear odom travel (m) before a recovery candidate may be
-                                   # adopted/confirmed. A still (or in-place-spinning) robot in a
-                                   # symmetric/sparse room sees the same geometry from the correct
-                                   # and the 180°-flipped heading, so scans re-scoring in place
-                                   # would self-confirm the wrong flip (boot-into-saved-map "front
-                                   # is back", 2026-08-11); only translation breaks the ambiguity.
-    recover_lin: 0.5               # recovery search half-window (m) around the prior
-    recover_ang: 1.0               # recovery search half-window (rad)
-    recover_half: 6                # recovery candidates per axis (2*half+1)
-    recover_refine: 3              # recovery coarse-to-fine passes
-    recover_spin: 0.6              # rad/s in-place spin while relocalizing (needs enable_motion)
-    recover_timeout: 12.0          # s before giving up the active relocalize search
-    recover_global: true           # also run a FULL-GRID relocalize search while lost. ONLY fires
-                                   # on a genuine kidnap (set down after being carried / boot into
-                                   # a saved map) — nav_node gates it on the recovery being marked
-                                   # as a kidnap. A driving loss keeps the local window search, so
-                                   # a far spurious global "better" peak can't teleport the pose.
-    recover_global_step: 10        # grid-cell step of the global search (10 = 20 cm at 2 cm res,
-                                   # same physical spacing as the old 4 @ 5 cm, keeps the search cheap)
-    recover_global_period: 2.0     # min s between full-grid searches while recovering
-    # --- personality -> motion (the behaviour layer's `caution` trait) ---
-    # OFF by default (it touches motion). When on, slam_nav subscribes /cognition/traits and
-    # eases stop_distance up + max_lin down with `caution`, CLAMPED here to safe bounds — the
-    # cognitive layer can influence but never override motion safety (max_lin/stop_distance
-    # above are the relaxed caution=0 end).
-    trait_motion: false            # let `caution` nudge the reactive motion thresholds
-    stop_distance_max: 0.45        # m: stop_distance at caution=1 (stops earlier when wary)
-    max_lin_min: 0.08              # m/s: max_lin at caution=1 (drives slower when wary)
-    # --- vision target tracking (pan-only: turn in place to keep a calibrated
-    # colour-blob centered in the camera frame). Reads /vision/state (web_control's
-    # GPU-vision feed) for the target's normalized x position + confidence. OFF by
-    # default; when on it WINS over goal-follow/auto-explore (the whole point of
-    # turning it on is "look at this now") but is still gated by enable_motion and
-    # still yields to pick-up/self-test/relocalization like everything else here.
-    track_enable: false            # master toggle. Live-tunable (web "🎯 Track target").
-    track_kp: 2.0                  # angular gain: rad/s commanded per unit of x-error (-0.5..0.5)
-    track_kd: 0.5                  # damping: rad/s commanded per rad/s of the robot's OWN
-                                    # measured yaw rate (IMU), opposing it -- brakes against
-                                    # real turning momentum near the setpoint (see nav_node's
-                                    # track_step docstring, 2026-07-16 3rd finding)
-    track_max_ang: 2.0             # rad/s cap for tracking turns (independent of nav's max_ang).
-                                    # Raised 2026-07-16 from 0.8: the ESP32's stiction/deadzone
-                                    # remap means real motor duty barely rises across this whole
-                                    # range, so a higher cap is nearly free extra tracking speed
-                                    # (MAX_ANGULAR_SPEED, firmware, is the true ceiling at 3.0)
-    track_min_eff_ang: 0.2         # rad/s: smallest turn rate that reliably moves the wheels at
-                                    # all (the ESP32's stiction compensation means anything
-                                    # commanded below ~0.16 rad/s produces zero motion, not a
-                                    # slow crawl) -- below this, track_step time-dithers full-
-                                    # floor pulses instead of asking for a rate the hardware
-                                    # can't produce (2026-07-16 4th finding)
-    track_deadband: 0.04           # normalized x-error within this = already centered, don't turn
-    track_deadband_soft: 0.04      # normalized x: width of the LINEAR taper just outside
-                                    # track_deadband. eff_err ramps from 0 at |err|=deadband to err
-                                    # at |err|=deadband+soft -- replaces the hard bang-in/out at the
-                                    # deadband edge (a classic limit cycle: enter -> stop -> drift
-                                    # out -> snap a turn -> re-enter) with a smooth blend. 0 = hard.
-    track_conf_min: 0.02           # ignore target reports below this confidence (too small/noisy)
-    track_conf_scale: 0.10         # confidence at/above which the FULL P/D authority is applied;
-                                    # below it the output scales down linearly (conf/track_conf_scale)
-                                    # so a weak/noisy lock can't yank the robot. 0 = ignore scaling.
-    track_timeout: 0.6             # s: no fresh target/vision-state past this -> stop turning
-    track_coast: 0.2               # s: hold the last commanded w with exponential decay across a
-                                    # transient target loss (a None frame or a sub-conf dip), then
-                                    # stop. Eliminates the stop-start jerk a brief occlusion used to
-                                    # cause with a hard send(0,0) per lost frame. 0 = hard stop.
-    track_ki: 0.0                  # integral gain (OPT-IN): rad/s of steady-state correction per
-                                    # (unit-x * s) of accumulated err. 0 = off (default -- preserves
-                                    # the prior PD behaviour); a small value (~0.3) cancels steady-
-                                    # state offset from camera misalignment or stiction bias. Anti-
-                                    # windup: only accumulates outside the deadband + when not
-                                    # saturated, bounded so its max contribution is track_max_ang/2.
-    track_kff: 0.5                 # target-velocity feedforward: rad/s commanded per normalized-x/s
-                                    # of target motion. Predictive lead -- the robot starts turning
-                                    # before the visual error grows, so a moving target is followed
-                                    # smoothly instead of always lagging by one P-reactive step.
-                                    # EMA-smoothed dx/dt over the last few /vision/state samples.
-                                    # 0 = pure reactive.
-    # --- true loop closure (drift correction; lowest-impact variant) ---
-    # The accumulated map IS the keyframe store (no separate pose graph). Every
-    # loop_probe_every scans the current scan is re-matched against the map centered on
-    # the odometry-predicted (drifted) pose with a WIDE window; a strong match that lands
-    # far from where we think we are = a far re-visit = the accumulated global offset,
-    # which is bled off smoothly (loop_alpha) into the live pose + (rarely) the grid.
-    # Cost: one extra match() every loop_probe_every scans (~few ms every ~10s at 300rpm)
-    # + a few float ops otherwise; steady-state RAM ~48 bytes. ON by default.
-    loop_closure: true              # master on/off
-    loop_probe_every: 50            # run the wide re-match every Nth scan
-    loop_lin: 0.5                   # wide search half-window (m) for the probe
-    loop_ang: 1.0                   # wide search half-window (rad) for the probe
-    loop_score: 4.0                 # probe match must score at least this to count
-    loop_min_shift: 0.3             # m: correction bigger than this = a real loop (else noise)
-    loop_alpha: 0.1                 # smoothing fraction applied per loop detection
-    loop_apply_thresh: 0.05         # m: warp the grid only once shift per-event exceeds this
-
-    # --- self-test / calibration (scripted forward/back/spin drive that cross-checks
-    # IMU vs encoders). Was module constants; now params so the SPIN-check investigation
-    # (see selftest-spin-imu-mismatch memory) can retune live instead of by edit.
-    test_lin: 0.12                 # m/s forward/back speed (capped by max_lin)
-    test_ang: 0.6                  # rad/s in-place spin speed (capped by max_ang)
-    test_dist: 0.35                # m to drive forward, then back
-    test_turns: 1.0                # full in-place rotations for the IMU-vs-odom cross-check
-    test_settle: 1.2               # s to settle between motion legs
-    # Odom auto-calibration baselines (mirror wheel_odometry below; the self-test's
-    # CALIBRATION line reports corrections to paste back here)
-    cal_ticks_per_rev: 1440
-    cal_wheel_radius: 0.0335
-    cal_wheel_sep: 0.16
-    # Wheel-slip / stall cross-check: gyro-z (IMU) vs wheel-odom-implied rotation.
-    # Informational only — logs WHEEL SLIP / WHEEL DRAG when the wheels turn far more
-    # (slip) or far less (drag/stall) than the IMU says the robot actually rotated.
-    slip_check: true
-    slip_min_rot: 0.15             # rad of accumulated wheel yaw needed to judge slip
-    slip_ratio_hi: 1.6             # |odom|/|imu| rotation above this = slipping wheel
-    slip_ratio_lo: 0.4             # ...below this = dragged/blocked wheel
-    slip_cooldown: 10.0            # s between slip/drag alerts
 
 # ---- Status -> SSD1306 OLED -------------------------------------------------
 oled_display:
@@ -462,14 +169,6 @@ sim_bridge:
     lds_rpm: 300.0
     lds_hz: 5.0
     heartbeat_rate: 1.0       # Hz
-
-# Republishes slam_nav's /dev/shm/nano_map.bin as nav_msgs/OccupancyGrid on /map, for
-# RViz. Useful on the real robot too (not sim-specific) -- see sim_hardware/map_bridge_node.py.
-map_bridge:
-  ros__parameters:
-    map_file: "/dev/shm/nano_map.bin"
-    frame_id: "odom"          # matches slam_nav seeding its pose straight from /odom
-    publish_rate: 2.0         # Hz
 
 # ---- Board health monitor -> diagnostic_msgs/DiagnosticArray on /diagnostics -
 sys_monitor:
@@ -632,15 +331,6 @@ web_control:
     drive_max_lin: 0.4        # m/s clamp (the ESP32 maps 0.4 to full PWM)
     drive_max_ang: 3.0        # rad/s clamp
     drive_timeout: 0.6        # s without a fresh POST -> publish one stop
-    # Manual-teleop wall clearance guard: when ON, POST /drive (web joystick /
-    # keyboard teleop) refuses to drive TOWARD a wall/obstacle closer than
-    # wall_guard_distance — rotation is always allowed so the driver can turn away.
-    # Inert while the SLAM pose is stale or the map blob is missing. Live-tunable
-    # from the Map card (the "Wall distance" slider sets this AND slam_nav's
-    # stop_distance together, so the drawn keep-away bubble matches the autonomous
-    # stop distance; the guard is a separate opt-in toggle).
-    wall_guard_enable: false
-    wall_guard_distance: 0.25   # m keep-away bubble for the manual guard
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"
@@ -728,7 +418,7 @@ web_control:
     # publishers, independent of skills_allow_actions below (deliberate: a
     # human-triggered diagnostic, not an autonomous skill) -- gated instead by
     # its own stationary preconditions + live re-checks + a web UI confirm().
-    imu_test_lds_rpm: 300.0      # target rpm for the LDS phase; matches slam_nav's lds_active_rpm
+    imu_test_lds_rpm: 300.0      # target rpm for the LDS phase (ESP32's normal spin)
     imu_test_motor_ang: 0.35     # rad/s for the OPTIONAL motor-wiggle phase (off by default)
     # Text-to-speech (English en-gb voices only). The web page POSTs /tts; the server
     # synthesises with espeak-ng (install via deploy/install-espeakng.sh; NOT on conda-forge), plays it

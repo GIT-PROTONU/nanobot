@@ -11,8 +11,10 @@ the page talks exclusively to this server:
   paths (goal, setpoints, OLED owners, tuning sliders). See telemetry.py.
 - `POST /drive` ({"v","w"}) — HTTP teleop. Publishes /cmd_vel directly with a
   node-side 10 Hz keepalive + dead-man (see the drive_* params).
-- `/map`, `/scan.bin` — the /dev/shm blobs slam_nav / lds_driver_py write,
-  served same-origin so the big messages never cross rosbridge.
+- `/scan.bin` — the /dev/shm blob lds_driver_py writes, served same-origin so
+  the big message never crosses rosbridge. (The old /map blob died with the
+  slam_nav migration — slam_toolbox serves /map as a real topic now; see
+  docs/nav2-migration.md for the scrapped web-UI consumers.)
 - `/stream.mjpg` — USB webcam as multipart/x-mixed-replace via a zero-dependency
   V4L2 MJPEG passthrough (mjpeg_camera); `/snapshot.jpg` is one still frame.
 - `/audio.pcm` — the webcam mic as raw PCM via arecord (mic_audio). Camera and
@@ -34,8 +36,6 @@ import subprocess
 import threading
 import time
 from datetime import datetime
-
-import numpy as np
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
@@ -111,138 +111,14 @@ LLM_PARAM_FOR = {
 SCAN_FILE = "/dev/shm/nano_scan.bin"          # compact lidar blob (for the read-lidar skill)
 VITALS_FILE = "/dev/shm/nano_vitals.json"     # sys_monitor's aggregated body snapshot
 
-# Web map-editor handoff to slam_nav: write no-go paint/erase requests here (atomic
-# os.replace). slam_nav polls this file on its control tick and applies them to the grid;
-# a rising "t" token makes each request idempotent (so the file may persist between writes).
-NGO_MAP_EDIT_FILE = "/dev/shm/nano_map_edit.json"
-
-# ---- Manual-teleop wall clearance guard -------------------------------------
-# Opt-in safety for POST /drive (the web joystick / keyboard teleop): when
-# wall_guard_enable is on, a drive command is refused if the robot would push
-# toward a wall/obstacle closer than wall_guard_distance. Reads the SLAM pose
-# (telemetry._slam_pose) + the /dev/shm map blob nav_node writes, so it needs no
-# new ROS wiring. Rotation is always allowed (that's how the driver turns away).
-WALL_GUARD_MAP_FILE = "/dev/shm/nano_map.bin"
-WALL_GUARD_STALE = 1.5      # s: SLAM pose older than this = guard inert (pose lost)
-WALL_GUARD_OCC = 50         # int8 occupancy above this counts as a wall
-WALL_GUARD_PROBE = 0.06     # m ahead/behind the centre to probe (motion between the
-                            # 10 Hz re-checks can't outrun this: max_lin 0.15 / 10 Hz)
-WALL_GUARD_LOG = 2.0        # s throttle on the "drive blocked" log line
-
 # The GATED "action tier" for topic-skills: the ONLY ROS topics a skill may publish, each
-# with a hard clamp. Anything else is refused. Motion is ALSO clamped reflexively by
-# slam_nav downstream, so a skill can never push the robot into an unsafe state. Builders
-# turn a skill's `value` into a ROS message; web_server only wires these when the
+# with a hard clamp. Anything else is refused. (The old "slam_nav clamps motion
+# reflexively" backstop is gone with slam_nav; the clamps below are the only guard.)
+# Builders turn a skill's `value` into a ROS message; web_server only wires these when the
 # skills_allow_actions master switch is on. (topic -> relative ROS topic name.)
 SKILL_MOTION_LIN_MAX = 0.15                    # m/s   cap on a skill's commanded linear speed
 SKILL_MOTION_ANG_MAX = 0.8                     # rad/s cap on a skill's commanded yaw rate
 SKILL_MOTION_DUR_MAX = 3.0                     # s     cap on /cmd_vel drive time before auto-stop
-
-# ---- EKF tuning ---------------------------------------------------------------
-# robot_localization loads ALL of its parameters ONCE in RosFilter's constructor and
-# exposes NO runtime set_on_set_parameters callback (verified against the installed
-# 3.5.4 binaries + the upstream repo) — a ros2 param set / POST /param silently changes
-# nothing. So "tuning the EKF from the web UI" genuinely = write the new values into
-# the ekf.yaml the ekf unit loads and restart just the lightweight nano-ekf.service.
-# These helpers read/write that file surgically (regex, no PyYAML dependency on the
-# board), leaving every non-tunable line and comment untouched. The tunables:
-#   frequency / sensor_timeout : scalar EKF params
-#   pn_x / pn_y / pn_yaw       : the (0,0),(1,1),(5,5) diagonal of the 15x15 Q matrix.
-# Keys are clamped to the (low, high) ranges below.
-EKF_TUNABLES = {
-    "frequency":      (2.0, 30.0),    # Hz       (15 Hz matches odom)
-    "sensor_timeout": (0.05, 2.0),    # s        before the filter goes prediction-only
-    "pn_x":           (0.005, 0.5),   # pos X process noise
-    "pn_y":           (0.005, 0.5),   # pos Y process noise
-    "pn_yaw":         (0.01, 1.0),    # yaw process noise
-}
-_PN_DIAG = {"pn_x": 0, "pn_y": 16, "pn_yaw": 80}    # 15x15 row-major diagonal indices
-_PN_LEN = 15 * 15
-
-
-def _ekf_installed_path():
-    """Find the installed ekf.yaml the ekf unit loads (board: $NANO/install/...; dev:
-    the repo copy). Returns the best candidate even if absent (for the error path)."""
-    cands = [
-        os.path.join(os.environ.get("NANO", os.path.expanduser("~/Nano")),
-                     "install", "robot_bringup", "share", "robot_bringup", "config", "ekf.yaml"),
-        os.path.join(os.getcwd(), "install", "robot_bringup", "share",
-                     "robot_bringup", "config", "ekf.yaml"),
-        os.path.join(os.path.expanduser("~"), "Nano", "install", "robot_bringup", "share",
-                     "robot_bringup", "config", "ekf.yaml"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
-                     "robot_bringup", "config", "ekf.yaml"),
-    ]
-    for p in cands:
-        if os.path.isfile(p):
-            return p
-    return cands[0]
-
-
-def _ekf_read(path):
-    """Parse the tunable subset of ekf.yaml. Returns (dict, None) or (None, err)."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-    except OSError as exc:
-        return None, f"can't read {path}: {exc}"
-    out = {}
-
-    def scalar(key):
-        m = re.search(r"(?m)^\s*" + re.escape(key) + r"\s*:\s*([+-]?[0-9.]+[eE]?[+-]?\d*)\b",
-                      text)
-        return float(m.group(1)) if m else None
-
-    out["frequency"] = scalar("frequency")
-    out["sensor_timeout"] = scalar("sensor_timeout")
-    out["two_d_mode"] = True if re.search(r"(?m)^\s*two_d_mode\s*:\s*true\b", text) else False
-    b = re.search(r"(?m)^\s*process_noise_covariance\s*:\s*\[", text)
-    if b:
-        e = text.find("]", b.end())
-        q = [float(x) for x in re.findall(r"[+-]?[0-9.]+[eE]?[+-]?\d*", text[b.end():e])]
-        out["pn"] = {
-            "x": round(q[0], 4), "y": round(q[16], 4), "yaw": round(q[80], 4)} \
-            if len(q) >= 81 else None
-    return out, None
-
-
-def _ekf_write(path, patch):
-    """Atomically apply a {tunable: value} patch (ranges clamped by the caller are not
-    re-checked here). Returns None on success, else an error string."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-    except OSError as exc:
-        return f"can't write {path}: {exc}"
-
-    for key, val in patch.items():
-        if key in ("frequency", "sensor_timeout"):
-            text = re.sub(r"(?m)^( *" + re.escape(key) + r"\s*:\s*)[+-]?[0-9.]+",
-                          lambda m: m.group(1) + repr(float(val)), text, count=1)
-        elif key in _PN_DIAG:
-            idx = _PN_DIAG[key]
-            m = re.search(r"(?m)^\s*process_noise_covariance\s*:\s*\[(.*?)\]\s*$",
-                          text, re.S)
-            if not m:
-                return "process_noise_covariance block not found to update"
-            nums = [float(x) for x in
-                    re.findall(r"[+-]?[0-9.]+[eE]?[+-]?\d*", m.group(1))]
-            if len(nums) != _PN_LEN:
-                return f"unexpected process_noise_covariance length {len(nums)}"
-            nums[idx] = float(val)
-            # Single-line dense array preserves the (0,0),(1,1),...,(14,14) diagonal.
-            block = "process_noise_covariance: [" + \
-                    ", ".join(repr(x) for x in nums) + "]"
-            text = text[:m.start()] + block + text[m.end():]
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except OSError as exc:
-        return f"write failed: {exc}"
-    return None
-
 
 class WebServerNode(Node):
     def __init__(self):
@@ -460,7 +336,6 @@ class WebServerNode(Node):
         self._locations_path = os.path.expanduser(
             g("locations_path").value or "~/.local/state/nanobot/locations.json")
         self._locations = {}
-        self._current_pose = None          # (x, y, yaw) from /slam_pose, None until seen
         self._load_locations()
         self._oled_mask_on = False         # OLED tracking-mask mirror state
         self._oled_mask_pub = None
@@ -560,11 +435,6 @@ class WebServerNode(Node):
         self.declare_parameter("drive_max_lin", 0.4)    # m/s clamp (ESP32 maps 0.4 to full PWM)
         self.declare_parameter("drive_max_ang", 3.0)    # rad/s clamp
         self.declare_parameter("drive_timeout", 0.6)    # s without a POST -> stop
-        # Manual-teleop wall guard (opt-in): refuse to drive TOWARD a wall closer
-        # than wall_guard_distance. The Map card's "Wall distance" slider sets this
-        # together with slam_nav/stop_distance so the drawn keep-away bubble matches.
-        self.declare_parameter("wall_guard_enable", False)
-        self.declare_parameter("wall_guard_distance", 0.25)   # m keep-away bubble
         # Same default as sys_monitor's health_log_path (it writes, we serve).
         self.declare_parameter("health_log_path", "~/.local/state/nanobot/health.log")
         self._drive_pub = self.create_publisher(Twist, "cmd_vel", 10)
@@ -572,11 +442,6 @@ class WebServerNode(Node):
         self._drive_v = self._drive_w = 0.0
         self._drive_at = 0.0                            # monotonic of last POST; 0 = idle
         self._last_drive_log = 0.0                      # throttle for the /drive log line
-        # wall-guard live state (read by telemetry's frame for the web UI)
-        self._guard_cache = None                        # (mtime_ns, size) -> parsed map
-        self._guard_blocked = False                     # a drive was just refused
-        self._guard_closest = 0.0                       # m to the nearest wall at the refusal
-        self._guard_last_log = 0.0                      # throttle for the block log line
         self._cpu_quick_at = 0.0                        # memo TTL for _cpu_percent_quick
         self._cpu_quick_val = 0.0
         self.create_timer(0.1, self._drive_tick)
@@ -601,7 +466,7 @@ class WebServerNode(Node):
         # scores each one's magnetometer disturbance. Creates its OWN LED/LDS/cmd_vel
         # publishers -- deliberately independent of skills_allow_actions (below), so a
         # human clicking this button can run it with autonomous action-skills still off.
-        self.declare_parameter("imu_test_lds_rpm", 300.0)   # matches slam_nav's lds_active_rpm
+        self.declare_parameter("imu_test_lds_rpm", 300.0)   # target rpm for the LDS phase
         self.declare_parameter("imu_test_motor_ang", 0.35)  # rad/s, optional motor-wiggle phase
         self._imu_test = IMUInterferenceTest(
             self, logger=self.get_logger().info,
@@ -765,9 +630,10 @@ class WebServerNode(Node):
         self._cog_health_pub = self.create_publisher(String, "brain/cognition_health", latched)
         self._behavior_health = {}                     # last received from mood_node
         self.create_subscription(String, "brain/behavior_health", self._on_behavior_health, 10)
-        # Named locations: track the live SLAM pose so "save current spot as X" has a pose
-        # to capture (slam_nav publishes /slam_pose in the map frame).
-        self.create_subscription(PoseStamped, "slam_pose", self._on_slam_pose, 10)
+        # NOTE: /slam_pose died with slam_nav (slam_toolbox owns the map->odom TF
+        # now but doesn't publish a pose topic the UI used). Locations' "save
+        # current spot" needs explicit x/y until a pose consumer is re-implemented
+        # (see the TODO in docs/nav2-migration.md / AGENTS.md).
         if bool(g("startup_greeting").value):
             # Say hello a few seconds after boot (once the OLED/TTS are up). Offline-safe via
             # the phrase bank's greeting fallback; the boot face is the behaviour node's job.
@@ -805,7 +671,6 @@ class WebServerNode(Node):
         if (v or w) and time.monotonic() - self._last_drive_log > 2.0:
             self._last_drive_log = time.monotonic()
             self.get_logger().info(f"POST /drive v {v:.2f} w {w:.2f} (web teleop)")
-        v, w = self._wall_guard(v, w)                  # opt-in wall clearance guard
         self._publish_drive(v, w)
         return {"status": "ok", "v": v, "w": w}
 
@@ -827,120 +692,7 @@ class WebServerNode(Node):
                 self._drive_v = self._drive_w = 0.0
                 self._drive_at = 0.0
             v, w = self._drive_v, self._drive_w
-        v, w = self._wall_guard(v, w)                  # re-assert the same guarded values
         self._publish_drive(v, w)                      # a stale drive publishes one stop
-
-    # ---- manual-teleop wall clearance guard ------------------------------------
-    def wall_guard_state(self):
-        """Live guard state for the telemetry frame (web UI toggle + map bubble)."""
-        g = self.get_parameter
-        return {"enable": bool(g("wall_guard_enable").value),
-                "distance": round(float(g("wall_guard_distance").value), 3),
-                "blocked": bool(self._guard_blocked),
-                "closest": round(self._guard_closest, 3)}
-
-    def _wall_guard(self, v, w):
-        """Refuse to drive TOWARD a wall closer than wall_guard_distance (opt-in).
-        Only the linear axis is gated; rotation is always passed through so the driver
-        can turn away. Inert when: disabled, distance <= 0, no/stale SLAM pose, or the
-        map blob is unreadable (restart/teardown window) — never worse than a no-op."""
-        g = self.get_parameter
-        if not bool(g("wall_guard_enable").value) or v == 0.0:
-            self._guard_blocked = False
-            return v, w
-        dist = float(g("wall_guard_distance").value)
-        if dist <= 0:
-            self._guard_blocked = False
-            return v, w
-        tm = getattr(self, "telemetry", None)
-        pose = tm._slam_pose if tm is not None else None
-        if pose is None:
-            self._guard_blocked = False
-            return v, w
-        x, y, yaw, at = pose
-        if time.monotonic() - at > WALL_GUARD_STALE:
-            self._guard_blocked = False                 # pose lost -> guard can't judge
-            return v, w
-        gm = self._guard_map()
-        if gm is None:
-            self._guard_blocked = False
-            return v, w
-        # Probe along the direction of travel: only block when THAT path runs into
-        # the bubble. A robot next to a wall can still drive parallel / away from it
-        # (a corridor narrower than 2*dist stays drivable down its middle).
-        d = math.cos(yaw) if v > 0 else -math.cos(yaw)
-        dy = math.sin(yaw) if v > 0 else -math.sin(yaw)
-        d0 = self._guard_clearance(gm, x, y, dist)
-        dp = self._guard_clearance(gm, x + d * WALL_GUARD_PROBE,
-                                   y + dy * WALL_GUARD_PROBE, dist)
-        self._guard_closest = min(d0, dp)
-        if dp >= dist:
-            self._guard_blocked = False
-            return v, w
-        self._guard_blocked = True
-        if time.monotonic() - self._guard_last_log > WALL_GUARD_LOG:
-            self._guard_last_log = time.monotonic()
-            self.get_logger().info(
-                f"wall guard: {'reverse' if v < 0 else 'forward'} drive blocked "
-                f"({self._guard_closest:.2f} m to wall, keep-away {dist:.2f} m)")
-        return 0.0, w
-
-    def _guard_map(self):
-        """Cached parse of nav_node's /dev/shm map blob (JSON header + int8 grid).
-        Re-reads only when the file mtime/size changes (the blob rewrites ~2 Hz)."""
-        try:
-            st = os.stat(WALL_GUARD_MAP_FILE)
-        except OSError:
-            self._guard_cache = None
-            return None
-        key = (st.st_mtime_ns, st.st_size)
-        if self._guard_cache is not None and self._guard_cache[0] == key:
-            return self._guard_cache[1]
-        try:
-            with open(WALL_GUARD_MAP_FILE, "rb") as f:
-                data = f.read()
-        except OSError:
-            self._guard_cache = None
-            return None
-        nl = data.find(b"\n")
-        if nl < 0:
-            self._guard_cache = None
-            return None
-        try:
-            meta = json.loads(data[:nl])
-        except ValueError:
-            self._guard_cache = None
-            return None
-        h = int(meta.get("h", 0)); w = int(meta.get("w", 0))
-        if not h or not w or len(data) - nl - 1 < h * w:
-            self._guard_cache = None
-            return None
-        g = {
-            "w": w, "h": h, "res": float(meta["res"]),
-            "ox": float(meta["ox"]), "oy": float(meta["oy"]),
-            # row 0 = origin_y (bottom); same orientation the browser map renders
-            "occ": np.frombuffer(data, dtype=np.int8, offset=nl + 1).reshape(h, w),
-        }
-        self._guard_cache = (key, g)
-        return g
-
-    def _guard_clearance(self, gm, x, y, dist):
-        """Nearest-occupied distance (m) from the world point (x, y), or inf when the
-        window is clear. Searches only a ~dist-sized window around the cell (cheap)."""
-        occ = gm["occ"]; res = gm["res"]; h, w = occ.shape
-        cx = (x - gm["ox"]) / res
-        cy = (y - gm["oy"]) / res
-        R = max(1, int(math.ceil(dist / res)) + 2)
-        r0 = max(0, int(math.floor(cy)) - R); r1 = min(h, int(math.ceil(cy)) + R + 1)
-        c0 = max(0, int(math.floor(cx)) - R); c1 = min(w, int(math.ceil(cx)) + R + 1)
-        if r0 >= r1 or c0 >= c1:
-            return float("inf")
-        win = occ[r0:r1, c0:c1]
-        mask = win > WALL_GUARD_OCC
-        if not mask.any():
-            return float("inf")
-        rows, cols = np.nonzero(mask)
-        return float(np.hypot((r0 + rows) - cy, (c0 + cols) - cx).min() * res)
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -988,58 +740,6 @@ class WebServerNode(Node):
 
     def stress_status(self):
         return self._stress.status()
-
-    # ---- EKF (robot_localization) tuning ------------------------------------
-    def get_ekf_config(self):
-        """Current effective EKF tunables from the ekf.yaml the ekf unit loads, plus
-        the measured /odometry/filtered rate. Read-only — changes need a restart."""
-        path = _ekf_installed_path()
-        data, err = _ekf_read(path)
-        if data is None:
-            return {"ok": False, "error": err, "path": path}
-        ecfg = data
-        ecfg["path"] = path
-        ecfg["writable"] = os.path.exists(path) and os.access(path, os.W_OK)
-        ecfg["ekf_hz"] = round(float(getattr(self.telemetry, "_ekf_hz", 0.0) or 0.0), 1)
-        return {"ok": True, **ecfg}
-
-    def set_ekf_config(self, data):
-        """Persist the webtunable EKF values into ekf.yaml (clamped to sane ranges).
-        Does NOT restart the node — the UI shows a 'restart EKF to apply' affordance."""
-        path = _ekf_installed_path()
-        patch = {}
-        for key, (lo, hi) in EKF_TUNABLES.items():
-            v = data.get(key)
-            if v is None:
-                continue
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                return {"ok": False, "error": f"{key}: not a number"}
-            patch[key] = max(lo, min(hi, v))
-        if not patch:
-            return {"ok": False, "error": "no tunable supplied"}
-        err = _ekf_write(path, patch)
-        if err:
-            return {"ok": False, "error": err, "path": path}
-        return {"ok": True, "saved": patch, "path": path,
-                "restart_required": True}
-
-    def restart_ekf(self):
-        """Apply the saved tuning: robot_localization reads its params only at start,
-        so restart just the lightweight EKF unit. Needs the scoped sudoers rule
-        in deploy/sudoers/nano-power ('systemctl restart nano-ekf.service')."""
-        cmd = ["/usr/bin/systemctl", "restart", "nano-ekf.service"]
-        if os.geteuid() != 0:
-            cmd = ["sudo", "-n"] + cmd
-        try:
-            subprocess.check_call(cmd, timeout=30)
-        except subprocess.CalledProcessError as exc:
-            return {"ok": False, "error": f"systemctl exit {exc.returncode}",
-                    "hint": "re-run deploy/sbc-setup.sh so the nano-ekf restart sudoers rule is live"}
-        except Exception as exc:    # noqa: BLE001  (any spawn/io failure is worth surfacing)
-            return {"ok": False, "error": str(exc)}
-        return {"ok": True}
 
     def update_settings(self, data):
         """Merge a partial settings dict from the web UI, persist, and apply."""
@@ -1983,17 +1683,11 @@ class WebServerNode(Node):
             pass
 
     # --- named locations ("go to the kitchen") --------------------------------
-    # A durable name->pose map persisted to locations.json (live-editable from the web
-    # map panel, same pattern as the vision-target palette / schedule). slam_nav already
-    # has click-to-go (goal_pose) + go_home; Locations adds a named waypoint layer: save
-    # the current pose under a name, then publish the stored pose to /goal_pose to go
-    # there. Current pose tracks /slam_pose so "save current spot" needs no extra plumbing.
-    def _on_slam_pose(self, msg: PoseStamped):
-        p = msg.pose.position
-        q = msg.pose.orientation
-        yaw = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
-        self._current_pose = (p.x, p.y, yaw)
-
+    # A durable name->pose map persisted to locations.json (same pattern as the
+    # vision-target palette / schedule). Locations adds a named waypoint layer:
+    # save a spot under a name, then publish the stored pose to /goal_pose to go
+    # there. (The old /slam_pose-backed "save current spot" is gone with slam_nav;
+    # saves now require explicit x/y — see the nav2-migration TODO.)
     def _load_locations(self):
         data = read_json(self._locations_path)
         if isinstance(data, dict) and isinstance(data.get("locations"), dict):
@@ -2008,12 +1702,13 @@ class WebServerNode(Node):
             self.get_logger().warning("locations: save failed")
 
     def get_locations(self):
-        """GET /locations: the name->pose map (for the map panel's waypoint overlay)."""
-        return {"locations": self._locations, "pose": self._current_pose}
+        """GET /locations: the name->pose map."""
+        return {"locations": self._locations}
 
     def location_save(self, d):
-        """POST /locations/save {name, [x,y,yaw]}: remember a spot. If x/y given, use them
-        (the map panel passes a clicked point); else capture the current /slam_pose."""
+        """POST /locations/save {name, x, y, [yaw]}: remember a spot. Requires explicit
+        x/y in the map frame (there is no live pose source since /slam_pose went away
+        with slam_nav)."""
         name = str((d or {}).get("name") or "").strip()[:32]
         if not name:
             return {"error": "empty name"}
@@ -2022,9 +1717,7 @@ class WebServerNode(Node):
             x = float(pose.get("x")); y = float(pose.get("y"))
             yaw = float(pose.get("yaw", 0.0)); from_point = True
         except (TypeError, ValueError, KeyError):
-            if self._current_pose is None:
-                return {"error": "no current pose yet (has /slam_pose arrived?)"}
-            x, y, yaw = self._current_pose; from_point = False
+            return {"error": "no x/y given (and no live pose source — save from the map click)"}
         # Clamp like the goal publisher does, so a saved spot is always a navigable goal.
         x = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, x))
         y = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, y))
@@ -2235,7 +1928,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/vision/targets": lambda n: n.get_vision_targets(),
         "/locations": lambda n: n.get_locations(),
         "/llm/vision_diary": lambda n: n.get_vision_diary(),
-        "/ekf/config": lambda n: n.get_ekf_config(),
     }
     POST_JSON = {
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
@@ -2264,8 +1956,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/locations/save": lambda n, d: n.location_save(d),
         "/locations/delete": lambda n, d: n.location_delete(d),
         "/locations/go": lambda n, d: n.location_go(d),
-        "/ekf/config": lambda n, d: n.set_ekf_config(d),   # persist tuning into ekf.yaml
-        "/ekf/apply": lambda n, d: n.restart_ekf(),        # restart nano-ekf.service
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.
@@ -2309,13 +1999,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._stream_motion_mask_mjpeg()
         if path == "/audio.pcm":
             return self._stream_audio()
-        if path == "/map":
-            return self._serve_map()
-        if path == "/map/nogo":
-            # The no-go overlay blob slam_nav writes (/dev/shm/nano_nogo.bin) so the map
-            # canvas can shade restricted zones. Same header+raw layout, rewritten only
-            # when the forbidden mask changes.
-            return self._serve_shm("/dev/shm/nano_nogo.bin", "no no-go zones yet")
         if path == "/scan.bin":
             return self._serve_scan()
         if path == "/brain/health":
@@ -2380,29 +2063,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             if not name:
                 return self._respond(400, "empty name")
             return self._respond_json(self._node.invoke_skill(name))
-        if path in ("/map/nogo/stroke", "/map/nogo/clear"):
-            # Paint/erase a no-go zone on the live map: {"x0","y0","x1","y1","brush",
-            # "erase"} in world metres, or clear-all. Forwards to slam_nav (atomic file
-            # handoff, token'd).
-            data = self._read_json()
-            return self._respond_json(self._write_map_edit(data))
         self.send_error(404)
-
-    @staticmethod
-    def _write_map_edit(edit):
-        """Forward a map-edit request to slam_nav via the atomic /dev/shm handoff file.
-        Injects a monotonic `t` token so slam_nav can apply each request exactly once even
-        if the file persists. Returns a small status dict."""
-        req = dict(edit or {})
-        req["t"] = int(time.time() * 1000)
-        tmp = NGO_MAP_EDIT_FILE + ".tmp"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(req, f)
-            os.replace(tmp, NGO_MAP_EDIT_FILE)
-            return {"ok": True, "action": req.get("action"), "t": req["t"]}
-        except OSError as exc:
-            return {"error": str(exc)}
 
     @staticmethod
     def _set_oled_action(action):
@@ -2674,12 +2335,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(jpeg)
         except OSError:
             pass
-
-    def _serve_map(self):
-        # The slam_nav node writes the live occupancy map to a RAM file (/dev/shm);
-        # we just hand the bytes over same-origin so the page's map canvas can render
-        # them. No ROS subscription / OccupancyGrid serialization in this process.
-        self._serve_shm("/dev/shm/nano_map.bin", "no map yet")
 
     def _serve_scan(self):
         # The lidar driver writes each scan as a compact blob to /dev/shm (JSON header +

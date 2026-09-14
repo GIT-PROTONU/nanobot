@@ -29,12 +29,20 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 
 ## Layout (`src/`)
 - `robot_msgs` — custom interfaces (ament_cmake).
-- `robot_bringup` — launch files + **the two configs `config/robot.yaml`** (all
-  ports/pins/rates) + **`config/ekf.yaml`** (robot_localization EKF: fuses
-  `/odom` + `/imu/data` → `/odometry/filtered` + `odom→base_link` TF).
+- `robot_bringup` — launch files + **the config `config/robot.yaml`** (all
+  ports/pins/rates) + **`config/nav2/`** (`nav2_params.yaml` for the Nav2 Humble
+  servers + slam_toolbox 2.6.10, and `recovery_bt.xml` — the minimal fail→clear
+  costmaps→back up→spin→retry BT). **Navigation = Nav2 + slam_toolbox** (the custom
+  `slam_nav` node and the robot_localization EKF were retired 2026-09-14 — see
+  [`docs/nav2-migration.md`](docs/nav2-migration.md): slam_toolbox turns `/scan` +
+  `/odom` into `/map` + the `map→odom` TF; the Nav2 servers plan/drive to
+  `/goal_pose` and publish `/cmd_vel` straight to the ESP32 contract).
   `launch/bringup.launch.py` is the one node graph shared
   by the real robot and the Gazebo dev-sim (`sim:=true`/`rviz:=true` args) — see
-  "Dev/prod ROS parity + Gazebo sim" below. Also holds the URDF (`urdf/nano.urdf.xacro`),
+  "Dev/prod ROS parity + Gazebo sim" below. Also holds `launch/nav2.launch.py`
+  (the ONE component container for the Nav2 servers + the `load_only:=true`
+  systemd pairing + the static `base_link→laser` TF with yaw π for this unit's
+  back-facing sensor head), the URDF (`urdf/nano.urdf.xacro`),
   the Gazebo world (`worlds/nano_room.sdf`), the `ros_gz_bridge` topic map
   (`config/gz_bridge.yaml`) and the RViz config (`rviz/nano.rviz`).
 - `lds_driver_py` — **the LDS driver in use** (rclpy, publishes `/scan`; also writes a
@@ -42,42 +50,20 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   The blob writer is `scan_blob.write_scan_blob`, shared with `sim_hardware` so the
   Gazebo dev-sim writes byte-identical blobs.
 - `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32, or from `sim_hardware` in
-  Gazebo dev-sim) into `/odom`; TF is published by the EKF (`publish_tf: false` here).
-  No longer reads GPIO.
-- `slam_nav` — super-light 2D SLAM (correlative scan-match on EKF-filtered odometry
-  `/odometry/filtered` + IMU yaw prior) +
-  click-to-go nav (planner + pure pursuit, gated by `enable_motion`), pick-up freeze +
-  lost-robot relocalization, LDS idle spin-down, the scripted **self-test** drive
-  (IMU-vs-encoder cross-check), the clamped `trait_motion` caution mapping, and
-  **pan-only vision target tracking** (2026-07-16, not hw-verified: `track_*` params,
-  turns in place to center the GPU-vision colour blob from `/vision/state`; wins over
-  goal-follow/explore while on, still yields to pick-up/self-test/relocalize.
-  2026-07-21 refinement for smoother + more accurate tracking: a **smooth deadband**
-  (`track_deadband_soft`, linear taper at the deadband edge — kills limit-cycle
-  bang-in/out), **coast on transient loss** (`track_coast`, holds the last `w` with
-  exponential decay through a None/sub-conf frame instead of a hard stop-start),
-  **integral term** (`track_ki`, opt-in/default 0, anti-windup — cancels steady-state
-  offset), **target-velocity feedforward** (`track_kff`, EMA-smoothed `dx/dt` —
-  predictive lead for a moving target), and **confidence-scaled authority**
-  (`track_conf_scale`, weak lock = cautious output). All five are live-tunable from the
-  Camera tab's "▸ Tracking tuning" expandable.)
-  **Occupancy grid is 2 cm/cell (1200×1200 @ 24 m)** — `robot.yaml
-  map_resolution: 0.02` (was 5 cm), with `plan_downsample`/`recover_global_step`
-  bumped 4→10 to keep the planner + relocalize coarse cells at the same 0.20 m
-  (nav behaviour unchanged); a saved 5 cm `.npz` will not load (geometry mismatch).
+  Gazebo dev-sim) into `/odom`; **this node owns the `odom→base_link` TF now**
+  (`publish_tf: true` — the EKF is gone). No longer reads GPIO.
 - `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
   `imu_driver` also wires the **WitMotion accel/mag calibration** (2026-07-16, not
   hw-verified: `/imu_calibrate` String cmds `accel|mag_start|mag_stop|save` executed
   in the reader thread → latched `/imu_calibrate_status`; web IMU card buttons + live
   mag xyz readout — no protocol readback exists, so verification is eyeballing
   |accel|≈9.8 + a smooth mag sweep).
-- `sim_hardware` — **dev-PC-only**, not built/launched on the board (linux-aarch64). Two
-  nodes used only by `bringup.launch.py sim:=true`: `sim_bridge_node` re-publishes
+- `sim_hardware` — **dev-PC-only**, not built/launched on the board (linux-aarch64). Used
+  only by `bringup.launch.py sim:=true`: `sim_bridge_node` re-publishes
   Gazebo's bridged `/joint_states_sim` + `/imu` + `/scan` as the exact contracts the real
   lidar/IMU/ESP32 publish (`/wheel_ticks`, `/imu/euler`+`/imu/web`, the scan blob), plus
-  synthetic ESP32 board telemetry; `map_bridge_node` republishes `slam_nav`'s
-  `/dev/shm/nano_map.bin` blob as a real `nav_msgs/OccupancyGrid` on `/map` for RViz
-  (useful on the real robot too, not sim-specific).
+  synthetic ESP32 board telemetry. (The old `map_bridge_node` — the `/dev/shm` map blob →
+  `/map` bridge — died with slam_nav; slam_toolbox publishes `/map` natively.)
 - `behavior` — **behaviour layer (Sismic statechart)**. *Human-readable overview of the
   whole brain (statechart + LLM + traits/evolution + model caps + decision log):
   [`docs/brain.md`](docs/brain.md); the bullets below are the terse engineering summary.*
@@ -136,8 +122,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
     `scripts/personality_creator.py`, persisted as they drift). Guards read them (curiosity
     gates the camera beat; extraversion scales the idle cadence; registry can demote beats),
     they're folded into the cognition prompt, and `mood_node` publishes them latched on
-    `/cognition/traits` (slam_nav maps `caution`→stop_distance/max_lin, **clamped reflexively
-    in slam_nav** so the brain can't push motion unsafe — gated by `trait_motion`). Evolution
+    `/cognition/traits` (expression-level influence only — the old slam_nav
+    `caution`→stop_distance/max_lin mapping went away with slam_nav). Evolution
     is event-driven + smoothed: an `evolve` event (exponential smoothing, internal transition)
     from **fast rules** (pickup→caution, in mood_node) OR **slow LLM reflection**
     (`web_control`, pro model reads the decision log on `reflect_period` + on events →
@@ -183,10 +169,11 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   crash/restart independently.
 - `app_hub` — the same move for the expression/cognition layer: **runs `web_control` +
   `oled_display` + `behavior` (mood_node) in ONE process**. The board now runs exactly
-  **four fault domains** — `sensor_hub` (the body), `ekf_node` (sensor fusion,
-  `robot_localization`, standalone C++ process, fuses `/odom` + `/imu/data` →
-  `/odometry/filtered` + `odom→base_link` TF), `slam_nav` (spatial, consumes
-  `/odometry/filtered`), `app_hub` (expression/web/brain) — plus the zenoh router.
+  **four fault domains** — `sensor_hub` (the body), the `nav2_container`
+  (spatial/nav: planner + controller + bt_navigator + behaviors + lifecycle manager in
+  ONE `component_container_isolated`), `slam_toolbox` (`nano-slam`, plain node, own
+  process — `/map` + `map→odom` TF), `app_hub` (expression/web/brain) — plus the zenoh
+  router and the one-shot `nano-nav-loader` that attaches the components.
   app_hub's main also preserves the OLED SIGTERM end-screen (restart/shutdown glyph).
 
 ## ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
@@ -209,8 +196,8 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   `/right_wheel_suspended` (Bool per-wheel off-ground microswitch, **published on change**
   for low latency + a 1 Hz heartbeat republish; **`true` = the wheel is UP / lifted, the
   robot is suspended — `SUSPEND_ACTIVE_HIGH` is `true` (2026-07-16 flip): the switch reads
-  HIGH (INPUT_PULLUP) while lifted, LOW while on the ground.** The SBC consumers — slam_nav
-  pickup freeze, mood_node pickup reflex, web_control snapshot — all honor a **latched
+  HIGH (INPUT_PULLUP) while lifted, LOW while on the ground.** The SBC consumers —
+  mood_node pickup reflex, web_control snapshot — all honor a **latched
   `/pickup_override` test hook** (Int8: -1 auto, 0 force-grounded, 1 force-lifted; ESP32
   1 Hz heartbeat makes overriding at the source impossible), set from the web
   Coprocessor card, auto-cleared on page reload), `/esp32_temp` (Float32) + `/esp32_hall`
@@ -285,17 +272,23 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
 - Run the stack: **`scripts/stack.sh {up|down|restart|status}`** — now a thin wrapper
   over **systemd**. The stack is six units under **`nano-robot.target`**:
   `nano-router` (zenohd-serial) → `nano-sensors` (sensor_hub = imu+sys+odom+lds) →
-  `nano-ekf` (robot_localization: /odom+/imu/data→/odometry/filtered) →
-  `nano-nav` (slam_nav) → `nano-app` (app_hub = web+oled+behavior) /
-  `nano-map` (map_bridge_node, `/dev/shm/nano_map.bin` → `/map` for a remote RViz).
+  `nano-nav` (ONE `rclcpp_components/component_container_isolated` hosting the Nav2
+  servers + their lifecycle manager; components attached by the `nano-nav-loader`
+  oneshot via `nav2.launch.py load_only:=true`; static `base_link→laser` TF with yaw π
+  as the unit's ExecStartPost) → `nano-slam` (slam_toolbox 2.6.10, own process) →
+  `nano-app` (app_hub = web+oled+behavior).
+  (The old `nano-ekf`/`nano-map` units died with the Nav2 migration — the EKF and the
+  map blob bridge are gone.)
   Ordering (`After=nano-router.service` + the router unit's ExecStartPost probe that
-  waits for :7447 to actually accept) encodes the rmw_zenoh island gotcha; the EKF
-  starts after sensors (needs /odom + /imu/data); nav starts after the EKF (consumes
-  /odometry/filtered). **Crash recovery is `Restart=on-failure`**, and **hang recovery
-  is the systemd watchdog**: app/sensors/nav are `Type=notify` and pet `WATCHDOG=1`
+  waits for :7447 to actually accept) encodes the rmw_zenoh island gotcha; nav/slam
+  start after sensors (need /odom + /scan). **Crash recovery is `Restart=on-failure`**, and
+  **hang recovery is the systemd watchdog**: app/sensors are `Type=notify` and pet
+  `WATCHDOG=1`
   every 5 s from an *executor timer* (`_sd_notify` in each main), so an alive-but-wedged
   executor (a stuck callback) stops petting and gets restarted (`WatchdogSec=90`). The
-  EKF is `Type=simple` (stock rclcpp binary, no watchdog). Each unit also has a
+  nav units are `Type=simple` (stock C++ binaries, no watchdog) guarded instead by
+  `CPUAffinity=2 3` + `Nice=10` + `MemoryMax=400M` (Ceres's thread spike + pose-graph
+  growth). Each unit also has a
   `MemoryMax` cap so a leak restarts that hub instead of waking the kernel OOM killer.
   (The old `nano-heal.timer` polling — and its heal-vs-restart duplicate-node race —
   is gone.)
@@ -313,24 +306,22 @@ There are now **two dev paths**, not one, serving different purposes:
 - **`scripts/dev_webui.py` / `dev_run.ps1`** (Windows, no ROS at all) — unchanged, still
   the fastest way to iterate on the LLM/personality/TTS layer (see the LLM/cognition
   section below). Doesn't run `web_control`'s rclpy node, `oled_display`,
-  `behavior/mood_node`, `wheel_odometry`, or `slam_nav` — it's a ROS-free stand-in for
+  `behavior/mood_node`, `wheel_odometry`, or the nav stack — it's a ROS-free stand-in for
   just the AI/Speak/Brain cards.
 - **`scripts/sim_run.sh`** (Ubuntu/Linux dev PC, real ROS 2 via the SAME `pixi.toml`
   RoboStack env the board uses — `linux-64` is already one of its `platforms`) — runs
   the **exact same node graph** as the robot: `web_control`, `oled_display`,
-  `behavior/mood_node`, `sys_monitor`, `wheel_odometry`, `slam_nav`, and the
-  `robot_localization` EKF (config/ekf.yaml, fuses /odom + /imu/data →
-  /odometry/filtered) are all real,
-  unmodified rclpy nodes. Only the lowest hardware-transducer layer differs: **Gazebo
+  `behavior/mood_node`, `sys_monitor`, `wheel_odometry`, the Nav2 container
+  (`launch/nav2.launch.py`: planner/controller/bt_navigator/behaviors/lifecycle
+  manager + slam_toolbox) are all real,
+  unmodified nodes. Only the lowest hardware-transducer layer differs: **Gazebo
   Sim** (`ros_gz_sim`, the modern actively-maintained "Ignition"-lineage simulator —
   `robostack-staging` doesn't cleanly ship classic `gazebo_ros_pkgs` for Humble, but does
-  ship `ros-gz-*`) plus `ros_gz_bridge` and the new `sim_hardware` package stand in for
+  ship `ros-gz-*`) plus `ros_gz_bridge` and the `sim_hardware` package stand in for
   the LDS02RR/BWT901CL/ESP32. `sim_hardware.sim_bridge_node` converts Gazebo's bridged
   wheel-joint angles into `/wheel_ticks` (so the **real** `wheel_odometry` node still
   does the integration — Gazebo's own diff-drive odometry is deliberately not used) and
-  its bridged IMU into `/imu/euler`+`/imu/web` matching `imu_driver`'s exact contract;
-  `sim_hardware.map_bridge_node` republishes `slam_nav`'s `/dev/shm/nano_map.bin` blob as
-  a real `nav_msgs/OccupancyGrid` on `/map` for RViz (also usable on the real robot).
+  its bridged IMU into `/imu/euler`+`/imu/web` matching `imu_driver`'s exact contract.
   The webcam/mic aren't simulated at all — `mjpeg_camera.py`/`mic_audio.py` are
   V4L2/ALSA and just use the dev PC's real ones.
   - `robot_bringup/launch/bringup.launch.py` (replaces the previously-stale
@@ -357,15 +348,14 @@ A third option, orthogonal to the two dev paths above: watch the **physical robo
 in RViz from the dev PC while it runs its own systemd stack unchanged — no Gazebo, no sim.
 - `scripts/rviz_remote.sh` (optionally `--connect <robot-ip>`) / `pixi run visualize` runs
   `robot_bringup/launch/visualize.launch.py`, which starts **only**
-  `robot_state_publisher` + `rviz2` — deliberately NOT `wheel_odometry`/`slam_nav`/
+  `robot_state_publisher` + `rviz2` — deliberately NOT `wheel_odometry`/the nav stack/
   `sensor_hub`/etc. a second time (the robot is already publishing all of that; a second
   copy on the dev PC would just be a redundant duplicate publisher on the same topics).
   `/scan`, `/odom`, `/imu/euler`, TF, `/map` all stream in over the shared `rmw_zenoh`
   graph.
-- **`/dev/shm` is per-machine RAM**, so `sim_hardware.map_bridge_node` (republishing
-  `slam_nav`'s map blob as a real `nav_msgs/OccupancyGrid`) has to run **on the board**,
-  not the dev PC, for a remote RViz to see `/map` — the `nano-map` unit runs it on the
-  board (after `nav`; harmless/cheap, no Gazebo deps).
+- **`/map` is a real ROS topic now**: slam_toolbox publishes it transient-local, so a
+  remote RViz simply subscribes over the zenoh graph (the old `/dev/shm` map blob +
+  `nano-map` bridge unit are gone with slam_nav).
 - **Cross-host zenoh discovery**: `ROS_DOMAIN_ID`/`RMW_IMPLEMENTATION` already match by
   construction (both machines activate the same `pixi.toml`). Same-LAN zenoh multicast
   scouting usually finds the robot's `zenohd-serial` router with no extra config; if not
@@ -389,17 +379,15 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
 - **`web_control` static server**: serves `web/` — `index.html` plus `style.css`. The
   page is **self-contained**: one big `"use strict"` inline block (`app.js`-derived: the
   SSE `/telemetry` EventSource + all control) with the OLED-mirror `oled.js` inlined
-  right before it, then smaller self-contained IIFE blocks (map panel, chrome tabs,
-  in-browser sim, motion-chain/EKF/slam-tuning) — all pure same-origin SSE/HTTP, no
+  right before it, then smaller self-contained IIFE blocks (chrome tabs,
+  in-browser sim, live odometry/IMU readouts) — all pure same-origin SSE/HTTP, no
   external scripts, no rosbridge/ROSLIB. Do NOT reintroduce external `<script src>`
   loading of the old split files (`app.js`, `map.js`, `oled.js`, `chrome.js`, `sim.js`,
   `devtools.js` — now orphaned).
-  The Map panel renders the raw `/map` blob as-is: **nearest-neighbour downscale**
-  (`imageSmoothingEnabled` only when magnified past 1:1) so fit-view walls don't smear
-  into a bilinear blur, plus a **"Sharp walls" toggle** (`#mapShade`, default on) that
-  switches the wall shading between a crisp √-gamma curve (mid-grey fringes → solid
-  black) and the flat linear ramp — toggling re-shades the last grid in place via
-  `shadeMap()` (no re-poll).
+  The web **Map panel is gone** (scrapped with slam_nav — see the nav2-migration TODO in
+  AGENTS.md for the reimplement-later list: a canvas map fed from slam_toolbox's `/map`,
+  click-to-goal, keep-away, no-go brush, locations' current-pose capture). `/scan.bin`
+  still feeds the Lidar hero view; `/goal_pose` (locations, skills) still drives Nav2.
   `/stream.mjpg` is a zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`);
   `/snapshot.jpg` is one still frame (📸 button); `/audio.pcm` is the webcam
   mic as raw PCM via `arecord` (`mic_audio.py`). Both streams are ref-counted (only
@@ -497,9 +485,9 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
     greet-face + a `greeting` beat, rate-limited, idle-only), **looming/clutter →
     caution fast rules** in `brain.Personality` (looming = edge-triggered startle;
     clutter = hold caution ≥ `clutter_caution` while it lasts and RELEASE to the
-    remembered pre-clutter value after — which, with slam_nav's `trait_motion` opt-in,
-    **is the clutter velocity throttle** through the existing caution→max_lin clamp,
-    no new motor-authority path), **ambient colour mood** (scene warmth R−B tints the
+    remembered pre-clutter value after — expression-level only now: the old
+    caution→max_lin velocity throttle died with slam_nav's `trait_motion`),
+    **ambient colour mood** (scene warmth R−B tints the
     chart's `feeling` face via the injected `ambient_mood` — the LLM's `drives.mood`
     always wins), and a **novelty boost** on the `looking` beat (transient `beat_boosts`
     multiplier in `choose_beat`, distinct from the LLM-evolvable registry priority).
@@ -706,8 +694,8 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   or a camera frame; routes through the same `_generate`/vision path) and a **gated *action*
   tier** (`kind: topic` — publishes a **whitelisted, clamped** ROS msg: `/led`, `/fan_pwm`,
   `/lds_target_rpm`, `/cmd_vel`). An action runs only when the skill sets `enabled: true` **AND**
-  `skills_allow_actions` (web_control param, **off by default**); motion stays clamped reflexively
-  by slam_nav, so a skill can never make the robot unsafe. **Two entry points:** autonomous (the
+  `skills_allow_actions` (web_control param, **off by default**); motion speeds are clamped in
+  `web_server` itself (SKILL_MOTION_* caps), so a skill can never make the robot unsafe. **Two entry points:** autonomous (the
   chart's `skill` beat → `_run_skill_beat` asks the cheap model to PICK one from the offered
   catalogue → performs it) and on-demand (`GET /skills`, `POST /skills/invoke {name}`,
   `POST /skills/reload`; web "🛠 Skills" card). Every invocation logs to the decision log as
@@ -767,10 +755,11 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
 - **Interaction fillers fire BEFORE the LLM call.** On a skill beat the instant "thinking"
   prelude is spoken before the (slow) skill-pick `complete()` call, not after (so TTS feels
   instant); the chosen skill then runs with `prelude=False` to avoid a double filler.
-- **Heavy topics stay OFF the telemetry frame:** the two biggest messages are served
-  same-origin from `/dev/shm` and polled by the page: `/map` (occupancy grid, written
-  by `slam_nav`) and `/scan.bin` (compact lidar blob = JSON header + raw float32
-  ranges, written by `lds_driver_py`) — the page controls the poll rate per view.
+- **Heavy topics stay OFF the telemetry frame:** `/scan.bin` (compact lidar blob =
+  JSON header + raw float32 ranges, written by `lds_driver_py`) is served
+  same-origin from `/dev/shm` and polled by the page — the page controls the poll
+  rate per view. (The old `/map` blob died with slam_nav; slam_toolbox publishes
+  `/map` as a real topic that no longer crosses the web gateway.)
   Everything light rides the ONE `/telemetry` SSE frame (see the gateway note above).
   web_control also publishes `/esp32_ping` @1 Hz (ESP liveness, always on).
 - **The vitals blob (`/dev/shm/nano_vitals.json`)**: sys_monitor writes ONE aggregated
