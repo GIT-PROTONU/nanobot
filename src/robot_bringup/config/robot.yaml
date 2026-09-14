@@ -52,30 +52,6 @@ wheel_odometry:
     odom_frame: "odom"
     base_frame: "base_link"
 
-# ---- cmd_vel -> PCA9685 PWM motor driver ------------------------------------
-# RETIRED: the ESP32 coprocessor now owns /cmd_vel -> H-bridge PWM directly (see
-# firmware/nanobot_coprocessor). This node is no longer launched by stack.sh; kept
-# here only for the optional PCA9685 LDS-spin/aux channels if you re-enable it.
-motor_control:
-  ros__parameters:
-    i2c_bus: 1                # /dev/i2c-1
-    i2c_address: 0x40         # PCA9685 default
-    pwm_freq_hz: 1000.0       # motor-driver PWM carrier (servos: use 50)
-    # Differential drive limits.
-    wheel_separation: 0.16
-    max_linear_speed: 0.4     # m/s mapped to full PWM
-    max_angular_speed: 3.0    # rad/s mapped to full PWM
-    cmd_timeout: 0.5          # s; stop motors if no /cmd_vel arrives
-    # PCA9685 channel wiring. Two channels per motor when driving an H-bridge
-    # in PWM+PWM mode (forward channel / reverse channel).
-    left_fwd_ch: 0
-    left_rev_ch: 1
-    right_fwd_ch: 2
-    right_rev_ch: 3
-    # Optional: drive the LDS spin motor at a constant duty from a spare channel.
-    lds_motor_ch: -1          # -1 = disabled
-    lds_motor_duty: 0.55
-
 # ---- 2D occupancy-grid SLAM (slam_nav) --------------------------------------
 # Builds a map from /scan with the pose = WHEEL-ODOMETRY dead-reckoning
 # (/odom), refined every scan by a robust scan-to-map matcher.

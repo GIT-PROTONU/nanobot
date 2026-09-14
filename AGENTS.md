@@ -3,7 +3,7 @@
 ## Build & run
 
 - Build: `pixi run build` (runs `scripts/build.sh` — colcon + explicit CMake Python hints for RoboStack). Python pkgs are `--symlink-install` (edit + restart, no rebuild).
-- **Do NOT add `rust`/`clang`/`libclang` to `pixi.toml`.** The Rust `lds_driver` is abandoned — `lds_driver_py` is the active driver. `src/lds_driver/` is reference only.
+- **Do NOT add `rust`/`clang`/`libclang` to `pixi.toml`.** The LDS is driven by the pure-Python `lds_driver_py`; the old Rust `lds_driver` node was abandoned and removed. The toolchain would pull ~1.6 GB onto the 7 GB board.
 - Runtime on the board: `scripts/stack.sh {up|down|restart|heal|status}`. Nodes launched by direct executable path (not `ros2 run`) to save RAM. `rmw_zenoh` router must start first.
 - Zenoh needs a serial-capable `zenohd` binary (conda builds lack `transport_serial`). Build with `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`.
 - `stack.sh restart` can leave stale processes. Prefer `down` → verify — `up`.
@@ -41,7 +41,6 @@
 | `slam_nav` | SLAM/mapping (writes `/dev/shm/nano_map.bin`) |
 | `web_control` | ROS glue layer: rosbridge + static web page + TTS + delegates to `nanobot_brain.cognition` |
 | `behavior` | ROS glue layer: Sismic chart lifecycle, topic wiring — delegates to `nanobot_brain.behavior` |
-| `motor_control` | **Retired** (ESP32 owns motor path) |
 | `oled_display` | I2C SSD1306 dashboard |
 | `wheel_odometry` | `/wheel_ticks` → `/odom` + TF (from ESP32, not GPIO) |
 | `imu_driver` | BWT901CL over USB-serial |

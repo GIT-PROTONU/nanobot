@@ -41,14 +41,9 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   compact scan blob to `/dev/shm/nano_scan.bin` for the web UI — see `web_control` below).
   The blob writer is `scan_blob.write_scan_blob`, shared with `sim_hardware` so the
   Gazebo dev-sim writes byte-identical blobs.
-- `lds_driver` — **abandoned** Rust/r2r LDS node; does NOT build against this
-  RoboStack. Kept for reference only. **Do not try to build it** (see below).
 - `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32, or from `sim_hardware` in
   Gazebo dev-sim) into `/odom`; TF is published by the EKF (`publish_tf: false` here).
   No longer reads GPIO.
-- `motor_control` — **retired** (PCA9685 path). The ESP32 owns `/cmd_vel`→motors;
-  not launched by the systemd units/`bringup.launch.py`. Kept for the optional PCA9685
-  LDS-spin/aux channels only.
 - `slam_nav` — super-light 2D SLAM (correlative scan-match on EKF-filtered odometry
   `/odometry/filtered` + IMU yaw prior) +
   click-to-go nav (planner + pure pursuit, gated by `enable_motion`), pick-up freeze +
@@ -382,7 +377,7 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
 
 ## Conventions / gotchas
 - **NEVER add `rust`, `clang`, or `libclang` to `pixi.toml`.** They were build-only
-  deps for the abandoned Rust LDS node and pulled a ~1.6 GB toolchain onto the 7 GB
+  deps for the now-removed Rust LDS node and pulled a ~1.6 GB toolchain onto the 7 GB
   card. A note in `pixi.toml` guards this.
 - **Python packages are installed editable (egg-link → src).** Editing a `.py`
   under `src/<pkg>/<pkg>/` + restarting the node picks it up — **no rebuild needed**.

@@ -7,7 +7,6 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/WheelEncoders.msg"
-  "msg/MotorCommand.msg"
   DEPENDENCIES std_msgs
 )
 

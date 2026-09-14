@@ -53,8 +53,6 @@ web_control       static control page + the browser's telemetry/control
 sensor_hub        single-process host for the four sensor nodes           [rclpy]
 app_hub           single-process host for web+oled+behavior               [rclpy]
 sim_hardware      dev-PC Gazebo stand-ins + the map bridge                [rclpy]
-lds_driver        abandoned Rust/r2r LDS node (doesn't build; reference)  [Rust / r2r]
-motor_control     retired (ESP32 owns /cmd_vel->motors; PCA9685 aux only) [rclpy]
 ```
 
 Data flows over **two planes**: the typed ROS/zenoh graph carries the small control
@@ -121,9 +119,7 @@ pixi run build        # colcon build (msgs + all python pkgs)
 ```
 
 > The LDS is driven by the Python `lds_driver_py` node (built by `pixi run build`
-> like the rest). The old Rust `lds_driver` is abandoned — it doesn't build against
-> this RoboStack Humble, and its toolchain is intentionally **not** in `pixi.toml`
-> (it cost ~1.6 GB). The source is kept under `src/lds_driver/` for reference only.
+> like the rest).
 
 ## 3b. (Optional) Text-to-speech
 
@@ -252,10 +248,6 @@ dev-made `memory/` seed. Run `pixi run smoke` before deploying.
 
 - **First boot debugging:** UART0 (`/dev/ttyS0`, PA4/5) stays the Armbian serial
   console — keep a USB-TTL adapter handy. Don't use it for the LDS.
-- **Rust LDS node (abandoned):** `lds_driver/src/main.rs` targets r2r 0.9, which
-  does not compile against this RoboStack Humble. `lds_driver_py` replaced it. Its
-  build toolchain (rust/clang/llvm, ~1.6 GB) is deliberately excluded from
-  `pixi.toml`; re-add those deps only if you revive the node.
 - **Fully offline:** the page loads no external scripts (roslib/rosbridge are gone),
   so the UI works with no internet at all.
 - **Run as a service:** `deploy/sbc-setup.sh` installs per-process systemd units under

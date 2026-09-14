@@ -45,15 +45,13 @@ ninja = "*"
 cxx-compiler = "*"
 pkg-config = "*"
 
-# NOTE: NO Rust/clang/LLVM toolchain here on purpose. The Rust `lds_driver` is
-# abandoned (it doesn't build against this RoboStack Humble; `lds_driver_py` is the
-# driver actually in use) and the toolchain pulled ~1.6 GB into the env on this 7 GB
-# board. Do NOT add `rust`, `clang`, or `libclang` back unless you are reviving the
-# Rust node — see src/lds_driver/ and the git history if so.
+# NOTE: NO Rust/clang/LLVM toolchain here on purpose. The LDS is driven by the
+# pure-Python `lds_driver_py`; the old Rust `lds_driver` node was abandoned and
+# removed. Do NOT add `rust`, `clang`, or `libclang` — that toolchain pulled
+# ~1.6 GB into the env on this 7 GB board.
 
 # --- Python hardware libraries (pure-python, available on conda-forge) ---
 pyserial = "*"          # serial access for the LDS (lds_driver_py) + IMU (imu_driver)
-smbus2 = "*"            # I2C for the PCA9685 driver
 
 # --- Dev-PC-only: Gazebo simulation + RViz (see scripts/sim_run.sh) ---------------
 # linux-64 ONLY (a [target.*] section, not [dependencies]) so none of this ever
