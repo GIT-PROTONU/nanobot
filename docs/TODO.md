@@ -4,7 +4,8 @@
 > live-verified on the dev PC: the custom `slam_nav` stack, the robot_localization EKF
 > and the map blob bridge are DELETED; navigation is now Nav2 Humble servers in one
 > component container + slam_toolbox 2.6.10 as its own process. Deviation notes live at
-> the bottom of that file; the reimplement-later web-UI TODO lives in AGENTS.md. Some
+> the bottom of that file. The reimplement-later web-UI TODO was EXECUTED 2026-09-15
+> (Map view + click-to-goal + Locations rebuilt on Nav2 — see AGENTS.md). Some
 > slam_nav/EKF-era items below are now MOOT (marked accordingly).
 
 Findings from the 2026-07-16 full-code review. Items here are *code/robustness

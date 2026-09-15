@@ -29,13 +29,16 @@ import threading
 import time
 
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.time import Time
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
+from action_msgs.msg import GoalStatusArray
 from sensor_msgs.msg import MagneticField
 from diagnostic_msgs.msg import DiagnosticArray
+from tf2_ros import Buffer as TfBuffer, TransformListener
 
 SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the last client
 # Optical virtual bumper (GPU vision Tier-B extension): commanded-to-move but the GPU's
@@ -56,6 +59,24 @@ MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.c
 TRIM_MAX = 0.30          # ESP32 firmware's TRIM_MAX -- |wheel_trim| rebalance range (main.cpp)
 GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- Nav2's global costmap is
                          # 24x24 m; a goal outside it would just fail to plan
+# Keep-away bubble drawn around the robot on the web map (metres) -- mirrors
+# local_costmap/global_costmap inflation_radius in config/nav2/nav2_params.yaml.
+# Deliberately hardcoded (NOT a startup get_parameters call): that service could
+# race the Nav2 lifecycle at boot, and the value is restart-only anyway. If you
+# tune inflation_radius in nav2_params.yaml, change this to match.
+NAV_INFLATION_M = 0.25
+# action_msgs/GoalStatus code -> the web map's status chip word. The status
+# sub is the LAST entry of /navigate_to_pose/_action/status (one entry per goal
+# bt_navigator knows, appended chronologically).
+NAV_STATUS = {
+    0: "idle",        # STATUS_UNKNOWN
+    1: "planning",    # STATUS_ACCEPTED
+    2: "navigating",  # STATUS_EXECUTING
+    3: "canceling",   # STATUS_CANCELING
+    4: "arrived",     # STATUS_SUCCEEDED
+    5: "idle",        # STATUS_CANCELED (goal gone)
+    6: "failed",      # STATUS_ABORTED (bt recovery gave up)
+}
 SCHEDULE_MAX_ENTRIES = 20  # cap on the scheduled-routines list a browser may set
 STALE = -1e9
 
@@ -124,6 +145,24 @@ class TelemetryHub:
         # baseline), and when the driving-but-much-blurrier condition started.
         self._edge_still_ema = None
         self._vibration_since = None
+        # --- Nav2 map view state (web map panel; see index.html's map IIFE) -----
+        # Latest /map OccupancyGrid: the grid is polled by the browser over the
+        # /map HTTP route (NOT the SSE frame — ~230 KB would dwarf the rest of
+        # the frame). slam_toolbox publishes every map_update_interval (5 s), so
+        # one cached copy is all a 1 Hz poll can consume.
+        self._map_meta = None          # {w, h, res, ox, oy, t} wire-format header
+        self._map_bytes = None         # raw int8 cells (bytes(msg.data))
+        self._map_arrival = STALE      # monotonic, for staleness surfacing
+        # map-frame pose via TF (map->odom from slam_toolbox + odom->base_link
+        # from wheel_odometry). Listener is lazy — created with the other
+        # browser-only subs, unregistered in _drop_subs.
+        self._tf_buf = None
+        self._tf_listener = None
+        # Goal mirror + Nav2 action status for the web chip. _goal tracks the
+        # last published /goal_pose (browser clicks, locations, skills — all go
+        # through publish_json); _goal_status comes from the action status sub.
+        self._goal = None              # [x, y] in the map frame, or None
+        self._goal_status = "idle"
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._latched_qos = latched
@@ -491,6 +530,16 @@ class TelemetryHub:
                      now=now, frozen=frozen),
                 "bumper": bumper,
             }
+        # Nav2 map view: pose (TF map->base_link), goal mirror + action status +
+        # the inflation bubble radius. All tiny; the heavy map grid itself is
+        # served by the /map HTTP route, never this frame.
+        pose = self._tf_pose()
+        f["nav"] = {
+            "pose": [round(v, 3) for v in pose] if pose else None,
+            "goal": self._goal,
+            "status": self._goal_status,
+            "inflation": NAV_INFLATION_M,
+        }
         # latched brain readouts, passed through as the raw JSON strings the page parses
         for k, v in (("purpose", self._purpose), ("task", self._task),
                      ("experiments", self._experiments), ("schedule", self._schedule)):
@@ -533,6 +582,22 @@ class TelemetryHub:
         s(sub(String, "task_current", self._mk_str("_task"), self._latched_qos))
         s(sub(String, "experiments", self._mk_str("_experiments"), self._latched_qos))
         s(sub(String, "schedule", self._mk_str("_schedule"), self._latched_qos))
+        # --- Nav2 map view ----------------------------------------------------
+        # slam_toolbox's latched map: transient-local so a browser that opens the
+        # Map view gets the current grid immediately (instead of waiting up to
+        # map_update_interval). The OccupancyGrid is cached once (see _on_map);
+        # the browser polls it over the /map HTTP route.
+        s(sub(OccupancyGrid, "map", self._on_map, self._latched_qos))
+        # bt_navigator's goal status: the state machine behind the web chip
+        # (idle/planning/navigating/arrived/failed). Tiny messages, and empty
+        # between goals.
+        s(sub(GoalStatusArray, "navigate_to_pose/_action/status", self._on_goal_status, 5))
+        # map->base_link TF (map->odom: slam_toolbox @10 Hz; odom->base_link:
+        # wheel_odometry) — the pose dot + "save current spot". tf subs are kept
+        # OUT of self._subs (TransformListener.unregister handles teardown).
+        if self._tf_listener is None:
+            self._tf_buf = TfBuffer()
+            self._tf_listener = TransformListener(self._tf_buf, n)
         self._node.get_logger().info("telemetry: browser connected — subscriptions up")
 
     def _drop_subs(self):
@@ -542,6 +607,13 @@ class TelemetryHub:
             except Exception:
                 pass
         self._subs = []
+        if self._tf_listener is not None:
+            try:
+                self._tf_listener.unregister()   # destroys its /tf + /tf_static subs
+            except Exception:
+                pass
+            self._tf_listener = None
+            self._tf_buf = None
         self._node.get_logger().info("telemetry: no browsers — subscriptions dropped")
 
     # ---- subscription callbacks (store the latest value, nothing else) ---------
@@ -619,11 +691,73 @@ class TelemetryHub:
             setattr(self, attr, msg.data)
         return cb
 
+    # ---- Nav2 map view (see the map IIFE in index.html) -------------------------
+    def _on_map(self, msg):
+        """Cache the latest /map OccupancyGrid for the /map HTTP route. One copy,
+        one memcpy per update (every map_update_interval = 5 s at most); no
+        per-tick work. A degenerate (0-sized or truncated) grid is skipped so a
+        half-written publish can't poison the browser's renderer."""
+        info = msg.info
+        data = bytes(msg.data)               # int8[] -> raw bytes (-1..100 mod 256)
+        if info.width <= 0 or info.height <= 0 or len(data) != info.width * info.height:
+            return
+        self._map_meta = {
+            "w": info.width, "h": info.height, "res": round(info.resolution, 6),
+            "ox": info.origin.position.x, "oy": info.origin.position.y,
+            "t": time.time(),
+        }
+        self._map_bytes = data
+        self._map_arrival = time.monotonic()
+
+    def _on_goal_status(self, msg):
+        """Track bt_navigator's action status (the web chip). status_list gains an
+        entry per goal state transition; the LAST entry is the current goal. On a
+        terminal state the goal mirror is dropped too, so the browser's goal ring
+        doesn't resurrect from every subsequent frame."""
+        if msg.status_list:
+            code = msg.status_list[-1].status
+            if isinstance(code, bytes):      # rmw_zenoh int8 paranoia (see _on_diag)
+                code = code[0]
+            code = int(code)
+            self._goal_status = NAV_STATUS.get(code, "idle")
+            if code in (4, 5, 6):            # SUCCEEDED / CANCELED / ABORTED
+                self._goal = None
+
+    def _tf_pose(self):
+        """map-frame pose (x, y, yaw_rad) from TF, or None (slam_toolbox or
+        wheel_odometry not up yet / TF stale). lookup_transform with a zero time
+        = latest available transform."""
+        if self._tf_buf is None:
+            return None
+        try:
+            t = self._tf_buf.lookup_transform("map", "base_link", Time())
+            tr, q = t.transform.translation, t.transform.rotation
+            yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+            return (tr.x, tr.y, yaw)
+        except Exception:                    # lookup/connectivity/extrapolation — all "no pose"
+            return None
+
+    def get_map_payload(self):
+        """The /map HTTP route body: (meta_dict, int8_bytes), or (None, None)
+        until slam_toolbox has published a grid."""
+        if self._map_meta is None or self._map_bytes is None:
+            return None, None
+        return self._map_meta, self._map_bytes
+
+    def clear_goal(self):
+        """Drop the goal mirror + chip state (POST /nav/cancel). Nav2's own status
+        topic will corroborate with CANCELED/UNKNOWN on the next tick."""
+        self._goal = None
+        self._goal_status = "idle"
+
     # ---- POST /publish ----------------------------------------------------------
     def publish_json(self, data):
         """Publish `value` on the whitelisted `topic`. Every topic has its own
         validator/clamp; anything else is refused."""
         topic = str((data or {}).get("topic") or "").strip()
+        if topic and not topic.startswith("/"):
+            topic = "/" + topic      # tolerate the bare form ("goal_pose") — location_go
+                                     # has sent it since aede005 and never matched the key
         entry = self._pubs.get(topic)
         if entry is None:
             return {"error": "topic not whitelisted: " + (topic or "(none)")}
@@ -635,12 +769,23 @@ class TelemetryHub:
         if msg is None:
             return {"error": "bad value"}
         pub.publish(msg)
+        if topic == "/goal_pose":
+            # Goal mirror for the web map (f["nav"].goal). Nav2 will corroborate
+            # via the action status topic within a tick or two; set "planning"
+            # here so the chip reacts to the click immediately.
+            self.note_goal(msg.pose.position.x, msg.pose.position.y)
         # Diagnosability: log map-click goals + LDS rpm etc. so "who told the robot to
         # go there / spin" is in the app log. Throttle the chatty spin-down? No — these
         # are discrete user actions, not a hot loop; every one is a meaningful event.
         if topic in ("/goal_pose", "/reset_ticks", "/laser_pwm"):
             self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
         return {"status": "ok", "topic": topic}
+
+    def note_goal(self, x, y):
+        """Record a goal published outside POST /publish (skill actions) so the
+        web map's goal ring + status chip stay in sync with those too."""
+        self._goal = [round(float(x), 3), round(float(y), 3)]
+        self._goal_status = "planning"
 
     @staticmethod
     def _mk_goal(v):

@@ -164,10 +164,15 @@ global costmaps → back up 0.15 m → spin 90° → retry path once → abort i
 
 ## Scrap-now / reimplement-later (web UI)
 
-Remove from active stack (record TODO in AGENTS.md): web Map panel (blob), wall guard, map
+Removed from the active stack: the old web Map panel (blob), wall guard, map
 buttons, `/slam_pose`, `/plan`, `nano_map.bin`/`nano_nogo.bin` consumers, and telemetry.py's
 `/odometry/filtered` + `/slam_pose` consumers (EKF + nav_node gone). Goal-sending already
 works via `/goal_pose`.
+
+**Update 2026-09-15:** the Map panel + click-to-goal + Locations were REBUILT on top of
+Nav2 (HTTP `/map` route + SSE `f.nav` + `/nav/cancel` + TF pose) — see the "Map view +
+click-to-goal REBUILT" block in AGENTS.md. Still gone on purpose: wall guard, map
+buttons, no-go brush.
 
 ## Verification
 

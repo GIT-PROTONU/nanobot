@@ -384,9 +384,11 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   external scripts, no rosbridge/ROSLIB. Do NOT reintroduce external `<script src>`
   loading of the old split files (`app.js`, `map.js`, `oled.js`, `chrome.js`, `sim.js`,
   `devtools.js` — now orphaned).
-  The web **Map panel is gone** (scrapped with slam_nav — see the nav2-migration TODO in
-  AGENTS.md for the reimplement-later list: a canvas map fed from slam_toolbox's `/map`,
-  click-to-goal, keep-away, no-go brush, locations' current-pose capture). `/scan.bin`
+  The web **Map panel is back (rebuilt 2026-09-15 on top of Nav2)** — a canvas fed from
+  slam_toolbox's `/map` via the `GET /map` HTTP route (NOT the SSE frame), click-to-goal,
+  a goal-status chip from `/navigate_to_pose/_action/status`, `POST /nav/cancel`, an
+  inflation bubble, and a rebuilt Locations card ("save spot" falls back to the TF pose).
+  See the "Map view + click-to-goal REBUILT" block in AGENTS.md. `/scan.bin`
   still feeds the Lidar hero view; `/goal_pose` (locations, skills) still drives Nav2.
   `/stream.mjpg` is a zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`);
   `/snapshot.jpg` is one still frame (📸 button); `/audio.pcm` is the webcam

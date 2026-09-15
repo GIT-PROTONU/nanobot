@@ -46,7 +46,7 @@
     </aside>
     <section id="left">
       <!-- shown only while the hero is collapsed away (#app.hero-hidden, mobile) -->
-      <button id="heroReveal">▾ Show lidar / camera view</button>
+      <button id="heroReveal">▾ Show lidar / map / camera view</button>
       <div id="hero">
         <div id="view-lidar" class="view on">
           <div id="wrap"><canvas id="cv"></canvas></div>
@@ -61,8 +61,18 @@
         <div id="view-oled" class="view">
           <canvas id="oledcv"></canvas>
         </div>
+        <div id="view-map" class="view">
+          <div id="mapWrap"><canvas id="mapcv"></canvas></div>
+          <div id="mapWait"><span>waiting for the map… is the lidar spinning, and is nano-slam up?</span></div>
+          <div id="mapZoomBtns" class="map-zoom overlay-btn">
+            <button id="mapZoomOut" title="Zoom out">−</button>
+            <button id="mapZoomIn" title="Zoom in">+</button>
+          </div>
+          <button id="mapFit" class="overlay-btn">⤢ Fit</button>
+        </div>
         <div id="viewSwitch">
           <button data-view="lidar" class="active">Lidar</button>
+          <button data-view="map">Map</button>
           <button data-view="cam">Camera</button>
           <button data-view="oled">OLED</button>
         </div>
@@ -99,6 +109,29 @@
             pixels match the calibrated colour right now — needs a target colour set first, or
             it'll show an error. <b>🖥 Mask → OLED</b> mirrors that same mask to the robot's
             physical OLED panel (128×64, re-binarized) — the face yields while it's on.</p>
+        </div>
+        <div id="ctlMap">
+          <!-- hidden checkbox driven by the view switcher; starts/stops the map poller -->
+          <input type="checkbox" id="mapOn" hidden>
+          <div class="chiprow">
+            <label class="switch"><input type="checkbox" id="mapMotion"><span class="track"></span>
+              Motion</label>
+            <span id="mapNavStatus" class="navchip" data-s="idle">idle</span>
+            <button id="mapCancel" class="btn" style="display:none">✕ Cancel goal</button>
+          </div>
+          <div class="chiprow">
+            <label class="switch"><input type="checkbox" id="mapShade" checked><span class="track"></span>
+              Sharp walls</label>
+          </div>
+          <p class="hint" id="mapHint">2D occupancy map from <b>slam_toolbox</b>, polled over
+            <b>/map</b> (slam_toolbox republishes it every ~5 s). Scroll/pinch to zoom, drag to
+            pan, ⤢ Fit recentres. <b>Tap the map to set a goal</b> — with <b>Motion</b> on the
+            click publishes <b>/goal_pose</b> and Nav2 drives there (Motion off = browse-only, so
+            an accidental tap can't move the robot). <span class="map-dot robot"></span>red = robot,
+            <span class="map-dot goal"></span>yellow = goal, <span class="map-dot trail"></span>cyan =
+            trail, dashed circle = the costmap's inflation radius (how close Nav2 will pass to
+            walls). <b>✕ Cancel goal</b> aborts the active navigation. In <b>sim</b> mode this
+            same view + Motion toggle drive the simulated robot.</p>
         </div>
       </div>
     </section>
@@ -370,6 +403,30 @@
             </div>
             <p class="hint">Board health from <b>/diagnostics</b>, 1 Hz. Tap <b>CPU</b> for per-core.
               <b>wifi</b> = signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
+          </div>
+          <div class="card">
+            <h2>Map (Nav2)</h2>
+            <div class="kv">
+              <span>grid</span><b id="mapGrid">–</b>
+              <span>pose (map)</span><b id="mapPose">–</b>
+              <span>nav status</span><b id="mapNavTxt">–</b>
+              <span>map age</span><b id="mapAge">–</b>
+            </div>
+            <p class="hint">The SLAM grid + Nav2 state behind the hero <b>Map</b> view.
+              <b>pose</b> is the TF <b>map→base_link</b> fix (slam_toolbox + wheel_odometry);
+              it goes stale when either is down.</p>
+          </div>
+          <div class="card">
+            <h2>Locations</h2>
+            <div class="row">
+              <input id="locName" type="text" placeholder="spot name (e.g. kitchen)" maxlength="32" style="flex:1;min-width:120px">
+              <button id="locSave" class="btn">💾 Save spot</button>
+            </div>
+            <div id="locList"></div>
+            <p class="hint"><b>Save spot</b> stores the robot's <i>current</i> map pose under the
+              name (needs a live pose — stand the robot where you want saved). <b>Go</b> publishes
+              that pose to <b>/goal_pose</b> exactly like a map click. Saved to
+              <b>~/.local/state/nanobot/locations.json</b>; skills can navigate to these names too.</p>
           </div>
           <div class="card">
             <h2>IMU</h2>
@@ -1308,6 +1365,10 @@ let connected=false;                     // the /telemetry stream is live
 // sim view+goal state (kept for the in-browser simulator; goals publish to
 // /goal_pose, which Nav2's bt_navigator consumes)
 let mapPlan=[], mapGoal=null;
+// ---- Nav2 map view state (f.nav from the SSE frame; consumed by the map IIFE) --
+let navFrame=null;                       // the last f.nav {pose, goal, status, inflation}
+let navTrail=[];                         // breadcrumb ring (map frame metres, map IIFE-fed)
+let mapOnNav=null;                       // hook the map IIFE sets (repaint + trail)
 
 $("connect").onclick=()=>connected?disconnect():connect();
 $("fit").onclick=autoFit;
@@ -1843,6 +1904,22 @@ function onFrame(f){
     }catch(e){}
   }
   if(f.imu_drift) onImuDrift(f.imu_drift);
+  // Nav2 map view: pose/goal/status + the inflation radius. The chip + Cancel
+  // button update even when the Map view was never opened (they're cheap); the
+  // map IIFE's hook repaints the canvas + extends the trail at 5 Hz.
+  if(f.nav){
+    navFrame=f.nav;
+    const chip=$("mapNavStatus");
+    if(chip && chip.dataset.s!==f.nav.status){
+      chip.dataset.s=f.nav.status;
+      chip.textContent=f.nav.status;
+      chip.className="navchip "+f.nav.status;
+    }
+    const cancel=$("mapCancel");
+    if(cancel) cancel.style.display=(f.nav.goal && (f.nav.status==="planning"||f.nav.status==="navigating"))?"":"none";
+    if(f.nav.goal) mapGoal=f.nav.goal;       // adopt the server's goal mirror (clicks set it locally first)
+    if(mapOnNav) mapOnNav(f.nav);
+  }
   // Brain readouts arrive as the same latched JSON strings the behaviour node
   // publishes; only re-render when they actually change (frames tick ~5 Hz).
   if(f.purpose && f.purpose!==rawPurpose){ rawPurpose=f.purpose; renderPurpose(f.purpose); }
@@ -3002,15 +3079,18 @@ connect();   // auto-connect on load
   document.querySelectorAll("#tabbar button").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
   $("statusChip").onclick=()=>showTab("system");
 
-  // hero view switcher: Lidar / Camera. Reuses the existing (now hidden)
-  // camOn checkbox — flipping it runs the original start/stop handler.
+  // hero view switcher: Lidar / Map / Camera. Reuses the existing (now hidden)
+  // camOn / mapOn checkboxes — flipping them runs the original start/stop handlers.
   function setChk(id,val){ const el=$(id); if(el && el.checked!==val){ el.checked=val; el.dispatchEvent(new Event("change")); } }
   function showView(name){
     document.querySelectorAll("#viewSwitch button").forEach(b=>b.classList.toggle("active",b.dataset.view===name));
     $("view-lidar").classList.toggle("on",name==="lidar");
+    $("view-map").classList.toggle("on",name==="map");
     $("view-cam").classList.toggle("on",name==="cam");
     $("ctlCam").classList.toggle("on",name==="cam");
+    $("ctlMap").classList.toggle("on",name==="map");
     setChk("camOn",name==="cam");
+    setChk("mapOn",name==="map");
   }
   document.querySelectorAll("#viewSwitch button").forEach(b=>b.onclick=()=>showView(b.dataset.view));
 
@@ -3059,6 +3139,359 @@ connect();   // auto-connect on load
   // initial UI state
   showTab("drive");
   showView("lidar");
+})();
+</script>
+
+<script>
+// ---- SLAM map panel (Nav2 era) ----------------------------------------------
+// Self-contained, pure HTTP: poll the raw occupancy map from /map (same-origin,
+// served from web_control's in-memory cache of slam_toolbox's latched OccupancyGrid)
+// and render it — no rosbridge involved. The response is a JSON metadata line, '\n',
+// then raw int8 occupancy (-1 unknown, 0 free .. 100 occupied; row 0 = origin_y).
+// slam_toolbox only republishes the map every ~5 s, so a 1 Hz poll is plenty and
+// keeps the transfer at ~one map copy per second. Live robot/goal/trail overlays
+// come from the SSE frame's `nav` field (5 Hz). Canvas clicks -> /goal_pose.
+(function(){
+  "use strict";
+  const $=id=>document.getElementById(id);
+  const cv=$("mapcv"), ctx=cv.getContext("2d");
+  const dec=new TextDecoder();
+  let timer=null, lastMeta=null;
+  let mapCanvas=null, img=null;        // offscreen grid-res canvas holding the occupancy grid
+  let lastGrid=null;                   // last raw occupancy bytes, for immediate re-shade on toggle
+  let sharpShade=true;                 // wall shading: posterize (crisp) vs linear (soft)
+  let flash=null;                      // {x, y, t} click-feedback ring (world metres)
+  let _goalClearT=undefined;           // pending "clear the goal ring" timer
+  const trailCap=250;                  // breadcrumb ring buffer (world metres)
+
+  // ---- zoom / pan: the display canvas is sized to the wrap (× devicePixelRatio) and
+  //      every frame re-renders it in SCREEN pixels. Smoothed drawImage is only used
+  //      when MAGNIFIED past native grid res (zooming in interpolates instead of
+  //      showing chunky cells); at the fit/zoomed-out scale the map is downscaled,
+  //      where bilinear smoothing smears walls into a soft grey blur —
+  //      nearest-neighbour keeps 5 cm cells crisp (= sharp walls). Vector overlays
+  //      are always drawn at full display resolution, razor sharp at any zoom. ----
+  const wrap=$("mapWrap");
+  let gw=0, gh=0, zoom=0, panX=0, panY=0;   // zoom 0 = auto-fit to the wrap
+  const dpr=()=>window.devicePixelRatio||1;
+  const fitZoom=()=> gw? Math.min(wrap.clientWidth/gw, wrap.clientHeight/gh)||1 : 1;
+  const cX=z=>((wrap.clientWidth-gw*z)/2), cY=z=>((wrap.clientHeight-gh*z)/2);
+  const origin=z=>[cX(z)+panX, cY(z)+panY]; // top-left of the map in screen px
+  function sizeCv(){
+    const d=dpr(), w=Math.max(1,Math.round(wrap.clientWidth*d)), h=Math.max(1,Math.round(wrap.clientHeight*d));
+    if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; }
+  }
+  function repaint(){
+    if(!lastMeta||!mapCanvas) return;
+    sizeCv(); ctx.setTransform(dpr(),0,0,dpr(),0,0);
+    ctx.clearRect(0,0,wrap.clientWidth,wrap.clientHeight);
+    const z=zoom||fitZoom(), [x0,y0]=origin(z);
+    // crisp when at/under native res, interpolated only when magnified past 1:1
+    ctx.imageSmoothingEnabled = z > 1;
+    if("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality="high";
+    ctx.drawImage(mapCanvas,x0,y0,gw*z,gh*z);
+    ctx.imageSmoothingEnabled=false;
+    const m=lastMeta;
+    const W2P=(x,y)=>[x0+((x-m.ox)/m.res)*z, y0+((gh-1)-(y-m.oy)/m.res)*z]; // world -> screen px
+    // breadcrumb trail (cyan polyline) — where the robot has been (sim provides
+    // its own trail in the map header; the live robot's is the nav hook's ring)
+    const trail=(m.trail && m.trail.length>1)? m.trail : navTrail;
+    if(trail.length>1){
+      ctx.strokeStyle="#22d3ee"; ctx.lineWidth=1; ctx.globalAlpha=0.7; ctx.beginPath();
+      trail.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+      ctx.stroke(); ctx.globalAlpha=1;
+    }
+    // planned path (green polyline — sim only; Nav2 doesn't expose a plan topic)
+    if(mapPlan && mapPlan.length>1){
+      ctx.strokeStyle="#34c759"; ctx.lineWidth=2; ctx.beginPath();
+      mapPlan.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+      ctx.stroke();
+    }
+    // goal marker (yellow ring)
+    if(mapGoal){
+      const [gx,gy]=W2P(mapGoal[0],mapGoal[1]);
+      ctx.strokeStyle="#ffd60a"; ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.arc(gx,gy,5,0,6.2832); ctx.stroke();
+    }
+    // robot pose: a small, crisp dot + heading line, drawn at full display
+    // resolution so it stays sharp (and constant-sized on screen) at any zoom.
+    // Pose source: the SSE frame's nav pose (live robot); the sim maps its pose
+    // into the /map header instead (px/py/pth), which wins when present.
+    const p=(m.px!==undefined)?{x:m.px,y:m.py,th:m.pth}:(navFrame&&navFrame.pose);
+    if(p){
+      const [rx,ry]=W2P(p.x,p.y), R=3.5;
+      ctx.fillStyle="#ff3b30";
+      ctx.strokeStyle="rgba(10,10,14,0.6)"; ctx.lineWidth=1;   // thin dark halo on light map
+      ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
+      ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.fill();
+      ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2; ctx.lineCap="round";
+      ctx.beginPath(); ctx.moveTo(rx,ry);
+      ctx.lineTo(rx+9*Math.cos(p.th||0), ry-9*Math.sin(p.th||0)); ctx.stroke();
+      ctx.lineCap="butt";
+      // inflation bubble: Nav2's inflation_radius — the distance the costmap keeps
+      // from walls (a dashed circle around the robot, grey).
+      const infl=(navFrame&&navFrame.inflation)||0.25;
+      if(infl>0){
+        const Rb=(infl/m.res)*z;
+        ctx.strokeStyle="#63666b"; ctx.lineWidth=1.5; ctx.setLineDash([5,4]);
+        ctx.beginPath(); ctx.arc(rx,ry,Rb,0,6.2832); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+    // click-feedback ring: fades out ~250 ms after a map tap so the click visibly
+    // registered even before Nav2 plans
+    if(flash){
+      const age=performance.now()-flash.t;
+      if(age>250){ flash=null; }
+      else{
+        const [fx,fy]=W2P(flash.x,flash.y), a=1-age/250;
+        ctx.strokeStyle=`rgba(255,214,10,${a.toFixed(3)})`; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.arc(fx,fy,5+age/12,0,6.2832); ctx.stroke();
+        requestAnimationFrame(repaint);
+      }
+    }
+  }
+  function fitMap(){ zoom=0; panX=0; panY=0; repaint(); }
+  function zoomAt(factor,mx,my){
+    const z=zoom||fitZoom();
+    const z1=Math.min(20,Math.max(fitZoom()*0.5, z*factor));
+    if(z1===z) return;
+    const [tx,ty]=origin(z);
+    const gx=(mx-tx)/z, gy=(my-ty)/z;               // grid pixel under cursor / pinch centre
+    zoom=z1; panX=mx-gx*z1-cX(z1); panY=my-gy*z1-cY(z1);
+    repaint();
+  }
+  wrap.addEventListener("wheel",e=>{
+    e.preventDefault();
+    const r=wrap.getBoundingClientRect();
+    zoomAt(e.deltaY<0?1.15:1/1.15, e.clientX-r.left, e.clientY-r.top);
+  },{passive:false});
+  // pan with one pointer, pinch-zoom with two. Capture on the canvas so the
+  // subsequent click still targets cv (click-to-goal), not the wrap container.
+  let panDrag=false, panMoved=false, pdsx=0,pdsy=0,pdpx=0,pdpy=0, pinch=null;
+  const pointers=new Map();
+  cv.addEventListener("pointerdown",e=>{
+    pointers.set(e.pointerId,[e.clientX,e.clientY]);
+    if(pointers.size===2){
+      const [[ax,ay],[bx,by]]=[...pointers.values()];
+      pinch={d:Math.hypot(bx-ax,by-ay), mx:(ax+bx)/2, my:(ay+by)/2};
+    } else { panDrag=true; panMoved=false; pdsx=e.clientX; pdsy=e.clientY; pdpx=panX; pdpy=panY; }
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener("pointermove",e=>{
+    if(pointers.has(e.pointerId)) pointers.set(e.pointerId,[e.clientX,e.clientY]);
+    if(pointers.size===2 && pinch){
+      const [[ax,ay],[bx,by]]=[...pointers.values()];
+      const d=Math.hypot(bx-ax,by-ay), mx=(ax+bx)/2, my=(ay+by)/2;
+      const r=wrap.getBoundingClientRect();
+      zoomAt(d/pinch.d, mx-r.left, my-r.top);
+      pinch={d, mx, my};
+    } else if(panDrag){
+      if(Math.hypot(e.clientX-pdsx,e.clientY-pdsy)>4) panMoved=true;
+      panX=pdpx+(e.clientX-pdsx); panY=pdpy+(e.clientY-pdsy); repaint();
+    }
+  });
+  const upPtr=e=>{
+    pointers.delete(e.pointerId);
+    if(pointers.size<2) pinch=null;
+    if(pointers.size===0) panDrag=false;
+  };
+  cv.addEventListener("pointerup",upPtr);
+  cv.addEventListener("pointercancel",upPtr);
+  $("mapFit").onclick=fitMap;
+  $("mapZoomIn").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1.5, r.width/2, r.height/2); };
+  $("mapZoomOut").onclick=()=>{ const r=wrap.getBoundingClientRect(); zoomAt(1/1.5, r.width/2, r.height/2); };
+  window.addEventListener("resize",repaint);
+
+  async function poll(){
+    try{
+      const r=await fetch("/map?t="+Date.now());
+      if(!r.ok) return;                        // 503 until slam_toolbox published a grid
+      const buf=new Uint8Array(await r.arrayBuffer());
+      const nl=buf.indexOf(10);                // end of the JSON header line
+      if(nl<0) return;
+      const meta=JSON.parse(dec.decode(buf.subarray(0,nl)));
+      render(meta, buf.subarray(nl+1));
+    }catch(e){ /* transient: keep polling */ }
+  }
+
+  function shadeMap(){
+    if(!img || !lastGrid || !lastMeta) return;
+    const w=lastMeta.w, h=lastMeta.h, d=img.data;
+    for(let row=0;row<h;row++){
+      const cy=h-1-row, base=row*w;            // grid row 0 = bottom -> flip for canvas
+      for(let c=0;c<w;c++){
+        let v=lastGrid[base+c]; if(v>127) v-=256;  // byte -> signed int8
+        const o=(cy*w+c)*4;
+        // unknown grey; 0 white..100 black. Sharp: hard posterize — cells at/above a
+        // single lidar hit (~70) snap to SOLID black with no transition band, so walls
+        // read as crisp hard-edged 1-2 cell lines against the white floor. Off = the
+        // flat linear ramp.
+        const s=v<0?44:(sharpShade
+          ? (v>=70?0 : 255-Math.round(v*2.4))
+          : 255-Math.round(v*2.55));
+        d[o]=d[o+1]=d[o+2]=s; d[o+3]=255;
+      }
+    }
+    mapCanvas.getContext("2d").putImageData(img,0,0);
+  }
+
+  function render(m, grid){
+    const w=m.w, h=m.h; gw=w; gh=h;
+    if(!mapCanvas || mapCanvas.width!==w || mapCanvas.height!==h){
+      mapCanvas=document.createElement("canvas");
+      mapCanvas.width=w; mapCanvas.height=h;
+      img=mapCanvas.getContext("2d").createImageData(w,h);
+    }
+    lastGrid=grid; lastMeta=m;
+    shadeMap();
+    $("mapWait").style.display="none";    // got a real frame: drop the placeholder
+    cv.style.cursor="crosshair";          // ...and arm click-to-go only now
+    repaint();
+    // Sensors-card readout line (grid geometry + map staleness)
+    const age=(m.t!==undefined)? Math.max(0,(Date.now()-m.t)/1000) : null;
+    $("mapGrid").textContent=`${w}×${h} @ ${m.res.toFixed(3)} m`;
+    $("mapAge").textContent=age===null?"–":(age<90?`${age.toFixed(0)} s ago`:"stale");
+  }
+
+  // click the map -> goal in world metres (account for zoom/pan + the y-flip).
+  // With Motion OFF the click only marks the goal locally (browse mode — an
+  // accidental tap can't move the robot); Motion ON publishes /goal_pose and
+  // Nav2's bt_navigator drives there.
+  cv.addEventListener("click",e=>{
+    if(!lastMeta) return;
+    if(panMoved){ panMoved=false; return; }   // a pan just ended, not a goal tap
+    const rect=cv.getBoundingClientRect();
+    const z=zoom||fitZoom(), [x0,y0]=origin(z);
+    const gcx=(e.clientX-rect.left-x0)/z;      // grid px
+    const gcy=(e.clientY-rect.top-y0)/z;
+    const m=lastMeta;
+    const wx=m.ox+gcx*m.res, wy=m.oy+(m.h-1-gcy)*m.res;
+    flash={x:wx,y:wy,t:performance.now()};
+    if($("mapMotion").checked){
+      mapSetGoal(wx,wy);                       // publishes /goal_pose (sim wraps this too)
+    }else{
+      mapGoal=[wx,wy];                         // browse-only: local marker, no publish
+    }
+    repaint();
+  });
+
+  // Motion toggle + cancel: Motion is browse-vs-drive for map clicks (and the sim's
+  // auto-drive switch); ✕ aborts the active NavigateToPose goal (POST /nav/cancel)
+  // and clears the local goal ring + breadcrumb.
+  $("mapCancel").onclick=()=>{
+    mapGoal=null;
+    navTrail.length=0; lastTrailPt=null;
+    fetch("/nav/cancel",{method:"POST"}).catch(()=>{});
+    repaint();
+  };
+  $("mapShade").addEventListener("change",e=>{ sharpShade=e.target.checked; shadeMap(); repaint(); });
+
+  // poll lifecycle: run only while the Map hero view is on (#mapOn, driven by the
+  // view switcher). 1 Hz — slam_toolbox republishes the grid every ~5 s.
+  $("mapOn").addEventListener("change",e=>{
+    const on=e.target.checked;
+    $("mapHint").style.display=on?"block":"none";
+    if(on){
+      $("mapWait").style.display="flex"; cv.style.cursor="default"; // until a frame lands
+      poll(); timer=setInterval(poll,1000);
+    } else { clearInterval(timer); timer=null; }
+  });
+
+  // ---- SSE nav hook: live robot pose + trail ----------------------------------
+  // onFrame (main script) calls this at 5 Hz with the frame's `nav` object.
+  let lastTrailPt=null;
+  mapOnNav=(nav)=>{
+    if(!nav) return;
+    // breadcrumb: keep the last trailCap poses, skipping repeats (<2 cm) so a
+    // parked robot doesn't fill the buffer with identical points
+    if(nav.pose){
+      const [x,y]=nav.pose;
+      if(!lastTrailPt || Math.hypot(x-lastTrailPt[0],y-lastTrailPt[1])>0.02){
+        lastTrailPt=[x,y];
+        navTrail.push([x,y]);
+        if(navTrail.length>trailCap) navTrail.shift();
+      }
+    }
+    // Sensors-card readouts
+    if(nav.pose){
+      $("mapPose").textContent=`${nav.pose[0].toFixed(2)}, ${nav.pose[1].toFixed(2)}, ${(nav.pose[2]*180/Math.PI).toFixed(0)}°`;
+    } else {
+      $("mapPose").textContent="lost";         // TF chain down (slam or odom)
+    }
+    $("mapNavTxt").textContent=nav.status||"–";
+    // drop the goal ring shortly after a terminal state (arrived/failed/cancel;
+    // the server clears its goal mirror on the same states — this handles the
+    // locally-set ring from a click that published just before that)
+    if(nav.status==="arrived"||nav.status==="failed"||nav.status==="idle"){
+      if(mapGoal && _goalClearT===undefined){
+        _goalClearT=setTimeout(()=>{ mapGoal=null; _goalClearT=undefined; repaint(); },4000);
+      }
+    } else if(_goalClearT!==undefined){
+      clearTimeout(_goalClearT); _goalClearT=undefined;
+    }
+    if($("mapOn").checked) repaint();
+  };
+
+  // ---- Locations card (Sensors tab) -------------------------------------------
+  // Server persists to ~/.local/state/nanobot/locations.json. Save stores the
+  // robot's CURRENT map pose (server-side TF fallback when x/y are omitted);
+  // Go publishes the stored pose to /goal_pose exactly like a map click.
+  const locList=$("locList");
+  async function loadLocations(){
+    try{
+      const r=await fetch("/locations");
+      if(!r.ok) return;
+      const j=await r.json();
+      renderLocations(j.locations||{});
+    }catch(e){ /* offline / restart: leave the list as-is */ }
+  }
+  function renderLocations(locs){
+    locList.innerHTML="";
+    const names=Object.keys(locs).sort();
+    if(!names.length){
+      locList.innerHTML='<p class="hint" style="margin:6px 0 0">No saved spots yet.</p>';
+      return;
+    }
+    for(const n of names){
+      const row=document.createElement("div"); row.className="chiprow";
+      const label=document.createElement("span");
+      label.textContent=n; label.style.flex="1"; label.style.overflow="hidden";
+      label.style.textOverflow="ellipsis"; label.style.whiteSpace="nowrap";
+      const pos=locs[n];
+      if(pos && pos.x!==undefined){
+        const small=document.createElement("span"); small.className="muted";
+        small.textContent=`(${pos.x.toFixed(1)}, ${pos.y.toFixed(1)})`;
+        row.appendChild(label); row.appendChild(small);
+      } else row.appendChild(label);
+      const go=document.createElement("button"); go.className="btn"; go.textContent="Go";
+      go.onclick=async()=>{
+        const r=await fetch("/locations/go",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:n})});
+        if(r.ok && locs[n] && locs[n].x!==undefined) mapGoal=[locs[n].x,locs[n].y];
+      };
+      const del=document.createElement("button"); del.className="btn"; del.textContent="✕";
+      del.title="Forget this spot";
+      del.onclick=async()=>{
+        if(!confirm(`Forget the spot "${n}"?`)) return;
+        await fetch("/locations/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:n})});
+        loadLocations();
+      };
+      row.appendChild(go); row.appendChild(del);
+      locList.appendChild(row);
+    }
+  }
+  $("locSave").onclick=async()=>{
+    const name=($("locName").value||"").trim();
+    if(!name){ alert("Name the spot first."); return; }
+    try{
+      const r=await fetch("/locations/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
+      const j=await r.json();
+      if(j.error){ alert("Save failed: "+j.error); return; }
+      $("locName").value="";
+      loadLocations();
+    }catch(e){ alert("Save failed (server unreachable)."); }
+  };
+  loadLocations();
 })();
 </script>
 

@@ -128,6 +128,21 @@ canvas#oledcv{image-rendering:pixelated;width:92%;max-width:560px;height:auto;
   border:1px solid var(--border);color:var(--muted);border-radius:var(--r-s);
   width:36px;height:34px;font:inherit;font-size:14px;cursor:pointer;
   display:flex;align-items:center;justify-content:center}
+/* Nav2 goal-status chip (Map card) — colour per state, set via className */
+.navchip{display:inline-flex;align-items:center;padding:3px 10px;border-radius:999px;
+  font-size:11.5px;font-weight:600;line-height:1.2;border:1px solid var(--border);
+  color:var(--muted);background:transparent;text-transform:uppercase;letter-spacing:.4px}
+.navchip.planning{color:#0a84ff;border-color:rgba(10,132,255,.45);background:rgba(10,132,255,.10)}
+.navchip.navigating{color:#30a46c;border-color:rgba(48,164,108,.45);background:rgba(48,164,108,.10)}
+.navchip.canceling{color:#ff9500;border-color:rgba(255,149,0,.45);background:rgba(255,149,0,.10)}
+.navchip.arrived{color:#30a46c;border-color:rgba(48,164,108,.6);background:rgba(48,164,108,.18)}
+.navchip.failed{color:#e5484d;border-color:rgba(229,72,77,.45);background:rgba(229,72,77,.10)}
+/* inline legend dots in the Map card hint */
+.map-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin:0 2px 0 4px;
+  vertical-align:baseline}
+.map-dot.robot{background:#ff3b30}
+.map-dot.goal{background:#ffd60a}
+.map-dot.trail{background:#22d3ee}
 .overlay-hint{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:7;
   background:rgba(10,12,17,.82);border:1px solid var(--accent);color:var(--txt);
   border-radius:var(--r-s);padding:7px 13px;font:inherit;font-size:12px;pointer-events:none}

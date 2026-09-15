@@ -43,6 +43,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, PoseStamped
+from action_msgs.srv import CancelGoal
+from action_msgs.msg import GoalInfo
 
 from . import procstats
 from .procstats import STAT_PATH, MEMINFO_PATH, THERMAL_PATH
@@ -329,10 +331,10 @@ class WebServerNode(Node):
         self._vision_target_active = None
         self._vision_approach = False      # anticipatory-approach signal (see _vision_state_tick)
         # Named locations ("go to the kitchen"): name -> {x, y, yaw} map persisted to
-        # locations.json. Live-editable from the web map panel; /locations/go publishes the
-        # stored pose to /goal_pose. Current pose comes from the /slam_pose subscription
-        # (same source the map panel's click-to-go uses), so "save current spot" needs no
-        # extra plumbing.
+        # locations.json. Live-editable from the web Locations card; /locations/go
+        # publishes the stored pose to /goal_pose (Nav2 navigates). "Save spot" without
+        # x/y falls back to the live map pose (telemetry's map->base_link TF lookup),
+        # so it needs no extra plumbing.
         self._locations_path = os.path.expanduser(
             g("locations_path").value or "~/.local/state/nanobot/locations.json")
         self._locations = {}
@@ -630,10 +632,15 @@ class WebServerNode(Node):
         self._cog_health_pub = self.create_publisher(String, "brain/cognition_health", latched)
         self._behavior_health = {}                     # last received from mood_node
         self.create_subscription(String, "brain/behavior_health", self._on_behavior_health, 10)
+        # Cancel goal (web map's ✕ / status chip): bt_navigator's cancel service.
+        # A GoalInfo with a zero ID + zero stamp = cancel ALL goals. Service client
+        # (not a full ActionClient) — one small client, fire-and-forget like /param,
+        # created here before spin so the HTTP thread never touches creation.
+        self._cancel_client = self.create_client(CancelGoal, "navigate_to_pose/_action/cancel_goal")
         # NOTE: /slam_pose died with slam_nav (slam_toolbox owns the map->odom TF
-        # now but doesn't publish a pose topic the UI used). Locations' "save
-        # current spot" needs explicit x/y until a pose consumer is re-implemented
-        # (see the TODO in docs/nav2-migration.md / AGENTS.md).
+        # now but doesn't publish a pose topic the UI used). The web map gets its
+        # pose from telemetry's TF lookup (map->base_link); Locations' "save
+        # current spot" uses that same pose.
         if bool(g("startup_greeting").value):
             # Say hello a few seconds after boot (once the OLED/TTS are up). Offline-safe via
             # the phrase bank's greeting fallback; the boot face is the behaviour node's job.
@@ -1132,6 +1139,7 @@ class WebServerNode(Node):
                 m.pose.position.y = float(loc["y"])
                 m.pose.orientation.w = 1.0
                 pub.publish(m)
+                self.telemetry.note_goal(m.pose.position.x, m.pose.position.y)
                 self.get_logger().info(
                     f"goal_pose -> '{name}' ({loc['x']:.2f}, {loc['y']:.2f}) (skill)")
                 return True, "/goal_pose -> '%s' (%.2f, %.2f)" % (name, loc["x"], loc["y"])
@@ -1706,18 +1714,23 @@ class WebServerNode(Node):
         return {"locations": self._locations}
 
     def location_save(self, d):
-        """POST /locations/save {name, x, y, [yaw]}: remember a spot. Requires explicit
-        x/y in the map frame (there is no live pose source since /slam_pose went away
-        with slam_nav)."""
+        """POST /locations/save {name, [x, y, yaw]}: remember a spot. x/y are
+        optional — a missing pair falls back to the live map-frame pose
+        (telemetry's map->base_link TF lookup), so "save current spot" works
+        from the browser and from scripts alike."""
         name = str((d or {}).get("name") or "").strip()[:32]
         if not name:
             return {"error": "empty name"}
-        pose = d or {}
+        d = d or {}
         try:
-            x = float(pose.get("x")); y = float(pose.get("y"))
-            yaw = float(pose.get("yaw", 0.0)); from_point = True
-        except (TypeError, ValueError, KeyError):
-            return {"error": "no x/y given (and no live pose source — save from the map click)"}
+            x = float(d.get("x")); y = float(d.get("y"))
+            yaw = float(d.get("yaw", 0.0)); from_point = True
+        except (TypeError, ValueError):
+            pose = self.telemetry._tf_pose()
+            if pose is None:
+                return {"error": "no x/y given and no live map pose (is SLAM up?)"}
+            x, y, yaw = pose
+            from_point = False
         # Clamp like the goal publisher does, so a saved spot is always a navigable goal.
         x = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, x))
         y = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, y))
@@ -1744,6 +1757,19 @@ class WebServerNode(Node):
         # Publish the goal in the map frame, exactly like the map panel's click-to-go.
         return self.telemetry.publish_json({"topic": "goal_pose",
                                             "value": {"x": loc["x"], "y": loc["y"]}})
+
+    def cancel_goal(self):
+        """POST /nav/cancel: cancel every active NavigateToPose goal (web map ✕).
+        Empty GoalInfo = cancel-all per CancelGoal.srv. Fire-and-forget like /param;
+        the goal mirror + status chip reset immediately so the UI reacts now."""
+        if not self._cancel_client.service_is_ready():
+            return {"error": "bt_navigator not reachable (is nano-nav up?)"}
+        req = CancelGoal.Request()
+        req.goal_info = GoalInfo()          # zero id + zero stamp = cancel ALL
+        self._cancel_client.call_async(req)
+        self.telemetry.clear_goal()
+        self.get_logger().info("POST /nav/cancel (web map)")
+        return {"ok": True}
 
     def _brain_health_tick(self):
         """Publish cognition-layer health as JSON on /brain/cognition_health (~1 Hz)."""
@@ -1956,6 +1982,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/locations/save": lambda n, d: n.location_save(d),
         "/locations/delete": lambda n, d: n.location_delete(d),
         "/locations/go": lambda n, d: n.location_go(d),
+        "/nav/cancel": lambda n, d: n.cancel_goal(),
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.
@@ -2001,6 +2028,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._stream_audio()
         if path == "/scan.bin":
             return self._serve_scan()
+        if path == "/map":
+            return self._serve_map()
         if path == "/brain/health":
             return self._respond_json(
                 self._node.get_brain_health() if self._node else {"error": "no node"})
@@ -2342,6 +2371,29 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # /scan LaserScan over the telemetry stream. Same idea as the map — heavy data
         # stays off the SSE frame.
         self._serve_shm("/dev/shm/nano_scan.bin", "no scan yet")
+
+    def _serve_map(self):
+        # Nav2 map view: the latest /map OccupancyGrid cached by telemetry (sub is
+        # transient-local, so it's ready the instant a browser opens the view).
+        # Wire format = the old slam_nav blob's: one JSON header line, '\n', then
+        # raw int8 cells (-1 unknown, 0 free .. 100 occupied; row 0 = origin_y).
+        # Served from memory, not /dev/shm — slam_toolbox publishes a real topic now.
+        meta, cells = self._node.telemetry.get_map_payload()
+        if meta is None:
+            # ASCII-only message: send_error writes the error page as latin-1, so
+            # non-latin1 characters here would raise inside it and drop the socket.
+            self.send_error(503, "no map yet - is nano-slam up?")
+            return
+        body = json.dumps(meta).encode() + b"\n" + cells
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
 
     def _serve_shm(self, path, missing_msg):
         try:
