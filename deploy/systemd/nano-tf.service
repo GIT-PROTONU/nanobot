@@ -1,0 +1,27 @@
+# The static base_link -> laser transform (yaw pi: the sensor head faces back)
+# that replaced slam_nav's heading_flip — see nav2.launch.py's heading_flip for
+# the launch-side equivalent. THE COORDINATES/YAW ARE DUPLICATED in
+# scripts/unit_exec.sh (case tf) and src/robot_bringup/launch/nav2.launch.py
+# (sim path) — edit all three together or slam_toolbox/Nav2 silently work in a
+# rotated frame again (the 2026-09-11 heading-flip class of bug).
+#
+# Its own unit, NOT nano-nav's ExecStartPost: a non-exiting ExecStartPost holds
+# a Type=simple unit in "activating" forever (the start job never completes,
+# TimeoutStartSec eventually fails the unit), which would keep nano-slam and
+# nano-nav-loader from ever starting. A static TF is set-and-forget — it needs
+# the router, not the nav container — so it survives a nav crash/restart.
+[Unit]
+Description=Nano static base_link->laser TF (yaw pi, back-mounted sensor head)
+After=nano-router.service nano-nav.service
+Wants=nano-router.service
+PartOf=nano-robot.target
+
+[Service]
+Type=simple
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/unit_exec.sh tf
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=nano-robot.target

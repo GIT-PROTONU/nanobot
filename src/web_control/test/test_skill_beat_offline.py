@@ -8,7 +8,7 @@ instead fall back to a local, LLM-free random pick among the runnable action ski
 """
 import random
 
-from web_control.cognition import CognitionCore
+from nanobot_brain.cognition import CognitionCore
 
 
 class _OfflineLLM:

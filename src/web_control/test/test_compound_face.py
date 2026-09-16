@@ -7,7 +7,7 @@ shows how it feels. oled_display / the web mirror render the shape + an accent o
 
     pixi run python -m pytest src/web_control/test
 """
-from web_control.cognition import CognitionCore, compose_face
+from nanobot_brain.cognition import CognitionCore, compose_face
 
 
 class _LLM:

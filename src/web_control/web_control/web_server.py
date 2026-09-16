@@ -655,6 +655,7 @@ class WebServerNode(Node):
         self._reflect_tick()                           # ditto (cheap when not due)
         self._llm_health_tick()                        # persistent "AI offline" indicator
         self._brain_health_tick()                      # cognition health heartbeat
+        self._vision_diary_tick()                      # visual diary sampler (cheap when not due)
 
     # ---- HTTP teleop ---------------------------------------------------------
     def drive(self, data):
@@ -747,6 +748,59 @@ class WebServerNode(Node):
 
     def stress_status(self):
         return self._stress.status()
+
+    # ---- IMU mounting-interference self-test (see imu_interference.py) --------
+    # Thin wrappers so the /imu/interference/* routes stay declarative in the
+    # route tables above; the test object owns the actual logic and state.
+    def imu_interference_start(self, data):
+        d = data or {}
+        try:
+            include_motor = bool(d.get("include_motor"))
+        except AttributeError:
+            include_motor = False
+        return self._imu_test.start(include_motor=include_motor)
+
+    def imu_interference_stop(self):
+        return self._imu_test.stop()
+
+    def imu_interference_status(self):
+        return self._imu_test.status()
+
+    # ---- health-event log (written by sys_monitor, served for the web card) ----
+    def get_health_log(self, limit=200):
+        """Tail of the durable ESP32/LDS outage log — the first stop for diagnosing
+        intermittent failures, now visible without an ssh session."""
+        path = os.path.expanduser(self.get_parameter("health_log_path").value
+                                  or "~/.local/state/nanobot/health.log")
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                start = max(0, f.tell() - 64 * 1024)   # last 64 KB is plenty for a tail
+                f.seek(start)
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return {"lines": [], "path": path}
+        if start and lines:
+            lines = lines[1:]                          # drop the line the seek cut in half
+        return {"lines": lines[-int(limit):], "path": path}
+
+    # ---- merged log stream: decision log + health log, interleaved by time ----
+    def get_merged_log(self, limit=200):
+        """Read-only merge of the two append-only event logs into one chronological
+        stream: the decision log (cognition — LLM/beat/skill activity, in-memory ring
+        buffer) and the health log (sys_monitor — ESP32/lidar outages, read fresh from
+        disk). Single-writer per file; this only interleaves reads for the web UI."""
+        limit = int(limit)
+        entries = []
+        for e in self._cog.get_cog_log()["entries"]:
+            d = dict(e)
+            d["source"] = "cognition"
+            entries.append(d)
+        for line in self.get_health_log(limit=limit)["lines"]:
+            t, text = _parse_health_line(line)
+            entries.append({"t": t, "source": "health", "text": text})
+        entries.sort(key=lambda e: e.get("t") or 0, reverse=True)
+        return {"entries": entries[:limit]}
 
     def update_settings(self, data):
         """Merge a partial settings dict from the web UI, persist, and apply."""

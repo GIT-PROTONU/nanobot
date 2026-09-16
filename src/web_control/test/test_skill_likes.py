@@ -7,7 +7,7 @@ autonomous skill beat favour it. The like count is a per-skill weight in a like-
 """
 import random
 
-from web_control.cognition import CognitionCore
+from nanobot_brain.cognition import CognitionCore
 
 
 class _LLM:
