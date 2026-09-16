@@ -476,7 +476,7 @@ class WebServerNode(Node):
             motor_ang=float(g("imu_test_motor_ang").value))
 
         # ---- Cognition core (shared, ROS-free) ----------------------------------
-        # ALL the LLM-personality logic lives in web_control.cognition.CognitionCore, shared
+        # ALL the LLM-personality logic lives in nanobot_brain.cognition.CognitionCore, shared
         # verbatim with the dev harness (scripts/dev_webui.py) — one base to maintain. We build
         # it here with ROS-backed adapters: face -> /oled_face, capture_frame -> webcam, sensors
         # -> /proc+IMU, the gated action tier -> whitelisted publishers, persist -> llm.json. Off
