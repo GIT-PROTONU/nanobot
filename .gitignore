@@ -19,6 +19,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# opencode agent workspace (plans, vendored node_modules)
+.opencode/
+
 # local SBC credentials (never commit)
 .nano-deploy.env
 .nano-askpass.sh
@@ -36,3 +39,5 @@ scripts/.openrouter_key
 # tracked in git (with an empty openrouter_key placeholder). Hand-crafted personality
 # and other memory files are versioned.
 /memory/openrouter_key
+# per-generation LLM log is runtime churn, not soul state
+/memory/cognition.log

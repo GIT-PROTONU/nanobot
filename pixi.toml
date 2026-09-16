@@ -1,7 +1,7 @@
 [workspace]
 name = "nano-robot"
 version = "0.1.0"
-description = "Lightweight ROS 2 Humble robot stack for a NanoPi NEO Plus2 (H5): Roborock LDS, wheel encoders, I2C OLED + PCA9685, web control."
+description = "Lightweight ROS 2 Humble robot stack for a NanoPi NEO Plus2 (H5): Roborock LDS, wheel encoders, I2C OLED, web control."
 authors = ["ib <ib.elfaramawy@gmail.com>"]
 channels = ["conda-forge", "robostack-staging"]
 # linux-aarch64 = the board (Armbian on the H5). linux-64 kept so you can develop

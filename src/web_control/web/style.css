@@ -372,15 +372,6 @@ kbd{background:var(--surface-2);border:1px solid var(--border);border-radius:5px
   padding:1px 6px;font-size:11px;font-family:var(--mono)}
 .muted{color:var(--muted);font-size:11px}
 
-/* sim map editor */
-.simEditWrap{width:100%;aspect-ratio:1;background:#0a0d13;border:1px solid var(--border);
-  border-radius:var(--r-m);overflow:hidden}
-#simEdit{width:100%;height:100%;display:block;cursor:crosshair;touch-action:none;
-  image-rendering:pixelated}
-#simTools .tool.active{background:var(--accent);color:var(--accent-ink);
-  border-color:var(--accent);font-weight:600}
-#panel-sim .row .btn,#panel-sim .row label.btn{flex:1}
-
 /* AI decision log */
 .logbox{margin-top:8px}
 .logbox>summary{cursor:pointer;color:var(--muted);font-size:12.5px;user-select:none;

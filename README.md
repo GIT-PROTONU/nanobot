@@ -17,7 +17,6 @@ Hardware:
 | **Speaker** (text-to-speech) | USB/analog audio out (`aplay`) | `web_control` (`espeak-ng`) | `POST /tts`; pub `/oled_word` |
 | **BWT901CL** IMU (+ web-UI accel/mag calibration) | USB-serial (`/dev/imu`, CH340) | `imu_driver` | `/imu/data`, `/imu/web` |
 | **Logitech C270** webcam + mic | USB | `web_control` | `/stream.mjpg`, `/audio.pcm` |
-| **PCA9685** PWM | I2C1 (`/dev/i2c-1`, 0x40) | — (retired; ESP32 owns motors) | — |
 | Web control + map | — | `web_control` (HTTP + SSE gateway) | browser |
 
 ## Architecture
@@ -275,7 +274,7 @@ RAM, 7 GB rootfs. Notes specific to this image:
   normally on-board Bluetooth — now disabled) is the **ESP32 zenoh-pico link**; both need
   their overlays (`uart1`/`uart2`). `ttyS0` is the serial console.
 - Scan the bus with `pixi run python scripts/i2c_scan.py` (expect `0x3c` SSD1306 on
-  **bus 0** (i2c-0); `0x40` PCA9685 on bus 1 if still wired).
+  **bus 0** (i2c-0)).
 - The build needs CMake **3.x** (not 4) plus Ninja + explicit Python hints — handled by
   `scripts/build.sh` / `pixi.toml`; see that script's header for the why.
 
