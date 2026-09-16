@@ -115,8 +115,7 @@
     <aside id="right">
       <nav id="tabbar">
         <button data-tab="drive" class="active"><span class="ic">🕹</span>Drive</button>
-        <button data-tab="speak"><span class="ic">💬</span>Speak</button>
-        <button data-tab="ai"><span class="ic">🧠</span>AI</button>
+        <button data-tab="ai"><span class="ic">🤖</span>AI · Speak</button>
         <button data-tab="sensors"><span class="ic">📊</span>Sensors</button>
         <button data-tab="system"><span class="ic">⚙️</span>System</button>
       </nav>
@@ -138,8 +137,9 @@
           </div>
         </section>
 
-        <!-- ===== SPEAK ===== -->
-        <section id="panel-speak" class="panel">
+        <!-- ===== AI & SPEAK (merged) ===== -->
+        <section id="panel-ai" class="panel">
+          <div class="group">🎙 Speech &amp; voice</div>
           <div class="card">
             <h2>Text to speech</h2>
             <input id="oledText" type="text" maxlength="300" placeholder="Type something to say…">
@@ -198,10 +198,7 @@
               behaviour layer's resting face). Frames are only sent on change, so idle eyes cost
               ~no CPU. Watch it live on the hero's <b>OLED</b> view — a pixel-exact mirror.</p>
           </div>
-        </section>
-
-        <!-- ===== AI ===== -->
-        <section id="panel-ai" class="panel">
+          <div class="group">🧠 AI &amp; brain</div>
           <div class="card">
             <h2>AI · OpenRouter</h2>
             <p class="hint" id="llmStatus">checking…</p>
@@ -358,27 +355,26 @@
               <div id="abLog" class="log">…</div>
             </details>
           </div>
+          <div class="card">
+            <h2>🩺 Brain health</h2>
+            <div class="kv" id="brainHealth">
+              <span>behavior</span><b id="bhBehavior">–</b>
+              <span>cognition</span><b id="bhCognition">–</b>
+              <span>LLM</span><b id="bhLlm">–</b>
+              <span>purpose</span><b id="bhPurpose">–</b>
+              <span>chart</span><b id="bhChart">–</b>
+            </div>
+            <p class="hint">Two brain layers: <b>behavior</b> (Sismic statechart + purpose) and
+              <b>cognition</b> (LLM personality + skills). Green = alive, red = lost.
+              Polled from <b>/brain/health</b>.</p>
+          </div>
         </section>
 
         <!-- ===== SENSORS ===== -->
         <section id="panel-sensors" class="panel">
           <label class="switch"><input type="checkbox" id="hintsToggle" checked><span class="track"></span>
             💡 Show hints (hover explanations)</label>
-          <div class="card">
-            <h2>System health</h2>
-            <div class="kv">
-              <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
-              <div class="cores" id="sysCores"></div>
-              <span>load</span><b id="sysLoad">–</b>
-              <span>memory</span><b id="sysMem">–</b>
-              <span>temp</span><b id="sysTemp">–</b>
-              <span>disk</span><b id="sysDisk">–</b>
-              <span>wifi</span><b id="sysWifi">–</b>
-              <span>uptime</span><b id="sysUp">–</b>
-            </div>
-            <p class="hint">Board health from <b>/diagnostics</b>, 1 Hz. Tap <b>CPU</b> for per-core.
-              <b>wifi</b> = signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
-          </div>
+          <div class="group">🗺️ SLAM &amp; navigation</div>
           <div class="card">
             <h2>Map (Nav2)</h2>
             <div class="kv">
@@ -404,6 +400,43 @@
               <b>~/.local/state/nanobot/locations.json</b>; skills can navigate to these names too.</p>
           </div>
           <div class="card">
+            <h2>Lidar (LDS)</h2>
+            <div class="kv">
+              <span>rate</span><b id="ldsHz">–</b>
+              <span>points</span><b id="ldsPts">–</b>
+              <span>lost/rev</span><b id="ldsLost">–</b>
+              <span>rx errors</span><b id="ldsErr">–</b>
+              <span>spin</span><b id="espLdsRpm">–</b>
+              <span>spin frames</span><b id="espLdsHz">–</b>
+              <span>spin duty</span><b id="espLdsDuty">–</b>
+            </div>
+            <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
+              <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
+            <div class="field"><label>Spin target <span id="ldsTgtV">300</span> rpm</label>
+              <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
+            <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
+              <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
+              bad-checksum packets since start (climbing fast = degraded serial RX wiring).
+              When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
+              UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.
+              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets
+              the rpm the ESP32 spins at (published straight to <b>/lds_target_rpm</b>).
+              0 = park the spin motor (the old idle auto-spin-down died with slam_nav —
+              use this manually if you want the lidar quiet).</p>
+          </div>
+          <div class="card">
+            <h2>Odometry</h2>
+            <div class="kv">
+              <span>x</span><b id="odoX">–</b>
+              <span>y</span><b id="odoY">–</b>
+              <span>θ</span><b id="odoTh">–</b>
+            </div>
+            <div class="field"><label>Publish rate <span id="odoRateV">15</span> Hz</label>
+              <input id="odoRate" type="range" min="1" max="50" step="1" value="15"></div>
+            <p class="hint"><b>/odom</b> + odom→base_link TF from <b>wheel_odometry</b>
+              (the pose chain slam_toolbox + Nav2 build on). Lower rate = less CPU.</p>
+          </div>
+          <div class="card">
             <h2>IMU</h2>
             <div class="kv">
               <span>roll</span><b id="imuR">–</b>
@@ -425,7 +458,7 @@
               chassis — and watch <b>mag magnitude</b>/<b>noise</b>; a jump means magnetic or
               electrical interference there. To find out WHICH nearby part is the culprit, hold
               it close to one at a time and briefly toggle that part — spin the LDS (Lidar
-              card), flip the cooling fan override (System card), or nudge the drive joystick —
+              card), flip the cooling fan override (Actuators card), or nudge the drive joystick —
               watching for a spike here. <b>Worst noise seen</b> peak-holds the biggest jump
               since the last reset, so you don't have to stare at it while walking the sensor
               around. Raw sensor counts — useful only to compare spots, not an absolute field
@@ -589,43 +622,7 @@
               starts, and it aborts automatically (restoring every actuator) if the robot is picked
               up or driven mid-run.</p>
           </div>
-          <div class="card">
-            <h2>Odometry</h2>
-            <div class="kv">
-              <span>x</span><b id="odoX">–</b>
-              <span>y</span><b id="odoY">–</b>
-              <span>θ</span><b id="odoTh">–</b>
-            </div>
-            <div class="field"><label>Publish rate <span id="odoRateV">15</span> Hz</label>
-              <input id="odoRate" type="range" min="1" max="50" step="1" value="15"></div>
-            <p class="hint"><b>/odom</b> + odom→base_link TF from <b>wheel_odometry</b>
-              (the pose chain slam_toolbox + Nav2 build on). Lower rate = less CPU.</p>
-          </div>
-          <div class="card">
-            <h2>Lidar (LDS)</h2>
-            <div class="kv">
-              <span>rate</span><b id="ldsHz">–</b>
-              <span>points</span><b id="ldsPts">–</b>
-              <span>lost/rev</span><b id="ldsLost">–</b>
-              <span>rx errors</span><b id="ldsErr">–</b>
-              <span>spin</span><b id="espLdsRpm">–</b>
-              <span>spin frames</span><b id="espLdsHz">–</b>
-              <span>spin duty</span><b id="espLdsDuty">–</b>
-            </div>
-            <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
-              <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
-            <div class="field"><label>Spin target <span id="ldsTgtV">300</span> rpm</label>
-              <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
-            <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
-              <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
-              bad-checksum packets since start (climbing fast = degraded serial RX wiring).
-              When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
-              UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.
-              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets
-              the rpm the ESP32 spins at (published straight to <b>/lds_target_rpm</b>).
-              0 = park the spin motor (the old idle auto-spin-down died with slam_nav —
-              use this manually if you want the lidar quiet).</p>
-          </div>
+          <div class="group">👁️ Vision</div>
           <div class="card">
             <h2>Camera (GPU vision)</h2>
             <label class="switch"><input type="checkbox" id="visCameraEnable" checked><span class="track"></span>
@@ -785,6 +782,7 @@
               <b>/led</b> from brightness with hysteresis (on/off thresholds must stay
               apart to avoid flicker).</p>
           </div>
+          <div class="group">⚙️ Actuators</div>
           <div class="card">
             <h2>Cooling fan</h2>
             <div class="kv">
@@ -817,19 +815,6 @@
             <p class="hint">Line-laser PWM on the ESP32 (<b>/laser_pwm</b>, GPIO 23/32).
               0 = off, 255 = full brightness. Publish-only, so a page reload resets to 0
               until the next drag; the lasers also cut out if the SBC link drops.</p>
-          </div>
-          <div class="card">
-            <h2>Brain health</h2>
-            <div class="kv" id="brainHealth">
-              <span>behavior</span><b id="bhBehavior">–</b>
-              <span>cognition</span><b id="bhCognition">–</b>
-              <span>LLM</span><b id="bhLlm">–</b>
-              <span>purpose</span><b id="bhPurpose">–</b>
-              <span>chart</span><b id="bhChart">–</b>
-            </div>
-            <p class="hint">Two brain layers: <b>behavior</b> (Sismic statechart + purpose) and
-              <b>cognition</b> (LLM personality + skills). Green = alive, red = lost.
-              Polled from <b>/brain/health</b>.</p>
           </div>
           <div class="card">
             <h2>Coprocessor (ESP32)</h2>
@@ -885,6 +870,21 @@
             <button id="connect" class="btn primary">Connect</button>
             <p class="hint">Live telemetry stream (same-origin /telemetry). The page
               auto-connects on load and reconnects after a stack reset / reboot.</p>
+          </div>
+          <div class="card">
+            <h2>System health</h2>
+            <div class="kv">
+              <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
+              <div class="cores" id="sysCores"></div>
+              <span>load</span><b id="sysLoad">–</b>
+              <span>memory</span><b id="sysMem">–</b>
+              <span>temp</span><b id="sysTemp">–</b>
+              <span>disk</span><b id="sysDisk">–</b>
+              <span>wifi</span><b id="sysWifi">–</b>
+              <span>uptime</span><b id="sysUp">–</b>
+            </div>
+            <p class="hint">Board health from <b>/diagnostics</b>, 1 Hz. Tap <b>CPU</b> for per-core.
+              <b>wifi</b> = signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
           </div>
           <div class="card">
             <h2>View</h2>
@@ -1838,7 +1838,7 @@ function onFrame(f){
 // readout works even with the video view never opened. The status numbers live in the
 // Sensors panel only (no on-video badge, per user preference) -- the crosshair is kept
 // on the video itself since it's a spatial indicator, not a text label.
-// Hover explanations for the Sensors tab (both "System health" and "Camera (GPU
+// Hover explanations for the Sensors + System tabs (both "System health" and "Camera (GPU
 // vision)" cards) -- readouts AND every tunable slider/toggle. Applied as plain
 // native `title` attributes (zero new UI component, browser handles the hover) via
 // element ID, so this needed no changes to the HTML markup itself. Toggleable
