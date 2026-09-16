@@ -20,24 +20,22 @@ left needs the physical robot and can't be closed from a dev host.
 
 - [ ] **Flash the ESP32 stray-tick firmware** (`/wheel_stray_ticks` + `/reset_ticks`,
       built 2026-07-15, not flashed).
-- [ ] **Deploy the Nav2 migration to the board**: build + `sudo bash
-      deploy/sbc-setup.sh` (installs the new unit set, retires nano-ekf/nano-map) +
-      `stack.sh down` → verify → `up`. Also sync the board's `brain/src` copy (the
-      dev-PC brain repo was fast-forwarded 2 commits for `strip_em_dash` — see
-      AGENTS.md's deploy note).
-- [ ] **Deploy to the board**: `goal_no_path_timeout` LDS-idle fix + the TTS
-      shutdown-cutoff fix (`TtsEngine.wait`) — both committed 2026-07-15, not deployed.
+- [x] **Deploy the Nav2 migration to the board** (DONE 2026-09-14/15 — build +
+      `sbc-setup.sh` unit set + live-verified; see `docs/nav2-migration.md`'s
+      execution notes and AGENTS.md). Ongoing: sync the board's `brain/src` **and**
+      `brain/skills` after brain-repo changes (AGENTS.md deploy note).
+- [x] ~~**Deploy to the board**: `goal_no_path_timeout` LDS-idle fix + the TTS
+      shutdown-cutoff fix~~ — `goal_no_path_timeout` was a slam_nav param (deleted
+      2026-09-14; Nav2 has its own timeouts). The TTS fix landed with the 2026-07
+      deploys.
 - [ ] **Hardware-verify the IMU accel/mag calibration + the new 6-axis mode /
       bandwidth filter / interference self-test** (2026-07-16) — then re-run the
       self-test SPIN check to test the magnetometer-interference hypothesis
       (`selftest-spin-imu-mismatch` memory, still OPEN).
-- [ ] **Hardware-verify vision target tracking** (2026-07-16 pan-only PD loop +
-      2026-07-21 refinement: smooth deadband / coast-on-loss / integral /
-      feedforward / confidence-scaled authority) — needs a calibrated colour target +
-      `enable_motion` + `track_enable`. Check: turn-direction sign, does the smooth
-      deadband kill the limit cycle, does coast-on-loss feel right vs. hard stop, does
-      `track_kff` follow a moving target without overshoot, does `track_ki` cancel
-      steady offset without windup.
+- [x] ~~**Hardware-verify vision target tracking** (pan-only PD loop + refinements:
+      smooth deadband / coast-on-loss / integral / feedforward /
+      confidence-scaled authority)~~ — MOOT: the slam_nav turn-to-track loop was
+      removed with the Nav2 migration; vision is expression/behaviour-level only.
 - [ ] **wheel_odometry: verify `ticks_per_rev: 1440` against measured travel.** The
       comment already correctly says single-channel rising-edge (not quadrature); the
       true counts/rev can only be confirmed by driving a measured distance on the
@@ -114,7 +112,6 @@ left needs the physical robot and can't be closed from a dev host.
 
 # Monitoring scripts to add
 
-- [ ] **Define `/scan_matching_quality` topic**: Broadcast ROS2 `float` values during
-      mapping.
+- [x] ~~**Define `/scan_matching_quality` topic**~~ — MOOT: slam_nav deleted; slam_toolbox
+      + Nav2 expose their own diagnostics topics.
 - [ ] **Create `ros2 topic echo /odom` script**: Compare odom drift against ground truth.
-- [ ] **Add `rqt` visualization panels**: For `/odom/filtered`, `/scan_matching_queue`.

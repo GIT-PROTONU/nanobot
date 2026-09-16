@@ -53,7 +53,7 @@ override any of them per-deployment without touching code.
 
 | File | Kind | Written by | Read by | Holds |
 |---|---|---|---|---|
-| `src/web_control/skills/*.md` | seed (committed catalogue) | hand-authored | `SkillLibrary` (`skills_dir`) | the built-in capabilities (narrative + action + meta kinds) |
+| nanobot-brain repo `skills/*.md` | seed (committed catalogue) | hand-authored | `SkillLibrary` (`resolve_skills_dir`) | the built-in capabilities (narrative + action + meta kinds) |
 | `memory/skills/*.md` → `~/.local/state/nanobot/skills/*.md` | state (learned) | `skillsmith.py` workshop (`workshop_dir`) | `SkillLibrary(extra_dir=…)`, overrides built-ins by name | skills forged/rehearsed/trialled by the workshop |
 | `~/.local/state/nanobot/workshop.json` | state | `WorkshopState` in `skillsmith.py` (`workshop_path`) | the workshop's `gate()` | trial ledger — run counts, 👍/👎, adopt/retire decisions |
 | `~/.local/state/nanobot/skill_likes.json` | state | `CognitionCore.like_skill` (`skill_likes_path`) | `CognitionCore._liked_skill_pick` | per-skill 👍/👎 tally, biases autonomous skill-beat picks |
@@ -77,5 +77,5 @@ override any of them per-deployment without touching code.
 
 - **"Where do I hand-tune traits/persona before first boot?"** → `memory/personality.json` (or run `scripts/personality_creator.py`).
 - **"The robot's personality feels off after weeks of running — how do I reset it?"** → delete/edit the `~/.local/state/nanobot/*.json` state files, or redeploy with `DEPLOY_SOUL=1` to overwrite state with the git seed.
-- **"I want to add a new capability without touching Python."** → drop a `.md` in `src/web_control/skills/`, `POST /skills/reload`.
+- **"I want to add a new capability without touching Python."** → drop a `.md` in the nanobot-brain repo's `skills/`, `POST /skills/reload`.
 - **"Why did the robot say that at 3am?"** → `GET /llm/log` / `~/.local/state/nanobot/cognition.log`.

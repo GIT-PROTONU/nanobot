@@ -27,13 +27,14 @@ The brain is split into **when**, **what**, and **how**:
         the "brain"           the "voice"            the "body"
 ```
 
-- **`src/behavior/behavior/presence.py`** — a **statechart** (a formal state machine, via
+- **`nanobot-brain: src/nanobot_brain/behavior/presence.py`** — a **statechart** (a formal state machine, via
   the [Sismic](https://sismic.readthedocs.io/) library) that decides *when* the robot acts.
   Pure Python, ROS-free, unit-tested offline
-  (`pixi run python -m pytest src/behavior/test`). It is the **single brain** — only one
+  (`cd ../nanobot-brain && pixi run python -m pytest tests/` — tests live in the
+  nanobot-brain repo since the 2026-09 split). It is the **single brain** — only one
   thing decides to act. `behavior/mood_node.py` is the thin ROS wrapper that maps
   topics→chart events and the chart's faces→`/oled_face`.
-- **`src/web_control/web_control/llm.py`** — a dependency-free OpenRouter client that turns
+- **`nanobot_brain.cognition.llm`** — a dependency-free OpenRouter client that turns
   a prompt into `{"say": "...", "mood": "happy"}`. This is *what* to say. ROS-free, no SDK,
   just stdlib `urllib`.
 - **OLED + TTS** — `oled_display` shows the face; `web_control/tts.py` speaks the line.
@@ -151,7 +152,8 @@ Inspect/force it: `GET /llm/phrases`, `POST /llm/phrases/regenerate`, or
 
 ## Skills — capabilities as self-documenting files
 
-Nano's capabilities live as a **portable library of Markdown files** (`src/web_control/skills/`,
+Nano's capabilities live as a **portable library of Markdown files** (the nanobot-brain
+repo's `skills/` dir — resolved by `resolve_skills_dir`, see AGENTS.md's skill library;
 an [OpenClaw](https://github.com/)-style "SKILL.md" idea). Each `.md` is **one capability** —
 a machine-readable YAML frontmatter contract plus a human/LLM-readable body that explains the
 "how":
@@ -325,7 +327,7 @@ Nav2's rotation control if wanted.)
 
 ## Purpose & goals (the "why" layer)
 
-`behavior/brain.py` (ROS-free, shared verbatim with the dev harness) adds a slow goal layer
+`nanobot_brain.behavior.brain` (ROS-free, shared verbatim with the dev harness) adds a slow goal layer
 on top of the beats: a **Purpose Engine** holds an objective + intrinsic-reward weights
 (reflected deterministically from the decision log), and a **Pursuit driver** occasionally
 upgrades the `musing` slot into a **`pursuing`** beat that narrates the current task —
@@ -462,13 +464,13 @@ On Windows, `scripts/start-dev.ps1` finds a real Python, loads the key, and laun
 
 | Concern | File |
 |---|---|
-| Statechart (when) | `src/behavior/behavior/presence.py` (+ `test/`) |
-| Purpose Engine + Pursuit + A/B bandit + Personality orchestration | `src/behavior/behavior/brain.py` |
+| Statechart (when) | nanobot-brain `src/nanobot_brain/behavior/presence.py` (+ `tests/`) |
+| Purpose Engine + Pursuit + A/B bandit + Personality orchestration | nanobot-brain `src/nanobot_brain/behavior/brain.py` |
 | ROS wrapper, fast-rule evolution, night tempo | `src/behavior/behavior/mood_node.py` |
-| OpenRouter client (what) | `src/web_control/web_control/llm.py` |
-| **Cognition core** (execution, reflection, log — shared robot+dev) | `src/web_control/web_control/cognition.py` |
-| Pre-generated phrase bank | `src/web_control/web_control/phrasebank.py` (+ `scripts/pregenerate_phrases.py`) |
-| Skill library (capabilities) | `src/web_control/web_control/skills.py` + `src/web_control/skills/*.md` |
+| OpenRouter client (what) | nanobot-brain `src/nanobot_brain/cognition/llm.py` |
+| **Cognition core** (execution, reflection, log — shared robot+dev) | nanobot-brain `src/nanobot_brain/cognition/` (package) |
+| Pre-generated phrase bank | nanobot-brain `src/nanobot_brain/cognition/phrasebank.py` (+ `scripts/pregenerate_phrases.py`) |
+| Skill library (capabilities) | nanobot-brain `src/nanobot_brain/cognition/skills.py` + the repo's `skills/*.md` |
 | ROS node + adapters (face/sensors/actions) | `src/web_control/web_control/web_server.py` |
 | TTS | `src/web_control/web_control/tts.py` |
 | Face rendering | `src/oled_display/` |

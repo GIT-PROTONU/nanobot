@@ -4,10 +4,9 @@
 
 - Build: `pixi run build` (runs `scripts/build.sh` — colcon + explicit CMake Python hints for RoboStack). Python pkgs are `--symlink-install` (edit + restart, no rebuild).
 - **Do NOT add `rust`/`clang`/`libclang` to `pixi.toml`.** The LDS is driven by the pure-Python `lds_driver_py`; the old Rust `lds_driver` node was abandoned and removed. The toolchain would pull ~1.6 GB onto the 7 GB board.
-- Runtime on the board: `scripts/stack.sh {up|down|restart|heal|status}`. Nodes launched by direct executable path (not `ros2 run`) to save RAM. `rmw_zenoh` router must start first.
+- Runtime on the board: `scripts/stack.sh {up|down|restart|status}` — a thin wrapper over systemd (`nano-robot.target`). Nodes launched by direct executable path (not `ros2 run`) to save RAM. `rmw_zenoh` router must start first.
 - Zenoh needs a serial-capable `zenohd` binary (conda builds lack `transport_serial`). Build with `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`.
-- `stack.sh restart` can leave stale processes. Prefer `down` → verify — `up`.
-- Auto-starts via systemd `nano-stack.service`.
+- Auto-starts via systemd `nano-robot.target` — 7 units: `nano-router`, `nano-app`, `nano-sensors`, `nano-nav`, `nano-tf`, `nano-slam`, `nano-nav-loader` (installed by `deploy/sbc-setup.sh`; `nano-stack.service` + `nano-heal.timer` are retired). Restart/recovery is systemd's (`Restart=on-failure`); `stack.sh down` → verify → `up` is still the clean cycle after a deploy.
 - Dev PC offline testing: `scripts/dev_webui.py` serves the real web UI + cognition (no ROS).
 
 ## Tests
@@ -35,16 +34,19 @@
 | Package | Role |
 |---|---|
 | `robot_msgs` | Custom ROS interfaces (ament_cmake) |
-| `robot_bringup` | Launch files + single config `config/robot.yaml` |
+| `robot_bringup` | Launch files + single config `config/robot.yaml` + `config/nav2/nav2_params.yaml` |
 | `lds_driver_py` | Active LDS driver (rclpy → `/scan` + `/dev/shm/nano_scan.bin`) |
 | `sensor_hub` | **One process** for imu_driver + sys_monitor + wheel_odometry + lds_driver_py |
-| `slam_nav` | SLAM/mapping (writes `/dev/shm/nano_map.bin`) |
-| `web_control` | ROS glue layer: rosbridge + static web page + TTS + delegates to `nanobot_brain.cognition` |
+| `web_control` | HTTP+SSE gateway: static web page + TTS + vision + delegates to `nanobot_brain.cognition` |
 | `behavior` | ROS glue layer: Sismic chart lifecycle, topic wiring — delegates to `nanobot_brain.behavior` |
+| `app_hub` | **One process** hosting web_control + oled_display + behavior (unit `nano-app`) |
 | `oled_display` | I2C SSD1306 dashboard |
 | `wheel_odometry` | `/wheel_ticks` → `/odom` + TF (from ESP32, not GPIO) |
 | `imu_driver` | BWT901CL over USB-serial |
 | `sys_monitor` | CPU/RAM/temp → `/diagnostics` |
+| `sim_hardware` | Dev-PC-only Gazebo hardware stand-in (`bringup.launch.py sim:=true`) |
+
+Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in one component container (unit `nano-nav`, loaded by `nano-nav-loader`) + **slam_toolbox 2.6.10** as its own process (unit `nano-slam`); the static `base_link→laser` TF is its own `nano-tf` unit. The custom `slam_nav` package and the robot_localization EKF were deleted 2026-09-14 (`docs/nav2-migration.md`).
 
 ### Brain architecture (nanobot-brain package)
 All brain logic lives in `nanobot-brain` — a **ROS-free** Python package. The robot's ROS nodes (`mood_node`, `web_server`) import from it:
@@ -89,7 +91,8 @@ Platform adapters (interfaces.py):
 - `cognition_log_path` default `~/.local/state/nanobot/cognition.log` (survives reboot).
 
 ### Skill library
-- Skills live in the `nanobot-brain` repo under `skills/*.md` — YAML frontmatter + markdown body. Drop a file, `POST /skills/reload`. No code change.
+- Skills are one `.md` each (YAML frontmatter + markdown body), living in the `nanobot-brain` repo under `skills/`. Drop a file, `POST /skills/reload`. No code change.
+- Resolution (`nanobot_brain.cognition.skills.resolve_skills_dir`): `skills_dir` param → `$NANOBOT_SKILLS_DIR` → **the brain repo's root `skills/`** → installed `<share>/web_control/skills` fallback. The brain `skills/` dir must be rsynced to the board next to `brain/src` (see the deploy note below).
 - Two tiers: narrative (`say`/`observe`/`look`) and gated action (`topic` — whitelisted, off by default).
 - Workshop (reflection mode) synthesizes new skills via LLM → `workshop_dir` (default `~/.local/state/nanobot/skills`).
 
@@ -111,7 +114,7 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
 **Web UI:** Sensors panel > "Brain health" card shows behavior, cognition, LLM, purpose, chart status — green/alive or red/lost. Polled every 2s from `/brain/health`. If the endpoint itself fails, all indicators show amber `err`.
 
 ### Nav2 migration (2026-09-14) — slam_nav/EKF REPLACED, sections below are historical
-`docs/nav2-migration.md` was executed: the custom `slam_nav` node, the robot_localization **EKF** (`nano-ekf`), and `nano-map` are **DELETED**. The stack is now Nav2 Humble servers composed into ONE `rclcpp_components/component_container_isolated` (unit `nano-nav`; components attached by a `nano-nav-loader` oneshot via `nav2.launch.py load_only:=true`; static `base_link→laser` TF as the unit's ExecStartPost), plus slam_toolbox 2.6.10 as its own `nano-slam` unit. Units are now `router app sensors nav slam nav-loader`. Key facts that differ from everything written below this point:
+`docs/nav2-migration.md` was executed: the custom `slam_nav` node, the robot_localization **EKF** (`nano-ekf`), and `nano-map` are **DELETED**. The stack is now Nav2 Humble servers composed into ONE `rclcpp_components/component_container_isolated` (unit `nano-nav`; components attached by a `nano-nav-loader` oneshot via `nav2.launch.py load_only:=true`), the static `base_link→laser` TF (yaw π) its OWN `nano-tf` unit (a never-exiting ExecStartPost would hold a Type=simple unit in "activating" forever — that is why it is not on `nano-nav`), plus slam_toolbox 2.6.10 as its own `nano-slam` unit. Units are now `router app sensors nav tf slam nav-loader`. Key facts that differ from everything written below this point:
 
 - **Pose chain:** `map→odom` = slam_toolbox, `odom→base_link` = wheel_odometry (`publish_tf: true` now — it owns the TF, the EKF is gone). No `/odometry/filtered`, no `/slam_pose`, no `/slam_nav/diag`, no `/plan`.
 - **heading_flip** survived as `nav2.launch.py heading_flip:=true` (default): a static `base_link→laser` TF with yaw π (this unit's sensor head faces back). slam_toolbox + Nav2 then work in the drive frame directly.
@@ -125,9 +128,9 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
 - **SSE `f.nav` field (5 Hz, tiny)**: `{pose:[x,y,th]|null, goal:[x,y]|null, status:"idle|planning|navigating|canceling|arrived|failed", inflation:0.25}`. `pose` = a `tf2_ros` `Buffer`+`TransformListener` lookup `map→base_link` (lazy — created with the other browser-only subs, `unregister()`-ed in `_drop_subs`; None when the TF chain is down). `status` = the LAST entry of `/navigate_to_pose/_action/status` (GoalStatusArray → `NAV_STATUS` map; on terminal codes 4/5/6 the goal mirror clears so the ring doesn't resurrect). `goal` = the mirror of the last published `/goal_pose` — `publish_json` records it AND `WebServerNode._publish_skill_action`'s direct goal publisher calls `telemetry.note_goal(x,y)`, so browser clicks, Locations Go, and skill go-tos all light the chip.
 - **Cancel = `POST /nav/cancel`**: a lightweight `CancelGoal` **service client** on `navigate_to_pose/_action/cancel_goal` (NOT a full ActionClient) with an empty `GoalInfo` = cancel-all per CancelGoal.srv; resets the goal mirror + chip immediately, fire-and-forget like `/param`. Client created before spin (thread-safe).
 - **Page (index.html)**: `#view-map` hero canvas + a trimmed `#ctlMap` hero card (Motion toggle, status chip, ✕ Cancel, Sharp-walls toggle) + a Sensors "Map (Nav2)" readout card + a rebuilt **Locations card** ("Save spot" with NO x/y falls back server-side to the TF pose; Go publishes like a click). The map IIFE ports the deleted panel: zoom/pan/pinch, click-to-goal (`panMoved` suppression, y-flip), sharp/linear wall shading (≥70 = solid black), trail + robot + goal overlays, an **inflation bubble** (dashed circle, radius = `f.nav.inflation`), and a click-feedback ring.
-- **Motion toggle semantics (deliberate):** a map click with Motion OFF only marks the goal locally (browse mode — an accidental tap can't move the robot); Motion ON publishes `/goal_pose` and Nav2 drives. Locations **Go** is never gated (explicit intent). The same checkbox drives the in-browser sim's auto-drive (its `$("mapMotion")` reads kept working unchanged).
-- **Sim compatibility kept:** the sim's `mapResponse()` fetch override satisfies the SAME `/map` wire format (its `px/py/pth/trail` header fields win over `f.nav` for the pose dot when present), so the Map view drives the simulated robot with zero sim-code changes.
-- **Deliberate omissions:** no server-side wall guard (Nav2's costmap enforces keep-away; the bubble is display-only, radius hardcoded `NAV_INFLATION_M=0.25` in telemetry.py to mirror `config/nav2/nav2_params.yaml` — if you tune `inflation_radius` there, change the constant: it's NOT read live, a startup get_parameters could race the nav lifecycle); no map Save/Clear buttons (map persistence is a `nano-slam` restart); no no-go brush; no live Nav2 tuning (restart-only per the params note above). Nav2 doesn't expose a plan topic, so the green plan polyline is sim-only.
+- **Motion toggle semantics (deliberate):** a map click with Motion OFF only marks the goal locally (browse mode — an accidental tap can't move the robot); Motion ON publishes `/goal_pose` and Nav2 drives. Locations **Go** is never gated (explicit intent).
+- **Sim removed (2026-09-16):** the in-browser Sim tab/`sim.js` were deleted (the dev sim was the last consumer of the removed fetch overrides). Dev-PC testing is `scripts/dev_webui.py` (page + cognition, no ROS) — the Lidar/Map hero views render only on the robot now.
+- **Deliberate omissions:** no server-side wall guard (Nav2's costmap enforces keep-away; the bubble is display-only, radius hardcoded `NAV_INFLATION_M=0.25` in telemetry.py to mirror `config/nav2/nav2_params.yaml` — if you tune `inflation_radius` there, change the constant: it's NOT read live, a startup get_parameters could race the nav lifecycle); no map Save/Clear buttons (map persistence is a `nano-slam` restart); no no-go brush; no live Nav2 tuning (restart-only per the params note above). Nav2 doesn't expose a plan topic, so there is no plan polyline (the sim that drew one was removed 2026-09-16).
 - **Verify after deploy:** Map view renders → click with Motion ON → `/goal_pose` published (app log `POST /publish /goal_pose`) → chip idle→navigating→arrived; ✕ mid-nav → chip back to idle; Locations Save (robot parked) → list shows the spot → Go → Nav2 drives; `/map` 503 while `nano-slam` is down (graceful placeholder in the hero).
 
 The rest of this section (up to `## Gotchas`) describes the OLD slam_nav/EKF pipeline — kept as tuning history; do not treat its params/topics as current.
@@ -219,7 +222,7 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **`rmw_zenoh` ordering:** a node started before `rmw_zenohd` runs islanded (won't appear in the graph).
 - **Python edits are live:** `--symlink-install` means edit `src/<pkg>/<pkg>/foo.py`, restart node = picked up. New modules import fine via egg-link.
 - **nanobot-brain is pip-installed**: edit `src/nanobot_brain/` in the nanobot-brain repo, restart node = picked up (editable install).
-- **`deploy.sh` does NOT push `nanobot-brain`** — the brain repo is a separate git checkout copied to the board at `/home/ibster/Nano/brain/src` (a `brain/src` PYTHONPATH entry, not pip-installed there). If you change the brain on the dev PC you MUST sync it to the board yourself: `rsync -az --exclude __pycache__ src/ nano:/home/ibster/Nano/brain/src/`. A stale brain silently breaks nodes at runtime with `TypeError: __init__() got an unexpected keyword argument ...` (e.g. `vision_diary_enable`, `nudge_looming_caution`, `chart_path`) — the glue (`mood_node`/`web_server`/`dev_webui`) and the brain must stay in lockstep.
+- **`deploy.sh` does NOT push `nanobot-brain`** — the brain repo is a separate git checkout copied to the board at `/home/ibster/Nano/brain/src` (a `brain/src` PYTHONPATH entry, not pip-installed there). If you change the brain on the dev PC you MUST sync it to the board yourself: `rsync -az --exclude __pycache__ src/ nano:/home/ibster/Nano/brain/src/` **and** `rsync -az skills/ nano:/home/ibster/Nano/brain/skills/` (the skill catalogue — `resolve_skills_dir` looks for `<brain>/skills` next to `brain/src`). A stale brain silently breaks nodes at runtime with `TypeError: __init__() got an unexpected keyword argument ...` (e.g. `vision_diary_enable`, `nudge_looming_caution`, `chart_path`) — the glue (`mood_node`/`web_server`/`dev_webui`) and the brain must stay in lockstep.
 - **`telemetry.py` `DiagnosticStatus.level` is `bytes` under rmw_zenoh** — `pipe.level` arrives as `b'\x00'|b'\x01'|b'\x02'`, which is NOT JSON-serializable and kills the entire app_hub (telemetry `_tick` runs on the executor, so an unhandled `TypeError` crashes the process → systemd respawn loop). Normalize to `int` at ingest (`_on_diag`). Any new raw ROS field put into the telemetry frame must be a JSON-safe type after passing through rmw_zenoh.
 - **Callback exceptions on the executor = respawn loop** — any unhandled error inside a subscription callback (not just `DiagnosticStatus.level`) kills the whole hub process, so systemd `Restart=on-failure` looks like a boot loop. Real case (fixed 2026-08-10): `telemetry.py:_on_slam_pose` copied the Odometry layout (`msg.pose.pose`) onto the actually-`PoseStamped` `/slam_pose` → `AttributeError` every tick. Match the real message type (`/slam_pose` is `PoseStamped` = `msg.pose`). Same class: `nav_node.py:_on_scan` used a local `angles` bound only inside the lidar-geometry memoization branch → `UnboundLocalError` on the 2nd scan; the memoized alias is `self._ang_cache` — always use that.
 - **Vision readouts are one atomic snapshot** — `gpu_vision` scalars are read via `snapshot()` (one `_lock` acquisition for all fields, added 2026-08-10). Don't revert to per-property getters in the 5 Hz telemetry build or the 10 Hz `_vision_state_tick`: that was ~20 lock round-trips/tick + cross-field reading skew.
@@ -230,5 +233,5 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **ESP32 link can wedge after a stack restart and needs a PHYSICAL power cycle** — after `stack.sh down/up` the coprocessor may never re-attach to the router's serial link (`/dev/ttyS1`): `esp32 DOWN: no heartbeat ever received`, `/wheel_ticks` silent, LDS motor dead (ESP32 drives its PID), scans stop. Service restarts, full `nano-robot.target` restarts, even a board `sudo systemctl reboot` do NOT reliably recover it — the firmware's auto-recovery watchdogs (`LINK_CONNECT_DEADLINE_MS`, `LINK_RX_TIMEOUT_MS` in `firmware/nanobot_coprocessor/src/main.cpp`) apparently can't re-sync a wedged UART. Symptom chain when it happens: `esp32 DOWN` → `lds DOWN: lidar not spinning` → `wheel_ticks SILENT` → map `feeds.scan: -1`. Diagnosis: `journalctl -u nano-sensors.service | grep -i esp32`, and confirm the router holds the fd (`ls -l /proc/$(pgrep -f zenohd-serial)/fd | grep ttyS1`). Fix = unplug/replug the ESP32's power. After a successful power cycle it comes back on its own (`esp32 UP after …`, `/wheel_ticks resumed`, `lds UP`), and `lds_idle_enable=false` + `lds_active_rpm=300` via `/param` wakes the lidar if it's parked.
 - **`plink -m` on Windows:** the script text becomes the shell's argv. `pkill -f` patterns can kill the controlling shell. Fix: `pscp` script, run by path.
 - **ESP32 firmware:** PlatformIO from dev PC (`pio run -t upload`). Don't build on the board. Tunables are `#define`s at top of `src/main.cpp`.
-- **Deploy soul overwrite:** `DEPLOY_SOUL=1` (default) pushes `devstate/` personality to board, discarding evolved drift. Set `DEPLOY_SOUL=0` to keep the robot's soul.
+- **Deploy soul overwrite:** `DEPLOY_SOUL=1` pushes `memory/` personality to the board, discarding evolved drift. Default is `DEPLOY_SOUL=0` (keep the robot's soul) — matching deploy.sh.
 - **Board has ~1 GB RAM and 7 GB rootfs** — watch memory, don't run heavy compiles.

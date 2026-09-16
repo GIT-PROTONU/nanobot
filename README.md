@@ -22,16 +22,19 @@ Hardware:
 ## Architecture
 
 Each subsystem is its own ROS 2 node wired through topics, but **on the board the
-nodes run packed into three single-process "hubs" matching the three fault domains**
-(each hub = one executor = one interpreter's RAM, supervised by its own systemd unit):
+nodes run packed into single-process "hubs" per fault domain** (each Python hub =
+one executor = one interpreter's RAM; the C++ nav/slam processes are their own
+units) — seven systemd units, supervised by `nano-robot.target`:
 
 ```
 nano-router      zenohd-serial — the rmw_zenoh graph + the ESP32's UART link
 nano-sensors     sensor_hub:  imu_driver + sys_monitor + wheel_odometry + lds_driver_py
 nano-nav         ONE rclcpp component container: the Nav2 Humble servers
                  (planner + controller + bt_navigator + behaviors + lifecycle
-                 manager); components attached by nano-nav-loader, static
-                 base_link->laser TF as the unit's ExecStartPost
+                 manager); components attached by nano-nav-loader
+nano-tf          static base_link->laser TF (yaw pi — own unit, not an
+                 ExecStartPost: a never-exiting one would hold the unit in
+                 "activating" forever)
 nano-slam        slam_toolbox 2.6.10: /map + map->odom TF (plain node, own process)
 nano-app         app_hub:     web_control + oled_display + behavior (the personality)
 ```
@@ -80,7 +83,8 @@ OLED dashboard + the cognition body snapshot without any fast subscriptions.
 
 > **Reflash recovery / one-shot:** `sudo bash deploy/sbc-setup.sh` applies all the
 > OS-level config automatically and idempotently — device-tree overlays
-> (`i2c0 i2c1 i2c2 uart1 usbhost1 usbhost2`), the I2C udev rule, the `dialout` +
+> (`usbhost0 usbhost1 usbhost2 usbhost3 i2c0 i2c1 i2c2 uart1 uart2 analog-codec`),
+> the I2C udev rule, the `dialout` +
 > `video` group memberships, the scoped passwordless sudoers rules (poweroff/reboot
 > for the web UI's power buttons + start/stop/restart of `nano-robot.target` for
 > `stack.sh`), and the per-process systemd units that auto-start the stack on boot.
@@ -89,7 +93,8 @@ OLED dashboard + the cognition body snapshot without any fast subscriptions.
 
 The H5 buses must be muxed before Linux exposes `/dev/i2c-*`, `/dev/ttyS1`, etc.
 See [`nanopi-neo-plus2-pinmap.md`](nanopi-neo-plus2-pinmap.md) for the full mapping.
-Easiest: `sudo armbian-config` → *System → Hardware*, enable **i2c1**, **uart2**,
+Easiest: `sudo armbian-config` → *System → Hardware*, enable **i2c0** (the OLED
+bus), **i2c1**, **uart1** (the ESP32 link, `/dev/ttyS1`), **uart2**,
 then reboot. Or edit `/boot/armbianEnv.txt`:
 
 ```

@@ -74,7 +74,7 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   (ROS-free, unit-tested offline: `pixi run python -m pytest src/behavior/test`); the node
   maps topics→events. No-op if sismic is missing or `behavior.enable:=false`.
   - **`mood_node` is thin ROS glue; ALL the ROS-free thinking is in `brain.py`** —
-    mirroring how `web_control.cognition.CognitionCore` factored the LLM side. `brain.py` is the
+    mirroring how `nanobot_brain.cognition.CognitionCore` factored the LLM side. `brain.py` is the
     single behaviour-layer "brain" module: the **Purpose Engine** (objective + intrinsic-reward
     weights, deterministic reflection — `default/merge/reflect_purpose`), the **Pursuit** driver
     + A/B **bandit** (`OBJECTIVES`/`precond_ok`/`Pursuit`/`Bandit`), and the orchestration —
@@ -270,12 +270,14 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   typed-nowhere contract between `telemetry.py` and `app.js`, and this is what catches
   a drift.
 - Run the stack: **`scripts/stack.sh {up|down|restart|status}`** — now a thin wrapper
-  over **systemd**. The stack is six units under **`nano-robot.target`**:
+  over **systemd**. The stack is seven units under **`nano-robot.target`**:
   `nano-router` (zenohd-serial) → `nano-sensors` (sensor_hub = imu+sys+odom+lds) →
   `nano-nav` (ONE `rclcpp_components/component_container_isolated` hosting the Nav2
   servers + their lifecycle manager; components attached by the `nano-nav-loader`
-  oneshot via `nav2.launch.py load_only:=true`; static `base_link→laser` TF with yaw π
-  as the unit's ExecStartPost) → `nano-slam` (slam_toolbox 2.6.10, own process) →
+  oneshot via `nav2.launch.py load_only:=true`) → `nano-tf` (the static
+  `base_link→laser` TF with yaw π — its OWN unit: a never-exiting ExecStartPost would
+  hold a Type=simple unit in "activating" forever) → `nano-slam` (slam_toolbox 2.6.10,
+  own process) →
   `nano-app` (app_hub = web+oled+behavior).
   (The old `nano-ekf`/`nano-map` units died with the Nav2 migration — the EKF and the
   map blob bridge are gone.)
@@ -380,10 +382,13 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   page is **self-contained**: one big `"use strict"` inline block (`app.js`-derived: the
   SSE `/telemetry` EventSource + all control) with the OLED-mirror `oled.js` inlined
   right before it, then smaller self-contained IIFE blocks (chrome tabs,
-  in-browser sim, live odometry/IMU readouts) — all pure same-origin SSE/HTTP, no
-  external scripts, no rosbridge/ROSLIB. Do NOT reintroduce external `<script src>`
-  loading of the old split files (`app.js`, `map.js`, `oled.js`, `chrome.js`, `sim.js`,
-  `devtools.js` — now orphaned).
+  live odometry/IMU readouts, the 2026-09-15 Map/click-to-goal/Locations block) — all
+  pure same-origin SSE/HTTP, no
+  external scripts, no rosbridge/ROSLIB. The old split files (`app.js`, `map.js`,
+  `oled.js`, `chrome.js`, `sim.js`, `devtools.js`, `logs.js`, `personality.js`) were
+  DELETED from the repo (2026-09-16) — do not reintroduce external `<script src>`
+  loading or wire a websocket. The in-browser Sim tab was removed with them (2026-09-16;
+  dev-PC testing is `scripts/dev_webui.py`).
   The web **Map panel is back (rebuilt 2026-09-15 on top of Nav2)** — a canvas fed from
   slam_toolbox's `/map` via the `GET /map` HTTP route (NOT the SSE frame), click-to-goal,
   a goal-status chip from `/navigate_to_pose/_action/status`, `POST /nav/cancel`, an
@@ -686,7 +691,7 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
     blocks on the LLM); excluded from autonomous skill-beat picks like the workshop. Force/
     inspect: `scripts/pregenerate_phrases.py [--show]`, `GET /llm/phrases`,
     `POST /llm/phrases/regenerate`. Config: `phrasebank_*` in robot.yaml.
-- **Skill library** (`skills.py`, ROS-free + unit-tested; `src/web_control/skills/*.md`):
+- **Skill library** (`nanobot_brain.cognition.skills`, ROS-free + unit-tested; the nanobot-brain repo's `skills/*.md`):
   capabilities as **self-documenting markdown** (an OpenClaw-style "SKILL.md" port). Each
   `.md` = one capability — YAML frontmatter contract (`name`/`description`/`trigger`/`action`)
   + a Markdown body the brain reads as the "how". Drop a new file in (and `POST /skills/reload`)
