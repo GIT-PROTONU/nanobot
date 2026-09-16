@@ -2187,11 +2187,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         return b""
 
     def _read_json(self):
-        """Parse the already-read request body as JSON; {} on any problem."""
+        """Parse the already-read request body as JSON; {} on any problem. A valid
+        non-object JSON body (a bare list/number) also becomes {} — every handler
+        assumes .get(), and an AttributeError escaping do_POST resets the connection."""
         try:
-            return json.loads(getattr(self, "_body", b"") or b"{}")
+            data = json.loads(getattr(self, "_body", b"") or b"{}")
         except Exception:
             return {}
+        return data if isinstance(data, dict) else {}
 
     def _respond(self, code, msg):
         body = msg.encode()

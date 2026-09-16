@@ -150,8 +150,9 @@ class TelemetryHub:
         # /map HTTP route (NOT the SSE frame — ~230 KB would dwarf the rest of
         # the frame). slam_toolbox publishes every map_update_interval (5 s), so
         # one cached copy is all a 1 Hz poll can consume.
-        self._map_meta = None          # {w, h, res, ox, oy, t} wire-format header
-        self._map_bytes = None         # raw int8 cells (bytes(msg.data))
+        self._map_payload = None       # atomic (meta{w,h,res,ox,oy,t}, raw int8 cells);
+                                       #   one tuple so /map can never pair a new header
+                                       #   with the previous grid
         self._map_arrival = STALE      # monotonic, for staleness surfacing
         # map-frame pose via TF (map->odom from slam_toolbox + odom->base_link
         # from wheel_odometry). Listener is lazy — created with the other
@@ -701,12 +702,11 @@ class TelemetryHub:
         data = bytes(msg.data)               # int8[] -> raw bytes (-1..100 mod 256)
         if info.width <= 0 or info.height <= 0 or len(data) != info.width * info.height:
             return
-        self._map_meta = {
+        self._map_payload = ({          # single atomic assignment (see __init__)
             "w": info.width, "h": info.height, "res": round(info.resolution, 6),
             "ox": info.origin.position.x, "oy": info.origin.position.y,
             "t": time.time(),
-        }
-        self._map_bytes = data
+        }, data)
         self._map_arrival = time.monotonic()
 
     def _on_goal_status(self, msg):
@@ -739,10 +739,9 @@ class TelemetryHub:
 
     def get_map_payload(self):
         """The /map HTTP route body: (meta_dict, int8_bytes), or (None, None)
-        until slam_toolbox has published a grid."""
-        if self._map_meta is None or self._map_bytes is None:
-            return None, None
-        return self._map_meta, self._map_bytes
+        until slam_toolbox has published a grid. Atomic: meta and cells always
+        come from the same /map message."""
+        return self._map_payload or (None, None)
 
     def clear_goal(self):
         """Drop the goal mirror + chip state (POST /nav/cancel). Nav2's own status

@@ -93,11 +93,18 @@ luma-oled = "*"         # SSD1306 OLED over I2C
 # no native build — safe on the 1 GB / 7 GB board. The behavior node degrades to a
 # no-op if it's missing, so an un-resolved board still boots the rest of the stack.
 sismic = ">=1.6"
+# NOTE: nanobot-brain is deliberately NOT a pypi path-dependency here — the board
+# keeps it as a PYTHONPATH copy at <repo>/brain/src (a relative path dep would make
+# every board `pixi run` try to resolve a checkout it doesn't have). Dev PC: set up
+# once with `pixi run brain`.
 
 [tasks]
 # Build the colcon workspace (msgs + all python packages). See scripts/build.sh
 # for why the explicit Python hints are needed under RoboStack.
 build = "bash scripts/build.sh"
+# Dev-PC one-shot: editable-install the sibling nanobot-brain checkout into the pixi
+# env (mood_node/web_server/dev_webui import nanobot_brain.* — see the NOTE above).
+brain = "pip install -e ../nanobot-brain"
 # (No `build-lds`/`build-all`: the Rust LDS node is abandoned and its toolchain is
 # intentionally not installed — see the dependencies note above.)
 

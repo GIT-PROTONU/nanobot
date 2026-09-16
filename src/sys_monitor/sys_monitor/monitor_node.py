@@ -23,6 +23,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 
 import rclpy
@@ -92,8 +93,9 @@ class MonitorNode(Node):
         self.host = socket.gethostname()
         self.zones = _thermal_zones()
         self._prev = self._cpu_times()      # (idle, total) for delta-based CPU%
-        self._ssid = ""                     # cached; refreshed at most every 5 s (subprocess)
-        self._ssid_at = -1e9
+        self._ssid = ""                     # cached; refreshed by a daemon thread (subprocess
+        self._ssid_at = -1e9                #   must stay off the shared sensor executor)
+        self._ssid_busy = [False]           # one probe in flight at a time
 
         # Durable health-event log: timestamped ESP32-link / LDS outage transitions
         # with a classified cause (see health_log.py), so intermittent failures can
@@ -189,25 +191,37 @@ class MonitorNode(Node):
                     return name.strip(), float("nan"), float("nan")
         return "", float("nan"), float("nan")
 
-    def _wifi_ssid(self, iface, now):
-        """SSID of `iface`, cached for 5 s (the only subprocess here; ~ms, 0.2 Hz)."""
-        if iface and now - self._ssid_at > 5.0:
-            self._ssid_at = now
-            self._ssid = ""
-            for cmd in (["iwgetid", "-r", iface], ["iw", "dev", iface, "link"]):
-                try:
-                    out = subprocess.run(cmd, capture_output=True, text=True,
-                                         timeout=1.0).stdout
-                except (OSError, subprocess.SubprocessError):
-                    continue
-                if cmd[0] == "iwgetid" and out.strip():
-                    self._ssid = out.strip(); break
-                for ln in out.splitlines():
-                    if ln.strip().startswith("SSID:"):
-                        self._ssid = ln.split("SSID:", 1)[1].strip(); break
-                if self._ssid:
-                    break
-        return self._ssid if iface else ""
+    def _wifi_ssid(self, iface):
+        """SSID of `iface`, refreshed by a daemon thread at most every 5 s. The probe
+        is this node's ONLY subprocess — it must never run on the shared sensor_hub
+        executor (a busy/hanging netlink call would stall /odom + TF + the LDS tick
+        for up to the subprocess timeout), so the tick just reads the last result."""
+        if not iface:
+            return ""
+        if time.monotonic() - self._ssid_at > 5.0 and not self._ssid_busy[0]:
+            self._ssid_at = time.monotonic()
+            self._ssid_busy[0] = True
+            threading.Thread(target=self._ssid_probe, args=(iface,), daemon=True).start()
+        return self._ssid
+
+    def _ssid_probe(self, iface):
+        """Blocking SSID probe — runs OFF the executor (daemon thread)."""
+        ssid = ""
+        for cmd in (["iwgetid", "-r", iface], ["iw", "dev", iface, "link"]):
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True,
+                                     timeout=1.0).stdout
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if cmd[0] == "iwgetid" and out.strip():
+                ssid = out.strip(); break
+            for ln in out.splitlines():
+                if ln.strip().startswith("SSID:"):
+                    ssid = ln.split("SSID:", 1)[1].strip(); break
+            if ssid:
+                break
+        self._ssid = ssid
+        self._ssid_busy[0] = False
 
     def _tick(self):
         now = time.monotonic()                       # one clock read for the whole tick
@@ -246,7 +260,7 @@ class MonitorNode(Node):
 
         # WiFi: signal/quality (pure /proc read) + SSID (cached subprocess, 0.2 Hz)
         wifi_if, wifi_q, wifi_dbm = self._wifi_link()
-        wifi_ssid = self._wifi_ssid(wifi_if, time.monotonic())
+        wifi_ssid = self._wifi_ssid(wifi_if)
         wifi_pct = max(0.0, min(100.0, wifi_q / 70.0 * 100.0)) if wifi_q == wifi_q else float("nan")
 
         fields = {

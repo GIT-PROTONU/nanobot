@@ -83,19 +83,15 @@ imu_driver:
     # here is pointless while the data is already chassis-aligned (it would double
     # the rotation), so base_link is both simpler and exact.
     frame_id: "base_link"
-    publish_rate: 50.0        # Hz; /imu/data rate. Raised for the robot_localization
-                              # EKF (20 Hz): at 50 Hz the IMU gyro arrives >2x per EKF
-                              # step, so every prediction gets fresh gyro data for smooth
-                              # yaw integration between wheel odometry ticks (100 ms).
-                              # Cost is negligible (~1.6 KB/s serial, ~200 frame
-                              # parses/sec). Device auto-follows (50 Hz via code 0x08).
+    publish_rate: 20.0        # Hz; /imu/data rate. The robot_localization EKF (the
+                              # reason for 50 Hz) was deleted in the Nav2 migration;
+                              # nothing subscribes /imu/data today, so 20 Hz keeps the
+                              # device streaming (~0.7 KB/s serial) without the dead
+                              # headroom. Device auto-follows the param (RRATE 0x08).
                               # Live-tunable via web UI slider (1..200).
-    euler_rate: 50.0          # Hz; /imu/euler feeds BOTH slam_nav's yaw-delta rotation
-                              # prior (use_imu_yaw: true) AND the web angle display.
-                              # Raised to match publish_rate so every scan-match cycle
-                              # (every ~100ms at 300 RPM LDS) sees a fresh IMU yaw
-                              # instead of a possibly 200ms-stale one. This also keeps
-                              # the EKF's IMU and slam_nav's yaw deltas in lockstep.
+    euler_rate: 50.0          # Hz; /imu/euler feeds the web IMU card, the OLED tilt
+                              # readout and the drift tool. Keep >= publish_rate so
+                              # the displays never lag the raw stream.
     mag_rate: 10.0            # Hz; /imu/mag is slow-moving + unused by the UI
     web_rate: 5.0             # Hz; /imu/web (|accel|,|gyro|,rate) summary — same story as
                               # euler_rate above, sys_monitor-only, no raw-topic UI reader

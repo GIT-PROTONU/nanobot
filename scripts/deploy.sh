@@ -52,5 +52,8 @@ for f in llm.json personality.json phrases.json workshop.json trait_history.json
 fi
 
 echo ">> build + restart on board"
+# Build via scripts/build.sh — the RoboStack env needs the explicit -DPython_* CMake
+# hints it contains (rosidl_generator_py fails to configure without them); a bare
+# `colcon build` here would only work by accident of a pre-existing build cache.
 ssh "$HOST" \
-  "cd $REMOTE_DIR && ~/.pixi/bin/pixi run bash -c 'colcon build --symlink-install $SEL && bash scripts/stack.sh restart'"
+  "cd $REMOTE_DIR && ~/.pixi/bin/pixi run bash scripts/build.sh $SEL && bash scripts/stack.sh restart"

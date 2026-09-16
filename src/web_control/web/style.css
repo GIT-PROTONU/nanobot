@@ -1,8 +1,5 @@
-/* Nano control — mobile-first dark UI.
-   Every ID/class the JS files consume (app.js / chrome.js / logs.js / map.js /
-   oled.js / sim.js / personality.js / devtools.js) is preserved verbatim; this
-   file only restyles + adds the hero size states (#app.hero-tall/.hero-hidden,
-   driven by chrome.js). */
+/* Nano control — mobile-first dark UI for the self-contained index.html
+   (all JS inline; style.css restyles only). */
 :root{
   --bg:#0a0c11; --surface:#11141c; --surface-2:#1a1f2b; --surface-3:#242b3b;
   --border:rgba(148,163,196,.14); --border-strong:rgba(148,163,196,.28);
@@ -54,33 +51,10 @@ html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;
 #body{flex:1;display:flex;flex-direction:column;min-height:0}
 #left{display:flex;flex-direction:column;flex:none;min-width:0}
 
-/* merged log panel: a genuine collapsible sidebar/section in NORMAL FLOW (no
-   position:fixed, no z-index) — it takes real layout space and pushes #left/
-   #right aside instead of overlaying them, so it structurally cannot cover the
-   tab bar or anything else. Collapsed = display:none, zero footprint. Stacks
-   above the hero view on mobile (own scroll, capped height); becomes a real
-   sidebar column to the left of the hero view on the desktop row layout. */
-#logsPanel{display:none;flex-direction:column;background:var(--surface);
-  border-bottom:1px solid var(--border)}
-#logsPanel.open{display:flex;flex:none;max-height:38vh}
-#logsHead{flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px 8px}
-#logsFilter{flex:none;padding:0 14px 8px}
-#logsBody{flex:1;overflow-y:auto;margin:0;padding:0 14px 12px;max-height:none}
-#logsBody .logrow.src-health{color:var(--amber)}
-
-/* ---------- hero viewport (lidar / map / camera / oled) ----------
-   Three mobile height states, cycled per tab by chrome.js:
-   default = compact, #app.hero-tall = big (map tapping / camera watching),
-   #app.hero-hidden = gone (settings tabs get the whole screen). */
+/* ---------- hero viewport (lidar / map / camera / oled) ---------- */
 #hero{position:relative;flex:none;height:min(32vh,340px);min-height:200px;
   background:#000;border-bottom:1px solid var(--border);overflow:hidden;
   transition:height .25s ease}
-#app.hero-tall #hero{height:56vh}
-#app.hero-hidden #hero,#app.hero-hidden #heroCtl{display:none}
-#heroReveal{display:none;flex:none;align-items:center;justify-content:center;gap:8px;
-  background:var(--surface);border:none;border-bottom:1px solid var(--border);
-  color:var(--muted);font:inherit;font-size:12.5px;padding:9px;cursor:pointer;width:100%}
-#app.hero-hidden #heroReveal{display:flex}
 
 .view{position:absolute;inset:0;display:none}
 .view.on{display:block}
@@ -123,11 +97,6 @@ canvas#oledcv{image-rendering:pixelated;width:92%;max-width:560px;height:auto;
   cursor:pointer}
 .map-zoom button:hover{background:rgba(255,255,255,.09)}
 .map-zoom button:active{background:var(--accent);color:var(--accent-ink)}
-#heroSize{position:absolute;bottom:10px;right:10px;z-index:6;
-  background:rgba(10,12,17,.72);backdrop-filter:blur(12px);
-  border:1px solid var(--border);color:var(--muted);border-radius:var(--r-s);
-  width:36px;height:34px;font:inherit;font-size:14px;cursor:pointer;
-  display:flex;align-items:center;justify-content:center}
 /* Nav2 goal-status chip (Map card) — colour per state, set via className */
 .navchip{display:inline-flex;align-items:center;padding:3px 10px;border-radius:999px;
   font-size:11.5px;font-weight:600;line-height:1.2;border:1px solid var(--border);
@@ -168,8 +137,7 @@ canvas#oledcv{image-rendering:pixelated;width:92%;max-width:560px;height:auto;
 .chiprow .switch{min-height:36px;font-size:12.5px;flex:none;
   background:var(--surface-2);border:1px solid var(--border);border-radius:999px;
   padding:4px 12px 4px 6px}
-#mapStats{font-size:12px;color:var(--muted)}
-#mapTestOut,#imuCalOut{white-space:pre-wrap;font-size:11px;line-height:1.4;
+#imuCalOut{white-space:pre-wrap;font-size:11px;line-height:1.4;
   font-family:var(--mono);color:var(--muted);margin:0}
 
 /* ---------- right column (tabs + panels) ---------- */
@@ -243,11 +211,6 @@ input[type=range]:disabled::-moz-range-thumb{background:var(--muted)}
   font-family:var(--mono);font-variant-numeric:tabular-nums}
 .field.inline{flex-direction:row;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
 .field.inline input{width:auto;flex:none;max-width:6em;min-height:40px}
-/* Map-card wall-guard row: "Wall guard" switch + the keep-away distance slider */
-.wall-dist{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted)}
-.wall-dist input[type=range]{width:110px;min-height:26px}
-.wall-dist span{color:var(--txt);min-width:2.6em;text-align:right;
-  font-family:var(--mono);font-variant-numeric:tabular-nums}
 .row{display:flex;gap:8px;align-items:center}
 .grow{flex:1;min-width:0}
 .prefix{color:var(--muted);font-family:var(--mono);font-size:13px;flex:none}
@@ -412,11 +375,8 @@ kbd{background:var(--surface-2);border:1px solid var(--border);border-radius:5px
   body{font-size:14px}
   #body{flex-direction:row}
   #left{flex:1;min-width:0}
-  /* hero always fully visible: the mobile size states don't apply here */
+  /* hero always fully visible on the desktop row layout */
   #hero{flex:1;height:auto!important;min-height:0}
-  #app.hero-hidden #hero{display:block}
-  #app.hero-hidden #heroCtl{display:block}
-  #heroSize,#heroReveal{display:none!important}
   #heroCtl{flex:none}
   #right{flex:none;width:400px;border-left:1px solid var(--border)}
   /* tab bar becomes a static segmented row above the panels (labels stay
@@ -427,9 +387,6 @@ kbd{background:var(--surface-2);border:1px solid var(--border);border-radius:5px
   #tabbar button{padding:7px 0 8px;font-size:10px;border-radius:var(--r-s)}
   #tabbar button .ic{font-size:17px}
   #panels{padding:14px}
-  /* a real sidebar column, not a stacked block — full height, own scroll */
-  #logsPanel.open{flex:none;width:330px;max-height:none;
-    border-right:1px solid var(--border);border-bottom:none}
 }
 
 @media(prefers-reduced-motion:reduce){

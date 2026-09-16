@@ -663,6 +663,12 @@ class MoodNode(Node):
             return
         if not isinstance(entries, list):
             return
+        # Schedule() reads per-entry .get("time") — a non-object row (e.g. a bare
+        # string from a rogue publisher) would raise out of this callback and kill
+        # app_hub (callback exception on the executor = systemd respawn loop).
+        if not all(isinstance(e, dict) for e in entries):
+            self.get_logger().warning("schedule edit rejected — entries must be objects")
+            return
         self._schedule = Schedule(entries, logger=self.get_logger().warning)
         save_json(self._schedule_path, {"entries": self._schedule.to_list()},
                   logger=self.get_logger().warning)

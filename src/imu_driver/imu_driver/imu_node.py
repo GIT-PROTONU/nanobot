@@ -348,12 +348,12 @@ class ImuNode(Node):
         # Latched status so the web UI can populate the offset/mount-rotation fields
         # with the TRUE effective values on page load (they're plain <input>s with a
         # static "0" in the HTML -- nothing else tells the browser what's actually
-        # active). Mirrors imu_calibrate_status below. Published once here (startup)
-        # and again on every change in _save_mount_settings.
+        # active). Mirrors imu_calibrate_status below. Published once here (startup,
+        # WITHOUT persisting — see _save_mount_settings) and again on every change.
         self.pub_mount_settings = self.create_publisher(
             String, "imu_mount_settings",
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self._save_mount_settings()
+        self._save_mount_settings(persist=False)
         self._prev_gyro = None          # for finite-differencing angular acceleration
         self._prev_gyro_t = None        # (only exercised while an offset is set)
         self._alpha = (0.0, 0.0, 0.0)   # last angular acceleration, rad/s^2
@@ -602,15 +602,18 @@ class ImuNode(Node):
                 self._save_mount_settings()
         return SetParametersResult(successful=True)
 
-    def _save_mount_settings(self):
-        """Best-effort persist of the mount offset/rotation so a web-UI tweak
-        outlives a restart -- same contract as tts.py's settings file. Also
-        republishes the latched status topic so the web UI's fields stay in sync."""
+    def _save_mount_settings(self, persist=True):
+        """Republish the latched mount status so the web UI's fields stay in sync.
+        With persist=True (a web-initiated change) also best-effort persist to the
+        settings file so the tweak outlives a restart -- same contract as tts.py's
+        settings file. Boot-time callers pass persist=False: the file is read-only
+        state at startup, and rewriting it there would re-shadow robot.yaml's
+        offset_*/mount_* keys forever (a later robot.yaml edit could never win)."""
         x, y, z = self._offset_m
         settings = {"offset_x_mm": x * 1000.0, "offset_y_mm": y * 1000.0,
                     "offset_z_mm": z * 1000.0, "mount_roll_deg": self._mount_roll_deg,
                     "mount_pitch_deg": self._mount_pitch_deg, "mount_yaw_deg": self._mount_yaw_deg}
-        if not _write_json(self._mount_path, settings):
+        if persist and not _write_json(self._mount_path, settings):
             self.get_logger().warning("IMU mount settings: could not persist")
         self.pub_mount_settings.publish(String(data=json.dumps(settings)))
 

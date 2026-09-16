@@ -14,7 +14,6 @@
   <header id="topbar">
     <span class="brand"><span id="dot"></span>NANO</span>
     <button class="status" id="statusChip"><b id="conn">disconnected</b></button>
-    <button class="status" id="logsBtn">📜 Logs</button>
     <div class="spacer"></div>
     <div class="metrics">
       <span class="m"><label>x</label><b id="px">0</b></span>
@@ -26,27 +25,7 @@
   </header>
 
   <div id="body">
-    <!-- Merged log panel: decision log (cognition.py) + health log (sys_monitor), one
-         chronological stream. A genuine collapsible sidebar/section laid out in normal
-         flow (no position:fixed, no z-index) — it takes real layout space and pushes
-         the lidar/map view + settings tabs aside instead of overlaying them, so it can
-         never cover the tab bar or anything else. Toggled by the topbar "📜 Logs"
-         button (always visible, not tied to any tab). -->
-    <aside id="logsPanel">
-      <div id="logsHead">
-        <b>📜 Log stream</b>
-        <button class="btn small" id="logsPanelClose">✕</button>
-      </div>
-      <div class="row" id="logsFilter">
-        <button class="btn small active" data-src="all">All</button>
-        <button class="btn small" data-src="cognition">🧠 Decisions</button>
-        <button class="btn small" data-src="health">🩺 Health</button>
-      </div>
-      <div id="logsBody" class="log">…</div>
-    </aside>
     <section id="left">
-      <!-- shown only while the hero is collapsed away (#app.hero-hidden, mobile) -->
-      <button id="heroReveal">▾ Show lidar / map / camera view</button>
       <div id="hero">
         <div id="view-lidar" class="view on">
           <div id="wrap"><canvas id="cv"></canvas></div>
@@ -76,8 +55,6 @@
           <button data-view="cam">Camera</button>
           <button data-view="oled">OLED</button>
         </div>
-        <!-- cycles the mobile hero size: compact → tall → hidden (chrome.js) -->
-        <button id="heroSize" title="Resize view">⤢</button>
       </div>
 
       <div id="heroCtl">
@@ -1929,13 +1906,6 @@ const HINTS = {
   visTargetSel: "The persistent calibration palette -- pick a stored colour target and press Track to make it live.",
   visTargetUse: "Make the selected stored target the live tracked colour (also restores its saved tuning).",
   visTargetDel: "Forget the selected stored target. Deleting the active one stops tracking.",
-  navTrackEnable: "Turns the robot in place to keep the calibrated colour target centered in the camera frame (pan only, never drives forward/back). Wins over any active nav goal/auto-explore while on; still respects enable_motion, pick-up freeze, and self-test.",
-  trackKp: "Turn gain -- rad/s commanded per unit of horizontal off-center error. Higher = snappier, but can overshoot/oscillate.",
-  trackKd: "Braking -- opposes the robot's OWN measured turning speed (from the IMU), damping overshoot from momentum near the setpoint. Higher = brakes harder, but too high can make it feel sluggish/hesitant.",
-  trackMaxAng: "Cap on the turn rate while tracking. Raised well above the old 0.8 default -- the ESP32's stiction compensation means real motor duty barely changes across this whole range, so a higher cap is nearly free extra tracking speed.",
-  trackMinEffAng: "Smallest turn rate that reliably moves the wheels at all (below this the ESP32's stiction compensation means the command does nothing). Fine corrections below this are time-dithered -- short pulses at this rate -- instead of asking for a rate the hardware can't produce, which is what actually fixes overshoot right at the setpoint. Shouldn't normally need tuning.",
-  trackDeadband: "How close to dead-center counts as \"close enough\" -- no turning inside this band.",
-  trackConfMin: "Minimum blob-lock confidence to trust before turning -- rejects noise/flicker locks too small to act on.",
   visGlare: "Glare rejection: derates the blob lock confidence by the frame's specular-highlight fraction, so a shiny reflection matching the tracked hue can't hold a false lock. 0 = off.",
   visNoveltyAlert: "Novelty score above which the \"scene changed\" alert fires.",
   visCamStall: "Seconds without a new frame (or with an exactly-zero diff) before the camera counts as frozen.",
@@ -3406,34 +3376,6 @@ connect();   // auto-connect on load
     }catch(e){ alert("Save failed (server unreachable)."); }
   };
   loadLocations();
-})();
-</script>
-
-<script>
-// ---- Live readouts (SSE /telemetry, no rosbridge) ----
-// The Odometry + IMU cards' raw readouts (their old per-node rosbridge wiring is
-// long dead). Was the full "motion chain (wheels -> EKF -> SLAM)" diagnostics card;
-// the EKF and slam_nav died in the Nav2/slam_toolbox migration
-// (docs/nav2-migration.md), so only the surviving sources are rendered here.
-// Read-only: never publishes or moves the robot.
-(function(){
-  "use strict";
-  const el=id=>document.getElementById(id);
-  const DEG=180/Math.PI;
-  let f=null;
-  function render(){
-    if(!f) return;
-    // Odometry card — the raw /odom sample (the pose chain Nav2 builds on).
-    if(f.odom){ el("odoX").textContent=f.odom[0].toFixed(2)+" m";
-                el("odoY").textContent=f.odom[1].toFixed(2)+" m";
-                el("odoTh").textContent=(f.odom[2]*DEG).toFixed(0)+"°"; }
-    // IMU card — roll/pitch/yaw straight from /imu/euler.
-    if(f.eul){ el("imuR").textContent=f.eul.r.toFixed(1)+"°";
-               el("imuP").textContent=f.eul.p.toFixed(1)+"°";
-               el("imuY").textContent=f.eul.y.toFixed(1)+"°"; }
-  }
-  const es=new EventSource("/telemetry");
-  es.onmessage=e=>{ try{ f=JSON.parse(e.data); render(); }catch(_x){} };
 })();
 </script>
 </body>

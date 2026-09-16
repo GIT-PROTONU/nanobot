@@ -88,6 +88,23 @@ except Exception:  # pragma: no cover
     _np = None
 
 
+def _draw_guard(fn):
+    """Wrap a draw-tick so a RUNTIME panel failure can't kill app_hub. Init failures
+    are handled in __init__, but an I2C NACK/hiccup mid-frame raises out of a timer
+    callback — on the shared executor that propagates out of spin_once and takes the
+    whole hub (web + behaviour + brain) down with it, respawn-looping on a flaky bus.
+    After the first failure the panel is latched dead for the process lifetime."""
+    def wrap(self, *args, **kwargs):
+        if self._panel_dead or self.device is None:
+            return
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as exc:
+            self._panel_dead = True
+            self.get_logger().error(f"OLED draw failed — panel disabled until restart: {exc!r}")
+    return wrap
+
+
 def _patch_fast_display(device):
     """Replace luma's ssd1306.display() frame-pack — a pure-Python per-pixel loop,
     benchmarked at ~10 ms/frame on the H5 — with an np.packbits version (~0.6 ms,
@@ -242,6 +259,7 @@ class DisplayNode(Node):
         self._sys = ""                  # "restart"/"shutdown" once a system action starts
 
         self.device = None
+        self._panel_dead = False   # latched by _draw_guard on the first runtime I2C failure
         self.font = None
         if HAVE_LUMA:
             try:
@@ -529,6 +547,7 @@ class DisplayNode(Node):
                      fill=255 if alive else 0)
         draw.text((48, y), value, font=self.font, fill=255)
 
+    @_draw_guard
     def _dashboard_tick(self):
         if not self.device or self._mood or self.speak_word or self._sys:
             return                                           # face/speech/system owns it
@@ -582,6 +601,7 @@ class DisplayNode(Node):
                 draw.text((max(0, W - 3 - self._text_w(tilt)), 52), tilt, font=self.font, fill=255)
 
     # ---- TTS karaoke (one word, big + centred) ----
+    @_draw_guard
     def _draw_word(self, word):
         """Render a single word as large as it'll fit, centred on the panel. The
         default luma font is tiny, so we draw the word once at 1x then nearest-scale
@@ -806,6 +826,7 @@ class DisplayNode(Node):
         draw.ellipse((bx - 9, by - 9, bx + 9, by + 9), fill=0)
         draw.ellipse((bx - 9, by - 9, bx + 9, by + 9), outline=255)
 
+    @_draw_guard
     def _face_tick(self):
         if not self.device or not self._mood or self.speak_word or self._sys:
             return
@@ -931,6 +952,7 @@ class DisplayNode(Node):
         self.device.display(img.convert("1"))
 
     # ---- shutdown ----
+    @_draw_guard
     def _shutdown_screen(self):
         """A centred 'Shutting down' screen with a power glyph (shown on stop)."""
         if not self.device:
