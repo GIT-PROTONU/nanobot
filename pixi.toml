@@ -129,5 +129,10 @@ web = { cmd = "bash -c 'source install/setup.bash && ros2 launch web_control web
 # publish/param whitelists, vitals blob, SIGTERM path). Run before deploying.
 smoke = { cmd = "bash -c 'source install/setup.bash && python scripts/smoke_test.py'", depends-on = ["build"] }
 
+# ROS-free unit tests (repo conftest.py adds the src paths). PYTEST_DISABLE_PLUGIN_AUTOLOAD
+# sidesteps the launch_testing/launch_testing_ros entrypoints, whose hooks break pytest
+# collection in the RoboStack env.
+test = { cmd = "python -m pytest src -q", env = { PYTEST_DISABLE_PLUGIN_AUTOLOAD = "1" } }
+
 # Convenience: open a shell with everything sourced.
 shell = "bash -c 'source install/setup.bash 2>/dev/null; exec bash'"

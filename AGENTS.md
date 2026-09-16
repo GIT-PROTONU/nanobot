@@ -11,12 +11,17 @@
 
 ## Tests
 
-- Brain tests live in the **nanobot-brain** repo at `/home/ib/Desktop/nanobot-brain`:
-  ```
-  cd /home/ib/Desktop/nanobot-brain
-  pixi run python -m pytest tests/
-  ```
-  All 94 tests are ROS-free (no rclpy, no network). The `nanobot-brain` package is a standalone dependency — no colcon overlay needed.
+- **Nano repo ROS-free unit tests:** `pixi run test` (adds `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` — without it the RoboStack env's `launch_testing`/`launch_testing_ros` pytest entrypoints register unknown hooks and collection crashes; see pixi.toml). Repo-root + per-package `conftest.py` files put each `src/<pkg>` on `sys.path` so tests import without a colcon build — but pytest's rootdir jumps to a package dir when you run one directly (each package has a `setup.cfg`), which is why the per-package conftest exists in addition to the root one.
+  - `src/wheel_odometry/test/test_odom_math.py` — the pure differential-drive integration (`odom_math.py`) behind `/odom` + the odom→base_link TF: midpoint vs exact arc geometry, heading wrap, quat. `odom_math.py` is stdlib-only so the test never touches rclpy/robot_msgs.
+  - `src/imu_driver/test/test_imu_mount_math.py` — the mount-matrix/lever-arm math that builds chassis-frame `/imu/data` (SLAM heading): pins the yaw-90 mount's roll↔pitch swap (the per-angle-shortcut bug class), lever-arm centripetal/tangential signs, quat↔matrix cross-check.
+  - `src/lds_driver_py/test/test_scan_blob.py` — the `/dev/shm/nano_scan.bin` wire format: header shape, float32/inf packing, atomicity (no torn reads).
+  - `src/web_control/test/test_nav_telemetry.py` — the Nav2-facing web glue: `NAV_STATUS` map, ±12 m goal clamp, degenerate/truncated `/map` rejection, goal-mirror lifecycle (terminal states 4/5/6 clear it), rmw_zenoh bytes-status normalization.
+  - Brain tests live separately in the **nanobot-brain** repo at `/home/ib/Desktop/nanobot-brain`:
+    ```
+    cd /home/ib/Desktop/nanobot-brain
+    pixi run python -m pytest tests/
+    ```
+    All 94 tests are ROS-free (no rclpy, no network). The `nanobot-brain` package is a standalone dependency — no colcon overlay needed.
 
 ## Dependencies
 

@@ -18,7 +18,6 @@ timer and integrates a differential-drive model:
 /joint_states and /wheel_encoders are only published when something subscribes (the
 map/UI use /odom + /wheel_ticks). The invert_* params are an SBC-side sign fallback.
 """
-import math
 import time
 
 import rclpy
@@ -33,11 +32,12 @@ from tf2_ros import TransformBroadcaster
 
 from robot_msgs.msg import WheelEncoders
 
+from .odom_math import integrate_pose, meters_per_tick, yaw_to_quat
+
 
 def _yaw_to_quat(yaw: float) -> Quaternion:
     q = Quaternion()
-    q.z = math.sin(yaw * 0.5)
-    q.w = math.cos(yaw * 0.5)
+    q.z, q.w = yaw_to_quat(yaw)[2:]
     return q
 
 
@@ -69,7 +69,7 @@ class EncoderNode(Node):
         rate = g("publish_rate").value
 
         # metres travelled per encoder tick
-        self.m_per_tick = (2.0 * math.pi * self.wheel_radius) / self.ticks_per_rev
+        self.m_per_tick = meters_per_tick(self.wheel_radius, self.ticks_per_rev)
 
         # Latest counts received from the coprocessor (None until first message).
         self.left_ticks = 0
@@ -173,12 +173,8 @@ class EncoderNode(Node):
         dr = (r - self._prev_r) * self.m_per_tick
         self._prev_l, self._prev_r, self._prev_time = l, r, now
 
-        ds = 0.5 * (dl + dr)
-        dth = (dr - dl) / self.wheel_sep
-        # midpoint integration
-        self.x += ds * math.cos(self.th + 0.5 * dth)
-        self.y += ds * math.sin(self.th + 0.5 * dth)
-        self.th = math.atan2(math.sin(self.th + dth), math.cos(self.th + dth))
+        self.x, self.y, self.th, ds, dth = integrate_pose(
+            self.x, self.y, self.th, dl, dr, self.wheel_sep)
         vx, wz = ds / dt, dth / dt
         stamp = now.to_msg()
 
