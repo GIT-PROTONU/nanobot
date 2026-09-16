@@ -5,7 +5,7 @@ On the real robot, three things live below the shared node graph: the LDS02RR li
 single-channel wheel encoders, board telemetry — see firmware/nanobot_coprocessor).
 Gazebo Sim (ros_gz_sim) + ros_gz_bridge stand in for the physics/sensors; THIS node is
 the only new logic, and its entire job is to re-publish exactly the topic contracts
-those three real sources publish, so every real consumer (wheel_odometry, slam_nav,
+those three real sources publish, so every real consumer (wheel_odometry,
 oled_display, web_control, behavior) runs completely unmodified:
 
     /joint_states (bridged, sensor_msgs/JointState, wheel angles)

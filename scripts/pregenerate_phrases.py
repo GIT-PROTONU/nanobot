@@ -26,7 +26,6 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
-sys.path.insert(0, os.path.join(_ROOT, "src", "web_control"))
 
 from nanobot_brain.cognition import LlmClient                       # noqa: E402
 from nanobot_brain.cognition import PhraseBank, CATEGORIES   # noqa: E402

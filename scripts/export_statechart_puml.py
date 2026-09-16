@@ -21,7 +21,6 @@ import sys
 # Make `behavior` importable whether or not the package is installed (e.g. a bare dev python):
 # add <repo>/src/behavior to sys.path relative to this script.
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_REPO, "src", "behavior"))
 
 
 def main():

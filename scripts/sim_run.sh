@@ -32,8 +32,9 @@ pixi run python scripts/pregenerate_phrases.py --if-needed \
   || echo "(phrase-bank pre-build skipped/failed -- continuing; runtime will retry)"
 
 # --- 3. Build + launch: Gazebo Sim + ros_gz_bridge + sim_hardware + the real behaviour/
-#        web_control/oled/slam_nav/wheel_odometry stack + (by default) RViz2. `pixi run
-#        sim` is the plain equivalent of this without the key/phrase-bank setup above. --
+#        web_control/oled/Nav2+slam_toolbox/wheel_odometry stack + (by default) RViz2.
+#        `pixi run sim` is the plain equivalent of this without the key/phrase-bank
+#        setup above. --
 RVIZ="true"
 if [ "${1:-}" = "--rviz" ] && [ "${2:-}" = "false" ]; then RVIZ="false"; fi
 pixi run build

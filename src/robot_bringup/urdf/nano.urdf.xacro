@@ -4,8 +4,8 @@ Minimal diff-drive model for RViz (RobotModel/TF) + Gazebo Sim (sim:=true).
 
 Dimensions/frame names are pulled from robot.yaml / the real driver nodes so the sim
 matches the physical robot's numbers, not arbitrary ones:
-  - wheel_radius=0.0335, wheel_separation=0.16  (wheel_odometry / motor_control)
-  - frame "laser"    (lds_driver_py's frame_id, also slam_nav's scan_topic frame)
+  - wheel_radius=0.0335, wheel_separation=0.16  (wheel_odometry / motors)
+  - frame "laser"    (lds_driver_py's frame_id, the static base_link->laser TF's child)
   - frame "imu_link" (imu_driver's frame_id)
   - frame "base_link"/"odom" (wheel_odometry's base_frame/odom_frame)
 

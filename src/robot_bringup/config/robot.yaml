@@ -74,14 +74,12 @@ imu_driver:
     baud: 115200              # BWT901CL is fixed at 115200
     # The driver pre-rotates every raw frame into the chassis frame (mount_*_deg)
     # and lever-arm-corrects accel to the base_link centre, so the published data
-    # is ALREADY in base_link coordinates. Declare it base_link so
-    # robot_localization can fuse the absolute yaw: with "imu_link" there is no
-    # base_link->imu_link static transform anywhere (confirmed 2026-08-10 — imu_link
-    # missing from the TF tree), the EKF cannot transform the measurement and
-    # silently drops the orientation, and /odometry/filtered yaw is then pure gyro
-    # dead-reckoning that SLAM's scan matcher fights. Adding an imu_link static TF
-    # here is pointless while the data is already chassis-aligned (it would double
-    # the rotation), so base_link is both simpler and exact.
+    # is ALREADY in base_link coordinates. Declare it base_link — it IS the chassis
+    # frame. (Historical note: the old robot_localization EKF needed this too —
+    # with "imu_link" there was no base_link->imu_link static transform anywhere,
+    # so it silently dropped the measurement. Adding an imu_link TF remains
+    # pointless while the data is already chassis-aligned; it would double the
+    # rotation.) base_link is both simpler and exact.
     frame_id: "base_link"
     publish_rate: 20.0        # Hz; /imu/data rate. The robot_localization EKF (the
                               # reason for 50 Hz) was deleted in the Nav2 migration;
@@ -123,13 +121,12 @@ imu_driver:
     mount_pitch_deg: 0.0
     mount_yaw_deg: 0.0
     # Heading DIRECTION knob (-1 = mirrored). The BWT901CL's corrected yaw rotates
-    # OPPOSITE the wheel encoders (slam_nav logs "OPPOSITE SIGNS — set
-    # imu_yaw_sign: -1"; live spin test: command +CCW -> wheels +0.09 rad, IMU
-    # -0.85 rad). A yaw-only mount rotation can't invert a rotation sign, so this
-    # mirrors gyro-z + euler-yaw + mag-z at publish so /imu/data (EKF) and
-    # /imu/euler (slam_nav rotation prior) are both wheel-consistent. Set here,
-    # not in imu_mount.json: the web IMU card rewrites that file and would clobber
-    # it. Re-verify with the spin test after any physical remount.
+    # OPPOSITE the wheel encoders (live spin test: command +CCW -> wheels +0.09 rad,
+    # IMU -0.85 rad). A yaw-only mount rotation can't invert a rotation sign, so
+    # this mirrors gyro-z + euler-yaw + mag-z at publish so the published heading
+    # stays wheel-consistent. Set here, not in imu_mount.json: the web IMU card
+    # rewrites that file and would clobber it. Re-verify with the spin test after
+    # any physical remount.
     yaw_sign: -1.0
     # A web-UI change to either the offset or rotation above persists here (default
     # ~/.local/state/nanobot/imu_mount.json) and wins over the values above on the
@@ -137,15 +134,15 @@ imu_driver:
     mount_settings_path: ""
     # Disable gyro auto-calibration (register 0x63 = 0x0001). The BWT901CL's default
     # gyro bias auto-calibration continuously re-adjusts the zero-rate offset while
-    # still, causing slow yaw wander during stationary periods that the
-    # robot_localization EKF interprets as real rotation. Locking it keeps the bias
-    # fixed after power-on settle. Leave true unless you have a reason to disable it.
+    # still, causing slow yaw wander during stationary periods. Locking it keeps the
+    # bias fixed after power-on settle. Leave true unless you have a reason to
+    # disable it.
     disable_gyro_autocal: true
     # 6-axis fusion mode (register 0x24 = 0x01). When true, the IMU's internal
     # fusion uses only gyro+accel — the magnetometer is excluded from the yaw
     # estimate. The magnetometer near the LDS motor and wiring picks up magnetic
     # interference that disturbs the fused heading; 6-axis trades that for slow
-    # gyro bias drift instead, which the scan matcher in slam_nav absorbs
+    # gyro bias drift instead, which slam_toolbox's scan matcher absorbs
     # continuously. The manual cal commands (axis6/axis9) can still override this
     # until the next (re)connect.
     axis6_mode: true
@@ -231,7 +228,7 @@ behavior:
     # Traits (curiosity/extraversion/caution/playfulness) + the behaviour registry live in
     # the Sismic context, seeded from personality.json (made by scripts/personality_creator.py)
     # and persisted there as they drift. They gate which/when beats fire, colour the spoken
-    # lines, and (via /cognition/traits) nudge slam_nav's motion thresholds. Evolution is
+    # lines, and (via /cognition/traits) nudge the motion-authority mapping. Evolution is
     # smoothed; if the cognitive layer goes quiet for brain_timeout the chart reverts to the
     # seeded baseline. With no personality.json it uses the built-in defaults.
     # NOTE: brain_timeout is a PROCESS-DEATH failsafe, so it MUST stay well above reflect_period
@@ -248,8 +245,8 @@ behavior:
     nudge_pickup_caution: 0.92  # fast rule: being picked up eases caution toward this
     nudge_pickup_playful: 0.3   #            and playfulness toward this (startled)
     # --- vision-driven reflexes (fed by web_control's /vision/state @2 Hz) ---
-    # All expression/trait-level: caution only moves motion through slam_nav's own
-    # clamped trait_motion mapping (opt-in there). The clutter rule doubles as the
+    # All expression/trait-level: caution only moves motion through the trait_motion
+    # mapping (opt-in there). The clutter rule doubles as the
     # clutter VELOCITY THROTTLE when trait_motion is on: caution is held at >=
     # clutter_caution while the floor looks busy (cables/toys below the lidar plane)
     # and eased back to the pre-clutter value once it clears — reversible by design,
@@ -567,10 +564,13 @@ web_control:
     # web UI's Skills panel can invoke any of them. Narrative skills (say/observe/look) are
     # always safe; the gated "action tier" (topic-publishing skills, e.g. /led, /cmd_vel) only
     # runs when BOTH the skill sets enabled:true AND skills_allow_actions is on here. Motion is
-    # still clamped reflexively by slam_nav, so a skill can never make the robot unsafe.
+    # still clamped reflexively by Nav2's costmaps + the velocity smoother, so a skill can
+    # never make the robot unsafe.
     skills_enable: true        # load + offer the skill library
     skills_allow_actions: false  # permit topic-publishing (physical) skills — OFF by default
-    skills_dir: ""             # "" = installed share (<pkg>/skills) or the source tree skills/
+    skills_dir: ""             # "" = the nanobot-brain repo's skills/ (resolve_skills_dir:
+                               #      param > $NANOBOT_SKILLS_DIR > repo-root skills/ >
+                               #      installed share), resolved by the cognition core
     # Skill workshop: while in reflection mode, the robot mines its own experience (decision log) to
     # propose ONE new or improved capability, checks + rehearses it, then puts it on TRIAL. A
     # trial is a normal, immediately-usable skill; it earns permanence (adopt) after enough good

@@ -4,7 +4,8 @@
     pixi run python scripts/i2c_scan.py          # all /dev/i2c-* buses
     pixi run python scripts/i2c_scan.py 1        # just bus 1
 
-Expected on this robot: 0x40 (PCA9685) and 0x3c (SSD1306) on bus 1.
+Expected on this robot: 0x3c (SSD1306 OLED) on bus 0. (The old 0x40 PCA9685 on
+bus 1 is retired — the ESP32 coprocessor owns motors now.)
 Uses a zero-length write probe (fast NAK on absent addresses) rather than
 read_byte, which can stall some controllers.
 """
@@ -13,7 +14,7 @@ import sys
 
 from smbus2 import SMBus, i2c_msg
 
-KNOWN = {0x40: "PCA9685", 0x3C: "SSD1306"}
+KNOWN = {0x3C: "SSD1306"}
 
 
 def scan(busnum: int) -> None:

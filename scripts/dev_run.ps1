@@ -6,7 +6,8 @@
 
 .DESCRIPTION
   Loads the OpenRouter key from $env:OPENROUTER_API_KEY, or (if unset) from the gitignored
-  memory\openrouter_key file (one line - NEVER committed; memory\ is in .gitignore). Then
+  memory\openrouter_key file (one line - NEVER committed; only that key file is gitignored,
+  the rest of memory\ is tracked). Then
   launches scripts\dev_webui.py with --behavior. Extra args pass straight through to
   dev_webui.py.
 

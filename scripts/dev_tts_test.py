@@ -25,7 +25,6 @@ import sys
 
 # Import the robot's modules straight from src/ (they have no rclpy dependency).
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "..", "src", "web_control"))
 
 from web_control.tts import TtsEngine            # noqa: E402
 from nanobot_brain.cognition import LlmClient, MOODS     # noqa: E402

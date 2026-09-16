@@ -263,14 +263,14 @@ class ImuNode(Node):
                                         # tipped/twisted in any direction, not just a
                                         # flat spin.
             ("yaw_sign", 1.0),          # +1/-1: heading DIRECTION knob. Flip when the
-                                        # corrected yaw rotates OPPOSITE the wheels (the
-                                        # "OPPOSITE signs" alarm slam_nav raises). A
+                                        # corrected yaw rotates OPPOSITE the wheels (a
+                                        # live spin test shows the mismatch). A
                                         # yaw-only mount rotation can't invert the
                                         # rotation sign, so a residual flip means the
                                         # sensor is physically mirrored (upside-down /
                                         # edge-mounted). Mirrors gyro-z + euler-yaw +
-                                        # mag-z at publish, so /imu/data (EKF) and
-                                        # /imu/euler (slam_nav prior) stay consistent.
+                                        # mag-z at publish, so every published heading
+                                        # stays wheel-consistent.
             ("mount_settings_path", ""),  # "" -> ~/.local/state/nanobot/imu_mount.json;
                                            # persists offset_{x,y,z}_mm + mount_{roll,
                                            # pitch,yaw}_deg across restarts once set
@@ -278,14 +278,14 @@ class ImuNode(Node):
             ("disable_gyro_autocal", True),  # write 0x0001 to register 0x63 to disable
                                               # the BWT901CL's gyro auto-calibration.
                                               # Without this, the gyro bias estimate drifts
-                                              # continuously, which can cause slow yaw
-                                              # wander in the robot_localization EKF.
+                                              # continuously, which shows up as slow yaw
+                                              # wander while parked.
             ("axis6_mode", True),            # write 0x01 to register 0x24 to select
                                               # 6-axis fusion (gyro+accel only, no
                                               # magnetometer in yaw). The magnetometer
                                               # near motors/LDS wiring can disturb yaw;
                                               # 6-axis trades that for slow gyro bias
-                                              # drift instead, which slam_nav's scan
+                                              # drift instead, which slam_toolbox's scan
                                               # matcher absorbs continuously.
         ])
         g = self.get_parameter
@@ -322,12 +322,13 @@ class ImuNode(Node):
         self._mount_roll_deg = float(saved.get("mount_roll_deg", g("mount_roll_deg").value))
         self._mount_pitch_deg = float(saved.get("mount_pitch_deg", g("mount_pitch_deg").value))
         self._mount_yaw_deg = float(saved.get("mount_yaw_deg", g("mount_yaw_deg").value))
-        self._mount_m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg, self._mount_yaw_deg)
-        self._mount_m_t = _transpose3(self._mount_m)
+        m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg, self._mount_yaw_deg)
+        # One ATOMIC tuple (m, m_t, use) — the reader thread unpacks it in one read,
+        # so a live param update can never mix a new matrix with the old transpose.
         # A 0/0/0 mount is an exact identity (mount_matrix uses exact 0.0/1.0); with
         # the default no-mount config, skip the per-frame rotation + orientation
         # round-trip entirely (see _handle) instead of paying it every cycle.
-        self._use_mount = self._mount_m != _IDENTITY3
+        self._mount = (m, _transpose3(m), m != _IDENTITY3)
         self._yaw_sign = -1.0 if float(g("yaw_sign").value) < 0 else 1.0
         # Reflect the effective (possibly persisted-overridden) values back into the
         # actual ROS parameters -- not just internal state -- so `ros2 param get` and
@@ -453,10 +454,9 @@ class ImuNode(Node):
                 # Disable gyro auto-calibration: write 0x0001 to register 0x63.
                 # The BWT901CL's gyro bias auto-calibration continuously adjusts the
                 # zero-rate offset while the sensor is still, which causes slow yaw
-                # wander during stationary periods — problematic for the
-                # robot_localization EKF (it interprets the drift as real rotation).
-                # This lock disables that adjustment so the gyro bias stays fixed
-                # once the device has settled after power-on.
+                # wander during stationary periods. This lock disables that
+                # adjustment so the gyro bias stays fixed once the device has
+                # settled after power-on.
                 self.ser.write(bytes((0xff, 0xaa, 0x63, 0x01, 0x00)))
                 time.sleep(0.05)
             if self._axis6_mode:
@@ -465,14 +465,14 @@ class ImuNode(Node):
                 # near the LDS motor and wiring picks up magnetic interference
                 # that disturbs the fused heading; 6-axis mode eliminates that
                 # at the cost of slow gyro bias drift instead, which the scan
-                # matcher in slam_nav absorbs continuously.
+                # matcher in slam_toolbox absorbs continuously.
                 self.ser.write(bytes((0xff, 0xaa, 0x24, 0x01, 0x00)))
                 time.sleep(0.05)
             # Enforce the measurement ranges the decode constants above assume
             # (GYRO_SCALE = +/-2000 deg/s, ACC_SCALE = +/-16 g). These register
             # writes are idempotent re-sends on every (re)connect — but if the
             # unit boots on a narrower range the raw counts decode ~8x too big
-            # and the device's fused heading comes out scaled (EKF/SLAM garbage).
+            # and the device's fused heading comes out scaled (SLAM garbage).
             # BWT901CL register map (low-WitMotion): 0x29 accel range, 0x2b gyro
             # range, and the codes are INVERTED (0x00 = narrowest, 0x03 = widest):
             #   0x29: 0=+/-2g, 1=+/-4g, 2=+/-8g, 3=+/-16g
@@ -533,10 +533,11 @@ class ImuNode(Node):
                 # ALG register (0x24) = 1: 6-axis algorithm (gyro+accel only) -- the
                 # fused yaw this driver reports no longer incorporates the magnetometer,
                 # so a mag disturbance can no longer step the heading. Trades that for
-                # slow gyro bias drift instead, which slam_nav's scan matcher is built
-                # to absorb continuously (see the IMU card's "margins for good SLAM"
-                # hint) -- likely a net win near motors/LDS/wiring. Per WitMotion's
-                # documented register table; not verified against this specific unit.
+                # slow gyro bias drift instead, which slam_toolbox's scan matcher is
+                # built to absorb continuously (see the IMU card's "margins for good
+                # SLAM" hint) -- likely a net win near motors/LDS/wiring. Per
+                # WitMotion's documented register table; not verified against this
+                # specific unit.
                 self.ser.write(bytes((0xff, 0xaa, 0x24, 0x01, 0x00)))
                 self._publish_cal_status(
                     "6-axis mode set (magnetometer no longer fused into yaw) — press Save to keep it")
@@ -595,10 +596,9 @@ class ImuNode(Node):
                     self._mount_pitch_deg = float(p.value)
                 else:
                     self._mount_yaw_deg = float(p.value)
-                self._mount_m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg,
-                                              self._mount_yaw_deg)
-                self._mount_m_t = _transpose3(self._mount_m)
-                self._use_mount = self._mount_m != _IDENTITY3
+                m = mount_matrix(self._mount_roll_deg, self._mount_pitch_deg,
+                                  self._mount_yaw_deg)
+                self._mount = (m, _transpose3(m), m != _IDENTITY3)   # atomic swap
                 self._save_mount_settings()
         return SetParametersResult(successful=True)
 
@@ -697,12 +697,13 @@ class ImuNode(Node):
         if t not in _WANTED:            # skip time/port/etc. frames -> no unpack
             return
         a, b, c, _ = _UNPACK_FROM(buf, off)     # decode straight from the buffer
+        mm, mt, use_mount = self._mount
         if t == T_ACC:
-            self.acc = (rotate_mount((a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE), self._mount_m)
-                        if self._use_mount else (a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE))
+            self.acc = (rotate_mount((a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE), mm)
+                        if use_mount else (a * ACC_SCALE, b * ACC_SCALE, c * ACC_SCALE))
         elif t == T_GYRO:
-            gyro = (rotate_mount((a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE), self._mount_m)
-                    if self._use_mount else (a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE))
+            gyro = (rotate_mount((a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE), mm)
+                    if use_mount else (a * GYRO_SCALE, b * GYRO_SCALE, c * GYRO_SCALE))
             gyro = (gyro[0], gyro[1], gyro[2] * self._yaw_sign)
             if self._offset_m != (0.0, 0.0, 0.0):
                 now = time.monotonic()
@@ -713,14 +714,14 @@ class ImuNode(Node):
                 self._prev_gyro, self._prev_gyro_t = gyro, now
             self.gyro = gyro
         elif t == T_MAG:
-            mag = (rotate_mount((float(a), float(b), float(c)), self._mount_m)
-                   if self._use_mount else (float(a), float(b), float(c)))
+            mag = (rotate_mount((float(a), float(b), float(c)), mm)
+                   if use_mount else (float(a), float(b), float(c)))
             self.mag = (mag[0], mag[1], mag[2] * self._yaw_sign)
         elif t == T_ANGLE:
             roll_s, pitch_s, yaw_s = a * ANG_SCALE, b * ANG_SCALE, c * ANG_SCALE
-            if self._use_mount:
+            if use_mount:
                 self.euler_deg = correct_orientation(roll_s, pitch_s, yaw_s,
-                                                      self._mount_m, self._mount_m_t)
+                                                      mm, mt)
             else:
                 # identity mount: the Euler round-trip is a no-op to ~1e-13°, so skip
                 # the matrix compose/extract entirely (the default config's hot path)

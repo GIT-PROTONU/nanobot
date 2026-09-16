@@ -21,7 +21,7 @@ setup(
     zip_safe=True,
     maintainer="ib",
     maintainer_email="ib.elfaramawy@gmail.com",
-    description="rosbridge + static web control page.",
+    description="HTTP + SSE web control page and telemetry gateway (no rosbridge).",
     license="MIT",
     entry_points={
         "console_scripts": [

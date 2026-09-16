@@ -5,8 +5,8 @@
 # (robot_bringup/launch/visualize.launch.py).
 #
 # Prerequisites:
-#  - the robot is up: `stack.sh up` on the board (now also runs sim_hardware's
-#    so /map exists as a real topic (slam_toolbox publishes it transient-local) -- see CLAUDE.md "Remote RViz").
+#  - the robot is up: `stack.sh up` on the board (slam_toolbox publishes /map
+#    transient-local — see CLAUDE.md "Remote RViz").
 #  - same ROS_DOMAIN_ID / RMW_IMPLEMENTATION -- already guaranteed since both machines
 #    activate the SAME pixi.toml (its [activation.env] sets both).
 #  - the dev PC's zenoh session can reach the robot's zenohd-serial router. Same-LAN

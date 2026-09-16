@@ -301,7 +301,7 @@ class MonitorNode(Node):
 
     def _pipeline_diagnostic(self, now):
         """A DiagnosticStatus summarising the localization-pipeline feed freshness —
-        the answer to 'is my IMU / encoder / EKF actually feeding SLAM?'. The web UI
+        the answer to 'is my IMU / encoder feed actually reaching the graph?'. The web UI
         renders sensors/staleness; telemetry also carries the per-feed ages."""
         ok = True
         vals = []
@@ -342,7 +342,7 @@ class MonitorNode(Node):
         hz, hz_at = self._hz
         if hz == hz:
             v["lds"] = {"hz": num(hz, 2), "age": round(now - hz_at, 2)}
-        # Localization-pipeline feed ages + freshness (odom/EKF/imu) — the "why is the
+        # Localization-pipeline feed ages + freshness (odom/imu) — the "why is the
         # map frozen" answer at a glance. `ok` is true only when ALL feeds are fresh.
         pipe = {}
         pipe_ok = True

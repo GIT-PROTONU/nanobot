@@ -21,7 +21,9 @@ exceptions, so the common failure (a USB/UART device vanishing) is handled witho
 taking the process down.
 """
 import os
+import signal
 import socket
+import threading
 
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -95,8 +97,13 @@ def main():
     _sd_notify("READY=1")
     if nodes:                       # executor-liveness watchdog pet (see _sd_notify)
         nodes[0].create_timer(5.0, lambda: _sd_notify("WATCHDOG=1"))
+    # systemd Type=notify stops this unit with SIGTERM — handle it so destroy_node()
+    # (serial ports, TF broadcaster) actually runs, same contract as app_hub.
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     try:
-        ex.spin()
+        while rclpy.ok() and not stop.is_set():
+            ex.spin_once(timeout_sec=0.2)
     except KeyboardInterrupt:
         pass
     finally:

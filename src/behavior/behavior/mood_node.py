@@ -1,8 +1,8 @@
 """Idle "feel alive" presence supervisor — the behaviour layer's ROS node.
 
 This is the ROS *glue* around the brain. The slow, declarative thinking lives in two
-ROS-free modules so it can be unit-tested offline (`pixi run python -m pytest
-src/behavior/test`):
+ROS-free modules so it can be unit-tested offline (in the nanobot-brain repo:
+`cd ../nanobot-brain && pixi run python -m pytest tests/`):
 
   * `presence.py` — the Sismic statechart (states + timed transitions + the personality
     context the guards read).
@@ -19,7 +19,7 @@ semantic signals, and on each tick steps the chart and delegates to `PurposeBrai
   * **Expression only.** It NEVER publishes `/cmd_vel` (or anything that moves the robot),
     so it cannot affect motion safety. The worst it can do is show a face on the OLED.
   * **It yields the panel.** The OLED face has other legitimate owners (the web UI's manual
-    mood buttons, TTS "karaoke" words, slam_nav's pick-up reaction). This node animates a
+    mood buttons, TTS "karaoke" words). This node animates a
     face only during *true idle* and "stands down" the instant any of those takes over.
   * **Degrades to nothing.** If Sismic isn't importable, or the node is disabled by param,
     it spins doing nothing — the rest of the stack is unaffected.
@@ -41,9 +41,9 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, String, Int8
 from geometry_msgs.msg import Twist, PoseStamped
 
-from nanobot_brain.behavior import build_interpreter, BEATS, clamp01
+from nanobot_brain.behavior import build_interpreter, clamp01
 from nanobot_brain.behavior import PurposeBrain, Personality
-from nanobot_brain.behavior import Schedule, merge_beats, load_json, save_json, _state_path
+from nanobot_brain.behavior import Schedule, merge_beats, load_json, save_json, state_path
 
 # Sismic is a pure-python pip/pixi dependency (see pixi.toml [pypi-dependencies]).
 # Import defensively so a board that hasn't run `pixi install` yet still boots the
@@ -90,8 +90,8 @@ class MoodNode(Node):
             ("nudge_pickup_caution", 0.92), # fast rule: being picked up eases caution toward this
             ("nudge_pickup_playful", 0.3),  #            and playfulness toward this (startled)
             # --- vision-driven reflexes (fed by web_control's /vision/state feed; all
-            #     expression/trait-level — motion only changes through slam_nav's own
-            #     clamped caution mapping, and only if its trait_motion opt-in is on) ---
+            #     expression/trait-level — motion only changes through the trait_motion
+            #     caution mapping, and only if its opt-in is on) ---
             ("vision_fresh_secs", 3.0),        # a /vision/state older than this = stand down
             ("vision_caution_enable", True),   # looming/clutter -> caution fast rules
             ("nudge_looming_caution", 0.85),   # looming startle eases caution toward this
@@ -167,7 +167,7 @@ class MoodNode(Node):
         self._ambient_delta = max(0.01, float(g("ambient_warmth_delta").value))
         self._novelty_boost = max(0.0, float(g("novelty_boost").value))
         self._vision = ({}, -1e9)      # (latest /vision/state dict, monotonic arrival)
-        self._schedule_path = _state_path(g("schedule_path").value, "schedule.json")
+        self._schedule_path = state_path(g("schedule_path").value, "schedule.json")
         _sched_data = load_json(self._schedule_path, logger=self.get_logger().warning) or {}
         self._schedule = Schedule(_sched_data.get("entries", []), logger=self.get_logger().warning)
 
@@ -196,8 +196,8 @@ class MoodNode(Node):
         # this into the /reflect state command we (and it) act on, so there's one entry path
         # for both the manual web toggle and this autonomous trigger.
         self.reflect_req_pub = self.create_publisher(Bool, "reflect_request", 10)
-        # Latched readouts so late subscribers (slam_nav's motion clamp, web_control's
-        # reflection, the web UI brain card) get them immediately; PurposeBrain/Personality
+        # Latched readouts so late subscribers (web_control's reflection, the web UI
+        # brain card) get them immediately; PurposeBrain/Personality
         # also republish them on a slow heartbeat for late (volatile-QoS) rosbridge subs.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Brain health: publish our status so web_server (and the web UI via HTTP) can monitor
@@ -206,8 +206,8 @@ class MoodNode(Node):
         self._cognition_alive = True                      # starts optimistic
         self._last_cognition_ping = time.monotonic()
         self._beat_last = {}
-        # Latched readouts so late subscribers (slam_nav's motion clamp, web_control's
-        # reflection, the web UI brain card) get them immediately; PurposeBrain/Personality
+        # Latched readouts so late subscribers (web_control's reflection, the web UI
+        # brain card) get them immediately; PurposeBrain/Personality
         # also republish them on a slow heartbeat for late (volatile-QoS) rosbridge subs.
         self.traits_pub = self.create_publisher(String, "cognition/traits", latched)
         self.purpose_pub = self.create_publisher(String, "purpose", latched)
@@ -232,7 +232,7 @@ class MoodNode(Node):
         # defaults — lets a beat be tuned, or a whole new one added (paired with a registry
         # entry), by editing JSON alone. Best-effort: absent/malformed -> the built-in BEATS.
         self._beats = merge_beats(load_json(
-            _state_path(g("beats_path").value, "beats.json"), logger=self.get_logger().warning))
+            state_path(g("beats_path").value, "beats.json"), logger=self.get_logger().warning))
 
         # INVARIANT: brain_timeout MUST stay well above reflect_period (purpose_period) --
         # it's a process-death failsafe, and if it's shorter than the gap between
@@ -345,7 +345,7 @@ class MoodNode(Node):
                 attend_secs=float(g("attend_secs").value),
                 feel_secs=float(g("feel_secs").value),
                 rng=random.Random(),          # the idle-beat lottery + burst/attend gates
-                chart_path=_state_path(g("chart_path").value, "presence_chart.yaml"),
+                chart_path=state_path(g("chart_path").value, "presence_chart.yaml"),
                 beats=self._beats, tempo=self._tempo,
                 ambient_mood=self._ambient_mood, beat_boosts=self._beat_boosts)
             self._personality.attach(self._interp)
@@ -372,7 +372,7 @@ class MoodNode(Node):
     def _emit_face(self, mood):
         """Publish a mood on /oled_face. Called both by the statechart (`on entry`) and
         by the node to release the panel. Records the value so the /oled_face
-        subscription can tell our own echo from a foreign (web/slam_nav) mood."""
+        subscription can tell our own echo from a foreign (web) mood."""
         mood = str(mood)
         self._self_face = (mood, time.monotonic())
         self._owns_face = bool(mood)
@@ -591,8 +591,8 @@ class MoodNode(Node):
         self._last_word_t = time.monotonic()
 
     def _on_face(self, msg: String):
-        """Track whether someone ELSE is driving the face (web manual mood, or
-        slam_nav's pick-up reaction). Suppress our own echo so we don't stand down
+        """Track whether someone ELSE is driving the face (web manual mood).
+        Suppress our own echo so we don't stand down
         from a face we set ourselves."""
         data = msg.data
         sf, st = self._self_face

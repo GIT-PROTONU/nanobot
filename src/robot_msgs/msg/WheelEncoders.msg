@@ -1,6 +1,6 @@
-# Raw cumulative quadrature counts straight from the encoder node.
-# Useful for debugging / dead-reckoning sanity checks; odometry is published
-# separately as nav_msgs/Odometry by wheel_odometry.
+# Raw cumulative single-channel (rising-edge, NOT quadrature) counts straight
+# from the encoder node. Useful for debugging / dead-reckoning sanity checks;
+# odometry is published separately as nav_msgs/Odometry by wheel_odometry.
 std_msgs/Header header
 int64 left_ticks
 int64 right_ticks

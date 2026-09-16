@@ -357,6 +357,7 @@ static void declare_lv(const char* topic, const char* type, int eid){
     "@ros2_lv/" DOMAIN "/" NODE_ZID "/0/%d/MP/%%/%%/" NODE_NAME "/%%%s/%s/TypeHashNotSupported/:1:,1:,:,:,,",
     eid, topic, type);
   z_view_keyexpr_t vke; z_view_keyexpr_from_str_unchecked(&vke, ke);
+  if (g_lv_n >= (int)(sizeof(g_lv)/sizeof(g_lv[0]))) return;   // 1 spare slot today
   z_liveliness_declare_token(z_session_loan(&s), &g_lv[g_lv_n++], z_view_keyexpr_loan(&vke), NULL);
 }
 
@@ -368,7 +369,8 @@ static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz
 // (last GID byte, unique per publisher) and the liveliness entity id (lv_eid, also
 // unique). The declare loop and the liveliness loop both walk this, so the two can't
 // drift. These wire identities are PROVEN-GOOD against the live graph — don't renumber
-// existing entries; new ones just take the next free tag/eid (11 was free).
+// existing entries; new ones just take the next free tag/eid (12 is the g_lv[] limit,
+// so there is one spare slot left).
 struct PubDef { ZPub* zp; const char* topic; const char* type; uint8_t gid_tag; int lv_eid; bool lds_only; };
 static const PubDef PUBS[] = {
   { &P_ticks, "wheel_ticks",           T_I64A, 1, 1, false },
@@ -388,7 +390,11 @@ static void zpub_declare(ZPub& zp, const char* topic, const char* type, uint8_t 
   char keyexpr[160];
   snprintf(keyexpr, sizeof(keyexpr), DOMAIN "/%s/%s/TypeHashNotSupported", topic, type);
   z_view_keyexpr_t ke; z_view_keyexpr_from_str_unchecked(&ke, keyexpr);
-  z_declare_publisher(z_session_loan(&s), &zp.p, z_view_keyexpr_loan(&ke), NULL);
+  // A failed declare is otherwise silent — "zenoh CONNECTED" would print while one
+  // topic never appears in the graph. Log loudly; the ping watchdogs only catch a
+  // TOTAL session failure, not one missing feed.
+  if (z_declare_publisher(z_session_loan(&s), &zp.p, z_view_keyexpr_loan(&ke), NULL) < 0)
+    Serial.printf("[nano] declare publisher FAILED: %s\n", topic);
   zp.seq = 0;
   static const uint8_t base[16] = {0x60,0x7c,0xc3,0x6d,0x07,0x32,0xd1,0x86,
                                    0xf5,0xb0,0x9b,0x47,0xb9,0xa6,0x22,0x00};
@@ -531,30 +537,38 @@ static bool zenohConnect(){
   z_view_keyexpr_t ke;
   z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
   z_closure_sample(&cl, cmd_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_cmd, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_cmd, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_cmd");
   z_view_keyexpr_from_str_unchecked(&ke, KE("led",T_BOOL));
   z_closure_sample(&cl, led_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_led, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_led, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_led");
   z_view_keyexpr_from_str_unchecked(&ke, KE("fan_pwm",T_F32));
   z_closure_sample(&cl, fan_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_fan, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_fan, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_fan");
   z_view_keyexpr_from_str_unchecked(&ke, KE("motor_trim",T_F32));
   z_closure_sample(&cl, trim_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_trim, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_trim, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_trim");
   z_view_keyexpr_from_str_unchecked(&ke, KE("reset_ticks",T_BOOL));
   z_closure_sample(&cl, reset_ticks_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_reset, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_reset, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_reset");
   z_view_keyexpr_from_str_unchecked(&ke, KE("motor_accel",T_F32));
   z_closure_sample(&cl, motor_slew_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_accel, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_accel, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_accel");
   z_view_keyexpr_from_str_unchecked(&ke, KE("laser_pwm",T_I32A));
   z_closure_sample(&cl, laser_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_laser, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_laser, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_laser");
 #if LINK_RX_TIMEOUT_MS
   static z_owned_subscriber_t sub_ping;
   z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
   z_closure_sample(&cl, ping_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_ping, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_ping, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_ping");
   g_last_ping_ms = millis(); g_ping_seen = false;   // (re)arm fresh on each (re)connect
 #endif
 
@@ -566,7 +580,8 @@ static bool zenohConnect(){
 #if LDS_ENABLED
   z_view_keyexpr_from_str_unchecked(&ke, KE("lds_target_rpm",T_F32));
   z_closure_sample(&cl, ldstgt_cb, NULL, NULL);
-  z_declare_subscriber(z_session_loan(&s), &sub_tgt, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_tgt, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_tgt");
 #endif
 
   Serial.println("[nano] zenoh CONNECTED");
@@ -874,7 +889,7 @@ void loop(){   // Core 1: real-time control
     last_ctl=now;
     bool cmd_stale = (now-g_last_cmd_ms > CMD_TIMEOUT_MS);
     if (cmd_stale){ g_left_duty=0; g_right_duty=0; }
-    // Ramp the applied duty toward the commanded duty (see MOTOR_SLEW_PER_S) instead of
+    // Ramp the applied duty toward the commanded duty (see g_motor_slew / MOTOR_SLEW_DEFAULT) instead of
     // stepping straight to it — smooths starts, stops, and direction reversals. Skipped on
     // a stale cmd so the dead-man stop is instant, not a ramped coast-down.
     static float l_ramped=0, r_ramped=0;

@@ -4,7 +4,7 @@
 Boots the REAL installed executables on this machine (a zenoh router when the env
 ships one, sys_monitor, and app_hub = web_control+oled_display+behavior) and drives
 the same surface a browser uses. This is the contract check for the /telemetry frame
-(telemetry.py <-> app.js have no type system between them), the publish/param
+(telemetry.py <-> the page have no type system between them), the publish/param
 whitelists, the vitals blob, and the SIGTERM shutdown path. Missing hardware is fine:
 every node degrades (no OLED/camera/TTS/LLM) without failing the gateway.
 
@@ -157,11 +157,15 @@ def main():
                        {"node": "slam_nav", "name": "match_lin", "value": 0})
         check("non-whitelisted param refused", b"not whitelisted" in body, body[:80])
         st, body = req("POST", "/drive", {"v": 0.1, "w": 0.0})
-        check("drive accepted", st == 200 and b'"v": 0.1' in body, body[:80])
+        try:
+            echo_v = json.loads(body)["v"]
+        except Exception:
+            echo_v = None
+        check("drive accepted", st == 200 and echo_v == 0.1, body[:80])
 
         # --- GPU vision frame contract (gpu_vision_enable defaults true; no camera on
         # this dev host, so GpuVision degrades to idle defaults -- the KEYS must still
-        # be present, that's the contract telemetry.py <-> app.js share) ------------
+        # be present, that's the contract telemetry.py <-> the page share) ------------
         vision = None
         for f in sse_frames(time.monotonic() + 6.0):
             if "vision" in f:

@@ -45,7 +45,7 @@ MIN_READ_CHUNK = 256
 # Compact scan blob for the web UI (see scan_blob.write_scan_blob): the browser polls it
 # same-origin (served by web_control from /dev/shm) and draws it directly — so /scan (the
 # heaviest message) no longer has to be bridged over rosbridge just to show the lidar.
-# Mirrors how slam_nav serves the occupancy map. Shared with the Gazebo dev-sim bridge
+# Mirrors how slam_toolbox serves its map topics. Shared with the Gazebo dev-sim bridge
 # (sim_hardware) so both write the identical format.
 
 
@@ -115,7 +115,8 @@ class LdsNode(Node):
     def __init__(self):
         super().__init__("lds_driver")
         self.declare_parameters("", [
-            ("port", "/dev/ttyS1"), ("baud", 115200), ("frame_id", "laser"),
+            # default matches robot.yaml — ttyS1 is the ESP32 zenoh link; the LDS lives on ttyS2
+            ("port", "/dev/ttyS2"), ("baud", 115200), ("frame_id", "laser"),
             ("clockwise", True), ("angle_offset_deg", 0.0),
             ("range_min", 0.12), ("range_max", 6.0), ("publish_rate", 10.0),
         ])

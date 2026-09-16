@@ -88,7 +88,8 @@ class EncoderNode(Node):
         self.tf_bc = TransformBroadcaster(self)
 
         # ESP32 /wheel_ticks liveness: if the coprocessor link dies, /odom keeps
-        # publishing the last integrated pose and the EKF/slam chain silently freezes.
+        # publishing the last integrated pose and the slam_toolbox odom chain
+        # silently freezes.
         # Timeout high enough that a slow boot or transient gap isn't a false alarm.
         self._last_tick_at = time.monotonic()
         self._tick_lost_warn = False
@@ -140,7 +141,7 @@ class EncoderNode(Node):
 
     def _check_ticks_alive(self):
         """Troubleshooting aid: if /wheel_ticks goes silent, /odom freezes silently
-        (it keeps republishing the last pose) and the EKF/SLAM chain stalls. Warn once
+        (it keeps republishing the last pose) and the SLAM chain stalls. Warn once
         per outage with an actionable cause instead of leaving the operator wondering
         why the robot's position stopped moving."""
         age = time.monotonic() - self._last_tick_at
