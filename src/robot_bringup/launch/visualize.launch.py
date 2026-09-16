@@ -8,7 +8,7 @@ laser_link/imu_link) and `rviz2`. It deliberately does NOT relaunch wheel_odomet
 the nav2 container, sensor_hub, etc. -- the robot is already publishing all of that; a
 second copy on the dev PC would just be a second, redundant publisher of the same topics.
 
-Prerequisites (see CLAUDE.md "Remote RViz"):
+Prerequisites (see AGENTS.md "Remote RViz"):
   - the robot is up (`stack.sh up` -- slam_toolbox publishes /map as a real
     transient-local topic, so remote RViz gets it over the zenoh graph)
   - the dev PC's rmw_zenoh session can reach the robot's zenohd-serial router (same

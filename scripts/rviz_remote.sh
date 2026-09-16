@@ -6,7 +6,7 @@
 #
 # Prerequisites:
 #  - the robot is up: `stack.sh up` on the board (slam_toolbox publishes /map
-#    transient-local — see CLAUDE.md "Remote RViz").
+#    transient-local — see AGENTS.md "Remote RViz").
 #  - same ROS_DOMAIN_ID / RMW_IMPLEMENTATION -- already guaranteed since both machines
 #    activate the SAME pixi.toml (its [activation.env] sets both).
 #  - the dev PC's zenoh session can reach the robot's zenohd-serial router. Same-LAN

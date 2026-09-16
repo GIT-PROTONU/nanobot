@@ -813,7 +813,7 @@ def run_behavior(state, idle_secs, reflect_secs):
     # Scheduled routines (parity with mood_node._check_schedule): fire a NAMED skill once a
     # day at a local HH:MM, independent of the idle-beat cadence. Same schedule.json shape
     # as the robot (hand-editable here; the web UI's Schedule card is robot-only, like the
-    # rest of /telemetry — see CLAUDE.md's web_control note).
+    # rest of /telemetry — see AGENTS.md's web_control note).
     schedule = Schedule(read_json(_dev_state("schedule.json"), {}).get("entries", []),
                         logger=lambda m: print(f"[behavior] {m}", file=sys.stderr))
     clock = SimulatedClock()

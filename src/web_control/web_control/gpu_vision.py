@@ -1,6 +1,6 @@
 """GPU-accelerated webcam vision (Mali-450/GLES2 via `lima`): continuous YUYV capture,
 on-GPU motion-diff ("PIR") + colour-threshold blob tracking, and a JPEG-encoded live-view
-tee for the browser. See CLAUDE.md / memory `gpu-vision-*` for the full design writeup —
+tee for the browser. See AGENTS.md / memory `gpu-vision-*` for the full design writeup —
 this implements the "flip camera ownership" architecture: GpuVision is the sole, continuous
 camera owner; the browser's live view is a downstream tee off the same captured frames, not
 a second V4L2 session.

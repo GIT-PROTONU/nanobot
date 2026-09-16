@@ -1,12 +1,82 @@
 # AGENTS.md — Nano robot
 
+Open work items live in [`docs/TODO.md`](docs/TODO.md) (consolidated 2026-09-16).
+Guidance for working in this repo. See `README.md` for the human-facing setup.
+
+## What this is
+**Nano** — a mobile robot on a **NanoPi NEO Plus2 (Allwinner H5, aarch64, 1 GB RAM)**
+running **Armbian**, with **ROS 2 Humble** installed as conda packages via
+**pixi + RoboStack** (channel `robostack-staging`). Middleware is **`rmw_zenoh`**
+(chosen for low RAM; needs `rmw_zenohd` running). The web UI is **a static HTML page
+served by `web_control`, which is also the browser's only gateway** — there is **NO
+rosbridge** (removed 2026-07-06; it cost ~a full core with the UI open).
+
+> **Two planes.** The typed ROS/zenoh graph is the *control plane* (small messages,
+> few Hz; incl. the ESP32 via zenoh-pico through `zenohd-serial`). Heavy/browser data
+> is the *data plane*: `/dev/shm` blobs + HTTP (`/scan.bin`, `/map`, camera, mic, TTS)
+> and ONE Server-Sent-Events stream (`GET /telemetry`, `web_control/telemetry.py`)
+> carrying every light readout as a ~5 Hz JSON frame built once and fanned out to all
+> viewers. Writes from the page are whitelisted POSTs: `/drive` (teleop), `/publish`
+> (topic pokes, clamped per topic), `/param` (live-tune sliders). The telemetry
+> subscriptions are created only while a browser is connected, so a closed page costs
+> nothing. Going zenoh-all-the-way to the browser (zenoh-ts) was considered and
+> rejected — you'd hand-decode CDR in JS.
+
+Hardware: Roborock **LDS02RR** lidar (scan on **UART2 `/dev/ttyS2`**; RPM also read by
+the ESP32), single-channel **wheel
+encoders** + **motors** (now via an **ESP32-WROOM coprocessor**, see below),
+**PCA9685** PWM (I2C, now unused by the stack), **SSD1306** OLED (I2C), **BWT901CL**
+IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
+
 ## Build & run
 
-- Build: `pixi run build` (runs `scripts/build.sh` — colcon + explicit CMake Python hints for RoboStack). Python pkgs are `--symlink-install` (edit + restart, no rebuild).
-- **Do NOT add `rust`/`clang`/`libclang` to `pixi.toml`.** The LDS is driven by the pure-Python `lds_driver_py`; the old Rust `lds_driver` node was abandoned and removed. The toolchain would pull ~1.6 GB onto the 7 GB board.
-- Runtime on the board: `scripts/stack.sh {up|down|restart|status}` — a thin wrapper over systemd (`nano-robot.target`). Nodes launched by direct executable path (not `ros2 run`) to save RAM. `rmw_zenoh` router must start first.
-- Zenoh needs a serial-capable `zenohd` binary (conda builds lack `transport_serial`). Build with `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`.
-- Auto-starts via systemd `nano-robot.target` — 7 units: `nano-router`, `nano-app`, `nano-sensors`, `nano-nav`, `nano-tf`, `nano-slam`, `nano-nav-loader` (installed by `deploy/sbc-setup.sh`; `nano-stack.service` + `nano-heal.timer` are retired). Restart/recovery is systemd's (`Restart=on-failure`); `stack.sh down` → verify → `up` is still the clean cycle after a deploy.
+- Build: `pixi run build` (runs `scripts/build.sh` — colcon + explicit CMake Python hints for RoboStack; msgs + all python pkgs). There is **no `build-lds`/`build-all`** — the Rust node and its toolchain are intentionally gone. Python pkgs are `--symlink-install` (edit + restart, no rebuild).
+- **Do NOT add `rust`/`clang`/`libclang` to `pixi.toml`.** The LDS is driven by the pure-Python `lds_driver_py`; the old Rust `lds_driver` node was abandoned and removed. The toolchain would pull ~1.6 GB onto the 7 GB board (a note in `pixi.toml` guards this).
+
+- **`pixi run smoke`** (`scripts/smoke_test.py`) — the end-to-end contract check: boots
+  the real router + sys_monitor + app_hub on the dev PC and asserts the /telemetry
+  frame keys, the publish/param whitelists, the OLED-face echo, the vitals blob, and
+  the SIGTERM shutdown path. **Run it before deploying** — the telemetry frame is a
+  typed-nowhere contract between `telemetry.py` and the web page, and this is what catches
+  a drift.
+
+- Run the stack: **`scripts/stack.sh {up|down|restart|status}`** — now a thin wrapper
+  over **systemd**. The stack is seven units under **`nano-robot.target`**:
+  `nano-router` (zenohd-serial) → `nano-sensors` (sensor_hub = imu+sys+odom+lds) →
+  `nano-nav` (ONE `rclcpp_components/component_container_isolated` hosting the Nav2
+  servers + their lifecycle manager; components attached by the `nano-nav-loader`
+  oneshot via `nav2.launch.py load_only:=true`) → `nano-tf` (the static
+  `base_link→laser` TF with yaw π — its OWN unit: a never-exiting ExecStartPost would
+  hold a Type=simple unit in "activating" forever) → `nano-slam` (slam_toolbox 2.6.10,
+  own process) →
+  `nano-app` (app_hub = web+oled+behavior).
+  (The old `nano-ekf`/`nano-map` units died with the Nav2 migration — the EKF and the
+  map blob bridge are gone.)
+  Ordering (`After=nano-router.service` + the router unit's ExecStartPost probe that
+  waits for :7447 to actually accept) encodes the rmw_zenoh island gotcha; nav/slam
+  start after sensors (need /odom + /scan). **Crash recovery is `Restart=on-failure`**, and
+  **hang recovery is the systemd watchdog**: app/sensors are `Type=notify` and pet
+  `WATCHDOG=1`
+  every 5 s from an *executor timer* (`_sd_notify` in each main), so an alive-but-wedged
+  executor (a stuck callback) stops petting and gets restarted (`WatchdogSec=90`). The
+  nav units are `Type=simple` (stock C++ binaries, no watchdog) guarded instead by
+  `CPUAffinity=2 3` + `Nice=10` + `MemoryMax=400M` (Ceres's thread spike + pose-graph
+  growth). Each unit also has a
+  `MemoryMax` cap so a leak restarts that hub instead of waking the kernel OOM killer.
+  (The old `nano-heal.timer` polling — and its heal-vs-restart duplicate-node race —
+  is gone.)
+  What each unit execs lives in ONE place: **`scripts/unit_exec.sh`** (pixi env
+  activation via `pixi shell-hook`, then `exec` of the installed executable — no
+  resident wrapper, no `ros2 run` RAM overhead). Logs: `journalctl -u nano-app` etc.
+
+- Auto-starts on boot via systemd `nano-robot.target`. `nano-stack.service` + `nano-heal.timer` are retired. Restart/recovery is systemd's (`Restart=on-failure`); `stack.sh down` → verify via `/proc` → `up` is still the clean cycle after a deploy (`stack.sh restart` can leave stale processes holding ports — see Gotchas).
+- Zenoh needs a serial-capable `zenohd` binary (conda builds lack `transport_serial`). Build with `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; the `nano-router` systemd unit (via `scripts/unit_exec.sh router`) runs it on the board so the ESP32 (serial) and the rmw_zenoh nodes (TCP) share a graph.
+
+- OS-level setup (overlays, udev, groups, sudoers, systemd units) is scripted in
+  **`deploy/sbc-setup.sh`** (idempotent; run once after a reflash + reboot).
+  stack.sh's start/stop/restart go through scoped NOPASSWD sudoers rules it installs
+  (deploy/sudoers).
+
 - Dev PC offline testing: `scripts/dev_webui.py` serves the real web UI + cognition (no ROS).
 
 ## Tests
@@ -34,6 +104,70 @@
   
   Install via `pip install -e /path/to/nanobot-brain` or add to `pixi.toml` as a pypi dependency.
 
+## Dev/prod ROS parity + Gazebo sim
+There are now **two dev paths**, not one, serving different purposes:
+- **`scripts/dev_webui.py` / `dev_run.ps1`** (Windows, no ROS at all) — unchanged, still
+  the fastest way to iterate on the LLM/personality/TTS layer (see the LLM/cognition
+  section below). Doesn't run `web_control`'s rclpy node, `oled_display`,
+  `behavior/mood_node`, `wheel_odometry`, or the nav stack — it's a ROS-free stand-in for
+  just the AI/Speak/Brain cards.
+- **`scripts/sim_run.sh`** (Ubuntu/Linux dev PC, real ROS 2 via the SAME `pixi.toml`
+  RoboStack env the board uses — `linux-64` is already one of its `platforms`) — runs
+  the **exact same node graph** as the robot: `web_control`, `oled_display`,
+  `behavior/mood_node`, `sys_monitor`, `wheel_odometry`, the Nav2 container
+  (`launch/nav2.launch.py`: planner/controller/bt_navigator/behaviors/lifecycle
+  manager + slam_toolbox) are all real,
+  unmodified nodes. Only the lowest hardware-transducer layer differs: **Gazebo
+  Sim** (`ros_gz_sim`, the modern actively-maintained "Ignition"-lineage simulator —
+  `robostack-staging` doesn't cleanly ship classic `gazebo_ros_pkgs` for Humble, but does
+  ship `ros-gz-*`) plus `ros_gz_bridge` and the `sim_hardware` package stand in for
+  the LDS02RR/BWT901CL/ESP32. `sim_hardware.sim_bridge_node` converts Gazebo's bridged
+  wheel-joint angles into `/wheel_ticks` (so the **real** `wheel_odometry` node still
+  does the integration — Gazebo's own diff-drive odometry is deliberately not used) and
+  its bridged IMU into `/imu/euler`+`/imu/web` matching `imu_driver`'s exact contract.
+  The webcam/mic aren't simulated at all — `mjpeg_camera.py`/`mic_audio.py` are
+  V4L2/ALSA and just use the dev PC's real ones.
+  - `robot_bringup/launch/bringup.launch.py` (replaces the previously-stale
+    `robot.launch.py`, which still referenced the abandoned Rust LDS node +
+    `micro_ros_agent`) is the single launch description for both: `sim:=false` (default)
+    launches the real `lds_driver_py`/`imu_driver` — a `ros2 launch`-based **debug**
+    alternative to the systemd units (which stay the production launcher, for their
+    RAM-saving direct-executable approach; note the launch path runs the nodes as
+    separate processes, not the hubs — same graph, more RAM, fine on a dev PC);
+    `sim:=true` swaps those for Gazebo +
+    `ros_gz_bridge` + `sim_hardware`. `rviz:=true` also opens RViz2
+    (`robot_bringup/rviz/nano.rviz`: RobotModel/TF/LaserScan/Map/Odometry).
+  - The Gazebo/RViz/`ros_gz_*`/`xacro`/`robot_state_publisher` deps live under
+    `pixi.toml`'s **`[target.linux-64.dependencies]`**, not the top-level
+    `[dependencies]` table, so none of it ever resolves onto the board
+    (`linux-aarch64`) — same "don't bloat the 1 GB/7 GB board" discipline as the
+    rust/clang ban below.
+  - `pixi run sim` / `scripts/sim_run.sh` build + launch it (the script additionally
+    resolves `OPENROUTER_API_KEY` and pre-warms the phrase bank, mirroring
+    `dev_run.ps1`'s job for the ROS-free path).
+
+### Remote RViz (the REAL robot, not a simulation)
+A third option, orthogonal to the two dev paths above: watch the **physical robot live**
+in RViz from the dev PC while it runs its own systemd stack unchanged — no Gazebo, no sim.
+- `scripts/rviz_remote.sh` (optionally `--connect <robot-ip>`) / `pixi run visualize` runs
+  `robot_bringup/launch/visualize.launch.py`, which starts **only**
+  `robot_state_publisher` + `rviz2` — deliberately NOT `wheel_odometry`/the nav stack/
+  `sensor_hub`/etc. a second time (the robot is already publishing all of that; a second
+  copy on the dev PC would just be a redundant duplicate publisher on the same topics).
+  `/scan`, `/odom`, `/imu/euler`, TF, `/map` all stream in over the shared `rmw_zenoh`
+  graph.
+- **`/map` is a real ROS topic now**: slam_toolbox publishes it transient-local, so a
+  remote RViz simply subscribes over the zenoh graph (the old `/dev/shm` map blob +
+  `nano-map` bridge unit are gone with slam_nav).
+- **Cross-host zenoh discovery**: `ROS_DOMAIN_ID`/`RMW_IMPLEMENTATION` already match by
+  construction (both machines activate the same `pixi.toml`). Same-LAN zenoh multicast
+  scouting usually finds the robot's `zenohd-serial` router with no extra config; if not
+  (blocked multicast / different subnet), `rviz_remote.sh --connect <ip>` writes a small
+   session config pointing at `tcp/<ip>:7447` and sets `ZENOH_SESSION_CONFIG_URI` — if
+   `ros2 topic list` on the dev PC doesn't show the robot's topics, check the installed
+   `rmw_zenoh_cpp` version's docs for the current session-config env var/schema.
+   Cross-host discovery is not yet tested end-to-end (tracked in `docs/TODO.md`).
+
 ## Architecture
 
 | Package | Role |
@@ -52,6 +186,239 @@
 | `sim_hardware` | Dev-PC-only Gazebo hardware stand-in (`bringup.launch.py sim:=true`) |
 
 Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in one component container (unit `nano-nav`, loaded by `nano-nav-loader`) + **slam_toolbox 2.6.10** as its own process (unit `nano-slam`); the static `base_link→laser` TF is its own `nano-tf` unit. The custom `slam_nav` package and the robot_localization EKF were deleted 2026-09-14 (`docs/nav2-migration.md`).
+
+### src/ layout in depth (`src/`)
+- `robot_msgs` — custom interfaces (ament_cmake).
+- `robot_bringup` — launch files + **the config `config/robot.yaml`** (all
+  ports/pins/rates) + **`config/nav2/`** (`nav2_params.yaml` for the Nav2 Humble
+  servers + slam_toolbox 2.6.10, and `recovery_bt.xml` — the minimal fail→clear
+  costmaps→back up→spin→retry BT). **Navigation = Nav2 + slam_toolbox** (the custom
+  `slam_nav` node and the robot_localization EKF were retired 2026-09-14 — see
+  [`docs/nav2-migration.md`](docs/nav2-migration.md): slam_toolbox turns `/scan` +
+  `/odom` into `/map` + the `map→odom` TF; the Nav2 servers plan/drive to
+  `/goal_pose` and publish `/cmd_vel` straight to the ESP32 contract).
+  `launch/bringup.launch.py` is the one node graph shared
+  by the real robot and the Gazebo dev-sim (`sim:=true`/`rviz:=true` args) — see
+  "Dev/prod ROS parity + Gazebo sim" below. Also holds `launch/nav2.launch.py`
+  (the ONE component container for the Nav2 servers + the `load_only:=true`
+  systemd pairing + the static `base_link→laser` TF with yaw π for this unit's
+  back-facing sensor head), the URDF (`urdf/nano.urdf.xacro`),
+  the Gazebo world (`worlds/nano_room.sdf`), the `ros_gz_bridge` topic map
+  (`config/gz_bridge.yaml`) and the RViz config (`rviz/nano.rviz`).
+- `lds_driver_py` — **the LDS driver in use** (rclpy, publishes `/scan`; also writes a
+  compact scan blob to `/dev/shm/nano_scan.bin` for the web UI — see `web_control` below).
+  The blob writer is `scan_blob.write_scan_blob`, shared with `sim_hardware` so the
+  Gazebo dev-sim writes byte-identical blobs.
+- `wheel_odometry` — integrates `/wheel_ticks` (from the ESP32, or from `sim_hardware` in
+  Gazebo dev-sim) into `/odom`; **this node owns the `odom→base_link` TF now**
+  (`publish_tf: true` — the EKF is gone). No longer reads GPIO.
+- `oled_display`, `imu_driver`, `sys_monitor`, `web_control` — rclpy nodes.
+  `imu_driver` also wires the **WitMotion accel/mag calibration** (2026-07-16, hw-
+  verification tracked in `docs/TODO.md`: `/imu_calibrate` String cmds `accel|mag_start|mag_stop|save` executed
+  in the reader thread → latched `/imu_calibrate_status`; web IMU card buttons + live
+  mag xyz readout — no protocol readback exists, so verification is eyeballing
+  |accel|≈9.8 + a smooth mag sweep).
+- `sim_hardware` — **dev-PC-only**, not built/launched on the board (linux-aarch64). Used
+  only by `bringup.launch.py sim:=true`: `sim_bridge_node` re-publishes
+  Gazebo's bridged `/joint_states_sim` + `/imu` + `/scan` as the exact contracts the real
+  lidar/IMU/ESP32 publish (`/wheel_ticks`, `/imu/euler`+`/imu/web`, the scan blob), plus
+  synthetic ESP32 board telemetry. (The old `map_bridge_node` — the `/dev/shm` map blob →
+  `/map` bridge — died with slam_nav; slam_toolbox publishes `/map` natively.)
+- `behavior` — **behaviour layer (Sismic statechart)**. *Human-readable overview of the
+  whole brain (statechart + LLM + traits/evolution + model caps + decision log):
+  [`docs/brain.md`](docs/brain.md); the bullets below are the terse engineering summary.*
+  `mood_node`: an idle "feel alive"
+  presence supervisor that drives the OLED face (`/oled_face`) during true idle and stands
+  down when another owner uses the panel (motion/goal, TTS, manual web mood, pick-up).
+  **Expression-only — never publishes `/cmd_vel`.** The chart lives in `presence.py`
+  (ROS-free, unit-tested offline: `pixi run python -m pytest src/behavior/test`); the node
+  maps topics→events. No-op if sismic is missing or `behavior.enable:=false`.
+  - **`mood_node` is thin ROS glue; ALL the ROS-free thinking is in `brain.py`** —
+    mirroring how `nanobot_brain.cognition.CognitionCore` factored the LLM side. `brain.py` is the
+    single behaviour-layer "brain" module: the **Purpose Engine** (objective + intrinsic-reward
+    weights, deterministic reflection — `default/merge/reflect_purpose`), the **Pursuit** driver
+    + A/B **bandit** (`OBJECTIVES`/`precond_ok`/`Pursuit`/`Bandit`), and the orchestration —
+    `PurposeBrain` (beat-upgrade decisions, reflect, reward, reflection mode, persist) +
+    `Personality` (chart-context traits/evolution: seed/evolve/heartbeat/persist). (The Purpose
+    Engine + Pursuit used to be separate `purpose.py`/`planner.py`; folded into `brain.py` to
+    keep the behaviour layer to three files — `brain.py` + `presence.py` + `mood_node.py`.) Both
+    classes announce state through injected adapters and run identically on the dev harness
+    (`scripts/dev_webui.py`) — one base, not a robot/dev copy. Unit-tested offline in
+    `test/test_brain.py` (+ `test_purpose.py`/`test_planner.py`, which now import from
+    `behavior.brain`). See [[llm-openrouter-personality]].
+  - **The chart is also the single brain for autonomous LLM expression — and the idle mix is
+    dynamic + self-learning.** Each idle cycle the chart enters ONE `performing` state that asks
+    the injected `pick_beat()` (pure `choose_beat` in `presence.py`) to choose a beat by a
+    **priority-weighted, novelty-aware, trait-gated lottery** over the *enabled* registry beats:
+    `musing` (sensors), `looking` (camera), `wondering` (a deep-question musing), `listening`
+    (reacts to the mic). Each beat's `priority` is its base weight and is **evolvable** (LLM
+    reflection nudges it), an optional `trait` scales the weight by a live personality axis, and
+    the most-recent beat is down-weighted (`HABITUATION`) so behaviour stays varied — so the
+    robot *learns* which beats to favour and the mix shifts with mood/reward. (`look_every` is
+    retired; the camera cadence is now `looking`'s learnable priority/trait.) On a beat the node
+    shows the default face immediately AND (if `enrich_enable`) fires a **fire-and-forget**
+    `/cognition/request` (JSON `{beat,state,prompt,camera,audio}`) that `web_control` executes
+    asynchronously (LLM line + optional camera/mic + mood). A slow/absent LLM = a silent
+    face-beat; the chart never waits. **Add a beat = one `BEATS` row + one `DEFAULT_REGISTRY`
+    row** (face/camera/audio/prompt + priority/needs/trait); no chart surgery. Both the beat
+    templates and the chart itself are also **hand-editable without touching code**: `BEATS` is
+    layered with an optional `memory/beats.json` (`presence.merge_beats`, robot-side
+    `beats_path` param) and the Sismic graph itself can be overridden with
+    `memory/presence_chart.yaml` (`presence.load_chart_yaml`/`_build_statechart`, robot-side
+    `chart_path` param) — either falls back to the bundled Python default if absent or broken,
+    so an edit can never take the presence layer offline. `scripts/export_statechart_puml.py`
+    renders whichever chart is active.
+  - **Skill beat (capability library).** Every `skill_every`-th body (`musing`) beat is
+    upgraded — like `pursuing` — into a **`skill` beat** (`mood_node._deliver_skill_beat`,
+    gated by `skills_enable`): a fire-and-forget `{beat:"skill",state:"acting"}` request that
+    `web_control` executes by **picking a capability** from the skill library and performing
+    it. Goals (`pursuing`) take the `musing` slot first, then skills, else the chosen beat
+    (musing/looking/wondering/listening). See the skill-library note under `web_control` and
+    [[skill-library]].
+  - **Parametric personality + evolution.** `traits` (curiosity/extraversion/caution/
+    playfulness, 0..1) + a `registry` (per-beat priority/enable/needs/trait for
+    musing/looking/wondering/listening) live as mutable
+    dicts in the Sismic context, seeded from `personality.json` (made by
+    `scripts/personality_creator.py`, persisted as they drift). Guards read them (curiosity
+    gates the camera beat; extraversion scales the idle cadence; registry can demote beats),
+    they're folded into the cognition prompt, and `mood_node` publishes them latched on
+    `/cognition/traits` (expression-level influence only — the old slam_nav
+    `caution`→stop_distance/max_lin mapping went away with slam_nav). Evolution
+    is event-driven + smoothed: an `evolve` event (exponential smoothing, internal transition)
+    from **fast rules** (pickup→caution, in mood_node) OR **slow LLM reflection**
+    (`web_control`, pro model reads the decision log on `reflect_period` + on events →
+    `/cognition/evolve`). A `brain_lost` heartbeat (`brain_timeout` with no evolve) reverts to
+    the **seeded baseline** (not generic defaults). **INVARIANT: `brain_timeout` MUST stay well
+    above `reflect_period`** — it's a process-death failsafe, and if it's shorter than the gap
+    between reflections the chart reverts accumulated drift during normal quiet, so the robot can
+    never "become its own" (this bit us once: 90 < 600). Reflexes (`greeting`/`resting`/`dormant`/
+    pickup) are NOT in the registry, so the brain can never disable them. See the
+    llm-openrouter-personality memory.
+  - **LLM-steerable `drives` (new expressive axes + new chart states).** Beyond the 4 traits, a
+    third Sismic-context dict `drives` gives the LLM *more kinds* of influence (not just weights):
+    `energy`/`focus`/`introspection` (0..1) + a categorical `mood` face. They ride the **same
+    `evolve` event** as traits (same guardrails: clamped, smoothed by `smoothing_alpha`, reverted
+    on `brain_lost`, seeded from + persisted to `personality.json`) and are **expression-only**.
+    Each drives NEW chart structure: `energy`→idle cadence + an *energetic burst* (`performing`
+    self-loops to chain a 2nd beat); `focus`→a brief alert **`attending`** perk-up state before a
+    beat (`attend_face`/`attend_secs`); `mood`→a **`feeling`** state that wears the face between
+    beats (`feel_secs`); `introspection`→scales `reflect_auto_idle` in mood_node. **0.5 is the
+    neutral "off" point** (`drive_prob`): at default the new states never fire, so behaviour is
+    unchanged until the LLM pushes a drive >0.5. The post-beat / perk-up choice is decided ONCE on
+    state entry (where the rng is rolled) so the competing eventless guards stay mutually exclusive
+    (Sismic errors on simultaneously-enabled non-orthogonal transitions). `cognition.reflect` may
+    propose `drives`; `mood_node`/`dev_webui` carry them through evolve; `robot.yaml` has
+    `attend_face`/`attend_secs`/`feel_secs`. Regenerate the chart diagram with
+    `scripts/export_statechart_puml.py` (→ `docs/presence.puml`).
+  - **Time awareness.** The chart's idle cadence is multiplied by a live `tempo()`
+    callable (injected by `mood_node._tempo`; re-read on every guard evaluation): inside
+    the `behavior.quiet_start`/`quiet_end` window it returns `night_tempo` (2.0 = beats
+    fire half as often), so the robot is naturally sleepier after hours — without touching
+    the LLM-owned traits/drives. The matching SPEECH muting lives in the cognition core
+    (web_control `quiet_start`/`quiet_end` — **keep the two yaml windows in sync**):
+    autonomous speech (beats, skill beats, boot greeting, offline line, stats announcer,
+    reflection bookends) is silenced and logged as `quiet-hours`; user-initiated speech
+    (chat/say/observe/look, POST /tts, a manually invoked skill) always talks. Faces still
+    animate at night — quiet, not dormant. `cognition.time_context()` ("It is Tuesday
+    21:47, in the evening.") is folded into the beat/skill-pick/observe prompts so lines
+    fit the moment. Helpers (`daypart`/`in_quiet_hours`) are pure + unit-tested
+    (`test_time_awareness.py`, `test_tempo.py`).
+- `sensor_hub` — **runs `imu_driver` + `sys_monitor` + `wheel_odometry` + `lds_driver_py`
+  in ONE process** (one executor) to save ~100+ MB RAM on the 1 GB board. Same node
+  names/topics/params/services — purely an packaging change. Trade-off: they no longer
+  crash/restart independently.
+- `app_hub` — the same move for the expression/cognition layer: **runs `web_control` +
+  `oled_display` + `behavior` (mood_node) in ONE process**. The board now runs exactly
+  **four fault domains** — `sensor_hub` (the body), the `nav2_container`
+  (spatial/nav: planner + controller + bt_navigator + behaviors + lifecycle manager in
+  ONE `component_container_isolated`), `slam_toolbox` (`nano-slam`, plain node, own
+  process — `/map` + `map→odom` TF), `app_hub` (expression/web/brain) — plus the zenoh
+  router and the one-shot `nano-nav-loader` that attaches the components.
+  app_hub's main also preserves the OLED SIGTERM end-screen (restart/shutdown glyph).
+
+### ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
+- **Native zenoh-pico over a direct UART link** (PlatformIO + Arduino) — NO micro-ROS,
+  NO Fast-DDS, no agent. It joins the SBC's `rmw_zenoh` graph directly, emitting
+  rmw_zenoh's exact wire format + liveliness tokens (see the `src/main.cpp` header).
+  Subscribes `/cmd_vel` (geometry_msgs/Twist → diff-drive → H-bridge LEDC PWM), `/led`
+  (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint), `/fan_pwm`
+  (Float32 0..1 → SBC cooling-fan LEDC PWM; published by `sys_monitor` from the CPU-temp
+  curve, web-overridable), `/motor_trim` (Float32 manual straight-line trim set/reset —
+  see below). **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
+  a dropped link, or the SBC genuinely powered off — same `linkAlive()`-gated treatment as
+  the LDS spin-motor park below; there's no SBC heat to move if the SBC isn't running, and
+  it resumes the instant `sys_monitor` reconnects (2026-07-15 fix — it used to hold its last
+  commanded duty forever on link loss, so the fan kept running after a clean SBC shutdown).
+  Publishes
+  `/wheel_ticks` (Int64MultiArray `[L,R]`) from **single-channel** rising-edge GPIO-
+  interrupt counts (**signed by commanded direction** — the encoders have no 2nd channel,
+  so the ISR signs each tick by the last `/cmd_vel` wheel direction),   `/left_wheel_suspended` +
+  `/right_wheel_suspended` (Bool per-wheel off-ground microswitch, **published on change**
+  for low latency + a 1 Hz heartbeat republish; **`true` = the wheel is UP / lifted, the
+  robot is suspended — `SUSPEND_ACTIVE_HIGH` is `true` (2026-07-16 flip): the switch reads
+  HIGH (INPUT_PULLUP) while lifted, LOW while on the ground.** The SBC consumers —
+  mood_node pickup reflex, web_control snapshot — all honor a **latched
+  `/pickup_override` test hook** (Int8: -1 auto, 0 force-grounded, 1 force-lifted; ESP32
+  1 Hz heartbeat makes overriding at the source impossible), set from the web
+  Coprocessor card, auto-cleared on page reload), `/esp32_temp` (Float32) + `/esp32_hall`
+  (Int32) on-die telemetry, and `/esp32_heartbeat` (Int32). Also reads a **spin-lidar**
+  (LDS02RR) → `/lds_rpm` (Float32, RPM only — scan data ignored; 0 when stale) + `/lds_hz`
+  (valid-frame rate, 0 = not receiving),   and closed-loop-controls its spin motor: a PID
+  (hardware tuning tracked in `docs/TODO.md`) holds `/lds_target_rpm` by driving the motor PWM, output on
+  `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 1; UART1 is drained once
+  per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
+- **Line lasers**: subscribes `/laser_pwm`
+  (`std_msgs/Int32MultiArray [v1,v2]`, each 0..255) and drives two line-laser PWM
+  outputs on **GPIO 23/32** (`LASER1..2_PIN`). 10-bit duty =
+  `value*1023/255`. The web "Line lasers" card's two sliders POST `/laser_pwm` via
+  `telemetry.py`'s `_mk_laser` whitelist builder. Publish-only (like `/motor_accel`) —
+  no read-back. Lasers park at 0 while the SBC link isn't alive (same
+  `linkAlive()`-gated park as the fan/LDS) and zero the setpoints so they resume at 0,
+  not the stale pre-drop value. **Laser 3 was removed 2026-08-18**: its GPIO13 stayed
+  stuck full-on through every PWM peripheral tried (LEDC low-speed ch 8 stuck it high
+  silently — every `ledcWrite()` incl. 0 drove the pin high; MCPWM couldn't sink it
+  either), so the laser was hardware-controlled, not `/laser_pwm`-controlled, and it's
+  gone from both firmware and the web UI. GPIO13 + LEDC ch 8 are now untouched.
+- **Bad-encoder-signal diagnostic (2026-07-15, built; flash/deploy tracked in `docs/TODO.md`)**: a
+  per-wheel `/wheel_stray_ticks` (Int64MultiArray `[L,R]`, same cadence as `/wheel_ticks`)
+  counts ISR ticks that land while that wheel is commanded **and settled** (`STRAY_SETTLE_MS`
+  = 300 ms coast-down grace period after duty→0) stopped — a real coast-down tick isn't
+  noise, but anything after that settle window can only be electrical noise/ground-bounce
+  on the encoder GPIO (relevant given the earlier [[esp32-hardware-fried-ground-fix]]
+  ground-bounce failure). Cheap bool check in the ISR, no FPU. Web Coprocessor card shows
+  it (red if nonzero) with a **🔁 Reset ticks** button (`/reset_ticks` Bool) that zeros
+  both `/wheel_ticks` and `/wheel_stray_ticks` on the ESP32; `wheel_odometry` also watches
+  `/reset_ticks` and re-seeds its prev-tick baseline (`_have_ticks=False`) so `/odom`
+  doesn't see a fake huge jump when the raw counters reset.
+- **Straight-line trim (open-loop rebalance)**: the mismatched gearmotors are rebalanced
+  by a single trim factor in `applyMotors` (`l*=(1-t)`, `r*=(1+t)`; **negative = robot was
+  pulling left** — boost left / cut right — because the robot currently veers LEFT). A
+  fixed **`TRIM_DEFAULT = -0.10`** (main.cpp, 2026-07-16) is the NVS fallback; the old
+  **`TRIM_AUTOCAL` is DISABLED** (`TRIM_AUTOCAL 0`) because on this board its encoder-signed
+  imbalance converged the WRONG way (pushed trim positive = more left veer). Persisted to
+  ESP32 NVS (survives reboot/reflash; written only while stopped, rate-limited). Manual
+  set/reset live via **`/motor_trim`** (Float32, 0 = reset) — the web Coprocessor card has
+  a **Wheel trim** slider (`±0.30`) that POSTs it and re-seeds from the live `/wheel_trim`
+  @1 Hz value; the slider's "Reset trim to 0" button clears it. Tunables `TRIM_*` in
+  `main.cpp`; compiled out if `WHEEL_PID_ENABLED`.
+- **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
+  `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
+  flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,
+  off-ground switches L=4 R=21, DRV8871 IN L=26/27 R=25/33 (fwd/rev; one DRV8871 per
+  motor, no STBY/enable pin),
+  onboard LED=2, **UART2 = zenoh link (TX=17, RX=16) → SBC `/dev/ttyS1`**, **LDS data on
+  UART1 RX=GPIO14 (TX=GPIO13 unused)**, LDS spin-motor PWM=18, cooling-fan PWM=22 (via a
+  logic-level MOSFET — the ESP can't source fan current). (SBC side: ESP32 link on
+  `/dev/ttyS1`/UART1-PG6/PG7, LDS scan on `/dev/ttyS2`/UART2-PA0/PA1, OLED on
+  `/dev/i2c-0`/PA11-PA12 @400kHz.) Keep diff-drive limits synced to `robot.yaml`.
+- **The link needs a serial-capable `zenohd`** — the conda `libzenohc` is built without
+  `transport_serial`, so stock `rmw_zenohd` can't open the UART. Build one with
+  `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; the
+  `nano-router` systemd unit (via `scripts/unit_exec.sh router`) runs it on the board
+  so the ESP32 (serial) and the rmw_zenoh nodes (TCP) share a graph.
+  See [[robostack-zenoh-no-serial]] and [[esp32-zenoh-pico-integration]].
+- Build/flash from the dev PC: `cd firmware/nanobot_coprocessor && pio run -t upload`
+  (pio lives in `~/pio-venv`). **Don't build the firmware on the board.**
 
 ### Brain architecture (nanobot-brain package)
 All brain logic lives in `nanobot-brain` — a **ROS-free** Python package. The robot's ROS nodes (`mood_node`, `web_server`) import from it:
@@ -101,6 +468,205 @@ Platform adapters (interfaces.py):
 - Two tiers: narrative (`say`/`observe`/`look`) and gated action (`topic` — whitelisted, off by default).
 - Workshop (reflection mode) synthesizes new skills via LLM → `workshop_dir` (default `~/.local/state/nanobot/skills`).
 
+### Cognition, skills & runtime internals (detail)
+
+- **Cognition core (`cognition.py`, ROS-free).** ALL the LLM-personality *logic* — generate +
+  express, the say/chat/observe/look paths, the statechart beat executor, the skill library
+  invocation, the phrase bank, the decision log, slow reflection, lifecycle speech — lives in
+  ONE class, `CognitionCore`, shared verbatim by `web_server.py` (robot) and `dev_webui.py`
+  (dev). Each side only injects a few **adapters** (face→`/oled_face` vs print, capture_frame→
+  V4L2 vs webcam, sensors→`/proc`+IMU vs synthetic, the gated action tier→whitelisted
+  publishers vs no-op, persist→`llm.json` vs none) plus its own HTTP handler + ROS/sim
+  plumbing. So a new cognition feature is written **once**. The node/`DevState` keep only thin
+  one-line delegators for the handler. See [[llm-openrouter-personality]].
+- **LLM personality (OpenRouter)** — the *client* is `llm.py` (ROS-free); the orchestration is
+  `cognition.py` (above). It
+  offloads "say something" / chat lines **plus the matching OLED expression** to a model
+  on OpenRouter. `LlmClient.generate()` is a blocking stdlib-`urllib` POST (no SDK) that
+  returns `{"say","mood"}`; the **mood is constrained to the OLED's four faces** +
+  `neutral` (coerced if the model strays). **Two text tiers, each FREE-FIRST:** the cheap
+  tier (everything) and the smart tier (chat + reflection, `generate(smart=True)`) each try
+  one or more **free** OpenRouter models (`llm_free_model` / `llm_free_smart_model`, comma-
+  separated lists) and only fall back to the **paid DeepSeek** model (`llm_model` flash /
+  `llm_smart_model` pro) when *all* the free ones are rate-limited. `_candidates(smart,image)`
+  builds the ordered `(model,is_paid)` list; `_chat` tries each, **falling through only on a
+  rate/daily-limit error** (429/402/limit-ish msg, incl. 200-with-error bodies) — other
+  failures stop. `last_model` = the slug that answered (logged). **Hourly caps apply only to
+  the PAID fallback** (`llm_smart_max_per_hour` 15 / `llm_vision_max_per_hour` 10, 0=off; free
+  is never capped). Vision tier is already free (`llm_vision_model`); no DeepSeek vision
+  fallback (set `llm_vision_fallback_model` for a paid one). Free `:free` slugs rotate +
+  get throttled → swap via OpenRouter `/models` if a default stops working. pro/reasoning
+  models narrate so `llm_max_tokens` is 1024 (too low → empty JSON = no-reply).
+  `LlmClient.complete(system,user,smart=,json_object=)` is a general (non-`{say,mood}`) call.
+  `scripts/personality_creator.py` (ROS-free) runs a short questionnaire through the smart
+  model → writes `personality.json` ({name,persona,traits,registry}) + a robot.yaml snippet.
+  **`POST /llm/observe`** is sensor-aware chatter: it builds a short plain-English snapshot
+  of the robot's own body — CPU/RAM/temp (`/proc`), IMU motion+tilt (`/imu/web`+`/imu/euler`),
+  pick-up (`/left|right_wheel_suspended`) — and has the model comment in character on how it
+  "feels" (web "👁 Observe" button). **`POST /llm/look`** is vision: it grabs one JPEG from
+  the webcam (`CameraStream.add_viewer→get_frame→remove_viewer`), base64-data-URIs it as an
+  `image_url` part, and routes to the **vision** model (`llm_vision_model`, default the
+  credit-free `nvidia/nemotron-nano-12b-v2-vl:free` — the text model can't see) so it
+  comments on what it sees (web "📷 Look" button). `generate(image_jpeg=…)` skips
+  `response_format` for image requests (some multimodal models reject it). Note: many
+  OpenRouter `:free` vision slugs come and go (Llama-3.2-vision is paid-only now) — pick a
+  current one via OpenRouter's `/models` API if the default stops working. Endpoints: `POST
+  /llm/say` (one-shot), `POST /llm/chat` (rolling history), `GET|POST /llm/config`,
+  `GET /llm/log`. The web "AI" card (AI tab) drives the on-demand ones. **Autonomous
+  chatter is NOT here** — it's driven by the `behavior` statechart's beats via
+  `/cognition/request`, which `web_control` executes (`_on_cog`→`_run_beat`: capture frame
+  if asked, append the sensor snapshot, `_generate`). The old standalone idle-chatter timer
+  was retired (one brain). Best-effort: **no key / no network = silent no-op**, never on
+  the critical path. All config is in `robot.yaml` (`llm_*`, and the `behavior:` beat
+  knobs); the **key is read from `llm_api_key` or, when blank, `$OPENROUTER_API_KEY`,
+  or — winning over both — a key pasted into the web "AI" card**. To set it up: copy
+  `memory/openrouter_key.example` to `memory/openrouter_key`, replace with your real
+  OpenRouter key (one line, no quotes), and the key is picked up by **every entry point**
+  (`scripts/dev_webui.py`, `scripts/sim_run.sh`, `scripts/unit_exec.sh` for the systemd
+  units, and all `pixi run` tasks). The LLM
+  **auto-enables** when a key is detected (`web_server.py` + `dev_webui.py` override
+  `llm_enabled: false` to `true`), so no web UI toggle needed on first run. UI toggles
+  (enable/model ids/persona) **and now the API key itself** persist to
+  `~/.local/state/nanobot/llm.json` (outside git) so they survive a reboot; the key field
+  is a write-only password input — `GET /llm/config` never echoes the saved secret back,
+  only an `api_key_set` boolean (`LlmClient.has_key`) the page shows as "saved"/"not set".
+  A key saved via the UI takes priority over `llm_api_key`/`$OPENROUTER_API_KEY` on the
+  next load. Calls run off the ROS executor thread and are one-at-a-time guarded.
+  - **Decision log** (`GET /llm/log`, web "🧠 Decision log" panel): every generation path
+    (`say`/`chat`/`observe`/`look`/`beat:*`) records a `CognitionLog` entry (trigger,
+    state, camera, model, status, say/mood, latency) — incl. skip reasons
+    (`skipped-busy`/`llm-unavailable`/`no-frame`). Appended as JSON lines to
+    `cognition_log_path` (default `~/.local/state/nanobot/cognition.log`) and seeded back
+    into the ring buffer on start, so it survives reboots. **Both `web_server` (robot) and
+    `scripts/dev_webui.py` (dev) write the same file/format**, so history is shared. See the
+    llm-openrouter-personality memory.
+  - **Trait trajectory** (`cognition.record_trait_snapshot`/`trait_trend_text`,
+    `trait_history.json`): a durable log of `(timestamp, traits)` snapshots so the robot can reason
+    about **how it has drifted over time**, not just react to the last few events. Sampled (≤ once
+    per `trait_history_period`) during reflection; `trait_trend_text()` summarises the change over
+    the trailing `trait_history_window` (e.g. `curiosity 0.50 -> 0.68 (rising)`) and is folded into
+    the `reflect()` + `consolidate()` prompts, so the self-narrative grows from a real trajectory.
+    Deploy-synced like the soul. Config: `trait_history_*` in robot.yaml; readout `get_trait_history`.
+  - **Phrase bank** (`phrasebank.py`): the most frequent lines — the body-reaction beats
+    (`musing`/`observe`) — are **pre-generated** instead of hitting the LLM every idle cycle.
+    A batch of in-character lines per *situation* (picked_up/hot/busy/idle/… classified from
+    the sensors), each with **placeholders** (`{name}{cpu}{mem}{temp}{tilt}`) filled with
+    live values at speak time → instant, free, offline, still varied. Logged
+    `status="bank"`. `pick()` prefers lines whose placeholders are all fillable. The bank
+    (`~/.local/state/nanobot/phrases.json`) stores the persona+traits **signature** it was
+    made with and **auto-regenerates in the background** when the soul drifts too far
+    (`phrasebank_drift`) or the persona changes; `phrasebank_live_ratio` still sends a few
+    beats live for freshness. **It also grows over time** (`PhraseBank.grow`/`maybe_grow`,
+    `CognitionCore.bank_grow_check`): each reflection (`brain_reflect` entry) it *appends* a
+    few BRAND-NEW LLM lines to the most under-filled offline situation (deduped, up to
+    `phrasebank_grow_max`) — so the offline-triggerable lines keep gaining variety without
+    discarding what's there. Growth only runs while the soul is stable (a drifted soul
+    regenerates first) and is rate-limited by `phrasebank_grow_period`. **Growth is also an
+    on-demand `phrases` meta skill** — `skills/grow-phrases.md` (`CognitionCore.grow_phrasebank`,
+    parallel to `forge-skill`): invoke it any time to add lines now (bypasses the period gate,
+    blocks on the LLM); excluded from autonomous skill-beat picks like the workshop. Force/
+    inspect: `scripts/pregenerate_phrases.py [--show]`, `GET /llm/phrases`,
+    `POST /llm/phrases/regenerate`. Config: `phrasebank_*` in robot.yaml.
+- **Skill library** (`nanobot_brain.cognition.skills`, ROS-free + unit-tested; the nanobot-brain repo's `skills/*.md`):
+  capabilities as **self-documenting markdown** (an OpenClaw-style "SKILL.md" port). Each
+  `.md` = one capability — YAML frontmatter contract (`name`/`description`/`trigger`/`action`)
+  + a Markdown body the brain reads as the "how". Drop a new file in (and `POST /skills/reload`)
+  to add a capability — no code change. `SkillLibrary` loads + indexes them; `web_server`
+  executes. **Two tiers:** *narrative* (`kind: say`/`observe`/`look` — speak a line steered by
+  the body, optionally with the sensor snapshot or a `read-lidar`-style `/dev/shm` scan summary
+  or a camera frame; routes through the same `_generate`/vision path) and a **gated *action*
+  tier** (`kind: topic` — publishes a **whitelisted, clamped** ROS msg: `/led`, `/fan_pwm`,
+  `/lds_target_rpm`, `/cmd_vel`). An action runs only when the skill sets `enabled: true` **AND**
+  `skills_allow_actions` (web_control param, **off by default**); motion speeds are clamped in
+  `web_server` itself (SKILL_MOTION_* caps), so a skill can never make the robot unsafe. **Two entry points:** autonomous (the
+  chart's `skill` beat → `_run_skill_beat` asks the cheap model to PICK one from the offered
+  catalogue → performs it) and on-demand (`GET /skills`, `POST /skills/invoke {name}`,
+  `POST /skills/reload`; web "🛠 Skills" card). Every invocation logs to the decision log as
+  `skill:<name>`. The dir resolves via `skills_dir` → share → source tree
+  (`resolve_skills_dir`); `dev_webui.py` wires the same panel off-robot (topic actions no-op
+  there, no ROS). See [[skill-library]].
+- **Skill workshop** (`skillsmith.py`, ROS-free + unit-tested): **reflection mode** (formerly
+  "meditation") is a **skill-synthesis loop**, not just consolidation. On reflection entry
+  `CognitionCore.run_skill_workshop()` runs
+  **suggest → check → rehearse → trial → adopt/retire**: the smart model mines the decision log
+  (gaps / repeated `no-pick`/`stumped`) for ONE *new* or *adapted* capability, it's validated
+  (`validate_candidate`: parse round-trip, kind whitelist, no name collision; action skills born
+  `enabled:false`), **rehearsed once** + smart-model **critiqued**, then written to a writable
+  **"learned" dir** (`workshop_dir`, default `~/.local/state/nanobot/skills`, loaded as
+  `SkillLibrary(extra_dir=…)` — separate from the committed catalogue, deploy-synced like the
+  soul/bank) and tracked in `workshop.json` (`WorkshopState`). A trial is a normal, immediately
+  auto-eligible skill; the `gate()` **auto-adopts** it (permanent) after `min_runs` good runs +
+  net-👍 + no errors, or **auto-retires** (deletes the file) on errors/net-👎. The contextual
+  👍/👎 reward is forwarded to the trial that last ran (`reward_trial_skill`). Manual override:
+  `GET /skills/workshop` + `POST /skills/workshop/{keep,kill}` (web "🛠 Skills" card, 🧪 trials).
+  `deploy.sh` pushes `memory/skills/*.md` + `workshop.json` with the soul. Config: `workshop_*`
+  in robot.yaml. Runs identically on the dev harness (mints into `memory/skills/`).
+  **The workshop is also an on-demand skill** — `skills/forge-skill.md` (`action.kind: workshop`,
+  a "meta" kind in `skills.py` that runs an internal routine, never a topic/narrative): invoke it
+  any time (web "🛠 Skills" / `POST /skills/invoke {name:"forge-skill"}`) to forge a skill outside
+  reflection mode. Meta skills are **excluded from autonomous skill-beat selection** (`offered()`),
+  so they only run when deliberately invoked. (`grow-phrases` — `action.kind: phrases` — is the
+  other meta skill: on-demand phrase-bank growth, see the phrase-bank note above.) See
+  [[meditation-skill-workshop]].
+  - **The autonomous skill beat (`run_skill_beat`) degrades gracefully when the LLM is down.**
+    Picking normally asks the model (`llm.complete`) which offered capability best fits the
+    moment; if the LLM is unavailable/rate-limited that call returns `None`, so the beat instead
+    falls back to a **plain random pick among the currently offered `topic` (action) skills**
+    (the only tier that needs zero model calls to execute) — a `blink-led`/`cool-down`-style
+    reflex still fires instead of the beat going silent. Narrative (`say`/`observe`/`look`)
+    skills (2026-07-16) now fall back too: `CognitionCore._invoke_skill` tries the generic
+    sensor-classified phrase bank (`_bank.pick`, bypassing `bank_say`'s live-ratio "go live
+    occasionally" skip since there's no live option right now) before requiring the LLM — so
+    a named skill still says *something*, just not the skill-specific line, matching the
+    generic idle "musing" beat's existing bank-first fallback.
+  - **A fourth meta skill grows that offline-only fallback pool: `skills/expand-offline.md`**
+    (`action.kind: offline`, `CognitionCore.expand_offline_skills`/`_do_offline_skill`). It reuses
+    the exact same workshop pipeline (`run_skill_workshop(offline=True)` → `_suggest_skill
+    (offline=True)`), constrained so the smart model MUST propose a pure `topic` capability — a
+    reply that ignores the constraint is discarded, nothing is minted. No-op if
+    `skills_allow_actions` is off (there'd be nothing useful to grow). Needs the LLM to invent
+    the capability now, even though the point is to have something that runs later without it.
+- **Reflection mode** (renamed from "meditation"; topic `/reflect`, web `POST /brain/reflect`,
+  `🧘 Reflection mode` toggle, `PurposeBrain.set_reflecting`/`.reflecting`, chart state
+  `reflecting` + event `reflect`/`wake`). It pauses beats and consolidates (purpose/A/B/bank +
+  long-term self-narrative) **and** forges a skill (the workshop). **The robot enters it on its
+  own** after a long idle: `behavior.mood_node._auto_reflect` publishes `/reflect_request` (Bool)
+  on `reflect_auto_idle` s of continuous idle, runs `reflect_auto_secs`, then wakes (and exits
+  early if activity resumes); `web_control` mediates that request through the same `brain_reflect`
+  the web toggle uses (`_on_reflect_request`). Manual reflections (web toggle) are sticky and
+  never auto-woken. The dev harness drives the same loop time-based in `run_behavior`.
+- **Interaction fillers fire BEFORE the LLM call.** On a skill beat the instant "thinking"
+  prelude is spoken before the (slow) skill-pick `complete()` call, not after (so TTS feels
+  instant); the chosen skill then runs with `prelude=False` to avoid a double filler.
+- **Heavy topics stay OFF the telemetry frame:** `/scan.bin` (compact lidar blob =
+  JSON header + raw float32 ranges, written by `lds_driver_py`) is served
+  same-origin from `/dev/shm` and polled by the page — the page controls the poll
+  rate per view. (The old `/map` blob died with slam_nav; slam_toolbox publishes
+  `/map` as a real topic that no longer crosses the web gateway.)
+  Everything light rides the ONE `/telemetry` SSE frame (see the gateway note above).
+  web_control also publishes `/esp32_ping` @1 Hz (ESP liveness, always on).
+- **The vitals blob (`/dev/shm/nano_vitals.json`)**: sys_monitor writes ONE aggregated
+  body snapshot per tick — CPU/RAM/temp/disk + IMU |a|/|g|/rate/tilt + LDS hz + ESP32
+  liveness/temp, NaN-free, with per-source ages + a wall-clock `t` so readers add the
+  file's own staleness. The slow consumers READ it instead of subscribing:
+  `oled_display`'s dashboard (its telemetry topic subs are gone; local /proc fallback
+  when the blob is stale) and `web_control` (cognition body snapshot + the frame's
+  imu/eul sections). sys_monitor is now the only /imu/web + /imu/euler subscriber, and
+  it's co-resident with imu_driver in sensor_hub — so IMU samples never cross a
+  process boundary. **/dev/shm convention: one writer per `nano_*` file, atomic
+  `os.replace`, JSON (or JSON-header+binary) payload.**
+- Tune live: `imu_driver`/`lds_driver_py` expose `publish_rate` as a settable param;
+  the web UI sliders POST `/param`, which calls `/<node>/set_parameters` (whitelisted).
+  The IMU's device stream rate auto-follows `publish_rate` (`output_rate_hz: 0`).
+  `sys_monitor.fan_temp_min`/`fan_min_duty`/`fan_smooth_alpha` (the Cooling fan card's "Fan
+  starts at" / "Floor duty" / "Smoothing" sliders) are whitelisted the same way. The auto
+  curve is fully OFF below `fan_temp_min` (50°C default), jumps straight to `fan_min_duty`
+  (30% default — a floor above the fan's own stall/dead-band duty so it doesn't crawl too
+  weakly to move air) right at that threshold, ramps linearly to `fan_max_duty` (100%) by
+  `fan_temp_max`=70°C, and is EMA-smoothed (`fan_smooth_alpha`, default 0.15) so CPU-temp
+  noise doesn't make it audibly hunt tick-to-tick. None of these `/param` values persist
+  across a `sys_monitor` restart — `robot.yaml` is the durable source of truth.
+
 ### Brain health monitoring
 Bidirectional heartbeat between the two brain layers:
 
@@ -118,6 +684,235 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
 
 **Web UI:** AI · Speak tab > AI & brain group > "Brain health" card shows behavior, cognition, LLM, purpose, chart status — green/alive or red/lost. Polled every 2s from `/brain/health`. If the endpoint itself fails, all indicators show amber `err`.
 
+### Web gateway static page + media endpoints
+
+- **`web_control` static server**: serves `web/` — `index.html` plus `style.css`. The
+  page is **self-contained**: one big `"use strict"` inline block (`app.js`-derived: the
+  SSE `/telemetry` EventSource + all control) with the OLED-mirror `oled.js` inlined
+  right before it, then smaller self-contained IIFE blocks (chrome tabs,
+  live odometry/IMU readouts, the 2026-09-15 Map/click-to-goal/Locations block) — all
+  pure same-origin SSE/HTTP, no
+  external scripts, no rosbridge/ROSLIB. The old split files (`app.js`, `map.js`,
+  `oled.js`, `chrome.js`, `sim.js`, `devtools.js`, `logs.js`, `personality.js`) were
+  DELETED from the repo (2026-09-16) — do not reintroduce external `<script src>`
+  loading or wire a websocket. The in-browser Sim tab was removed with them (2026-09-16;
+  dev-PC testing is `scripts/dev_webui.py`).
+  The web **Map panel is back (rebuilt 2026-09-15 on top of Nav2)** — a canvas fed from
+  slam_toolbox's `/map` via the `GET /map` HTTP route (NOT the SSE frame), click-to-goal,
+  a goal-status chip from `/navigate_to_pose/_action/status`, `POST /nav/cancel`, an
+  inflation bubble, and a rebuilt Locations card ("save spot" falls back to the TF pose).
+  See the "Map view + click-to-goal REBUILT" block in AGENTS.md. `/scan.bin`
+  still feeds the Lidar hero view; `/goal_pose` (locations, skills) still drives Nav2.
+  `/stream.mjpg` is a zero-dep V4L2 MJPEG passthrough (`mjpeg_camera.py`);
+  `/snapshot.jpg` is one still frame (📸 button); `/audio.pcm` is the webcam
+  mic as raw PCM via `arecord` (`mic_audio.py`). Both streams are ref-counted (only
+  run while a client is connected) and the audio endpoint **must** be HTTP/1.1 chunked
+  (browsers don't stream an HTTP/1.0 body to `fetch`). `GET /health/log` serves the
+  tail of sys_monitor's durable outage log for the web "Health events" card.
+### GPU vision
+
+- **GPU vision** (`gpu_vision.py`, `gpu_vision_enable` param, default `true`): runs the
+  webcam through the H5's **Mali-450** instead of a plain passthrough — a headless
+  EGL/GLES2 context (raw ctypes, no `moderngl`/OpenCV) captures continuous YUYV,
+  converts to RGB in-shader, and runs everything else as GLSL ES 1.00 fragment shaders
+  reduced via a box-filter downsample chain (`build_downsample_chain`/
+  `run_downsample_chain`, ~1.9ms/pass measured on hardware) so only a handful of bytes
+  ever cross back to the CPU — never a full frame. **Core** (hardware-verified,
+  committed a881ddc): PIR motion-diff (`_DIFF_FS`) → `motion_score`/`motion_center`,
+  and calibrated colour-blob tracking (`_THRESHOLD_FS` + largest-blob selection) →
+  `target` (bearing/confidence), with live-tunable match tolerance + min/max blob-size
+  gating. **Tier-B**: kinetic-intercept alert (blob-area growth rate), flashlight/dark
+  reflex (opt-in, auto-`/led`), and the optical virtual bumper
+  (commanded-but-not-moving → possible stall, in `telemetry.py`). (The old **manual
+  mode** — `POST /vision/manual`, a live swap to the direct `CameraStream`
+  passthrough — was REMOVED 2026-07-14 (01e64f9): the passthrough now engages only
+  as the automatic fallback when GPU vision is off/unavailable. The same commit
+  compensates the **upside-down camera mount** once at the YUYV→RGB source pass
+  (`_VFLIP_VS`), so every consumer sees an upright frame.) Two on-demand debug MJPEG views mirror this same
+  reduction machinery for human eyes: `/stream_mask.mjpg` (the colour-threshold hit
+  mask) and `/stream_motion_mask.mjpg` (the PIR diff mask, reusing the same
+  `_MASK_VIEW_FS` shader unmodified against a different source texture) — both
+  viewer-gated (zero cost unwatched), toggled from the Camera tab.
+  **Cheap-tier batch** (2026-07-12, live-verified on hardware): five more raw signals —
+  `edge_density`/`overhead_edge_density` (a new 3-tap gradient shader, whole-frame and
+  cropped to the top 30% as an overhead-clearance heuristic), `luma_max` (free —
+  extends the existing dark-reflex luma readback with a max), `highlight_fraction`
+  (reuses the blob-tracking shader with a fixed white target in a separate FBO so it
+  never collides with the user's calibrated colour), and `motion_target_match` (pure
+  CPU distance between the motion and blob centroids). All threshold/alert logic lives
+  in `telemetry.py`'s `_vision_alerts` (NOT `gpu_vision.py`), mirroring the optical
+  bumper's "read live ROS params, not fixed constants" pattern — **12 alerts total**
+  (`obstructed`/`clutter`/`overhead_alert`/`focus_blur`/`backlit`/`shiny`/`looming`/
+  `colorcast`/`motion_matches_target`, plus the 2026-07-13 batch's `novelty`/
+  `camera_freeze`/`vibration`), each with its own `vision_*` param, live
+  sliders under the Camera card's "▸ Vision alerts tuning". `vision_obstruction_var_max`
+  was retuned from a wrong-by-~100x guess (15) to 400 after a live reading showed an
+  ordinary scene reads `luma_variance` ~2700 — a reminder that these thresholds are
+  real hardware quantities, not proportions, and need checking against actual readings
+  before trusting a default. A software-measured **`gpu_duty`** ("pipeline load")
+  tracks the fraction of each frame's period spent in the shader+readback block —
+  measured 60-190%/tick on hardware with the full batch running, i.e. the vision loop
+  can fall behind its configured fps under load (degrades gracefully, no crash). A
+  **true hardware GPU-utilization reading was tried and removed**: a devfreq
+  frequency-ratio estimate (`sys_monitor`) turned out to always read "n/a" on this
+  board's kernel (no GPU devfreq node) and GPU temp just tracked CPU temp with no new
+  information — both pulled from the UI; `gpu_duty` was kept since it's a different,
+  demonstrably-useful number. Scalar readouts are exposed via **one
+  `gpu_vision.snapshot()` atomic read** (single `_lock` acquisition for all ~20
+  fields incl. frame_age/zero_motion_secs, added 2026-08-10): the 5 Hz telemetry
+  build and the 10 Hz `_vision_state_tick` use it instead of ~20 per-property
+  getters, each of which re-took the lock — saving ~60 guarded round-trips/s and
+  removing cross-field reading skew. A **master camera switch** (`POST /vision/camera_enable`,
+  the Camera tab's "📷 Camera enabled") fully stops BOTH `GpuVision` and the direct
+  passthrough — for when the fuller pass set's cost isn't wanted. While off, the live-view `<img>` shows
+  a real `#camWait` overlay message ("Camera disabled…") instead of a broken-image
+  icon, and `app.js`'s `onVision` diffs `camera_enabled` tick-to-tick so re-enabling
+  auto-resets the stream `src` itself — no manual page refresh needed to get the feed
+  back. The Sensors tab's readouts AND every tunable slider have hover explanations
+  (native `title` attributes keyed by element ID in `app.js`, not markup changes),
+  toggleable/persisted via **💡 Show hints**.
+  **2026-07-13 batch (code-complete + unit/smoke/GL-tested on the dev PC; hardware
+  verification tracked in `docs/TODO.md`) — all built:**
+  - **Named colour targets**: calibrations persist to `vision_targets.json` under a
+    name (the "target name" box in the Camera view; default "default") and now
+    **survive restarts** (re-applied on boot). One target is tracked at a time —
+    selection, not simultaneous multi-target. `GET /vision/targets`,
+    `POST /vision/target_select|target_delete`; blob-tune edits sync into the active
+    entry; Sensors→Camera has the palette row.
+  - **Novelty score** (`GpuVision.novelty`): mean diff of the already-read-back small
+    colour buffer vs. a slow EMA background (`update_novelty`, `NOVELTY_EMA_ALPHA`
+    ~22 s) — sustained scene change scores high then habituates. Zero extra GPU cost.
+  - **Camera-freeze diagnostic** (`frame_age`/`zero_motion_secs` + the
+    `camera_freeze` alert): capture stopped delivering, or delivers the identical
+    buffer (exactly-zero diff) — "recover the camera", vs. the bumper's wheel-stall.
+  - **Vibration diagnostic** (`vibration` alert, telemetry.py): edge-density far
+    below the standing-still EMA baseline while driving = excess blur (loose screw /
+    imbalance). Maintenance hint.
+  - **Glare rejection** (`vision_glare_derate`, default 0=off): blob confidence is
+    derated by `highlight_fraction` so a specular reflection can't hold a false lock.
+  - **OLED mask mirror** (`POST /vision/oled_mask`, latched `/oled_mask` Bool +
+    `/dev/shm/nano_oled_mask.bin`): gpu_vision rides the thresh chain to 160×120 then
+    one more pass to exactly 128×64, re-binarizes (bytes.translate), writes the blob;
+    `oled_display` renders it as a "mask" owner (below reflecting/words/shutdown,
+    above the face). Auto-dropped when the camera master switch stops capture.
+  - **Vision→behaviour plumbing**: web_control publishes a compact `/vision/state`
+    JSON @2 Hz (approach/looming/clutter/novelty/warmth/motion, only while the
+    pipeline is live — staleness IS the stand-down signal). mood_node consumes it:
+    **anticipatory greeting** (motion growing + centred = someone walking up →
+    greet-face + a `greeting` beat, rate-limited, idle-only), **looming/clutter →
+    caution fast rules** in `brain.Personality` (looming = edge-triggered startle;
+    clutter = hold caution ≥ `clutter_caution` while it lasts and RELEASE to the
+    remembered pre-clutter value after — expression-level only now: the old
+    caution→max_lin velocity throttle died with slam_nav's `trait_motion`),
+    **ambient colour mood** (scene warmth R−B tints the
+    chart's `feeling` face via the injected `ambient_mood` — the LLM's `drives.mood`
+    always wins), and a **novelty boost** on the `looking` beat (transient `beat_boosts`
+    multiplier in `choose_beat`, distinct from the LLM-evolvable registry priority).
+  - **Visual diary** (`cognition.record_vision_snapshot`/`vision_trend_text`,
+    `vision_diary.json`): scene scalars sampled every `vision_diary_period` (10 min),
+    trend ("the room has got darker (60% → 15%), and calmer") folded into the
+    `reflect()`/`consolidate()` prompts like the trait trajectory. `GET /llm/vision_diary`.
+  Deferred/excluded (tracked in `docs/TODO.md`): the overhead-clearance
+  camera-mount geometry check (needs the physical robot) and the docking/cliff
+  items (explicitly excluded by the user).
+### Stress test
+
+- **Stress test mode** (`stress.py`, ROS-free; web "Stress test" card in System):
+  `POST /stress/start {duration,workers?}` / `POST /stress/stop` / `GET /stress/status`.
+  Deliberately loads every CPU core to validate the hardening tier (systemd watchdogs,
+  MemoryMax, the fan curve) under real load — **without starving the web server that
+  has to keep answering the browser during the test**. Workers are separate, NICED
+  (19, the lowest scheduling priority) subprocesses running a tight busy loop; they
+  aren't pinned away from any core, so an idle board gets genuinely pegged to 100% on
+  every core, but the kernel's CFS scheduler always prefers a normal-priority process
+  (this web server, the other ROS hubs) the instant it has work — same trick as
+  `nice -19 stress --cpu N`, no core reservation needed. A background watchdog
+  auto-stops the run at `stress_max_duration` (300 s default; a forgotten test can't
+  run forever) regardless of the caller, and can abort early past `stress_temp_abort_c`
+  (82°C default, 0 = off). CPU-only by design — no memory allocation, so there's no
+  risk of tripping app_hub's own systemd `MemoryMax` and getting the web server's unit
+  OOM-killed mid-test. Single-flight (one run at a time); `destroy_node` stops an active
+  run on shutdown. Shared verbatim with `scripts/dev_webui.py` (same `StressTest` class).
+### Browser telemetry+control gateway
+
+- **Browser telemetry+control gateway (`telemetry.py`, replaced rosbridge)**:
+  `GET /telemetry` is ONE SSE stream (browser `EventSource`, native auto-reconnect)
+  of a compact JSON frame at `telemetry_rate` (5 Hz) with every light readout —
+  odom, IMU, `/diagnostics`, ESP32 (hb/ticks/susp/temp/hall), LDS rpm/hz/duty, fan,
+  plan (downsampled), latched brain strings (purpose/task/experiments), selftest,
+  and the OLED-mirror inputs (face/word/brand/system). The frame is built ONCE per
+  tick and fanned out; the underlying subscriptions are **lazy** (created on the
+  first client — on the executor thread via the tick timer — dropped `SUB_LINGER`
+  after the last), so idle cost is ~zero. Writes: `POST /publish {topic,value}`
+  (whitelisted + clamped per topic: goal_pose, lds_target_rpm, motor_trim, pickup_override,
+  reset_ticks, imu_calibrate, schedule_edit,
+  selftest, go_home/save_map, oled_*) and `POST /param {node,name,value}`
+  (whitelisted nodes/params via `/<node>/set_parameters`, fire-and-forget). The
+  power buttons only POST `/system/*`; the server itself publishes `/oled_system`.
+  **Zenoh gotcha:** `DiagnosticStatus.level` (from `sys_monitor`'s `/diagnostics`,
+  carried as `_pipe_diag`) can arrive as a raw `bytes` (`b'\x00'|b'\x01'|b'\x02'`) under
+  rmw_zenoh rather than a plain `int`. It is normalized to an `int` in
+  `telemetry.py:_on_diag` — keep it that way, and treat every raw ROS field added to the
+  frame as potentially-non-JSON-safe after the zenoh round-trip (an unhandled `bytes`
+  in `json.dumps` in `_tick` kills the whole app hub → systemd respawn loop).
+  **Any** unhandled exception inside a subscription callback runs on the executor
+  thread and kills the hub the same way — e.g. `_on_slam_pose` reading
+  `msg.pose.pose` (the Odometry layout) on the actually-`PoseStamped` `/slam_pose`
+  was an `AttributeError` respawn loop (fixed 2026-08-10). New callbacks must
+  match the real message type and be JSON-safe end-to-end after the zenoh round-trip.
+### HTTP teleop
+
+- **HTTP teleop (`POST /drive`)**: the page POSTs `{v,w}` same-origin; `web_server`
+  clamps (`drive_max_lin`/`drive_max_ang`), publishes `/cmd_vel` immediately, and
+  re-asserts it at 10 Hz while non-zero with a `drive_timeout` dead-man — so browser
+  jank can't outlast the ESP32's 500 ms cmd watchdog and stutter the drive. The dev
+  harness accepts it as a no-op.
+### Text-to-speech (TTS)
+
+- **Text-to-speech** (`tts.py`): `POST /tts {text,voice?}` synthesises with
+  `espeak-ng` (install via `deploy/install-espeakng.sh`; NOT on conda-forge so must be
+  apt-installed on the board separately) to a `/dev/shm` WAV, prepends `LEAD_SILENCE`
+  (0.35 s) so the H5 codec's power-up ramp can't swallow the first word (it wakes on
+  PCM open; a back-to-back utterance was never clipped because it was still awake),
+  plays it with `aplay`, and
+  publishes the words one at a time on **`/oled_word`** timed to the clip duration
+  (espeak emits no word marks, so timing is length-weighted). `oled_display` shows
+  each word big+centred as it's spoken ("karaoke"); `""` returns to the dashboard.
+  Both binaries run **only while speaking** (zero idle cost). The web "Speak" box
+  reuses the old OLED-text field; it no longer publishes `/oled_text` (that brand
+  override still works if published manually). HTTP POST on purpose (server owns audio+timing).
+  - **`TtsEngine.wait(timeout=)`** blocks until the in-flight utterance's playback thread
+    exits. `POST /system/{restart,reboot,shutdown}` (`web_server.py`) speaks the matching
+    farewell/restart line (`system_announce`→`cognition.speak_lifecycle`) then calls this
+    (10 s bound) before firing the detached systemctl/stack.sh command — **fixed 2026-07-15**:
+    it used to fire after a flat 3 s sleep regardless of the line's actual length, so a longer
+    line got cut off mid-sentence by the shutdown/reboot itself (deployed with the
+    2026-07 deploys).
+  - **Voice/volume/speed/pitch** are tuned in the UI and applied directly to
+    espeak-ng's `-v`/`-a`/`-s` flags. They + the stats announcer are **persisted**
+    to `~/.local/state/nanobot/tts.json` (override with
+    the `tts_settings_path` param) and reloaded on node start, so they survive a
+    reboot. `GET/POST /tts/config` read/update them; the page restores its controls
+    from `GET /tts/config` on load.
+  - **Spoken system stats**: a server-side 1 Hz tick (`_announce_tick`) speaks
+    CPU%/RAM%/CPU-temp every `announce_interval` s when `announce` is on — it lives
+    in the node, so it **keeps running after every browser closes** and resumes after
+    a reboot. `POST /tts/announce` says it once now. CPU/RAM/temp come from the same
+    cheap `/proc` + thermal reads the OLED uses; phrasing follows the selected voice.
+  - **Cross-platform TTS for dev testing**: `tts.py` is ROS-free and auto-selects a
+  backend — `espeak-ng` on Linux, Windows SAPI (via PowerShell `System.Speech`) or
+  macOS `say`. So `scripts/dev_tts_test.py` (no ROS) speaks a line on a dev PC:
+  `python scripts/dev_tts_test.py "hi"`, or `--llm "prompt"` to run the full
+  OpenRouter→speech pipeline (needs `OPENROUTER_API_KEY`). espeak-ng supports
+  volume, speed, and pitch natively. `scripts/dev_webui.py` serves the
+  **real `web/index.html`** on a dev PC (ROS-free stand-in for `web_server`) and runs
+    the **same `CognitionCore`** (so there's one base, not two — see below), wiring `/llm/*`,
+    `/skills/*`, `/tts*` + the brain card, so the AI/Skills/Brain cards + Speak box can be
+    tested in a browser locally (telemetry/joystick/map show offline — no /telemetry). Reads
+    the persona/model from robot.yaml (PyYAML) and the key from `$OPENROUTER_API_KEY`, or —
+    if unset — a one-line `memory/openrouter_key` file (gitignored; `llm.load_openrouter_key()`,
+    the ONE shared loader called by `dev_webui.py`/`dev_tts_test.py`/`personality_creator.py`/
+    `pregenerate_phrases.py`, falling back to the old `scripts/.openrouter_key` path).
 ### Nav2 migration (2026-09-14) — slam_nav/EKF REPLACED, sections below are historical
 `docs/nav2-migration.md` was executed: the custom `slam_nav` node, the robot_localization **EKF** (`nano-ekf`), and `nano-map` are **DELETED**. The stack is now Nav2 Humble servers composed into ONE `rclcpp_components/component_container_isolated` (unit `nano-nav`; components attached by a `nano-nav-loader` oneshot via `nav2.launch.py load_only:=true`), the static `base_link→laser` TF (yaw π) its OWN `nano-tf` unit (a never-exiting ExecStartPost would hold a Type=simple unit in "activating" forever — that is why it is not on `nano-nav`), plus slam_toolbox 2.6.10 as its own `nano-slam` unit. Units are now `router app sensors nav tf slam nav-loader`. Key facts that differ from everything written below this point:
 
@@ -138,13 +933,37 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
 - **Deliberate omissions:** no server-side wall guard (Nav2's costmap enforces keep-away; the bubble is display-only, radius hardcoded `NAV_INFLATION_M=0.25` in telemetry.py to mirror `config/nav2/nav2_params.yaml` — if you tune `inflation_radius` there, change the constant: it's NOT read live, a startup get_parameters could race the nav lifecycle); no map Save/Clear buttons (map persistence is a `nano-slam` restart); no no-go brush; no live Nav2 tuning (restart-only per the params note above). Nav2 doesn't expose a plan topic, so there is no plan polyline (the sim that drew one was removed 2026-09-16).
 - **Verify after deploy:** Map view renders → click with Motion ON → `/goal_pose` published (app log `POST /publish /goal_pose`) → chip idle→navigating→arrived; ✕ mid-nav → chip back to idle; Locations Save (robot parked) → list shows the spot → Go → Nav2 drives; `/map` 503 while `nano-slam` is down (graceful placeholder in the hero).
 
-The rest of this section (up to `## Gotchas`) describes the OLD slam_nav/EKF pipeline — kept as tuning history; do not treat its params/topics as current.
+## Deploying to the live board (from a dev host)
+- One-shot deploy: **`scripts/deploy.sh [pkgs…]`** — `rsync`s `src/`+`scripts/` over the
+  passwordless `ssh nano` key alias (`~/.ssh/config`, `Host nano`; override the target with
+  `NANO_HOST`), colcon-builds on the board (optionally `--packages-select`), then
+  `stack.sh restart`. No creds needed in the environment — key auth only.
+  It also pushes the dev-made soul/bank (`memory/personality.json` + `phrases.json`, plus
+  hand-edited `presence_chart.yaml`/`beats.json` if present)
+  into the board's `~/.local/state/nanobot/` — **OFF by default**
+  (`DEPLOY_SOUL=0`), so the robot keeps whatever personality it has evolved on its own.
+  Set **`DEPLOY_SOUL=1`** to overwrite the board's persisted soul with `memory/` (discards
+  accumulated trait drift).
+- The dev host is native Ubuntu with the passwordless `ssh nano`/`scp nano:` alias above
+  (`.nano-deploy.env`, gitignored, only still used by `.nano-askpass.sh` to bootstrap the
+  key if it's ever missing). (Historical, from the old Windows/PuTTY deploy path: `plink -m
+  <localfile>` sends the file's text as the remote shell's argv, so any `pkill -f`/`pgrep -f`
+  pattern appearing in the script kills the controlling shell — `pscp` the script and run it
+  by path instead. No longer relevant now that deploy is `ssh`/`rsync`-based.)
+- `stack.sh restart` is now `systemctl restart nano-robot.target` — systemd owns
+  stop/kill/verify, so the old "stale process serving old code" failure mode (and the
+  heal-timer duplicate-node race) is gone by construction. If a change "doesn't take",
+  check `journalctl -u nano-app` (etc.) and `systemctl status nano-robot.target`.
+- The board has only ~1 GB RAM and a 7 GB rootfs — watch memory and disk. Don't run
+  heavy compiles on it.
+
+The rest of this Architecture section describes the OLD slam_nav/EKF pipeline — kept as tuning history; do not treat its params/topics as current.
 **HTTP teleop gotcha (2026-09-11):** `POST /drive` parses the raw body with `json.loads()` and IGNORES `Content-Type` — any scripted POST with `{"v":..,"w":..}` works (curl included). BUT a single POST only pulses the motors ~0.5 s (web `drive_timeout: 0.6` + ESP32 `CMD_TIMEOUT_MS` 500): the joystick re-POSTs at 10 Hz while pushed. Scripted teleop must re-POST within ~0.5 s or the wheels just twitch. Also: the ESP32 can wedge into a no-motion stall after hard stop/turn sequences — heartbeat/LDS keep running while encoder counts sit frozen (pattern: ~1-2 s of motion then silence) — that's the documented physical power-cycle case, not a nav bug.
 Sensor chain: ESP32 (`/wheel_ticks`, signed by commanded wheel direction in firmware) → `wheel_odometry/encoder_node.py` → `/odom` → robot_localization **EKF** (`src/robot_bringup/config/ekf.yaml`, fuses `/odom` + `/imu/data` → `/odometry/filtered` @15 Hz) → `slam_nav` (`odom_topic = odometry/filtered`, `imu_yaw_sign: -1` in `robot.yaml`).
 
 IMU heading wiring (fixed 2026-08-10): `imu_driver` publishes `/imu/data` with **`frame_id: base_link`** (the driver pre-rotates via the mount matrix + lever-arm-corrects into the chassis frame, so `imu_link` gets dropped by the EKF — it had no TF and robot_localization silently ignored the absolute orientation). `robot.yaml imu_driver.yaw_sign: -1` aligns the BWT901CL heading with the wheels. `imu_driver/_configure_device()` forces the sensor's **range registers on every connect** (`0x29=0x03` → accel ±16 g, `0x2B=0x03` → gyro ±2000°/s — WitMotion codes are **inverted**: 0x00 = narrowest). If this unit boots at ±250°/s while the driver decodes ±2000, **every gyro axis and the device's fused heading come out 8× too big**, silently poisoning the EKF/SLAM heading (symptom: `/odom` yaw looks ~10× smaller than `/imu/euler` during a spin, on top of real tire slip).
 
-Sensor-heading-vs-drive frame flip (`slam_nav heading_flip`, refined 2026-09-11): this unit's sensor head (LDS + IMU) is mounted **facing the robot's back**, so the SENSOR references (IMU yaw, lidar beam 0) sit 180° from the drive direction. The map is internally **consistent** (scan matcher keeps working, no lost-storms), but the global "which way is front" anchor was off: **autonomous nav drove the wrong way** (it rotated the physical back toward the goal then drove forward = away). Fix = rotate the SENSOR references only: `heading_flip: true` → `nav_node.py` adds π to `_on_euler` yaw + `_on_scan` beam angles. **The `/odom` WHEEL yaw is NOT rotated** — it comes from the wheel encoders and is the physical drive frame. (The flip was introduced as "one knob, three ingest flips" when the yaw source was the IMU-anchored EKF; the same-day retune that moved the pose yaw to raw `/odom` (`odom_topic: odom`, `use_imu_yaw: false`) left the π on the wheel yaw, so `pth` meant the physical **back**: the scan matcher locked the map's heading 180° from the drive direction and goals came out unreachable — the "map shifting / driving in circles" symptom, 2026-09-11.) Also `head_tol` (default 0.6 rad) bounds how far a scan match may correct the pose heading per scan vs the wheel prior, and `pos_tol` (0.35 m) + the odom-lock (below `recover_min_seen` the scan matcher may not move the pose at all *except on a genuine revisit*) do the same for position — a sparse/symmetric-map well can otherwise slowly WALK `pth`/the pose off the physical heading & position without any lost-storm. **Restart-only**; default `false` for the usual front-facing mount. The browser's **Lidar hero view** still draws raw `/scan.bin` beam 0 as "the nose" and was NOT flipped — if the head stays back-mounted it will look 180° off versus the SLAM map icon. *See the **TODO — map still skews** section below for the open 2026-09-11 sub-thread (sparse-map revisit snapping, `pos_tol_sparse`/`head_tol_sparse` wheel-anchored clamps, loop-closure firing) — treat that as PARTIAL and keep the diagnosis open.*
+Sensor-heading-vs-drive frame flip (`slam_nav heading_flip`, refined 2026-09-11): this unit's sensor head (LDS + IMU) is mounted **facing the robot's back**, so the SENSOR references (IMU yaw, lidar beam 0) sit 180° from the drive direction. The map is internally **consistent** (scan matcher keeps working, no lost-storms), but the global "which way is front" anchor was off: **autonomous nav drove the wrong way** (it rotated the physical back toward the goal then drove forward = away). Fix = rotate the SENSOR references only: `heading_flip: true` → `nav_node.py` adds π to `_on_euler` yaw + `_on_scan` beam angles. **The `/odom` WHEEL yaw is NOT rotated** — it comes from the wheel encoders and is the physical drive frame. (The flip was introduced as "one knob, three ingest flips" when the yaw source was the IMU-anchored EKF; the same-day retune that moved the pose yaw to raw `/odom` (`odom_topic: odom`, `use_imu_yaw: false`) left the π on the wheel yaw, so `pth` meant the physical **back**: the scan matcher locked the map's heading 180° from the drive direction and goals came out unreachable — the "map shifting / driving in circles" symptom, 2026-09-11.) Also `head_tol` (default 0.6 rad) bounds how far a scan match may correct the pose heading per scan vs the wheel prior, and `pos_tol` (0.35 m) + the odom-lock (below `recover_min_seen` the scan matcher may not move the pose at all *except on a genuine revisit*) do the same for position — a sparse/symmetric-map well can otherwise slowly WALK `pth`/the pose off the physical heading & position without any lost-storm. **Restart-only**; default `false` for the usual front-facing mount. The browser's **Lidar hero view** still draws raw `/scan.bin` beam 0 as "the nose" and was NOT flipped — if the head stays back-mounted it will look 180° off versus the SLAM map icon. *The 2026-09-11 "map still skews" sub-thread below is a slam_nav-era diagnosis record; its surviving validation items live in `docs/TODO.md`.*
 
 What the page already surfaces for each stage:
 - **Wheel ticks** — Coprocessor/ESP32 card: `/wheel_ticks` L/R counts, tick Hz, heartbeat, stray-tick diagnostic + reset.
@@ -165,9 +984,9 @@ New behaviours to know about:
 - **`save()`/`load()` use the packed `cells`**, and old float32 log-odds `.npz` maps are **imported automatically** (seen & log>0 → Occupied, else Free) — a pre-rewrite save loads fine as long as the geometry still matches.
 - Web export is byte-identical in meaning (−1 unknown / 0 free / 100 wall), so the Map panel, Sharp-walls posterize, and keep-away bubble all render as documented.
 
-Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2 = extra points for an EXACT wall hit, keeping the peak sharp above the DT basin), `BLEACH_N`, `ANG_NQ`. nav_node: new `dynamic_reject` (whitelisted in telemetry.py), and `pos_tol`/`head_tol` are now velocity-scaled automatically. Validated live 2026-09-12: parked pose-vs-odom drift **0.000 m** over 90 s on a fresh map, zero lost-storms + crisp walls through a self-test forward/back/spin, and the rasterization lock kept the map clean during the spin. See the TODO just below for the still-open map-vs-room skew question — the rewrite removed the pose-walk *mechanisms* the old matcher was blamed for, so what remains points at the drive-chain / wheel-scale side (2026-09-12 live finding: the robot is exercised in a confined ~1×1.5 m area, so full-drive validation is still pending on open floor).
+Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2 = extra points for an EXACT wall hit, keeping the peak sharp above the DT basin), `BLEACH_N`, `ANG_NQ`. nav_node: new `dynamic_reject` (whitelisted in telemetry.py), and `pos_tol`/`head_tol` are now velocity-scaled automatically. Validated live 2026-09-12: parked pose-vs-odom drift **0.000 m** over 90 s on a fresh map, zero lost-storms + crisp walls through a self-test forward/back/spin, and the rasterization lock kept the map clean during the spin. See the TODO just below for the still-open map-vs-room skew question — the rewrite removed the pose-walk *mechanisms* the old matcher was blamed for, so what remains points at the drive-chain / wheel-scale side (2026-09-12 live finding: the robot is exercised in a confined ~1×1.5 m area, so full-drive validation is still pending on open floor; surviving items live in `docs/TODO.md`).
 
-**TODO — map still skews vs the room after manual driving (2026-09-11, PARTIAL):** after clearing a fresh map, driving one lap a few metres by hand, then parking, the map walls do NOT line up with the physical room *and* the SLAM pose does not sit back on the wheel chain. This is a **live, open problem** — several candidate causes were found and fixed. **2026-09-12 live-driven diagnosis (real robot, dev-PC offline matcher):** the single biggest remaining cause found & fixed was the **boot-into-saved-map frame deadlock** (see the new block below); after that fix a loaded map self-matched to **1.9 cm / 1.8°** (was 22 cm / 58°), scans became trusted (`t 1`), and coverage grew. The residual manual-driving skew question now points at the wheel-scale/slip side (`/odom` scale, `wheel_trim`), NOT the matcher — but a clean *second-lap-doesn't-paint-shifted* drive is still to be re-verified live on open floor (the last scripted lap was interrupted by an ESP32 no-motion stall; see the hardware note below). Verified facts and the trail:
+**Map skew vs the room after manual driving (2026-09-11, slam_nav-era diagnosis record — the matcher retired 2026-09-14; surviving validation items live in `docs/TODO.md`):** after clearing a fresh map, driving one lap a few metres by hand, then parking, the map walls did NOT line up with the physical room *and* the SLAM pose did not sit back on the wheel chain. This was a **live, open problem** at the time — several candidate causes were found and fixed. **2026-09-12 live-driven diagnosis (real robot, dev-PC offline matcher):** the single biggest remaining cause found & fixed was the **boot-into-saved-map frame deadlock** (see the new block below); after that fix a loaded map self-matched to **1.9 cm / 1.8°** (was 22 cm / 58°), scans became trusted (`t 1`), and coverage grew. The residual manual-driving skew question now points at the wheel-scale/slip side (`/odom` scale, `wheel_trim`), NOT the matcher — the open-floor re-verification is tracked in `docs/TODO.md` (the last scripted lap was interrupted by an ESP32 no-motion stall; see the hardware note below). Verified facts and the trail:
 
 - **scan↔map are internally consistent** (`overlap 0.82-0.98`, map `loc ok`, no lost-storms) — the map is a *valid-looking* room, just positioned/rotated wrong wrt reality.
 - **`heading_flip: true` IS correct** (verified 2026-09-11: projecting the live scan with beam+π gives 31-36% wall hits vs ~5% without — the reversed-head frame is real).
@@ -176,22 +995,18 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **What was fixed & deployed** (all live on the board, all tensioned toward "converge on the first trace, never walk"):
   - sparse-map `_on_scan` wheel-authority gate now: `coverage ≥ recover_min_seen` → full `pos_tol`/`head_tol` (unchanged); `overlap ≥ min_overlap_ratio` re-visit below that → position snap capped at NEW `pos_tol_sparse` (0.12 m, was 0.35 = too generous, seeded the 35 cm walk) + heading capped at `head_tol_sparse` (0.15 rad, not 0.6 = seeded a 0.6 rad rotational smear); else pure odom-lock (unchanged). `pos_tol_sparse` whitelisted + live-tunable.
   - `_maybe_loop_close` now accepts a wide re-match that only *improves over the offset-free wheel prior* (was: absolute `loop_score ≥ 4`, which never fired on a fresh map). It fired once (19:26 drift 0.62 m) — but `loop_alpha: 0.1` bled only ~6 cm per event, so it cannot out-run the drift in a single drive.
-- **Still-open candidate causes (next things to try):**
-  1. ~~Even a 9 cm idle gap is too much — the pose should return to within ~2 cm of odom when parked. Instrument WHICH scan/correction moves the pose last while driving (temporary per-scan log of `trusted / cand / ax,ay / dpos / dhead`)~~ — **DONE 2026-09-12**: the per-scan `scan->` breadcrumb now logs exactly this (trusted / pose / anch / cand / score / improve / overlap / dpos / dhead) at 1 Hz; the "9 cm gap" turned out to be the boot-into-saved-map frame mis-load at the parked replay point (fixed above), not a residual walk. Re-check the gap ONLY on a cleanly-built fresh map. 2. `loop_alpha 0.1` is too slow for single-drive convergence — try 0.3-0.5 with a matching `loop_apply_thresh`, and/or run the probe more often (`loop_probe_every`).
-  3. The whole-map frame may be caught in a slightly-rotated seed (`rot_from`/`_seed_pth` at first scan) — compare final `pth` to `odom yaw` after a clean 360° in place: they must match (mod 2π) to within `head_tol_sparse`.
-  4. Manual driving = wheels are the only truth; if actual tyre scale/slip is big (few %), the map will always skew by the same %. Re-check `/odom` scale vs a measured rollout and consider `wheel_trim`/scale compensation before blaming the matcher.
-  Verify after any change: **park → paused → `map (px,py)` must equal wheel-integrated odom position within a few cm AND a clean second lap must not paint a shifted mask** (watch `seen` grow monotonically / walls stay 1-2 cells, max log ~100).
+- **Open items moved to `docs/TODO.md` (2026-09-16):** the surviving validation work — the `/odom` wheel-scale vs a measured rollout (`wheel_trim`/scale compensation) and the open-floor check that a clean second lap must not paint a shifted mask (park → pause: map pose back on wheel-integrated odom within a few cm, re-checked only on a cleanly-built fresh map). The slam_nav-specific knobs in the old list — `loop_alpha 0.1` → 0.3–0.5 + tighter `loop_apply_thresh`/more frequent `loop_probe_every`, the rotated-seed `rot_from`/`_seed_pth` pth-vs-odom check, `pos_tol_sparse`/`head_tol_sparse` retunes — retired with slam_nav on 2026-09-14. (The struck-through "instrument which scan moves the pose" item was DONE 2026-09-12: the per-scan `scan->` breadcrumb below, kept — the 9 cm gap was the boot-into-saved-map frame mis-load, not a residual walk.)
 
 **Boot-into-saved-map FRAME deadlock — the big 2026-09-12 "map shifted+rotated" bug (FIXED, live-verified):** `occupancy.save/load` used to persist **only the occupancy cells** (no frame metadata). On boot the nav node loaded the grid but `rot_from`/`_seed_pth`/`_seed_odom` stayed at their init defaults (the seed path that anchors them only runs for FRESH maps). Since odom is continuous across a nav-only restart (the sensor hub keeps publishing), the loaded grid was then interpreted in the WRONG odom frame: `_predict` rotated odom deltas by `rot_from=0` while the walls were painted under `R(old_seed_yaw)`, so EVERY scan's best match sat a fixed ~0.3 rad / 0.2–0.4 m away from the wheel-anchored pose. The sparse trust gate (pos_tol_sparse 0.12 / head_tol_sparse 0.15) then rejected that correction forever (`t 0` in the breadcrumb), coverage froze at the loaded value, and because global coverage (≈0.3% for a small room) < `recover_min_seen` (0.25 = 144 m² of the 24 m grid!) the lost-counter could NEVER fire → no boot-locate → permanent mismatch. **Fix (all in `occupancy.py` + `nav_node.py`):**
   1. `save()` now also persists the frame anchors: `rot` (map-vs-odom yaw) + the seed tuple `s0-s5` = (odom x, odom y, odom yaw, seed_dx, seed_dy, seed_pth) — i.e. WHERE the robot was in both frames when the map was anchored. `load()` restores them (older npz without the keys → zeros → treated as "drawn in the current odom frame", which old saves effectively were).
   2. On boot-into-saved-map `_on_scan` re-anchors: `pose = (seed_dx, seed_dy) + R(rot_from)·(odom − seed_odom)`, `pth = seed_pth + (odom_yaw − seed_odom_yaw)`, then enters recovery (kidnap) so the matcher can still correct e.g. a carried robot. Live-verified: loaded map self-match residual **1.9 cm / 1.8°** (was 22 cm / 58°), scan trust restores (`t 1`), wall cells grow.
   3. A recovery/load path that found the map too EMPTY now checks **occupied-cell count** (`grid.occ_count()`, local structure) instead of global coverage fraction — a real 1.5 m²-room map reads 0.3 % coverage but has hundreds of wall cells and MUST be kept/matched; a truly empty grid (0 walls) is discarded → fresh seed.
   4. `_on_scan`/`_on_clear_map` gained a per-scan matcher breadcrumb (`scan->cov … | t … | pose | anch | cand | sc/imp/ov | dpos/dhead`) throttled to 1 Hz — the TODO's "instrument which scan moves the pose" ask; keep it, it makes the next diagnosis log-only.
-  **Old saved maps without frame metadata cannot be repaired in place** — clear the map once after deploying this fix so the seed tuple is written fresh. **Remaining knob (untouched 2026-09-12):** `loop_alpha 0.1` is still too slow to be a real loop-closer on a single drive; per-the-TODO try 0.3–0.5 + tighter `loop_apply_thresh` once the matcher-side is confirmed healthy on open floor.
+  **Old saved maps without frame metadata cannot be repaired in place** — clear the map once after deploying this fix so the seed tuple is written fresh. *(The remaining `loop_alpha 0.1` loop-closer knob died with slam_nav, 2026-09-14 — see `docs/TODO.md`.)*
 
 **Empty-map relocalize guard (`recover_min_seen`, added 2026-08-11):** when localization is lost on a near-empty grid there is nothing for the scan matcher to lock onto, so a persistent low score is *expected* (fresh map / just cleared) rather than evidence of drift — and the relocalize in-place spin (`recover_spin`) only smears the grid + drains the battery. `slam_nav` now suppresses the spin whenever map coverage (`grid.coverage()`) is below `recover_min_seen` (default **0.25**): it holds pose, logs `map too empty (seen X%) to relocalize — holding pose, not spinning` (throttled 5 s), and keeps running the recovery matching in `_on_scan` so the spin resumes automatically once the map fills past the threshold. Live-tunable via `/param` (`recover_min_seen`), whitelisted in `telemetry.py`. Verified 2026-08-11: pre-fix a goal-click on a just-cleared map stormed 155 `localization lost` cycles in ~100 s spinning at 0.6 rad/s; post-fix the same scenario logs the guard line and publishes **zero** cmd_vel. `0.10` was too low (a 0.106-covered smeared map still stormed) — hence `0.25`. Threshold choice is a map-density judgment; raise it for sparse rooms, lower for dense ones. NOTE 2026-09-12: the drop-to-remap branch now keys on `occ_count() < 4` (structure), because global coverage can never reach 0.25 for a small-room map.
 
-**EKF heading is now pure gyro-z (fixed 2026-08-11):** the BWT901CL's *device-fused* yaw (0x53) develops a decaying bias transient for a minute+ after any real motion (measured: +450° in 76 s post-drive while raw gyro-z stayed ~0) — fusing it into the EKF made the fused heading, and thus SLAM's motion prior, drift for a minute after every drive. Fix: **`ekf.yaml imu0_config` yaw fusion is OFF** (only `vyaw` = gyro-z is fused for heading, `Ax/Ay` for tilt); heading = gyro-z integration from 0 at boot. Verified: rest 120 s EKF yaw delta +0.03°; drive EKF −178° vs scan −168° (gyro ~1.05× over-rotates; SLAM absorbs it); post-drive 70 s EKF holds −0.53° while device fused yaw runs +101° (now display-only, feeds the web 3D + IMU card, NOT navigation). The web drift tool reads EKF yaw (`telemetry.py _drift_yaw_deg()`), roll/pitch stay on `/imu/euler`. **Config drift warning:** the EKF/robot.yaml changes were applied on the board directly — dev-repo `ekf.yaml`/`robot.yaml` still carry the old imu0-yaw-on / `use_imu_yaw: true` layout and MUST be synced (deploy diffs only `telemetry.py`). One knock-on tradeoff: nav_node's runtime slip/sign diagnostics now compare odom-vs-odom (IMU yaw no longer feeds nav_node), so those checks are inert.
+**EKF heading is now pure gyro-z (fixed 2026-08-11):** the BWT901CL's *device-fused* yaw (0x53) develops a decaying bias transient for a minute+ after any real motion (measured: +450° in 76 s post-drive while raw gyro-z stayed ~0) — fusing it into the EKF made the fused heading, and thus SLAM's motion prior, drift for a minute after every drive. Fix: **`ekf.yaml imu0_config` yaw fusion is OFF** (only `vyaw` = gyro-z is fused for heading, `Ax/Ay` for tilt); heading = gyro-z integration from 0 at boot. Verified: rest 120 s EKF yaw delta +0.03°; drive EKF −178° vs scan −168° (gyro ~1.05× over-rotates; SLAM absorbs it); post-drive 70 s EKF holds −0.53° while device fused yaw runs +101° (now display-only, feeds the web 3D + IMU card, NOT navigation). The web drift tool reads EKF yaw (`telemetry.py _drift_yaw_deg()`), roll/pitch stay on `/imu/euler`. **Config drift warning (MOOT):** the EKF/robot.yaml changes were applied on the board directly — the sync concern ended with the 2026-09-14 migration that deleted `ekf.yaml`/`use_imu_yaw` entirely (no references remain in the dev repo). One knock-on tradeoff: nav_node's runtime slip/sign diagnostics now compare odom-vs-odom (IMU yaw no longer feeds nav_node), so those checks are inert.
 
 **Boot-into-saved-map 180° heading flip (`recover_min_move`, fixed 2026-08-11):** saved maps carry **no heading metadata** (`occupancy.py save/load` stores only `log/seen/forb/n/res`), and on load `pth` stays at the default `0.0` — the IMU/odom seed only runs for fresh maps. With no absolute heading, the full-grid 16-heading `relocalize` is the only way to find the robot, and on a **symmetric or sparse** room the correct and the 180°-flipped heading score identically — so the `recover_confirm` gate re-scoring the SAME pose while the robot is still/spinning-in-place **self-confirms the wrong flip** ("robot thinks its front is its back"; the EKF/drift-tool/teleop are all still correct — only the SLAM map pose `pth` flips, and the web map arrow reads `pth` from the map JSON header). Only **translation** changes what the scan sees, so recovery candidates may now be adopted AND confirmed only after the robot has actually moved ≥ `recover_min_move` (default **0.10 m**) from where recovery started; a still robot holds the odom-derived (physically-correct) heading and stays "recovering" until nudged (or the 12 s timeout runs on the best estimate). Live-tunable via `/param` (`recover_min_move`), whitelisted in `telemetry.py`. A pure in-place recovery spin does NOT break the 180° ambiguity by itself.
 
@@ -225,7 +1040,7 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **`stack.sh restart` is unreliable** — can leave stale processes holding ports. Clean `down` → verify via `/proc` → `up`.
 - **A missing `/dev/shm/nano_nogo.bin` right around a restart is teardown, not a bug** — during a `deploy.sh`/`stack.sh restart` window the old processes + the `user@1000` session teardown transiently remove blobs (even a hand-created dummy `/dev/shm/nano_nogo.bin` vanished within that window). Nothing in code deletes it (no `os.remove`/`unlink`/`os.replace` to that path anywhere; tmpfiles.d/crons/timers are clean). Re-check once the stack is quiet before hunting a "deleter" — the blob persists indefinitely after a clear once settled. See `web-map-clear-buttons-nogo` memory.
 - **`brain_timeout` must stay well above `reflect_period`** (invariant: timeouts shorter than the reflection gap cause the chart to revert accumulated drift).
-- **Heavy topics bypass rosbridge:** `/map` and `/scan.bin` are served from `/dev/shm` via HTTP, not bridged.
+- **Heavy data paths bypass the ROS graph and the SSE frame:** `/scan.bin` (+ the other `nano_*` blobs) live in `/dev/shm` and are served over HTTP; `/map` is served by the `GET /map` HTTP route (telemetry holds a transient-local sub to slam_toolbox). (rosbridge was removed 2026-07-06 — there is no bridge at all.)
 - **`rmw_zenoh` ordering:** a node started before `rmw_zenohd` runs islanded (won't appear in the graph).
 - **Python edits are live:** `--symlink-install` means edit `src/<pkg>/<pkg>/foo.py`, restart node = picked up. New modules import fine via egg-link.
 - **nanobot-brain is pip-installed**: edit `src/nanobot_brain/` in the nanobot-brain repo, restart node = picked up (editable install).
