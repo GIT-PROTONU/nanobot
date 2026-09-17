@@ -392,11 +392,13 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   doesn't see a fake huge jump when the raw counters reset.
 - **Straight-line trim (open-loop rebalance)**: the mismatched gearmotors are rebalanced
   by a single trim factor in `applyMotors` (`l*=(1-t)`, `r*=(1+t)`; **negative = robot was
-  pulling left** — boost left / cut right — because the robot currently veers LEFT). A
-  fixed **`TRIM_DEFAULT = -0.10`** (main.cpp, 2026-07-16) is the NVS fallback; the old
-  **`TRIM_AUTOCAL` is DISABLED** (`TRIM_AUTOCAL 0`) because on this board its encoder-signed
-  imbalance converged the WRONG way (pushed trim positive = more left veer). Persisted to
-  ESP32 NVS (survives reboot/reflash; written only while stopped, rate-limited). Manual
+  pulling left** — boost left / cut right — because the robot currently veers LEFT).
+  **`TRIM_DEFAULT = -0.10`** (main.cpp, 2026-07-16) is the NVS fallback; **`TRIM_AUTOCAL` is
+  re-enabled (`TRIM_AUTOCAL 1`, 2026-09-17)** — the 2026-07-16 wrong-way convergence ran
+  under the old inverted-polarity gate (it only passed while the robot was LIFTED); with
+  `SUSPEND_ACTIVE_HIGH true` verified, the gate means "both wheels on the ground" and the
+  loop math is sound negative feedback. Adaptation result persists to ESP32 NVS (survives
+  reboot/reflash; written only while stopped, rate-limited). Manual
   set/reset live via **`/motor_trim`** (Float32, 0 = reset) — the web Coprocessor card has
   a **Wheel trim** slider (`±0.30`) that POSTs it and re-seeds from the live `/wheel_trim`
   @1 Hz value; the slider's "Reset trim to 0" button clears it. Tunables `TRIM_*` in

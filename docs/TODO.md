@@ -35,23 +35,13 @@ in this checkout.
       quadrature); the true counts/rev can only be confirmed by driving a measured
       distance on the robot (ties into the odom-autocal backlog item and the
       map-skew item above).
-- [ ] **Flash the ESP32 stray-tick firmware** (`/wheel_stray_ticks` +
-      `/reset_ticks`, built 2026-07-15, not flashed) — from the dev PC:
-      `cd firmware/nanobot_coprocessor && pio run -t upload` (never build on the
-      board).
-- [ ] **Unblock the encoder trim autocal** (2026-07-16, memory note
-      `slam-map-rotation-encoder-trim`). The off-ground microswitches read
-      INCONSISTENT polarity (one wheel always reports "suspended"), so the autocal
-      gate `!g_susp_l && !g_susp_r` never passes — straight-line trim is running on
-      a MANUAL `wheel_trim=0.22` (NVS) instead. Fix options: (a) read raw
-      per-switch `digitalRead` idle levels via firmware serial → set correct
-      polarity PER WHEEL (not the single `SUSPEND_ACTIVE_HIGH`); or (b) relax the
-      autocal gate to key off "straight command + enough ticks" and drop the switch
-      dependency entirely; then re-flash and let autocal converge from a reset
-      trim. Needs the physical robot.
-- [ ] **Re-enable `pickup_pause: true`** (currently `false` in robot.yaml) only
-      AFTER the suspension switches read truthfully — until then it false-freezes
-      SLAM.
+- [ ] **Flash the ESP32 firmware** (`/wheel_stray_ticks` + `/reset_ticks`, built
+      2026-07-15, and the 2026-09-17 `TRIM_AUTOCAL 1` re-enable) — from the dev
+      PC: `cd firmware/nanobot_coprocessor && pio run -t upload` (never build on
+      the board). After flashing: reset trim to 0 (web Coprocessor card or
+      `POST /motor_trim 0`), then drive straight a few seconds and let autocal
+      converge — verify it settles on a NEGATIVE trim (the known left veer) and
+      the robot tracks straight.
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze
@@ -65,8 +55,6 @@ in this checkout.
       (memory note `selftest-spin-imu-mismatch`, still OPEN). No protocol readback
       exists — verification is eyeballing |accel|≈9.8 + a smooth mag sweep via
       `/imu_calibrate` cmds + `/imu_calibrate_status`.
-- [ ] **Tune the LDS spin-motor PID on hardware** (firmware/nanobot_coprocessor —
-      the PID holding `/lds_target_rpm` is marked "tune on hardware").
 - [ ] **Test cross-host zenoh discovery end-to-end** — `rviz_remote.sh --connect
       <ip>` (the `ZENOH_SESSION_CONFIG_URI` path) was written without a way to test
       it from the dev PC. If `ros2 topic list` on the dev PC doesn't show the
@@ -86,6 +74,9 @@ in this checkout.
 - LDS keeps spinning during vision tracking — deliberate (tracking rotations count
   as "moved", so the safety lidar never idle-parks while tracking); revisit only if
   tracking sessions turn out long/stationary.
+- LDS spin-motor PID tuning (firmware/nanobot_coprocessor — the PID holding
+  `/lds_target_rpm`): seems fine as-is, marked done 2026-09-17; take a closer
+  look only if the LDS doesn't turn on when it should.
 
 ## Standing invariants (must never regress — full context in AGENTS.md)
 
@@ -131,3 +122,18 @@ in this checkout.
 - MOOT: EKF yaw process-noise tuning, slam_nav scan-matching logger,
   `/scan_bias`, `/scan_quality_metrics`, `/scan_matching_quality`, and the
   slam_nav vision pan-track loop (vision is expression/behaviour-level only).
+- [x] **Encoder trim autocal unblocked** (2026-09-17): the 2026-07-16
+      "converged the wrong way" observation ran under the inverted-polarity
+      switch gate (with `SUSPEND_ACTIVE_HIGH false` the `!g_susp_l && !g_susp_r`
+      gate only passed while the robot was LIFTED — tuning on free-spinning
+      wheels). With the polarity flip verified, the gate means "both wheels on
+      the ground" and the loop math is sound negative feedback → `TRIM_AUTOCAL 1`
+      re-set in firmware. Pending flash + straight-drive converge check (folded
+      into the flash item in "Open — needs the physical robot").
+- MOOT: re-enable `pickup_pause: true` — the param was slam_nav's and died with
+  the Nav2 migration (2026-09-14); no SLAM pickup-freeze exists anymore and the
+  remaining pickup consumers (mood_node reflex, web snapshot) need no config
+  flip. Residual gap to keep in mind: nothing pauses Nav2 while the robot is
+  held off the ground (wheels spin → commanded-direction-signed encoder ticks
+  corrupt `/odom` + SLAM). If that ever matters, add a pickup gate (ESP32-side
+  duty/tick gate or web_control-side) as a new open item.

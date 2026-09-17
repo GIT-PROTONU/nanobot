@@ -146,9 +146,13 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // std_msgs/Float32 on /motor_trim to set it directly (0 = reset); current value is
 // republished on /wheel_trim at 1 Hz and in the status line below.
 // (Compiled out under WHEEL_PID_ENABLED — a velocity PID equalizes the wheels itself.)
-#define TRIM_AUTOCAL    0   // disabled: the encoder-signed autocal was converging the WRONG way on
-                            // this board (robot veers LEFT, but autocal pushed trim positive => more
-                            // left veer). Set a fixed TRIM_DEFAULT below instead and tune via /motor_trim.
+#define TRIM_AUTOCAL    1   // re-enabled 2026-09-17: with SUSPEND_ACTIVE_HIGH true (verified),
+                            // the gate below means "both wheels on the ground" — the 2026-07-16
+                            // wrong-way convergence ran under the old inverted-polarity gate,
+                            // which only passed while the robot was LIFTED (free-spinning wheels).
+                            // The loop math itself is sound negative feedback. If it still
+                            // drifts the wrong way on hardware, set 0 + TRIM_DEFAULT and tune
+                            // via /motor_trim.
 #define TRIM_DEFAULT    -0.10f  // starting straight-line offset; NEGATIVE = boost left / cut right,
                                 // counteracting a leftward veer. Tune live with POST /motor_trim.
 #define TRIM_MAX        0.30f   // |trim| clamp — beyond this something is broken, not unmatched
