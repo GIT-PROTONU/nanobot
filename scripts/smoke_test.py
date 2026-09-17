@@ -127,7 +127,7 @@ def main():
             break
         check("telemetry frame arrives", first is not None)
         if first:
-            missing = [k for k in ("susp", "oled", "esp", "lds") if k not in first]
+            missing = [k for k in ("susp", "oled", "esp", "lds", "nav") if k not in first]
             check("frame has base keys", not missing, f"missing={missing}")
 
         st, body = req("POST", "/publish", {"topic": "/oled_face", "value": "happy"})

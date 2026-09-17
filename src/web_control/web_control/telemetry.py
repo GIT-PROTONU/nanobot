@@ -128,6 +128,7 @@ class TelemetryHub:
         self._hall = None
         self._wheel_trim = None     # live straight-line trim from the ESP32 (/wheel_trim)
         self._lds = {}                # rpm / hz / duty
+        self._lds_at = None           # monotonic ts of the last /lds_* arrival
         self._fan = None
         self._mag = None              # (x, y, z) raw counts, for eyeballing IMU cal quality
         self._eul = None              # (roll, pitch, yaw deg, arrival monotonic) -- direct
@@ -431,7 +432,8 @@ class TelemetryHub:
                     "stray": self._stray,
                     "tick_hz": round(self._tick_hz, 1),
                     "wheel_trim": self._wheel_trim},
-            "lds": self._lds,
+            "lds": dict(self._lds, age=round(now - self._lds_at, 1)
+                        if self._lds_at is not None else None),
             "oled": self._oled,
         }
         # IMU |accel|/|gyro| summary rides the vitals blob (numeric labels only, 1 Hz
@@ -535,11 +537,18 @@ class TelemetryHub:
         # the inflation bubble radius. All tiny; the heavy map grid itself is
         # served by the /map HTTP route, never this frame.
         pose = self._tf_pose()
+        map_age = (now - self._map_arrival) if self._map_arrival != STALE else None
         f["nav"] = {
             "pose": [round(v, 3) for v in pose] if pose else None,
             "goal": self._goal,
             "status": self._goal_status,
             "inflation": NAV_INFLATION_M,
+            # Feeds-health strip (Map card): seconds since slam_toolbox last
+            # published /map (None = never arrived) + whether the static
+            # base_link->laser TF exists (None = nano-tf down). Both cheap:
+            # _map_arrival is already tracked, _tf_laser_age is one TF lookup.
+            "map_age": round(map_age, 1) if map_age is not None else None,
+            "tf_laser": self._tf_laser_age(),
         }
         # latched brain readouts, passed through as the raw JSON strings the page parses
         for k, v in (("purpose", self._purpose), ("task", self._task),
@@ -666,6 +675,7 @@ class TelemetryHub:
     def _mk_lds(self, key):
         def cb(msg):
             self._lds[key] = round(msg.data, 3)
+            self._lds_at = time.monotonic()   # staleness for the feeds strip
         return cb
 
     def _on_fan(self, msg):
@@ -722,6 +732,21 @@ class TelemetryHub:
             self._goal_status = NAV_STATUS.get(code, "idle")
             if code in (4, 5, 6):            # SUCCEEDED / CANCELED / ABORTED
                 self._goal = None
+
+    def _tf_laser_age(self):
+        """base_link→laser static TF existence check for the Map card's feeds
+        strip: 0.0 when the TF resolves (nano-tf unit up — static transforms
+        are latched so 'exists' is the meaningful state, not age), None when
+        it doesn't (nano-tf down → slam_toolbox can't resolve the scan frame
+        and silently drops every scan). One tf2 lookup per tick, same lazy
+        buffer as _tf_pose."""
+        if self._tf_buf is None:
+            return None
+        try:
+            self._tf_buf.lookup_transform("base_link", "laser", Time())
+            return 0.0
+        except Exception:                    # missing TF / connectivity — nano-tf down
+            return None
 
     def _tf_pose(self):
         """map-frame pose (x, y, yaw_rad) from TF, or None (slam_toolbox or

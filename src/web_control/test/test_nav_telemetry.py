@@ -22,7 +22,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from action_msgs.msg import GoalStatus, GoalStatusArray
 
-from web_control.telemetry import GOAL_MAX_ABS_M, NAV_STATUS, TelemetryHub
+from web_control.telemetry import GOAL_MAX_ABS_M, NAV_STATUS, STALE, TelemetryHub
 
 
 class _FakeLog:
@@ -198,6 +198,33 @@ def test_on_map_replaces_whole_payload():
     meta2, cells = h.get_map_payload()
     assert meta2["w"] == 4 and len(cells) == 16
     assert meta2 is not meta1
+
+
+# ---- feeds-health strip (Map card) ----------------------------------------------
+def test_map_arrival_starts_stale_then_fresh():
+    """map_age: None (never arrived) before the first /map, ~0 right after —
+    the SLAM dot's contract (fresh = slam_toolbox publishing)."""
+    h = _hub()
+    assert h._map_arrival == STALE
+    h._on_map(_grid(2, 2))
+    assert h._map_arrival != STALE
+
+
+def test_tf_laser_none_without_buffer():
+    """No TF listener (browser never connected) → the TF dot reads down/not-
+    yet rather than crashing the frame build."""
+    assert _hub()._tf_laser_age() is None
+
+
+def test_lds_age_tracks_arrival():
+    """lds.age: null until the first /lds_* arrives, then set — the LDS dot's
+    staleness signal (a dead ESP32 link leaves rpm>0 but ages the timestamp)."""
+    from std_msgs.msg import Float32
+    h = _hub()
+    assert h._lds_at is None
+    h._mk_lds("rpm")(Float32(data=299.5))
+    assert h._lds_at is not None
+    assert h._lds["rpm"] == pytest.approx(299.5)
 
 
 # ---- goal mirror + chip ----------------------------------------------------------

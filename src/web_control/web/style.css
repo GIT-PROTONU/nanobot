@@ -107,6 +107,8 @@ canvas#oledcv{image-rendering:pixelated;width:92%;max-width:560px;height:auto;
 .navchip.arrived{color:#30a46c;border-color:rgba(48,164,108,.6);background:rgba(48,164,108,.18)}
 .navchip.failed{color:#e5484d;border-color:rgba(229,72,77,.45);background:rgba(229,72,77,.10)}
 /* inline legend dots in the Map card hint */
+.fdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3a4356;
+  margin-right:3px;vertical-align:middle;transition:background .3s}
 .map-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin:0 2px 0 4px;
   vertical-align:baseline}
 .map-dot.robot{background:#ff3b30}

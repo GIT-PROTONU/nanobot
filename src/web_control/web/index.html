@@ -100,6 +100,13 @@
             <label class="switch"><input type="checkbox" id="mapShade" checked><span class="track"></span>
               Sharp walls</label>
           </div>
+          <div class="chiprow" id="mapFeeds">
+            <span class="fdot" id="feedEsp32"></span>ESP32
+            <span class="fdot" id="feedLds"></span>LDS
+            <span class="fdot" id="feedOdom"></span>Odom
+            <span class="fdot" id="feedTf"></span>TF
+            <span class="fdot" id="feedSlam"></span>SLAM
+          </div>
           <p class="hint" id="mapHint">2D occupancy map from <b>slam_toolbox</b>, polled over
             <b>/map</b> (slam_toolbox republishes it every ~5 s). Scroll/pinch to zoom, drag to
             pan, ⤢ Fit recentres. <b>Tap the map to set a goal</b> — with <b>Motion</b> on the
@@ -1817,6 +1824,23 @@ function onFrame(f){
     const cancel=$("mapCancel");
     if(cancel) cancel.style.display=(f.nav.goal && (f.nav.status==="planning"||f.nav.status==="navigating"))?"":"none";
     if(f.nav.goal) mapGoal=f.nav.goal;       // adopt the server's goal mirror (clicks set it locally first)
+    // Feeds-health strip (Map card): one dot per link in the map-building
+    // chain — green = OK, red = down, grey = no data yet. Pinpoints which
+    // feed broke when the map stops growing: ESP32 (heartbeat), LDS (spin),
+    // Odom (sys_monitor pipeline watcher), TF (static base_link→laser),
+    // SLAM (/map arriving — covers slam_toolbox + the whole TF chain).
+    const pf=f.pipeline&&f.pipeline.feeds||{};
+    const feeds=[
+      ["feedEsp32", f.esp && f.esp.hb_age!=null && f.esp.hb_age<3],
+      ["feedLds",   !!(f.lds && f.lds.rpm>0 && f.lds.age!=null && f.lds.age<3)],
+      ["feedOdom",  /^ok/.test(pf.odom||"")],
+      ["feedTf",    f.nav.tf_laser!=null],
+      ["feedSlam",  f.nav.map_age!=null && f.nav.map_age<10],
+    ];
+    for(const [id,ok] of feeds){
+      const el=$(id);
+      if(el) el.style.background=ok?"var(--green)":"var(--red)";
+    }
     if(mapOnNav) mapOnNav(f.nav);
   }
   // Brain readouts arrive as the same latched JSON strings the behaviour node

@@ -99,6 +99,10 @@ in this checkout.
       `sbc-setup.sh` unit set + live-verified; see `docs/nav2-migration.md`).
 - [x] **Map view + click-to-goal + Locations rebuilt on Nav2** (2026-09-15,
       dev-verified — see AGENTS.md).
+- [x] **Feeds-health strip in the Map card** (2026-09-17 — five dots
+      `ESP32 · LDS · Odom · TF · SLAM`, one per map-chain link; motivated by a
+      "only one scan, map never grew" session where the broken feed had to be
+      hunted over SSH. See the AGENTS.md Map block for the diagnosis table).
 - [x] **TTS shutdown-cutoff fix deployed** — `TtsEngine.wait(timeout=)` landed
       with the 2026-07 deploys (the 2026-07-15 "not yet deployed" note in the
       pre-consolidation CLAUDE.md was stale).
