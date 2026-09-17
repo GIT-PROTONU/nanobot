@@ -47,8 +47,8 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import UnlessCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
 
@@ -120,19 +120,19 @@ def generate_launch_description():
 
     # Static base_link -> laser: the TF-world replacement for slam_nav's
     # heading_flip (this unit's sensor head faces BACK → yaw π). Offset matches
-    # the URDF's laser_joint (top centre of the base, +2 cm head height).
+    # the URDF's laser_joint (top centre of the base, +2 cm head height). Owned
+    # by the nano-tf systemd unit on the board (never emitted with load_only —
+    # a long-running static_transform_publisher would hang the loader oneshot),
+    # spawned only on the ros2-launch dev path.
     static_tf_args = ["--x", "0", "--y", "0", "--z", "0.065",
                       "--frame-id", "base_link", "--child-frame-id", "laser"]
-    static_tf_flip = Node(
+    static_tf = Node(
         package="tf2_ros", executable="static_transform_publisher",
         name="base_to_laser",
-        arguments=static_tf_args + ["--yaw", "3.14159265"],
-        output="screen", condition=IfCondition(heading_flip))
-    static_tf_plain = Node(
-        package="tf2_ros", executable="static_transform_publisher",
-        name="base_to_laser",
-        arguments=static_tf_args,
-        output="screen", condition=UnlessCondition(heading_flip))
+        arguments=static_tf_args + ["--yaw", PythonExpression(
+            ['3.14159265 if "', heading_flip, '" == "true" else "0"'])],
+        output="screen",
+        condition=UnlessCondition(load_only))
 
     return LaunchDescription([
         DeclareLaunchArgument("container_name", default_value="nav2_container"),
@@ -148,6 +148,5 @@ def generate_launch_description():
         container,
         load_nodes,
         slam_toolbox,
-        static_tf_flip,
-        static_tf_plain,
+        static_tf,
     ])
