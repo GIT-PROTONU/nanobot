@@ -117,9 +117,22 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // full-scale 0.4 m/s command — duty 0.63 after the v+w normalization — moved at all, and
 // in-place turns at 0.37 duty didn't). Remap any command above MOTOR_DEADZONE from
 // (0..1] to [MOTOR_MIN_DUTY..1] so slow speeds and tank turns still overcome friction.
-// Tune MOTOR_MIN_DUTY down to just below where the wheels reliably start on the ground.
-#define MOTOR_MIN_DUTY 0.55f
+// 0.55 was measured (2026-09-19 drive test) to still re-stick at crawl: wheels jerked,
+// ran 1.5-2.4 s at constant ~0.60-0.69 remapped duty, then seized mid-command (the
+// documented "low-duty turn stall"), on BOTH crawl speeds (0.12 m/s) and in-place
+// spins (0.5 rad/s). 0.70 + the breakaway kick below keeps them turning; the cost is
+// coarser low-speed duty resolution ([0.70..1] spans 0..0.4 m/s).
+#define MOTOR_MIN_DUTY 0.70f
 #define MOTOR_DEADZONE 0.02f   // |duty| below this = intended stop, not a crawl
+// Breakaway kick: at crawl the wheel breaks away on the initial ramp, crawls ~1.5-2 s,
+// then static friction re-seizes it at constant duty (it only restarts on a direction/
+// phase change). Two pulses fix it without hurting velocity resolution: a full-duty
+// START kick whenever a wheel's ramped duty leaves the deadzone, and a STALL re-kick
+// whenever it is powered but hasn't ticked for MOTOR_KICK_RECHECK. Keyed off the RAMPED
+// duty (same as the stray gating below); the kick bypasses the slew ramp (it IS the
+// jolt) but trim still applies, so it stays direction-correct.
+#define MOTOR_KICK_MS      80
+#define MOTOR_KICK_RECHECK 350
 // Acceleration control: duty (a step function of the latest /cmd_vel) used to be applied
 // to the motors instantly, so any joystick flick or direction reversal was a hard jolt.
 // MOTOR_SLEW_DEFAULT caps how fast the APPLIED duty may follow the commanded duty (duty
@@ -903,7 +916,33 @@ void loop(){   // Core 1: real-time control
       l_ramped = slewTo(l_ramped, g_left_duty, maxDelta);
       r_ramped = slewTo(r_ramped, g_right_duty, maxDelta);
     }
-    applyMotors(l_ramped, r_ramped);
+    // Breakaway kick (see MOTOR_KICK_* above): full-duty pulse on start-from-stop and
+    // while powered-but-stalled. Ticks are the stall signal — at crawl they still flow
+    // every few 10 ms windows, so 350 ms of frozen counts under nonzero duty can only
+    // be a seized rotor, not quantization.
+    static float l_prev_ramped=0, r_prev_ramped=0;
+    static int32_t l_kick_ticks=0, r_kick_ticks=0;
+    static uint32_t l_kick_until=0, r_kick_until=0;
+    static uint32_t l_stall_since=0, r_stall_since=0;
+    if (fabsf(l_ramped) > MOTOR_DEADZONE){
+      if (fabsf(l_prev_ramped) <= MOTOR_DEADZONE) l_kick_until = now + MOTOR_KICK_MS;
+      if (l_stall_since && g_left_ticks == l_kick_ticks){
+        if (now - l_stall_since > MOTOR_KICK_RECHECK){ l_kick_until = now + MOTOR_KICK_MS; l_stall_since = now; }
+      } else { l_stall_since = now; l_kick_ticks = g_left_ticks; }
+    } else { l_kick_until = 0; l_stall_since = 0; }
+    if (fabsf(r_ramped) > MOTOR_DEADZONE){
+      if (fabsf(r_prev_ramped) <= MOTOR_DEADZONE) r_kick_until = now + MOTOR_KICK_MS;
+      if (r_stall_since && g_right_ticks == r_kick_ticks){
+        if (now - r_stall_since > MOTOR_KICK_RECHECK){ r_kick_until = now + MOTOR_KICK_MS; r_stall_since = now; }
+      } else { r_stall_since = now; r_kick_ticks = g_right_ticks; }
+    } else { r_kick_until = 0; r_stall_since = 0; }
+    // Kick direction keys off the COMMANDED duty, not the ramp: at ramp start l_ramped
+    // is still 0.0 and copysign(1, 0.0) = +1, which would pulse the wrong way for one
+    // 10 ms tick on a reverse command.
+    float l_apply = (now < l_kick_until) ? copysignf(1.0f, (g_left_duty != 0.0f) ? g_left_duty : l_ramped) : l_ramped;
+    float r_apply = (now < r_kick_until) ? copysignf(1.0f, (g_right_duty != 0.0f) ? g_right_duty : r_ramped) : r_ramped;
+    l_prev_ramped = l_ramped; r_prev_ramped = r_ramped;
+    applyMotors(l_apply, r_apply);
     // Stray-tick gating: a wheel counts as "stopped" STRAY_SETTLE_MS after its APPLIED
     // (ramped) duty last went to exactly 0 (coast-down grace period), and un-stops the
     // instant nonzero power is applied again. MUST key off the ramped duty (l_ramped/

@@ -47,9 +47,14 @@ slam_toolbox:
     ceres_nonlinear_solver: SPARSE_NORMAL_CHOLESKY
     # Pose-graph growth guard: only add a node when the robot has actually
     # moved. This is the real CPU/RAM protection on the H5 — every graph node
-    # is a Ceres optimization problem.
+    # is a Ceres optimization problem. minimum_travel_heading is ALSO a smear
+    # guard: each scan covers a full ~0.2 s revolution with NO deskew, so every
+    # node added while rotating paints a motion-blurred scan; 0.17 rad added a
+    # blurred node every ~10 deg of spin (the 2026-09-19 dust map). 0.35 keeps
+    # pose heading tracking (the matcher still runs per scan) while cutting the
+    # number of blurred graph nodes roughly in half.
     minimum_travel_distance: 0.1
-    minimum_travel_heading: 0.17
+    minimum_travel_heading: 0.35
     minimum_time_interval: 0.5
     throttle_scans: 1
     # Map publishing + TF pacing
@@ -59,6 +64,15 @@ slam_toolbox:
     tf_buffer_duration: 30.0
     enable_interactive_mode: false
     debug_logging: false
+    # Correlation matcher window (karto): the translational search is centered
+    # on the wheel-odom prior. The upstream default (0.5) = only +/-0.25 m of
+    # recovery per scan; with the unverified ticks_per_rev / stiction-crawl
+    # drive chain, scans were locking past that. 0.8 = +/-0.4 m at 2x the
+    # correlation-grid CPU (still small vs the H5 headroom; slam idled ~3.5%
+    # of a core with the default window).
+    correlation_search_space_dimension: 0.8
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
     # Online-async matcher subset. NOTE: the robostack Humble package is
     # slam_toolbox 2.6.10 — later keys like minimum_angle_gap /
     # minimum_match_distance / position_revisit_* do NOT exist there (they are
@@ -106,7 +120,11 @@ controller_server:
       min_lookahead_dist: 0.3
       max_lookahead_dist: 0.9
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 1.5
+      rotate_to_heading_angular_vel: 0.5
+      # (0.5 rad/s, was the 1.5 upstream default: the LDS sweep has NO deskew —
+      # each 0.2 s revolution smears w*0.2 rad; 1.5 rad/s = 17 deg of blur per
+      # scan = the wall-dust failure. Rotations are the map-quality bottleneck,
+      # not straight driving.)
       rotate_to_heading_min_angle: 0.785
       max_angular_accel: 3.2
       use_velocity_scaled_lookahead_dist: true

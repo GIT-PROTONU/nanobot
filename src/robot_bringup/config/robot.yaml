@@ -322,7 +322,13 @@ web_control:
     # non-zero, with a dead-man stop when the page stops refreshing (browser jank
     # could otherwise outlast the ESP32's 500 ms /cmd_vel watchdog = stutter).
     drive_max_lin: 0.4        # m/s clamp (the ESP32 maps 0.4 to full PWM)
-    drive_max_ang: 3.0        # rad/s clamp
+    # Angular clamp. Each /scan covers a full ~0.2 s lidar revolution and slam_toolbox
+    # (2.6.10, the active mapper) has NO deskew — a turn at w rad/s smears every scan by
+    # w*0.2 rad (3.0 rad/s = 34 deg/scan = the wall-dust that wrecked the 2026-09-19 map;
+    # 0.8 = 9 deg/scan, still a visible blur during spins but survivable). Keep any raise
+    # tied to a map-quality check, and note the ESP32's low-duty stall: spins around
+    # 0.3-0.5 rad/s can re-stick the wheels (see MOTOR_MIN_DUTY / the firmware kick).
+    drive_max_ang: 0.8        # rad/s clamp
     drive_timeout: 0.6        # s without a fresh POST -> publish one stop
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).

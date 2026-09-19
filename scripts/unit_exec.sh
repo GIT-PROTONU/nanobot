@@ -28,6 +28,21 @@
 #    nano-nav.service runs it as ExecStartPost so both die/restart together.
 set -u
 
+# Clock-step guard: the board has no battery-backed RTC, so every power-on boots with a
+# days-stale fake-hwclock and NTP STEPS the clock forward ~a minute after boot — mid-run,
+# while the stack is already up. A step under a live SLAM session destroys it (every scan
+# stamp jumps ~44 h; slam_toolbox's message filter drops them all: "earlier than all the
+# data in the transform cache", 2026-09-19 12:00:53). Wait up to 20 s for NTP before
+# exec'ing anything, then proceed anyway so an offline robot still boots its stack
+# (bounded, never a permanent block). Every unit runs this; after the router's wait the
+# rest see a synced clock instantly. Keep it here in ONE place —
+# deploy/systemd/nano-router.service deliberately has no ExecStartPre twin.
+for i in $(seq 1 40); do
+  [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && break
+  sleep 0.5
+  [ "$i" = 40 ] && echo "unit_exec: clock not NTP-synced after 20s — starting anyway (stale-clock risk)" >&2
+done
+
 NANO="${NANO:-$HOME/Nano}"
 # glibc gives each thread its own malloc arena (real RSS creep on the threaded nodes);
 # cap the arenas — a cheap RSS win on the 1 GB board.

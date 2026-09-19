@@ -19,14 +19,31 @@ in this checkout.
       (from the AGENTS.md 2026-09-11 "map still skews" thread — the matcher-side
       causes were fixed there, and the slam_nav matcher itself is gone since the
       Nav2 migration; what survives is the physical/drive-chain validation):
+      - **2026-09-19 SLAM diagnosis (live session)**: the old map was incoherent
+        dust (852 scattered occ cells; live-scan-vs-map hit-rate 33% at ANY rigid
+        offset — sensor itself was clean, 1-3 cm scan-to-scan parked). Root causes
+        found: teleop/Nav2 rotation rates (34°/17° of sweep smear per scan —
+        slam_toolbox has NO deskew; each scan covers a full 0.2 s revolution) +
+        jerk-stall drive chain (above) + an oversized dust-fed pose graph. Fixed
+        in config (deployed live 2026-09-19): `drive_max_ang 3.0 → 0.8`,
+        `rotate_to_heading_angular_vel 1.5 → 0.5`, slam `minimum_travel_heading
+        0.17 → 0.35` (fewer blurred nodes), `correlation_search_space_dimension
+        0.5 → 0.8`. Fresh-map parked hit-rate after the fix: **96-98% at zero
+        offset with a sharp peak** (was 15-33%); after a stall-contaminated
+        out-and-back: 0.84-0.86 (one bad lock strip from the OUT jerk). Also:
+        the board's no-RTC clock steps (~44 h at power-on, 2026-09-19 12:00:53)
+        destroy live SLAM sessions — a bounded NTP wait now gates `unit_exec.sh`
+        (deployed live; 20 s max, offline robots still boot).
+      - RE-VALIDATE after flashing the firmware kick (item above): restart
+        nano-slam (fresh map — no map_file_name is configured, so a restart IS a
+        clear), drive a clean lap, confirm walls line up with the room, a second
+        lap doesn't paint a shifted mask, and the out-and-back map-pose tracking
+        has no bad locks (the BACK direction tracked perfectly both sessions;
+        the stall-jerk FWD runs did not — recheck with working drive chain).
       - Re-check `/odom` wheel scale against a measured rollout (ties into the
         `ticks_per_rev` item below); if real tyre scale/slip is a few %, consider
         `wheel_trim`/scale compensation — in manual driving the wheels are the only
         truth, and the map skews by the same %.
-      - On open floor (the robot has only been exercised in a confined ~1×1.5 m
-        area): clear a fresh map, drive a clean lap by hand, park, and confirm the
-        walls line up with the room; a clean second lap must NOT paint a shifted
-        mask (walls stay 1-2 cells, coverage grows monotonically).
       - Park → pause: the pose must sit back on the wheel-integrated odom position
         within a few cm — re-check only on a cleanly-built fresh map (the old 9 cm
         idle gap was the boot-into-saved-map frame mis-load, fixed 2026-09-12).
@@ -36,12 +53,21 @@ in this checkout.
       distance on the robot (ties into the odom-autocal backlog item and the
       map-skew item above).
 - [ ] **Flash the ESP32 firmware** (`/wheel_stray_ticks` + `/reset_ticks`, built
-      2026-07-15, and the 2026-09-17 `TRIM_AUTOCAL 1` re-enable) — from the dev
-      PC: `cd firmware/nanobot_coprocessor && pio run -t upload` (never build on
-      the board). After flashing: reset trim to 0 (web Coprocessor card or
-      `POST /motor_trim 0`), then drive straight a few seconds and let autocal
-      converge — verify it settles on a NEGATIVE trim (the known left veer) and
+      2026-07-15; the 2026-09-17 `TRIM_AUTOCAL 1` re-enable; and the 2026-09-19
+      low-duty stall fix) — from the dev PC: `cd firmware/nanobot_coprocessor &&
+      pio run -t upload` (never build on the board). After flashing: reset trim to 0
+      (web Coprocessor card or `POST /motor_trim 0`), then drive straight a few seconds
+      and let autocal converge — verify it settles on a NEGATIVE trim (the known left veer) and
       the robot tracks straight.
+      - **2026-09-19 drive-test evidence (SLAM diagnosis session)**: with the flashed
+        deadband build (`MOTOR_MIN_DUTY 0.55`), wheels seized ~1.4-2.4 s into every
+        command at crawl/mid duty — 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins
+        (remapped duty ~0.60-0.83): moved, crawled, froze mid-command for the rest of
+        the phase (my test ran full timeouts with the robot frozen). Fixed in-repo:
+        `MOTOR_MIN_DUTY 0.55 → 0.70` + a breakaway kick (start-from-stop + 350 ms
+        no-ticks re-kick, `MOTOR_KICK_*` in main.cpp) — **unflashed**. Until flashed,
+        slow/crawl maneuvers (Nav2 approach speeds, in-place turns) are unreliable and
+        every jerk-stall sequence feeds slam_toolbox jerk priors (bad locks, see below).
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze
@@ -55,6 +81,13 @@ in this checkout.
       (memory note `selftest-spin-imu-mismatch`, still OPEN). No protocol readback
       exists — verification is eyeballing |accel|≈9.8 + a smooth mag sweep via
       `/imu_calibrate` cmds + `/imu_calibrate_status`.
+      - **2026-09-19: device attitude is GARBAGE right now** — parked robot reads
+        roll ≈ +91° / pitch ≈ −134° (SSE `eul`), and device-fused yaw moved only
+        ±2° across a session where the robot yawed 69°+ (drive test). Not in the
+        SLAM chain (slam_toolbox consumes only /scan + TF) so mapping is unaffected,
+        but the web IMU card / drift tool are junk until fixed. Suspect the device
+        got into a bad mode (post mag-cal experiments?); try a USB replug /
+        power-cycle of the BWT901CL first, then re-check |accel|≈9.8.
 - [ ] **Test cross-host zenoh discovery end-to-end** — `rviz_remote.sh --connect
       <ip>` (the `ZENOH_SESSION_CONFIG_URI` path) was written without a way to test
       it from the dev PC. If `ros2 topic list` on the dev PC doesn't show the

@@ -6,6 +6,8 @@ PartOf=nano-robot.target
 
 [Service]
 User=ibster
+# NOTE: the NTP clock-step guard lives in scripts/unit_exec.sh (the board has no
+# battery RTC; see the comment there). Keep it in ONE place.
 ExecStart=/home/ibster/Nano/scripts/unit_exec.sh router
 # rmw_zenoh ordering: a node that starts before the router is listening runs islanded
 # (never appears in the graph). Hold "started" until the router actually ACCEPTS on

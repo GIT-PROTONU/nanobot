@@ -67,7 +67,13 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   is gone.)
   What each unit execs lives in ONE place: **`scripts/unit_exec.sh`** (pixi env
   activation via `pixi shell-hook`, then `exec` of the installed executable — no
-  resident wrapper, no `ros2 run` RAM overhead). Logs: `journalctl -u nano-app` etc.
+  resident wrapper, no `ros2 run` RAM overhead). **Every unit also runs a bounded
+  NTP clock-step wait at the top of `unit_exec.sh`** (up to 20 s, then starts anyway):
+  the board has no battery RTC, so a power-on boots with a days-stale fake-hwclock and
+  NTP steps the clock mid-run while the stack is already up — under a live SLAM session
+  that step drops every scan (slam_toolbox message filter: "earlier than all the data in
+  the transform cache", hit 2026-09-19). All units are `After=nano-router`, so the
+  router's wait orders the whole stack. Logs: `journalctl -u nano-app` etc.
 
 - Auto-starts on boot via systemd `nano-robot.target`. `nano-stack.service` + `nano-heal.timer` are retired. Restart/recovery is systemd's (`Restart=on-failure`); `stack.sh down` → verify via `/proc` → `up` is still the clean cycle after a deploy (`stack.sh restart` can leave stale processes holding ports — see Gotchas).
 - Zenoh needs a serial-capable `zenohd` binary (conda builds lack `transport_serial`). Build with `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; the `nano-router` systemd unit (via `scripts/unit_exec.sh router`) runs it on the board so the ESP32 (serial) and the rmw_zenoh nodes (TCP) share a graph.
@@ -403,6 +409,19 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   a **Wheel trim** slider (`±0.30`) that POSTs it and re-seeds from the live `/wheel_trim`
   @1 Hz value; the slider's "Reset trim to 0" button clears it. Tunables `TRIM_*` in
   `main.cpp`; compiled out if `WHEEL_PID_ENABLED`.
+- **Low-duty stall + breakaway kick (2026-09-19, in repo — UNFLASHED).** The gearmotors
+  seize at crawl even under the stiction deadband: the 2026-09-19 drive test measured
+  wheels jerking, running 1.5-2.4 s at constant ~0.60-0.83 remapped duty, then freezing
+  mid-command at 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins (they only restart on a
+  direction/phase change). Fix in `main.cpp`: `MOTOR_MIN_DUTY 0.55 → 0.70` plus a
+  **breakaway kick** (`MOTOR_KICK_MS 80` / `MOTOR_KICK_RECHECK 350`) — a full-duty pulse
+  when a wheel's ramped duty leaves the deadzone (start-from-stop) and re-pulsed while
+  powered-but-not-ticking (350 ms of frozen tick counts under nonzero duty can only be a
+  seized rotor, not tick quantization). Keyed off the RAMPED duty like the stray gating;
+  kick direction keys off the COMMANDED duty (copysign(1, 0.0) = +1 would pulse the wrong
+  way for one tick on a reverse). Until flashed, slow maneuvers (Nav2 approach, spins) are
+  unreliable and every jerk-stall feeds slam_toolbox a bad prior — see the SLAM block and
+  docs/TODO.md.
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,
@@ -923,6 +942,23 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
 - **slam_toolbox lifecycle:** the robostack build is **2.6.10, where SlamToolbox is a PLAIN `rclcpp::Node`** — its own executable main calls `configure()`; there are NO lifecycle services and **composing the registered component is inert** (nothing calls configure; verified against the installed binaries; robostack has no newer build for either platform — 2.6.x only). So slam_toolbox runs as its OWN process (`nano-slam.service`, `unit_exec.sh slam`, `async_slam_toolbox_node` + `config/nav2/nav2_params.yaml`), NOT in the container and NOT in any lifecycle manager. The `lifecycle_manager_slam`/`bond_timeout: 0.0` design in the original plan applied to slam_toolbox ≥2.7 only. Do NOT try to "compose slam_toolbox" until robostack ships a ≥2.7 build (then revisit: a second manager with bond_timeout 0.0 drives it).
 - **Goals:** browser/skills publish `/goal_pose` (PoseStamped, frame `map`) exactly as before — bt_navigator consumes it. The minimal recovery BT (`config/nav2/recovery_bt.xml`): fail → clear costmaps → back up 0.15 m → spin 90° → retry once → abort.
 - **Params:** Nav2 tunables live in `config/nav2/nav2_params.yaml` (NOT robot.yaml; NOT live-tunable — restart `nano-nav`). The web `/param` whitelist's `slam_nav` entries are GONE. RPP controller: `rotate_to_heading_angular_vel` is the angular cap (no `max_angular_vel` in Humble); Ceres threads are hardcoded 50 upstream — the guards are `minimum_travel_distance/heading` pose-graph gating + `CPUAffinity=2 3`/`Nice=10`/`MemoryMax=400M` on `nano-nav.service` + `MALLOC_ARENA_MAX=2`.
+
+**SLAM rotation-smear tuning (2026-09-19, live-verified):** the first slam_toolbox map came out
+as incoherent dust (852 scattered wall cells; a live scan correlated with it at only 33% at ANY
+rigid offset — while the LDS itself repeated scans to 1-3 cm parked). Root causes were the drive
+chain, not the matcher: **no deskew** (each scan covers a full ~0.2 s lidar revolution, so a turn
+at `w` rad/s smears every scan by `w·0.2` rad — teleop's 3.0 rad/s clamp = 34°/scan) + the
+low-duty motor stall (above) feeding jerk priors. Fixes, all in config and live on the board:
+`drive_max_ang 3.0 → 0.8` (robot.yaml), `rotate_to_heading_angular_vel 1.5 → 0.5`,
+slam `minimum_travel_heading 0.17 → 0.35` (fewer motion-blurred graph nodes; the matcher still
+runs per scan for heading tracking) and `correlation_search_space_dimension 0.5 → 0.8` (±0.4 m
+karto search vs the unverified wheel scale; ~2× correlation CPU, slam idled ~3.5% of a core
+before). After the fix a fresh map scored **96-98% live-scan-to-map wall-hit at zero offset with
+a sharp ±5° falloff** (was 15-33%, no coherent peak); after a stall-contaminated out-and-back it
+held 0.84-0.86 (one bad-lock strip from the FWD jerk; the reverse run tracked map-pose-to-odometry
+exactly). **There is no deskew in slam_toolbox 2.6.10 — keep every rotation rate (teleop clamp,
+RPP cap, skill motion) tied to the `w·0.2 rad/scan` smear budget, and note the map resets on any
+`nano-slam` restart (no `map_file_name` is configured — restart IS the map clear).**
 - **Dead web-UI features** (scrapped per the plan): the old Map hero view + click-to-goal, wall guard + keep-away bubble, map buttons (Home/Save/Clear/Self-test), no-go brush, the Motion-chain and EKF cards, slam_nav/track_* sliders, LDS idle auto-spin-down (set Spin target 0 manually on the Lidar card instead). **The Map view + click-to-goal + Locations were REBUILT 2026-09-15 — see the block below.**
 
 **Map view + click-to-goal REBUILT (2026-09-15, dev-verified):** the web Map hero view is back on top of Nav2, built resource-light (the 1 GB board budget):
@@ -1054,7 +1090,7 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **Vision readouts are one atomic snapshot** — `gpu_vision` scalars are read via `snapshot()` (one `_lock` acquisition for all fields, added 2026-08-10). Don't revert to per-property getters in the 5 Hz telemetry build or the 10 Hz `_vision_state_tick`: that was ~20 lock round-trips/tick + cross-field reading skew.
 - **BWT901CL gyro/accel range registers are inverted and NOT persisted** — WitMotion maps `0x00 = narrowest`, `0x03 = widest`: `0x29` accel (0=±2 g … 3=±16 g), `0x2B` gyro (0=±250 … 3=±2000 °/s). The device defaults to ±250°/s at power-on, but the driver decodes raw as ±2000 → **8× too big on every axis + the device's internal fused heading** (root cause of the 2026-08-10 SLAM lost-storms). `imu_driver/_configure_device()` re-writes `0x29=0x03, 0x2B=0x03` on every (re)connect exactly like RRATE — do NOT "simplify" them away, or the next power-cycle silently reintroduces a scaled heading.
 - **A differential robot's body yaw rate is bounded by its wheel command** — if `/imu/euler` Δyaw vastly exceeds what the wheels could have rolled (`(ΔL+ΔR)/2·m_per_tick`, ARC of both wheels), suspect an IMU scale/sign error, not an encoder undercount. Wheel-odom translation is correctly scaled; expect only small tire-slip gaps on spins.
-- **Low-duty turn commands can stall the wheels** — in-place turns map to tiny per-wheel speeds (±0.04 m/s at 0.5 rad/s) whose duty can stop the motors ~0.5-1 s in (wheels AND body both freeze mid-command; encoder counts + IMU plateau together). This is a drive-power issue, separate from sensing.
+- **Low-duty turn commands can stall the wheels** — in-place turns map to tiny per-wheel speeds (±0.04 m/s at 0.5 rad/s) whose duty can stop the motors ~0.5-1 s in (wheels AND body both freeze mid-command; encoder counts + IMU plateau together). This is a drive-power issue, separate from sensing. The 2026-09-19 drive test sharpened it: with the flashed `MOTOR_MIN_DUTY 0.55` deadband the wheels still seized 1.4-2.4 s into EVERY command at 0.12 m/s, 0.25 m/s AND 0.5 rad/s spins (constant ~0.60-0.83 remapped duty), recovering only on a direction change — the firmware breakaway kick + 0.70 floor (above, UNFLASHED) is the fix. Scripted teleop (`POST /drive`) still needs ~10 Hz re-POSTs; my 2026-09-19 test loop (~0.4 s period) kept `/cmd_vel` alive via web_server's 10 Hz re-assert, so freezes were real stalls, not cmd-timeouts.
 - **`config/robot.yaml` is the single config source** — all ports, pins, rates, LLM params live there. Its `slam_nav:` block uses the ROS param layout (`slam_nav.ros__parameters.<name>`). Indentation must match sibling keys exactly: a block one space off parses as a *nested map* and the whole `slam_nav` section silently returns `None` to nav_node (only the in-code default saves you). Always sanity-check with `python3 -c "import yaml,sys; print(yaml.safe_load(open('src/robot_bringup/config/robot.yaml'))['slam_nav']['ros__parameters']['recover_min_seen'])"` after editing, and remember the running stack reads it via the `build/ → src/` symlink, not a copied install.
 - **ESP32 link can wedge after a stack restart and needs a PHYSICAL power cycle** — after `stack.sh down/up` the coprocessor may never re-attach to the router's serial link (`/dev/ttyS1`): `esp32 DOWN: no heartbeat ever received`, `/wheel_ticks` silent, LDS motor dead (ESP32 drives its PID), scans stop. Service restarts, full `nano-robot.target` restarts, even a board `sudo systemctl reboot` do NOT reliably recover it — the firmware's auto-recovery watchdogs (`LINK_CONNECT_DEADLINE_MS`, `LINK_RX_TIMEOUT_MS` in `firmware/nanobot_coprocessor/src/main.cpp`) apparently can't re-sync a wedged UART. Symptom chain when it happens: `esp32 DOWN` → `lds DOWN: lidar not spinning` → `wheel_ticks SILENT` → map `feeds.scan: -1`. Diagnosis: `journalctl -u nano-sensors.service | grep -i esp32`, and confirm the router holds the fd (`ls -l /proc/$(pgrep -f zenohd-serial)/fd | grep ttyS1`). Fix = unplug/replug the ESP32's power. After a successful power cycle it comes back on its own (`esp32 UP after …`, `/wheel_ticks resumed`, `lds UP`), and `lds_idle_enable=false` + `lds_active_rpm=300` via `/param` wakes the lidar if it's parked.
 - **`plink -m` on Windows:** the script text becomes the shell's argv. `pkill -f` patterns can kill the controlling shell. Fix: `pscp` script, run by path.
