@@ -52,27 +52,38 @@ in this checkout.
       quadrature); the true counts/rev can only be confirmed by driving a measured
       distance on the robot (ties into the odom-autocal backlog item and the
       map-skew item above).
-- [ ] **Flash the 2026-09-20 breakaway PUSH rewrite** (`MOTOR_PUSH_*` in main.cpp —
-      IN REPO, UNFLASHED; compiled + size-checked on the dev PC, RAM 8.4 % / Flash
-      35.6 %): `pio run -t upload` from `firmware/nanobot_coprocessor` with the ESP32
-      USB tethered to the dev PC (as for the 2026-09-20 morning flash). Then
-      re-validate on carpet with an instrumented drive (RELIABLE-QoS /wheel_ticks
-      recorder, 15 Hz): **crawl-start lag target <0.5 s with no stall-kick-stall
-      judder** (the flashed 80 ms-kick build measured 1-2 s of judder then a lurch —
-      pulses don't sustain enough torque to break static friction; mid-run crawl at
-      0.79 duty is already smooth and stops ramp cleanly), then spins + the SLAM
-      re-validation item above. Watch the push-cap behavior against a deliberate
-      wall/obstacle: the capped push should nudge-and-back-off (doubling to 1.6 s),
-      not ram.
-- [ ] **Post-flash ESP32 verification** (firmware FLASHED 2026-09-20 on the dev PC —
-      `/wheel_stray_ticks` + `/reset_ticks` (built 2026-07-15), the 2026-09-17
-      `TRIM_AUTOCAL 1` re-enable, and the 2026-09-19 low-duty breakaway kick;
-      `upload_speed = 115200` added to platformio.ini since the default 460800
-      handshake failed to verify): on the robot, reset trim to 0 (web Coprocessor
-      card or `POST /motor_trim 0`), then drive straight a few seconds
-      and let autocal converge — verify it settles on a NEGATIVE trim (the known left veer) and
-      the robot tracks straight. Then re-validate crawl/spin maneuvers (Nav2 approach,
-      in-place turns) and the SLAM re-validation item above.
+- [ ] **Flash + hardware-tune the 2026-09-20 closed-loop wheel-PID motor control**
+      (supersedes the breakaway PUSH rewrite, which stays in the repo compiled out
+      behind `#if !WHEEL_PID_ENABLED` as the legacy open-loop path): `WHEEL_PID_ENABLED
+      1` — the I-term integrates through stiction so crawl holds deterministically
+      instead of riding on the stiction remap (removed: `writeSide` is now linear,
+      only `MOTOR_DEADZONE` zeroes an intended stop) + the breakaway push. Accel
+      limiting moved to a SETPOINT slew (`WHEEL_TGT_SLEW`, m/s per s) so the loop
+      stays lag-free; `/motor_accel` is compiled out under the PID (the web
+      Coprocessor card's dead "Accel ramp" slider was replaced by live PID
+      KP/KI/KD sliders). `MAX_ANGULAR_SPEED`
+      synced 3.0 → 0.8 (robot.yaml `drive_max_ang`, SLAM smear budget). Starting
+      gains KP 0 / KI 8.0 / KD 0 (`WHEEL_KFF` feedforward baseline): NEVER flash
+      with KP=KI=0 — feedforward-only will not crawl anymore (no remap). **Gains
+      are LIVE-TUNABLE once flashed (one last flash to get the feature)**:
+      `/motor_pid` (Float32MultiArray [kp,ki,kd], whitelisted) updates the running
+      PID instantly (integrators reset) and persists to ESP32 NVS once parked;
+      the web Coprocessor card's PID sliders drive it, re-seeded from the 1 Hz
+      `/wheel_pid` readback (`f.esp.wheel_pid`) — tuning iterations do NOT need a
+      reflash. Tuning
+      order on hardware (debug console prints vel/tgt/duty @3.3 Hz): KI until a
+      crawl breaks away <0.5 s without stick-slip hunting (halve if it oscillates),
+      then KP ~0.5·KFF for stiffness; KD stays 0 (tick quantization). Accepted
+      limit: feedback is single-channel (ticks signed by COMMANDED direction) —
+      blind on reverse-through-zero/stall/slip/being-pushed; the real fix is a 2nd
+      quadrature channel. Build verified both paths (`pio run` via
+      `pixi run ~/.local/bin/pio run` — the zenoh-pico build needs the pixi env's
+      cmake): RAM 8.5% / Flash 35.7%. Then re-validate on carpet with an
+      instrumented drive (RELIABLE-QoS /wheel_ticks recorder, 15 Hz): **crawl-start
+      lag <0.5 s, no judder, smooth continuous crawl, clean ramp-down stops**, then
+      spins + the SLAM re-validation item above, and a deliberate wall-press check
+      (full-duty hold, integral clamped — no backoff anymore, dead-man still cuts on
+      command loss).
       - **2026-09-19 drive-test evidence (SLAM diagnosis session)**: with the flashed
         deadband build (`MOTOR_MIN_DUTY 0.55`), wheels seized ~1.4-2.4 s into every
         command at crawl/mid duty — 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins
@@ -83,23 +94,43 @@ in this checkout.
       - **2026-09-20 carpet re-test (instrumented, RELIABLE /wheel_ticks @15 Hz)**: the
         kick build judders at crawl starts — ~1.2 s of 80 ms pulses before breakaway
         (sometimes 0.35 s — variance), then smooth continuous crawl (5.3 s at 0.79
-        duty, zero frozen windows) and clean ramp-down stops. Motivated the PUSH
-        rewrite above. Same session: a wheel pressed against an obstacle stays frozen
-        through sustained full-duty pushing (expected physics). NOTE: at this deadband
-        the slowest nonzero command ≈0.28 m/s physical (the [0.70..1] remap) — there is
-        no true slow crawl; manual "slow" driving would need either a lower floor
-        (stalls return) or the closed-loop WHEEL_PID path (OFF).
+        duty, zero frozen windows) and clean ramp-down stops. Same session: a wheel
+        pressed against an obstacle stays frozen through sustained full-duty pushing
+        (expected physics). NOTE: at this deadband the slowest nonzero command ≈0.28
+        m/s physical (the [0.70..1] remap) — there is no true slow crawl; the
+        closed-loop PID above replaces the remap and re-opens the slow range.
+- [ ] **Post-flash ESP32 verification** (firmware FLASHED 2026-09-20 on the dev PC —
+      `/wheel_stray_ticks` + `/reset_ticks` (built 2026-07-15), the 2026-09-17
+      `TRIM_AUTOCAL 1` re-enable, and the 2026-09-19 low-duty breakaway kick;
+      `upload_speed = 115200` added to platformio.ini since the default 460800
+      handshake failed to verify): on the robot, reset trim to 0 (web Coprocessor
+      card or `POST /motor_trim 0`), then drive straight a few seconds
+      and let autocal converge — verify it settles on a NEGATIVE trim (the known left veer) and
+      the robot tracks straight. Then re-validate crawl/spin maneuvers (Nav2 approach,
+      in-place turns) and the SLAM re-validation item above.
+      - NOTE 2026-09-20: the wheel-PID build (above) compiles `TRIM_AUTOCAL` OUT (a
+        per-wheel velocity PID equalizes the wheels itself) — the autocal-convergence
+        check here only applies while the legacy open-loop path is flashed. Under the
+        PID, verify straight tracking directly (equal commanded wheel speeds → equal
+        measured tick rates).
 - [ ] **Diagnose the web gateway's intermittent 1-9 s POST stalls** (they chop the
       10 Hz /drive stream → dead-man cut mid-drive → stop → lurch on recovery —
       manual-driving feel depends on this as much as the firmware): 2026-09-20
       evidence — two `POST /drive` clients timed out on connect while TTS was
       speaking (espeak-ng running), and one processed 2.2 s late; board load
       reached 3.95/4 cores. A /proc-based stall trap (`/tmp/stall_trap.sh` on the
-      board, 15 min windows, snapshots every app_hub thread's wchan/state on a
-      >600 ms stall → `/tmp/stall_*.txt`) was deployed 2026-09-20 ~11:22 — review
+      board, 15 min windows, snapshots every app_hub thread's wchan/state on a >600 ms stall → `/tmp/stall_*.txt`) was deployed 2026-09-20 ~11:22 — review
       dumps; py-spy needs root (board sudo is passworded), so if /proc wchan is too
       coarse, add an in-process `faulthandler.register(SIGUSR1)` to app_hub (edit +
       restart, no ptrace needed) and SIGUSR1 on stall.
+      - **The /cmd_vel chop component is FIXED 2026-09-20**: the 10 Hz drive
+        keepalive moved OFF app_hub's ROS executor into a dedicated thread
+        (`web_server._drive_loop`, os.nice(-5) best-effort, daemon, joined in
+        `destroy_node`) — executor slips under TTS/vision/LLM load can no longer
+        starve the re-assert past the ESP32's 500 ms watchdog. Remaining open:
+        WHY executor callbacks slip that far under load (the stall-trap dumps), and
+        whether POST /drive handling itself (HTTP thread) still stalls under load —
+        that part is ThreadingHTTPServer, not the executor.
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze

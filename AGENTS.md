@@ -350,7 +350,9 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   (Bool, onboard-LED pipeline test), `/lds_target_rpm` (Float32 PID setpoint), `/fan_pwm`
   (Float32 0..1 → SBC cooling-fan LEDC PWM; published by `sys_monitor` from the CPU-temp
   curve, web-overridable), `/motor_trim` (Float32 manual straight-line trim set/reset —
-  see below). **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
+  see below), `/motor_pid` (Float32MultiArray `[kp,ki,kd]` — LIVE wheel-PID gains, see
+  the closed-loop note below; **the web Coprocessor card's PID sliders drive it**, so
+  tuning needs no reflash). **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
   a dropped link, or the SBC genuinely powered off — same `linkAlive()`-gated treatment as
   the LDS spin-motor park below; there's no SBC heat to move if the SBC isn't running, and
   it resumes the instant `sys_monitor` reconnects (2026-07-15 fix — it used to hold its last
@@ -409,38 +411,49 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   a **Wheel trim** slider (`±0.30`) that POSTs it and re-seeds from the live `/wheel_trim`
   @1 Hz value; the slider's "Reset trim to 0" button clears it. Tunables `TRIM_*` in
   `main.cpp`; compiled out if `WHEEL_PID_ENABLED`.
-- **Low-duty stall + breakaway push (2026-09-19; kicked 2026-09-20, PUSH REWRITE in repo 2026-09-20 UNFLASHED).** The gearmotors
-  seize at crawl even under the stiction deadband: the 2026-09-19 drive test measured
-  wheels jerking, running 1.5-2.4 s at constant ~0.60-0.83 remapped duty, then freezing
-  mid-command at 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins (they only restart on a
-  direction/phase change). First fix, flashed 2026-09-20 morning: `MOTOR_MIN_DUTY 0.55 → 0.70` plus an
-  80 ms full-duty **breakaway kick** pulse on start-from-stop + while powered-but-not-ticking
-  (kick direction keyed off the COMMANDED duty). **2026-09-20 carpet re-test (instrumented
-  drive, RELIABLE /wheel_ticks capture at 15 Hz): the pulses judder without reliably
-  breaking away — 1-2 s of stall-kick-stall after every joystick press, then a lurch into
-  motion; once moving the crawl is smooth (5.3 s continuous at 0.79 remapped duty, zero
-  frozen windows) and stops are clean ramp-downs. A pulse doesn't sustain enough torque to
-  exceed static friction, and each re-pulse restarts from zero.** Rewrite (IN REPO,
-  `MOTOR_PUSH_*`, UNFLASHED — flash pending): a **sustained full-duty push** whenever a
-  wheel is powered but hasn't ticked for `MOTOR_PUSH_RECHECK` (250 ms) — held until ticks
-  resume (smooth handoff back to the ramped duty), capped at `MOTOR_PUSH_MAX_MS` (700 ms);
-  a push that expires without breakaway re-arms the frozen timer and DOUBLES the wait
-  before the next attempt (up to `MOTOR_PUSH_MAX_BACKOFF` 1600 ms, reset the moment the
-  wheel moves), so a hard jam nudges occasionally instead of ramming. No separate start
-  kick: a fresh start IS a frozen wheel (ramp stalled at low duty), so the same detector
-  catches it — on easy floor the wheel ticks immediately and no push ever fires. Push
-  direction keys off the RAMPED duty (a push only ever starts ≥250 ms after the ramp left
-  the deadzone, so the ramp already carries the command's sign — the old
-  copysign-of-commanded-duty fallback for the ramp-start pulse is gone). Keyed off the
-  RAMPED duty like the stray gating. Flashed 2026-09-20 morning from the dev PC
-  (`upload_speed = 115200` was added to `platformio.ini` — the default 460800 handshake
-  failed to verify); the push rewrite still needs `pio run -t upload` + on-robot
-  re-validation (crawl-start lag target <0.5 s, no judder) — see docs/TODO.md.
-  NOTE 2026-09-20: a wheel pressed against an obstacle freezes hard (full duty can't
-  break it away — expected physics; the capped push backs off rather than ramming), and
-  manual-driving feel on this robot also depends on the web gateway's intermittent
-  1-9 s POST stalls (dead-man cuts mid-drive → stop → lurch on recovery) — a /proc-based
-  stall trap runs on the board (see docs/TODO.md).
+- **Motor control is now CLOSED-LOOP: per-wheel velocity PID (2026-09-20, built +
+  compile-verified, UNFLASHED — flash + tune pending).** `WHEEL_PID_ENABLED 1`: each
+  wheel's commanded linear speed (m/s) is held by a feedforward+PI(D) on encoder-tick
+  velocity at `WHEEL_PID_HZ` (50) — the standard ROS 2 control shape (`/cmd_vel` is a
+  SETPOINT refresh, the fixed-rate loop owns the dynamics deterministically regardless
+  of SBC load). This SUPERSEDES the whole open-loop band-aid stack: the stiction
+  `MOTOR_MIN_DUTY` remap is gone (`writeSide` is linear now — only `MOTOR_DEADZONE`
+  zeroes an intended stop), and the breakaway kick/push state machine is compiled out
+  (both kept verbatim behind `#if !WHEEL_PID_ENABLED` as the legacy fallback — that
+  path still compiles). Why closed-loop: the 2026-09-19/20 drive tests proved
+  breakaway is physically unpredictable (wheels seized 1.4-2.4 s into every crawl at
+  remapped duty 0.60-0.83; then the flashed 80 ms kick juddered 1-2 s before a lurch;
+  a pulse can't sustain torque past static friction) — the I-term integrates through
+  stiction instead of gambling on it. **Accel limiting moved to a SETPOINT slew**
+  (`WHEEL_TGT_SLEW` m/s per s, applied to the per-wheel target before the PID):
+  slewing the PID OUTPUT would add loop lag + integral windup, so the old duty slew +
+  `/motor_accel` live knob are compiled out under the PID (the web Coprocessor card's
+  dead "Accel ramp" slider was replaced by the live PID KP/KI/KD sliders,
+  2026-09-20). Starting gains
+  KP 0 / KI 8.0 / KD 0 (`WHEEL_KFF` = 1/full-scale feedforward; NEVER flash with
+  KP=KI=0 — feedforward-only will NOT crawl without the remap). **The gains are
+  LIVE-TUNABLE — no reflash per iteration**: publish `/motor_pid`
+  (Float32MultiArray `[kp,ki,kd]`, whitelisted via `telemetry.py`'s `_mk_motor_pid`;
+  firmware clamps kp 0..20 / ki 0..50 / kd 0..5) and the running PID picks them up
+  instantly, resetting its integrators; the web Coprocessor card's PID KP/KI/KD
+  sliders drive it and re-seed from the 1 Hz `/wheel_pid` Float32MultiArray readback
+  (`f.esp.wheel_pid`). Gains persist to ESP32 NVS (`kp`/`ki`/`kd` keys) rate-limited
+  like the trim — but only while parked, so gains tuned mid-drive save once the robot
+  stops. Tuning on hardware
+  (debug console prints vel/tgt/duty): KI until crawl breaks away <0.5 s without
+  stick-slip hunting, then KP ~0.5·KFF; KD stays 0 (tick quantization). Accepted
+  limit: feedback is single-channel (ticks signed by COMMANDED direction) — blind on
+  reverse-through-zero/stall/slip/being-pushed; the real fix is a 2nd quadrature
+  channel. Also `MAX_ANGULAR_SPEED` synced 3.0 → 0.8 (robot.yaml `drive_max_ang`,
+  SLAM rotation-smear budget — firmware backstop now matches). Trim: `TRIM_AUTOCAL`
+  is compiled out under the PID (per-wheel control equalizes the wheels itself) — the
+  manual `/motor_trim` offset still applies and the loop absorbs it. NOTE 2026-09-20:
+  a wheel pressed against an obstacle holds full duty (integral clamped, no backoff
+  anymore — the dead-man still cuts on command loss; DRV8871 `nFAULT` wiring remains
+  the proper hardware fix), and manual-driving feel on this robot also depends on the
+  web gateway's intermittent 1-9 s POST stalls (dead-man cuts mid-drive → stop →
+  lurch on recovery) — a /proc-based stall trap runs on the board (see docs/TODO.md);
+  the keepalive half of that problem is fixed (see the HTTP teleop note below).
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,
@@ -905,7 +918,13 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
 - **HTTP teleop (`POST /drive`)**: the page POSTs `{v,w}` same-origin; `web_server`
   clamps (`drive_max_lin`/`drive_max_ang`), publishes `/cmd_vel` immediately, and
   re-asserts it at 10 Hz while non-zero with a `drive_timeout` dead-man — so browser
-  jank can't outlast the ESP32's 500 ms cmd watchdog and stutter the drive. The dev
+  jank can't outlast the ESP32's 500 ms cmd watchdog and stutter the drive. The
+  10 Hz keepalive runs on a **dedicated thread, not the ROS executor**
+  (`web_server._drive_loop`, 2026-09-20): executor callbacks slip 1-9 s under
+  TTS/vision/LLM load, which starved the re-assert past the ESP32 watchdog and
+  dead-manned the drive mid-motion (stop → lurch on recovery). rclpy publishers are
+  thread-safe; the thread only touches the lock-protected (v,w) state + publish(),
+  gets a best-effort `os.nice(-5)`, and is joined in `destroy_node`. The dev
   harness accepts it as a no-op.
 ### Text-to-speech (TTS)
 

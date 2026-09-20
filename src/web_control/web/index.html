@@ -836,17 +836,28 @@
               <span>stray ticks L/R</span><b id="espStray">–</b>
             </div>
             <button id="espResetTicks" class="btn">🔁 Reset ticks</button>
-            <div class="field"><label>Accel ramp <span id="motorAccelV">3.0</span> duty/s</label>
-              <input id="motorAccel" type="range" min="0.3" max="8" step="0.1" value="3.0"></div>
             <div class="field"><label>Wheel trim <span id="motorTrimV">0.00</span> <span id="motorTrimLive" class="live"></span></label>
               <input id="motorTrim" type="range" min="-0.30" max="0.30" step="0.01" value="0.00"></div>
             <button id="motorTrimReset" class="btn">↺ Reset trim to 0</button>
+            <div class="field"><label>PID KP <span id="pidKpV">0.0</span></label>
+              <input id="pidKp" type="range" min="0" max="20" step="0.1" value="0"></div>
+            <div class="field"><label>PID KI <span id="pidKiV">8.0</span></label>
+              <input id="pidKi" type="range" min="0" max="50" step="0.1" value="8"></div>
+            <div class="field"><label>PID KD <span id="pidKdV">0.0</span></label>
+              <input id="pidKd" type="range" min="0" max="5" step="0.05" value="0"></div>
             <p class="hint"><b>Wheel trim</b> rebalances the mismatched gearmotors so a forward
               command goes straight. If the robot drifts <b>left</b>, push the slider
               <b>negative</b> (boost left / cut right); if it drifts <b>right</b>, push
               <b>positive</b>. The live value (in parentheses) is what the ESP32 is actually
               using and is persisted to its flash, so it survives a reboot — the slider
               re-syncs to it on load. <b>Reset trim to 0</b> clears the rebalance.</p>
+            <p class="hint"><b>PID KP/KI/KD</b> live-tune the ESP32's closed-loop wheel velocity
+              controller — no reflash needed. The firmware holds each wheel's commanded
+              speed; KI breaks static friction at crawl (raise until a slow crawl starts
+              within ~0.5 s without judder), KP stiffens tracking, KD stays 0 (encoder
+              quantization makes it jittery). Changes apply instantly, reset the
+              integrators, and persist to the ESP32's flash once the robot is parked.
+              Sliders re-sync to the live values (f.esp.wheel_pid) on load.</p>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>
@@ -862,11 +873,7 @@
               a rising count with the robot motionless means encoder-line noise
               (ground bounce, a loose signal wire), not real rotation. <b>Reset ticks</b>
               zeros both counters (and the stray counters) for a clean baseline —
-              odometry re-seeds automatically so /odom doesn't jump. <b>Accel ramp</b>
-              caps how fast the applied motor duty may follow a commanded change (duty
-              units/sec) instead of stepping straight to it — lower is smoother/gentler
-              but laggier, higher is snappier but jerkier. A dead-man stop (lost link/cmd)
-              always cuts power immediately, ignoring this ramp.</p>
+              odometry re-seeds automatically so /odom doesn't jump.</p>
           </div>
         </section>
 
@@ -1359,12 +1366,19 @@ function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value));
 // count after fixing a wiring issue); wheel_odometry re-seeds itself off the same topic
 // so /odom doesn't jump.
 $("espResetTicks").addEventListener("click",()=>{ pub("/reset_ticks",true); $("espStray").style.color=""; });
-// ESP32 motor accel-ramp rate (duty/s, see main.cpp's MOTOR_SLEW_DEFAULT) -- how fast
-// applied motor duty may follow a commanded change; lower = smoother/gentler & laggier,
-// higher = snappier & jerkier. Fire-and-forget like reset_ticks -- not read back, so a
-// page reload shows the slider's default rather than the ESP32's actual live value.
-$("motorAccel").oninput=()=>$("motorAccelV").textContent=$("motorAccel").value;
-$("motorAccel").onchange=()=>pub("/motor_accel",Number($("motorAccel").value));
+// ESP32 wheel-PID live gains [kp, ki, kd] (duty units) -> /motor_pid Float32MultiArray.
+// The closed-loop wheel velocity controller holds each wheel's commanded speed; KI
+// breaks static friction at crawl, KP stiffens tracking, KD stays 0 (encoder tick
+// quantization at 50 Hz makes D jittery). Applies instantly on release (onchange),
+// resets the firmware integrators, and persists to the ESP32's NVS once parked.
+// Readback: f.esp.wheel_pid re-syncs the sliders on first arrival (persisted values).
+const pidPublish=()=>pub("/motor_pid",[$("pidKp").value,$("pidKi").value,$("pidKd").value].map(Number));
+$("pidKp").oninput=()=>$("pidKpV").textContent=Number($("pidKp").value).toFixed(1);
+$("pidKi").oninput=()=>$("pidKiV").textContent=Number($("pidKi").value).toFixed(1);
+$("pidKd").oninput=()=>$("pidKdV").textContent=Number($("pidKd").value).toFixed(2);
+$("pidKp").onchange=pidPublish;
+$("pidKi").onchange=pidPublish;
+$("pidKd").onchange=pidPublish;
 // ESP32 straight-line wheel trim: negative = boost left / cut right (robot veers left),
 // positive = the opposite. The slider only sends; the live value comes back from the
 // telemetry frame (f.esp.wheel_trim) and is shown in the readout + re-syncs the slider
@@ -1373,7 +1387,7 @@ $("motorTrim").oninput=()=>$("motorTrimV").textContent=Number($("motorTrim").val
 $("motorTrim").onchange=()=>pub("/motor_trim",Number($("motorTrim").value));
 $("motorTrimReset").addEventListener("click",()=>{ $("motorTrim").value="0"; $("motorTrimV").textContent="0.00"; pub("/motor_trim",0); });
 // Line laser PWM 1..2 (0..255 each) -> /laser_pwm Int32MultiArray on the ESP32
-// (GPIO 23/32). Publish-only like motor_accel: not read back, so a page reload
+// (GPIO 23/32). Publish-only (not read back), so a page reload
 // shows 0 until the next drag.
 $("laser1").oninput=()=>$("laser1V").textContent=$("laser1").value;
 $("laser2").oninput=()=>$("laser2V").textContent=$("laser2").value;
@@ -2250,6 +2264,15 @@ function onEsp(e, susp){
       $("motorTrimV").textContent=t.toFixed(2);
     }
   }
+  if(e.wheel_pid!=null && !pidSynced){
+    // Live wheel-PID gains [kp,ki,kd] from the ESP32 (its NVS-persisted values) —
+    // re-seed the sliders once on first arrival so the page matches the firmware.
+    pidSynced=true;
+    const [kp,ki,kd]=e.wheel_pid;
+    $("pidKp").value=String(kp); $("pidKpV").textContent=kp.toFixed(1);
+    $("pidKi").value=String(ki); $("pidKiV").textContent=ki.toFixed(1);
+    $("pidKd").value=String(kd); $("pidKdV").textContent=kd.toFixed(2);
+  }
 }
 function onLds(l){
   if(l.rpm!=null) $("espLdsRpm").textContent=l.rpm.toFixed(0)+" rpm";
@@ -2898,6 +2921,7 @@ function onOdom(o){
 // 500 ms /cmd_vel watchdog and stutter the drive. The dev harness accepts it as a no-op.
 let curV=0, curW=0, driveBusy=false;
 let motorTrimSynced=false;   // whether the wheel-trim slider has been seeded from live ESP state
+let pidSynced=false;         // whether the PID sliders have been seeded from f.esp.wheel_pid
 function setCmd(v,w){ curV=v; curW=w; }
 function publishCmd(){
   const v=curV*Number($("lin").value), w=curW*Number($("ang").value);

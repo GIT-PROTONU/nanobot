@@ -8,10 +8,16 @@
 //   sub  lds_target_rpm        std_msgs/Float32          -> LDS spin-speed PID setpoint
 //   sub  fan_pwm               std_msgs/Float32 (0..1)   -> SBC cooling fan PWM duty
 //   sub  motor_trim            std_msgs/Float32 (-0.3..0.3) -> manual L/R trim set/reset
+//   sub  motor_pid             std_msgs/Float32MultiArray [kp,ki,kd] -> LIVE wheel-PID gains
+//                                                         (duty units; persisted to NVS)
 //   sub  motor_accel           std_msgs/Float32 (0.3..8.0)  -> accel-ramp rate (duty/s)
+//                                                         (open-loop build only; compiled
+//                                                         out under the wheel PID)
 //   sub  reset_ticks           std_msgs/Bool (true)      -> zero wheel_ticks + wheel_stray_ticks
 //   sub  laser_pwm             std_msgs/Int32MultiArray  [v1,v2] 0..255 -> line laser PWM 1-2
 //   pub  wheel_ticks           std_msgs/Int64MultiArray  [L,R] raw cumulative counts
+//   pub  wheel_pid             std_msgs/Float32MultiArray [kp,ki,kd] live wheel-PID gains
+//                                                         (1 Hz readback for the web sliders)
 //   pub  wheel_stray_ticks     std_msgs/Int64MultiArray  [L,R] cumulative ticks seen while the
 //                                                         wheel was commanded+settled stopped
 //                                                         (bad-encoder-signal diagnostic)
@@ -105,7 +111,11 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 
 #define WHEEL_SEPARATION  0.16f
 #define MAX_LINEAR_SPEED  0.4f
-#define MAX_ANGULAR_SPEED 3.0f
+// Synced with robot.yaml web_control.drive_max_ang (was 3.0): the SLAM rotation-smear
+// budget caps rotation at 0.8 rad/s (a scan spans ~0.2 s of lidar revolution, so a turn
+// at w smears it by w*0.2 rad). The SBC clamps first; this is the firmware backstop.
+// Keep the two in sync (AGENTS.md).
+#define MAX_ANGULAR_SPEED 0.8f
 #define CMD_TIMEOUT_MS    500
 // Grace period after a wheel's duty drops to 0 before its ticks count as "stray" (see
 // g_left_stray/g_right_stray) -- real wheel inertia keeps ticking briefly after power
@@ -113,6 +123,44 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define STRAY_SETTLE_MS   300
 #define INVERT_LEFT  false
 #define INVERT_RIGHT true   // 2026-07-15: right motor's fwd/rev harness pins were swapped
+// |duty| below this = intended stop, not a crawl (shared by both control paths below).
+#define MOTOR_DEADZONE 0.02f
+
+// ---- closed-loop wheel velocity PID (THE motor control path since 2026-09-20) --
+// Holds each wheel's commanded linear speed (m/s) via a per-wheel feedforward+PI(D) on
+// encoder-tick velocity, replacing the open-loop duty map: the I-term integrates through
+// stiction, so crawl speeds hold deterministically instead of riding on the stiction
+// remap + breakaway push (both compiled out with this path — see the !WHEEL_PID_ENABLED
+// block below). This is the standard ROS 2 control shape: /cmd_vel is a SETPOINT refresh
+// (any cadence up to the CMD_TIMEOUT_MS dead-man) and this fixed-rate loop owns the
+// dynamics deterministically, regardless of SBC load.
+// Feedback is single-channel (ticks signed by COMMANDED direction): blind on
+// reverse-through-zero / stall / slip / being pushed — accepted 2026-09-20; the only
+// real fix is wiring the 2nd quadrature channel.
+// Tuning (hardware, watch the debug console's vel/tgt line): raise KI until a crawl
+// breaks away in <0.5 s without stick-slip hunting (halve KI if it oscillates), then KP
+// for stiffness (~0.5*KFF to start); KD stays 0 (tick quantization noise at 50 Hz makes
+// D jittery). KP=KI=0 is feedforward only — it will NOT crawl (the stiction remap is
+// gone), so never flash this path with both zero.
+#define WHEEL_PID_ENABLED 1
+#define WHEEL_RADIUS      0.0335f   // m  (matches robot.yaml wheel_odometry.wheel_radius)
+#define TICKS_PER_REV     1440.0f   // counts/wheel-rev as the ESP emits them (matches odom)
+#define WHEEL_PID_HZ      50        // PID rate; longer window than the 100 Hz loop => less tick-quantization noise
+// Full-scale wheel speed at duty=1 (the per-wheel max from the clamps above); KFF maps a
+// target m/s to the baseline duty the I-term corrects from.
+#define WHEEL_KFF   (1.0f/(MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f))
+#define WHEEL_KP    0.0f            // stiffness — tune after KI (start ~0.5*KFF)
+#define WHEEL_KI    8.0f            // crawl breakaway <0.5 s (0.12 m/s stall -> +0.7 duty in ~0.46 s)
+#define WHEEL_KD    0.0f
+#define WHEEL_INTEG_MAX 1.0f        // anti-windup: integral clamp (duty units via KI)
+// Command shaping: the per-wheel SETPOINT is slewed (m/s per s) before the PID — smooths
+// accel without lagging the loop (slewing the PID OUTPUT would add loop lag + integral
+// windup). ~the old open-loop 3.0 duty/s feel at the 0.464 m/s full scale.
+#define WHEEL_TGT_SLEW 1.5f
+static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RADIUS);
+
+#if !WHEEL_PID_ENABLED
+// ---- legacy OPEN-LOOP path (compiled out under the wheel PID) ------------------
 // Stiction deadband compensation: the gearmotors don't move below ~60% duty (only a
 // full-scale 0.4 m/s command — duty 0.63 after the v+w normalization — moved at all, and
 // in-place turns at 0.37 duty didn't). Remap any command above MOTOR_DEADZONE from
@@ -123,7 +171,6 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // spins (0.5 rad/s). 0.70 + the breakaway push below keeps them turning; the cost is
 // coarser low-speed duty resolution ([0.70..1] spans 0..0.4 m/s).
 #define MOTOR_MIN_DUTY 0.70f
-#define MOTOR_DEADZONE 0.02f   // |duty| below this = intended stop, not a crawl
 // Breakaway push: at crawl the wheel breaks away on the initial ramp, crawls ~1.5-2 s,
 // then static friction re-seizes it at constant duty (it only restarts on a direction/
 // phase change). 2026-09-20 hardware re-test on carpet showed the previous 80 ms full-
@@ -155,6 +202,7 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define MOTOR_SLEW_DEFAULT 3.0f
 #define MOTOR_SLEW_MIN     0.3f
 #define MOTOR_SLEW_MAX     8.0f
+#endif
 
 // ---- straight-line trim (motor matching) --------------------------------------
 // The two gearmotors don't run the same speed at the same duty, so open-loop straight
@@ -167,7 +215,8 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // The result persists in NVS (survives reboot AND reflash). Manual path: publish
 // std_msgs/Float32 on /motor_trim to set it directly (0 = reset); current value is
 // republished on /wheel_trim at 1 Hz and in the status line below.
-// (Compiled out under WHEEL_PID_ENABLED — a velocity PID equalizes the wheels itself.)
+// (Autocal is compiled out under WHEEL_PID_ENABLED — a velocity PID equalizes the
+// wheels itself; the manual /motor_trim offset still applies and the loop absorbs it.)
 #define TRIM_AUTOCAL    1   // re-enabled 2026-09-17: with SUSPEND_ACTIVE_HIGH true (verified),
                             // the gate below means "both wheels on the ground" — the 2026-07-16
                             // wrong-way convergence ran under the old inverted-polarity gate,
@@ -185,26 +234,6 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define TRIM_MATCH_TOL  0.02f   // commanded duties must match within this = "straight"
 #define TRIM_SAVE_MS    10000   // NVS write rate limit (flash wear)
 #define TRIM_SAVE_DELTA 0.005f  // ...and only if it moved at least this much
-
-// ---- closed-loop wheel velocity PID (OPTIONAL; OFF by default) ----------------
-// Holds each wheel's commanded linear speed (m/s) via a per-wheel PID on encoder-tick
-// velocity, replacing the open-loop duty = speed/full-scale map. DISABLED by default:
-// an untuned PID can drive erratically, and the feedback is single-channel (blind on
-// reverse-through-zero / stall / slip / being pushed — see [[esp32-pid-velocity-pending]]).
-// To use: set =1, then tune KP/KI ON HARDWARE (watch wheel vel on the debug console). With
-// KP=KI=KD=0 the feedforward alone reproduces today's open-loop behavior — a safe baseline.
-#define WHEEL_PID_ENABLED 0
-#define WHEEL_RADIUS      0.0335f   // m  (matches robot.yaml wheel_odometry.wheel_radius)
-#define TICKS_PER_REV     1440.0f   // counts/wheel-rev as the ESP emits them (matches odom)
-#define WHEEL_PID_HZ      50        // PID rate; longer window than the 100 Hz loop => less tick-quantization noise
-// Full-scale wheel speed at duty=1; KFF = 1/that maps a target m/s straight to the
-// open-loop duty, so feedforward-only == today's behavior.
-#define WHEEL_KFF   (1.0f/(MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f))
-#define WHEEL_KP    0.0f            // <- tune up first
-#define WHEEL_KI    0.0f            // <- then add a little to kill steady-state error
-#define WHEEL_KD    0.0f
-#define WHEEL_INTEG_MAX 1.0f        // anti-windup: integral clamp (duty units)
-static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RADIUS);
 
 #define LDS_BAUD       115200
 #define LDS_TIMEOUT_MS 300
@@ -293,7 +322,20 @@ static volatile uint16_t g_laser[2] = {0,0};                 // /laser_pwm 0..25
 // Straight-line trim: loaded from NVS in setup(), adapted on Core 1 (autocal), manually
 // set from the zenoh RX task (/motor_trim cb). Aligned-32-bit volatile = atomic enough.
 static volatile float    g_trim = 0;
+#if WHEEL_PID_ENABLED
+// Live wheel-PID gains (defaults = the WHEEL_KP/KI/KD defines; NVS-loaded in setup()).
+// Changed at runtime via /motor_pid (Float32MultiArray [kp,ki,kd], duty units) — tune
+// without reflashing — and persisted to NVS rate-limited like the trim, so a tuning
+// session survives a reboot. Readback on /wheel_pid @1 Hz feeds the web sliders.
+// Clamps mirror motor_pid_cb (kp 0..20, ki 0..50, kd 0..5).
+static volatile float    g_wkp = WHEEL_KP, g_wki = WHEEL_KI, g_wkd = WHEEL_KD;
+static volatile bool     g_pid_reset = false; // cb -> PID block: reset integ/prev on a gain change
+static volatile bool     g_pid_save  = false; // cb -> 1 Hz block: gains changed, NVS write pending
+static float             g_pid_saved[3];      // last values written to NVS (Core 1 only)
+#endif
+#if !WHEEL_PID_ENABLED
 static volatile float    g_motor_slew = MOTOR_SLEW_DEFAULT;   // live /motor_accel setpoint
+#endif
 static Preferences       g_prefs;          // NVS handle (namespace "nano", key "trim")
 static float             g_trim_saved = 0; // last value written to NVS (Core 1 only)
 static volatile float    g_temp = 0;
@@ -339,6 +381,14 @@ static size_t cdr_i64arr2(uint8_t* b, int64_t a, int64_t bb){
   memcpy(b+20,&a,8); memcpy(b+28,&bb,8);
   return 36;
 }
+// Float32MultiArray [a,b,c], empty layout: hdr | dim_len=0 | data_offset=0 | data_len=3 |
+// a | b | c. float32 is 4-aligned from the body start, so no pad bytes (unlike int64).
+static size_t cdr_f32arr3(uint8_t* b, float a, float c, float d){
+  memcpy(b,CDR_HDR,4);
+  uint32_t z=0,three=3; memcpy(b+4,&z,4); memcpy(b+8,&z,4); memcpy(b+12,&three,4);
+  memcpy(b+16,&a,4); memcpy(b+20,&c,4); memcpy(b+24,&d,4);
+  return 28;
+}
 
 // ============================ zenoh session (Core 0) ==========================
 #define DOMAIN "0"
@@ -348,6 +398,7 @@ static size_t cdr_i64arr2(uint8_t* b, int64_t a, int64_t bb){
 #define T_BOOL "std_msgs::msg::dds_::Bool_"
 #define T_I64A "std_msgs::msg::dds_::Int64MultiArray_"
 #define T_I32A "std_msgs::msg::dds_::Int32MultiArray_"
+#define T_F32A "std_msgs::msg::dds_::Float32MultiArray_"
 #define T_TWIST "geometry_msgs::msg::dds_::Twist_"
 
 // Fixed session ZID so we can hardcode it in the rmw_zenoh liveliness tokens below.
@@ -376,27 +427,27 @@ static inline bool linkAlive(){ return ready; }
 #endif
 // rmw_zenoh liveliness token = makes a publisher visible in the ROS graph. Format:
 // @ros2_lv/<domain>/<zid>/<nid>/<eid>/MP/%/%/<node>/%<topic>/<type>/<typehash>/<qos>
-static z_owned_liveliness_token_t g_lv[12]; static int g_lv_n = 0;
+static z_owned_liveliness_token_t g_lv[14]; static int g_lv_n = 0;
 static void declare_lv(const char* topic, const char* type, int eid){
   char ke[260];
   snprintf(ke, sizeof(ke),
     "@ros2_lv/" DOMAIN "/" NODE_ZID "/0/%d/MP/%%/%%/" NODE_NAME "/%%%s/%s/TypeHashNotSupported/:1:,1:,:,:,,",
     eid, topic, type);
   z_view_keyexpr_t vke; z_view_keyexpr_from_str_unchecked(&vke, ke);
-  if (g_lv_n >= (int)(sizeof(g_lv)/sizeof(g_lv[0]))) return;   // 1 spare slot today
+  if (g_lv_n >= (int)(sizeof(g_lv)/sizeof(g_lv[0]))) return;   // 2 spare slots today
   z_liveliness_declare_token(z_session_loan(&s), &g_lv[g_lv_n++], z_view_keyexpr_loan(&vke), NULL);
 }
 
 // one publisher + its rmw attachment identity
 struct ZPub { z_owned_publisher_t p; int64_t seq; uint8_t gid[16]; };
-static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim;
+static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim, P_pid;
 
 // Single source of truth for every publisher: topic/type, the attachment GID tag
 // (last GID byte, unique per publisher) and the liveliness entity id (lv_eid, also
 // unique). The declare loop and the liveliness loop both walk this, so the two can't
 // drift. These wire identities are PROVEN-GOOD against the live graph — don't renumber
-// existing entries; new ones just take the next free tag/eid (12 is the g_lv[] limit,
-// so there is one spare slot left).
+// existing entries; new ones just take the next free tag/eid (14 is the g_lv[] limit,
+// so there are two spare slots left).
 struct PubDef { ZPub* zp; const char* topic; const char* type; uint8_t gid_tag; int lv_eid; bool lds_only; };
 static const PubDef PUBS[] = {
   { &P_ticks, "wheel_ticks",           T_I64A, 1, 1, false },
@@ -410,6 +461,7 @@ static const PubDef PUBS[] = {
   { &P_hz,    "lds_hz",                T_F32,  7, 8, true  },
   { &P_duty,  "lds_duty",              T_F32,  8, 9, true  },
   { &P_trim,  "wheel_trim",            T_F32, 10, 10, false },
+  { &P_pid,   "wheel_pid",             T_F32A, 12, 12, false },
 };
 
 static void zpub_declare(ZPub& zp, const char* topic, const char* type, uint8_t tag){
@@ -523,8 +575,29 @@ static void trim_cb(z_loaned_sample_t* sm, void*){
     if (!isnan(f)){ g_trim = clampf(f,-TRIM_MAX,TRIM_MAX); Serial.printf("[nano] manual trim=%.3f\n", (double)g_trim); }
   }
 }
+#if WHEEL_PID_ENABLED
+// /motor_pid (Float32MultiArray [kp, ki, kd], duty units): LIVE wheel-PID gains — tune
+// without reflashing (the WHEEL_KP/KI/KD defines are just the defaults). Clamped; a change
+// resets both integrators (windup accumulated under the old gains must not leak into the
+// new tuning) and flags the rate-limited NVS save. Readback: /wheel_pid @1 Hz.
+static void motor_pid_cb(z_loaned_sample_t* sm, void*){
+  uint8_t b[40]; size_t n = sample_bytes(sm,b,sizeof(b));
+  uint32_t dim=0, off=0;
+  if (n >= 16){ memcpy(&dim,b+4,4); memcpy(&off,b+8,4); }
+  if (dim != 0 || n < 16+off+3*4) return;                // empty layout, 3 floats required
+  float kp,ki,kd;
+  memcpy(&kp,b+16+off,4); memcpy(&ki,b+20+off,4); memcpy(&kd,b+24+off,4);
+  if (isnan(kp)||isnan(ki)||isnan(kd)) return;
+  g_wkp = clampf(kp,0,20); g_wki = clampf(ki,0,50); g_wkd = clampf(kd,0,5);
+  g_pid_reset = true; g_pid_save = true;
+  Serial.printf("[nano] wheel PID kp=%.3f ki=%.3f kd=%.3f (integ reset)\n",
+                (double)g_wkp,(double)g_wki,(double)g_wkd);
+}
+#endif
+#if !WHEEL_PID_ENABLED
 // /motor_accel (Float32, duty/s): live acceleration-ramp rate — see MOTOR_SLEW_DEFAULT
-// above / the web UI's Coprocessor card "Accel ramp" slider. Not persisted.
+// above / the web UI's Coprocessor card "Accel ramp" slider. Not persisted. (Open-loop
+// build only: under the wheel PID, accel limiting is the WHEEL_TGT_SLEW setpoint slew.)
 static void motor_slew_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){
     float f; memcpy(&f,b+4,4);
@@ -534,6 +607,7 @@ static void motor_slew_cb(z_loaned_sample_t* sm, void*){
     }
   }
 }
+#endif
 #if LINK_RX_TIMEOUT_MS
 // /esp32_ping (Int32) from the SBC web_control node — payload ignored; arrival = link alive.
 static void ping_cb(z_loaned_sample_t*, void*){
@@ -558,7 +632,13 @@ static bool zenohConnect(){
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
-  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset, sub_accel, sub_laser;   // kept alive (static)
+  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset, sub_laser;   // kept alive (static)
+#if WHEEL_PID_ENABLED
+  static z_owned_subscriber_t sub_pid;     // /motor_pid — live wheel-PID gains
+#endif
+#if !WHEEL_PID_ENABLED
+  static z_owned_subscriber_t sub_accel;   // /motor_accel — open-loop duty slew only
+#endif
   z_owned_closure_sample_t cl;
   z_view_keyexpr_t ke;
   z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
@@ -581,10 +661,18 @@ static bool zenohConnect(){
   z_closure_sample(&cl, reset_ticks_cb, NULL, NULL);
   if (z_declare_subscriber(z_session_loan(&s), &sub_reset, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
     Serial.println("[nano] declare subscriber FAILED: sub_reset");
+#if WHEEL_PID_ENABLED
+  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_pid",T_F32A));
+  z_closure_sample(&cl, motor_pid_cb, NULL, NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_pid, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_pid");
+#endif
+#if !WHEEL_PID_ENABLED
   z_view_keyexpr_from_str_unchecked(&ke, KE("motor_accel",T_F32));
   z_closure_sample(&cl, motor_slew_cb, NULL, NULL);
   if (z_declare_subscriber(z_session_loan(&s), &sub_accel, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
     Serial.println("[nano] declare subscriber FAILED: sub_accel");
+#endif
   z_view_keyexpr_from_str_unchecked(&ke, KE("laser_pwm",T_I32A));
   z_closure_sample(&cl, laser_cb, NULL, NULL);
   if (z_declare_subscriber(z_session_loan(&s), &sub_laser, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
@@ -661,6 +749,9 @@ static void zenohTask(void*){
       zpub_put(P_suspL,buf, cdr_bool(buf, g_susp_l));
       zpub_put(P_suspR,buf, cdr_bool(buf, g_susp_r));
       zpub_put(P_trim, buf, cdr_f32(buf, g_trim));
+#if WHEEL_PID_ENABLED
+      zpub_put(P_pid,  buf, cdr_f32arr3(buf, g_wkp, g_wki, g_wkd));
+#endif
     }
     delay(2);
   }
@@ -670,7 +761,14 @@ static void zenohTask(void*){
 static void writeSide(int chf, int chr, float duty){
   duty = clampf(duty,-1,1);
   float m = fabsf(duty);
+#if WHEEL_PID_ENABLED
+  // Closed-loop path: the PID's I-term owns low-speed control (it integrates through
+  // stiction), so the duty->PWM map stays linear — only an intended stop zeroes it.
+  if (m < MOTOR_DEADZONE) m = 0.0f;
+#else
+  // Open-loop stiction remap (see MOTOR_MIN_DUTY above).
   m = (m < MOTOR_DEADZONE) ? 0.0f : MOTOR_MIN_DUTY + m*(1.0f - MOTOR_MIN_DUTY);
+#endif
   if (duty>=0){ ledcWrite(chr,0); ledcWrite(chf,(uint32_t)(m*PWM_MAX)); }
   else        { ledcWrite(chf,0); ledcWrite(chr,(uint32_t)(m*PWM_MAX)); }
 }
@@ -681,8 +779,10 @@ static inline float slewTo(float cur, float target, float maxDelta){
 }
 static void applyMotors(float l, float r){
   // Straight-line trim: positive trim boosts RIGHT / cuts LEFT (robot was pulling right).
-  // Applied pre-remap so it stays monotonic through the stiction compensation; writeSide
-  // clamps, so a boosted side saturating just means the cut side does the correcting.
+  // Open-loop: applied pre-remap so it stays monotonic through the stiction compensation.
+  // PID: a static duty distortion the per-wheel loop simply absorbs (it still reaches the
+  // commanded wheel speed). writeSide clamps, so a boosted side saturating just means the
+  // cut side does the correcting.
   float t = clampf(g_trim, -TRIM_MAX, TRIM_MAX);
   l *= (1.0f - t); r *= (1.0f + t);
   writeSide(CH_LEFT_FWD, CH_LEFT_REV, INVERT_LEFT?-l:l);
@@ -714,11 +814,12 @@ static void ldsControl(float dt){
 }
 #if WHEEL_PID_ENABLED
 // Per-wheel velocity PID: feedforward + PI(+D) with conditional integration + clamp.
+// Gains are the LIVE g_wkp/g_wki/g_wkd (defaults = the defines; see motor_pid_cb).
 struct WPid { float integ, prev; };
 static float wheelPid(WPid& st, float tgt, float meas, float dt){
   float err = tgt - meas;
   float deriv = dt>0 ? (err - st.prev)/dt : 0; st.prev = err;
-  float u = WHEEL_KFF*tgt + WHEEL_KP*err + WHEEL_KI*st.integ + WHEEL_KD*deriv;
+  float u = WHEEL_KFF*tgt + g_wkp*err + g_wki*st.integ + g_wkd*deriv;
   float duty = clampf(u,-1,1);
   if (duty == u)   // integrate only when not saturated (anti-windup), then clamp the integral
     st.integ = clampf(st.integ + err*dt, -WHEEL_INTEG_MAX, WHEEL_INTEG_MAX);
@@ -766,6 +867,16 @@ void setup(){
   // Straight-line trim from NVS (falls back to TRIM_DEFAULT if never calibrated / saved).
   g_prefs.begin("nano", false);
   g_trim = g_trim_saved = clampf(g_prefs.getFloat("trim", TRIM_DEFAULT), -TRIM_MAX, TRIM_MAX);
+#if WHEEL_PID_ENABLED
+  // Live-tuned PID gains (motor_pid_cb) persist like the trim — a tuning session
+  // survives reboot/reflash. Clamped to the same ranges the cb enforces.
+  g_wkp = clampf(g_prefs.getFloat("kp", WHEEL_KP), 0, 20);
+  g_wki = clampf(g_prefs.getFloat("ki", WHEEL_KI), 0, 50);
+  g_wkd = clampf(g_prefs.getFloat("kd", WHEEL_KD), 0, 5);
+  g_pid_saved[0]=g_wkp; g_pid_saved[1]=g_wki; g_pid_saved[2]=g_wkd;
+  Serial.printf("[nano] wheel PID gains kp=%.3f ki=%.3f kd=%.3f (NVS)\n",
+                (double)g_wkp,(double)g_wki,(double)g_wkd);
+#endif
   Serial.printf("[nano] wheel trim from NVS: %.3f\n", (double)g_trim);
 
 #if LDS_ENABLED
@@ -872,17 +983,31 @@ void loop(){   // Core 1: real-time control
 
 #if WHEEL_PID_ENABLED
   static uint32_t last_wpid=0; static int32_t wp_l=0, wp_r=0; static WPid wpid_l{0,0}, wpid_r{0,0};
+  static float l_tgt_s=0, r_tgt_s=0;                     // slewed setpoints (command shaping)
   if (now-last_wpid >= (uint32_t)(1000/WHEEL_PID_HZ)){     // wheel velocity PID @WHEEL_PID_HZ
     float dt=(now-last_wpid)/1000.0f; last_wpid=now;
     int32_t l=g_left_ticks, r=g_right_ticks;               // atomic 32-bit reads
     g_left_vel  = (l-wp_l)/TICKS_PER_METER/dt; wp_l=l;
     g_right_vel = (r-wp_r)/TICKS_PER_METER/dt; wp_r=r;
+    if (g_pid_reset){                                      // live gain change (motor_pid_cb):
+      g_pid_reset = false;                                 // stale integ/prev must not leak
+      wpid_l.integ=wpid_l.prev=0; wpid_r.integ=wpid_r.prev=0;   // into the new tuning
+    }
     if (now-g_last_cmd_ms > CMD_TIMEOUT_MS){               // cmd stale: stop + reset integrators
       wpid_l.integ=wpid_l.prev=0; wpid_r.integ=wpid_r.prev=0;
+      l_tgt_s=r_tgt_s=0;
       g_left_duty=0; g_right_duty=0;
     } else {
-      g_left_duty  = wheelPid(wpid_l, g_left_tgt,  g_left_vel,  dt);
-      g_right_duty = wheelPid(wpid_r, g_right_tgt, g_right_vel, dt);
+      // Command shaping: slew the per-wheel SETPOINT toward the latest /cmd_vel target
+      // (WHEEL_TGT_SLEW) — accel limiting OUTSIDE the loop, so the controller itself
+      // stays lag-free (slewing the PID output instead would lag the plant response and
+      // wind the integrator). A fresh command snaps the slewed setpoint's course; the
+      // dead-man above snaps it to 0 instantly.
+      float maxDv = WHEEL_TGT_SLEW*dt;
+      l_tgt_s = slewTo(l_tgt_s, g_left_tgt,  maxDv);
+      r_tgt_s = slewTo(r_tgt_s, g_right_tgt, maxDv);
+      g_left_duty  = wheelPid(wpid_l, l_tgt_s,  g_left_vel,  dt);
+      g_right_duty = wheelPid(wpid_r, r_tgt_s, g_right_vel, dt);
     }
   }
 #endif
@@ -911,14 +1036,24 @@ void loop(){   // Core 1: real-time control
 #endif
 
   if (now-last_ctl >= 10){                                  // motors + watchdog @100 Hz
-    uint32_t ctl_dt_ms = now-last_ctl;
+    uint32_t ctl_dt_ms = now-last_ctl;                      // ms since the previous tick
     last_ctl=now;
     bool cmd_stale = (now-g_last_cmd_ms > CMD_TIMEOUT_MS);
     if (cmd_stale){ g_left_duty=0; g_right_duty=0; }
+    static float l_ramped=0, r_ramped=0;
+    float l_apply = 0, r_apply = 0;
+#if WHEEL_PID_ENABLED
+    // Closed-loop path: the applied duty IS the PID output (recomputed @50 Hz above, set
+    // to 0 by the dead-man). No duty slew here — accel limiting is the SETPOINT slew in
+    // the PID block (WHEEL_TGT_SLEW); slewing the output would lag the loop and wind the
+    // integrator. The dead-man (cmd_stale) zeroes everything instantly either way.
+    (void)ctl_dt_ms;
+    l_ramped = g_left_duty; r_ramped = g_right_duty;
+    l_apply = l_ramped; r_apply = r_ramped;
+#else
     // Ramp the applied duty toward the commanded duty (see g_motor_slew / MOTOR_SLEW_DEFAULT) instead of
     // stepping straight to it — smooths starts, stops, and direction reversals. Skipped on
     // a stale cmd so the dead-man stop is instant, not a ramped coast-down.
-    static float l_ramped=0, r_ramped=0;
     if (cmd_stale){ l_ramped=0; r_ramped=0; }
     else {
       float maxDelta = g_motor_slew * (ctl_dt_ms/1000.0f);
@@ -969,8 +1104,9 @@ void loop(){   // Core 1: real-time control
     // Push direction keys off the RAMPED duty: a push only ever starts >=MOTOR_PUSH_RECHECK
     // after the ramp left the deadzone, so the ramp already carries the command's sign
     // (the old immediate start-kick needed the commanded-duty fallback; that's gone).
-    float l_apply = l_pushing ? copysignf(1.0f, l_ramped) : l_ramped;
-    float r_apply = r_pushing ? copysignf(1.0f, r_ramped) : r_ramped;
+    l_apply = l_pushing ? copysignf(1.0f, l_ramped) : l_ramped;
+    r_apply = r_pushing ? copysignf(1.0f, r_ramped) : r_ramped;
+#endif
     applyMotors(l_apply, r_apply);
     // Stray-tick gating: a wheel counts as "stopped" STRAY_SETTLE_MS after its APPLIED
     // (ramped) duty last went to exactly 0 (coast-down grace period), and un-stops the
@@ -1026,6 +1162,23 @@ void loop(){   // Core 1: real-time control
       g_prefs.putFloat("trim", g_trim_saved);
       Serial.printf("[nano] trim %.3f saved to NVS\n", (double)g_trim_saved);
     }
+#if WHEEL_PID_ENABLED
+    // Same deal for the live-tuned wheel-PID gains (g_pid_save set by motor_pid_cb).
+    // Shares the trim's rate limit + while-stopped gate; the flag survives until a
+    // quiet window actually writes, so gains tuned mid-drive persist once parked.
+    static uint32_t last_pid_save=0;
+    if (g_pid_save && now-g_last_cmd_ms > CMD_TIMEOUT_MS
+        && now-last_pid_save > TRIM_SAVE_MS){
+      last_pid_save=now;
+      g_pid_saved[0]=g_wkp; g_pid_saved[1]=g_wki; g_pid_saved[2]=g_wkd;
+      g_prefs.putFloat("kp", g_pid_saved[0]);
+      g_prefs.putFloat("ki", g_pid_saved[1]);
+      g_prefs.putFloat("kd", g_pid_saved[2]);
+      g_pid_save = false;
+      Serial.printf("[nano] wheel PID gains %.3f/%.3f/%.3f saved to NVS\n",
+                    (double)g_pid_saved[0],(double)g_pid_saved[1],(double)g_pid_saved[2]);
+    }
+#endif
   }
 #if STATUS_PRINT_MS
   static uint32_t last_dbg=0;

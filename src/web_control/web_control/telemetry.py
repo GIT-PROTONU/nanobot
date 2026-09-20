@@ -32,7 +32,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.time import Time
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
-from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, String
+from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, Float32MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, OccupancyGrid
 from action_msgs.msg import GoalStatusArray
@@ -127,6 +127,7 @@ class TelemetryHub:
         self._esp_temp = (None, STALE)
         self._hall = None
         self._wheel_trim = None     # live straight-line trim from the ESP32 (/wheel_trim)
+        self._wheel_pid = None      # live wheel-PID gains [kp,ki,kd] from the ESP32 (/wheel_pid)
         self._lds = {}                # rpm / hz / duty
         self._lds_at = None           # monotonic ts of the last /lds_* arrival
         self._fan = None
@@ -183,6 +184,11 @@ class TelemetryHub:
             # (robot veers left), positive = the opposite. Live-tunes the open-loop trim that
             # rebalances the mismatched gearmotors in main.cpp's applyMotors(); persisted to NVS.
             "/motor_trim": (pub(Float32, "motor_trim", 5), self._mk_motor_trim),
+            # ESP32 wheel-PID live gains [kp, ki, kd] (duty units) — tune the closed-loop
+            # wheel velocity controller without reflashing. Firmware clamps to sane ranges,
+            # resets its integrators on change, and persists to NVS. Readback on /wheel_pid
+            # (f.esp.wheel_pid) re-seeds the web sliders.
+            "/motor_pid": (pub(Float32MultiArray, "motor_pid", 5), self._mk_motor_pid),
             # ESP32 line lasers 1-2 (GPIO 23/32): [v1,v2] PWM 0..255 each.
             "/laser_pwm": (pub(Int32MultiArray, "laser_pwm", 5), self._mk_laser),
             "/oled_face": (node._face_pub, self._mk_face),
@@ -431,7 +437,8 @@ class TelemetryHub:
                     "hall": self._hall, "ticks": self._ticks,
                     "stray": self._stray,
                     "tick_hz": round(self._tick_hz, 1),
-                    "wheel_trim": self._wheel_trim},
+                    "wheel_trim": self._wheel_trim,
+                    "wheel_pid": self._wheel_pid},
             "lds": dict(self._lds, age=round(now - self._lds_at, 1)
                         if self._lds_at is not None else None),
             "oled": self._oled,
@@ -569,6 +576,7 @@ class TelemetryHub:
         s(sub(Float32, "esp32_temp", self._on_esp_temp, 2))
         s(sub(Int32, "esp32_hall", self._on_hall, 2))
         s(sub(Float32, "wheel_trim", self._on_wheel_trim, 2))
+        s(sub(Float32MultiArray, "wheel_pid", self._on_wheel_pid, 2))
         s(sub(Float32, "lds_rpm", self._mk_lds("rpm"), 2))
         s(sub(Float32, "lds_hz", self._mk_lds("hz"), 2))
         s(sub(Float32, "lds_duty", self._mk_lds("duty"), 2))
@@ -671,6 +679,11 @@ class TelemetryHub:
 
     def _on_wheel_trim(self, msg):
         self._wheel_trim = round(float(msg.data), 3)
+
+    def _on_wheel_pid(self, msg):
+        # Float32MultiArray [kp, ki, kd] readback from the ESP32's live PID gains
+        d = list(msg.data) if msg.data else []
+        self._wheel_pid = [round(float(x), 4) for x in d[:3]] if len(d) >= 3 else None
 
     def _mk_lds(self, key):
         def cb(msg):
@@ -801,7 +814,7 @@ class TelemetryHub:
         # Diagnosability: log map-click goals + LDS rpm etc. so "who told the robot to
         # go there / spin" is in the app log. Throttle the chatty spin-down? No — these
         # are discrete user actions, not a hot loop; every one is a meaningful event.
-        if topic in ("/goal_pose", "/reset_ticks", "/laser_pwm"):
+        if topic in ("/goal_pose", "/reset_ticks", "/laser_pwm", "/motor_pid"):
             self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
         return {"status": "ok", "topic": topic}
 
@@ -834,6 +847,15 @@ class TelemetryHub:
         if not (-TRIM_MAX <= t <= TRIM_MAX):
             return None          # out of the rebalance range; ignore rather than clamp silently
         return Float32(data=t)
+
+    @staticmethod
+    def _mk_motor_pid(v):
+        if not isinstance(v, (list, tuple)) or len(v) != 3:
+            raise ValueError("expected a 3-element list [kp, ki, kd]")
+        kp, ki, kd = (float(x) for x in v)
+        return Float32MultiArray(data=[min(20.0, max(0.0, kp)),
+                                       min(50.0, max(0.0, ki)),
+                                       min(5.0, max(0.0, kd))])
 
     @staticmethod
     def _mk_pickup(v):

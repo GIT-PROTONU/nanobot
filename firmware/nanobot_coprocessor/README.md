@@ -4,11 +4,14 @@ The ESP32-WROOM motor/encoder/LDS coprocessor. It runs as a **native zenoh peer 
 serial** (no micro-ROS agent, no Fast-DDS), talking straight to the Humble `rmw_zenoh`
 graph in rmw_zenoh's exact wire format. Topic contract (see `src/main.cpp` header):
 
-- **sub** `cmd_vel`, `led`, `lds_target_rpm`, `fan_pwm`, `motor_trim`, `motor_accel`,
-  `reset_ticks`, `laser_pwm` (`Int32MultiArray [v1,v2]`, 0..255 → line laser PWM on
-  GPIO 23/32 via LEDC ch 6-7; laser 3 was removed 2026-08-18 — see `LASER1_PIN` in main.cpp)
+- **sub** `cmd_vel`, `led`, `lds_target_rpm`, `fan_pwm`, `motor_trim`, `motor_pid`
+  (`Float32MultiArray [kp,ki,kd]` — LIVE wheel-PID gains, no reflash needed; persisted
+  to NVS), `reset_ticks`, `laser_pwm` (`Int32MultiArray [v1,v2]`, 0..255 → line laser PWM on
+  GPIO 23/32 via LEDC ch 6-7; laser 3 was removed 2026-08-18 — see `LASER1_PIN` in main.cpp).
+  (`motor_accel` — the old open-loop accel-ramp knob — is compiled out under the wheel PID.)
 - **pub** `wheel_ticks`, `wheel_stray_ticks`, `left/right_wheel_suspended`, `esp32_temp`,
-  `esp32_hall`, `lds_rpm`, `lds_hz`, `lds_duty`, `esp32_heartbeat`, `wheel_trim`
+  `esp32_hall`, `lds_rpm`, `lds_hz`, `lds_duty`, `esp32_heartbeat`, `wheel_trim`,
+  `wheel_pid` (`Float32MultiArray [kp,ki,kd]` @1 Hz gain readback)
   (`reset_ticks` sub clears the stray counter)
 
 ## How the link works (and why)

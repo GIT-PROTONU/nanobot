@@ -446,7 +446,16 @@ class WebServerNode(Node):
         self._last_drive_log = 0.0                      # throttle for the /drive log line
         self._cpu_quick_at = 0.0                        # memo TTL for _cpu_percent_quick
         self._cpu_quick_val = 0.0
-        self.create_timer(0.1, self._drive_tick)
+        # The 10 Hz keepalive runs on its OWN thread, NOT the ROS executor: under load
+        # (TTS/espeak, GPU vision, LLM calls) executor callbacks slip 1-9 s, the
+        # re-assert misses the ESP32's 500 ms /cmd_vel watchdog, and the drive
+        # dead-mans mid-motion -> stop -> lurch on recovery (2026-09-20 POST-stall
+        # evidence). rclpy publishers are thread-safe, and the thread only touches the
+        # lock-protected (v,w) state + publish(), so it is executor-jank-independent.
+        self._drive_stop = threading.Event()
+        self._drive_thread = threading.Thread(
+            target=self._drive_loop, name="drive-keepalive", daemon=True)
+        self._drive_thread.start()
 
         # ---- Stress test mode (POST /stress/start|stop, GET /stress/status) -----------
         # Deliberately loads every CPU core to validate the hardening tier (systemd
@@ -688,19 +697,26 @@ class WebServerNode(Node):
         tw.angular.z = float(w)
         self._drive_pub.publish(tw)
 
-    def _drive_tick(self):
-        """10 Hz: re-assert the active HTTP-teleop command (the ESP32 stops the motors
-        if /cmd_vel goes stale) and dead-man-stop when the page vanishes mid-drive."""
-        with self._drive_lock:
-            if not self._drive_at:
-                return
-            stale = (time.monotonic() - self._drive_at
-                     > float(self.get_parameter("drive_timeout").value))
-            if stale:
-                self._drive_v = self._drive_w = 0.0
-                self._drive_at = 0.0
-            v, w = self._drive_v, self._drive_w
-        self._publish_drive(v, w)                      # a stale drive publishes one stop
+    def _drive_loop(self):
+        """Dedicated 10 Hz keepalive thread (NOT the ROS executor — see the init
+        comment): re-assert the active HTTP-teleop command (the ESP32 stops the
+        motors if /cmd_vel goes stale) and dead-man-stop when the page vanishes
+        mid-drive. `wait(0.1)` doubles as the interruptible sleep for shutdown."""
+        try:
+            os.nice(-5)             # best-effort per-thread priority bump (Linux nice
+        except (PermissionError, OSError):   # is per-thread; unprivileged = EPERM)
+            pass
+        timeout = float(self.get_parameter("drive_timeout").value)
+        while not self._drive_stop.wait(0.1):
+            with self._drive_lock:
+                if not self._drive_at:
+                    continue
+                stale = time.monotonic() - self._drive_at > timeout
+                if stale:
+                    self._drive_v = self._drive_w = 0.0
+                    self._drive_at = 0.0
+                v, w = self._drive_v, self._drive_w
+            self._publish_drive(v, w)                      # a stale drive publishes one stop
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -1913,6 +1929,11 @@ class WebServerNode(Node):
             return float("nan")
 
     def destroy_node(self):
+        try:
+            self._drive_stop.set()
+            self._drive_thread.join(timeout=1.0)    # stop the /cmd_vel keepalive first
+        except Exception:
+            pass
         try:
             self._stress.stop()
         except Exception:
