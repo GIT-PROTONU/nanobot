@@ -409,20 +409,38 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   a **Wheel trim** slider (`±0.30`) that POSTs it and re-seeds from the live `/wheel_trim`
   @1 Hz value; the slider's "Reset trim to 0" button clears it. Tunables `TRIM_*` in
   `main.cpp`; compiled out if `WHEEL_PID_ENABLED`.
-- **Low-duty stall + breakaway kick (2026-09-19, in repo; FLASHED 2026-09-20).** The gearmotors
+- **Low-duty stall + breakaway push (2026-09-19; kicked 2026-09-20, PUSH REWRITE in repo 2026-09-20 UNFLASHED).** The gearmotors
   seize at crawl even under the stiction deadband: the 2026-09-19 drive test measured
   wheels jerking, running 1.5-2.4 s at constant ~0.60-0.83 remapped duty, then freezing
   mid-command at 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins (they only restart on a
-  direction/phase change). Fix in `main.cpp`: `MOTOR_MIN_DUTY 0.55 → 0.70` plus a
-  **breakaway kick** (`MOTOR_KICK_MS 80` / `MOTOR_KICK_RECHECK 350`) — a full-duty pulse
-  when a wheel's ramped duty leaves the deadzone (start-from-stop) and re-pulsed while
-  powered-but-not-ticking (350 ms of frozen tick counts under nonzero duty can only be a
-  seized rotor, not tick quantization). Keyed off the RAMPED duty like the stray gating;
-  kick direction keys off the COMMANDED duty (copysign(1, 0.0) = +1 would pulse the wrong
-   way for one tick on a reverse). Flashed 2026-09-20 from the dev PC (`upload_speed = 115200`
-   was added to `platformio.ini` — the default 460800 handshake failed to verify). Slow-maneuver
-   reliability (Nav2 approach, spins) and the slam_toolbox jerk-prior effect now need on-robot
-   re-validation — see the SLAM block and docs/TODO.md.
+  direction/phase change). First fix, flashed 2026-09-20 morning: `MOTOR_MIN_DUTY 0.55 → 0.70` plus an
+  80 ms full-duty **breakaway kick** pulse on start-from-stop + while powered-but-not-ticking
+  (kick direction keyed off the COMMANDED duty). **2026-09-20 carpet re-test (instrumented
+  drive, RELIABLE /wheel_ticks capture at 15 Hz): the pulses judder without reliably
+  breaking away — 1-2 s of stall-kick-stall after every joystick press, then a lurch into
+  motion; once moving the crawl is smooth (5.3 s continuous at 0.79 remapped duty, zero
+  frozen windows) and stops are clean ramp-downs. A pulse doesn't sustain enough torque to
+  exceed static friction, and each re-pulse restarts from zero.** Rewrite (IN REPO,
+  `MOTOR_PUSH_*`, UNFLASHED — flash pending): a **sustained full-duty push** whenever a
+  wheel is powered but hasn't ticked for `MOTOR_PUSH_RECHECK` (250 ms) — held until ticks
+  resume (smooth handoff back to the ramped duty), capped at `MOTOR_PUSH_MAX_MS` (700 ms);
+  a push that expires without breakaway re-arms the frozen timer and DOUBLES the wait
+  before the next attempt (up to `MOTOR_PUSH_MAX_BACKOFF` 1600 ms, reset the moment the
+  wheel moves), so a hard jam nudges occasionally instead of ramming. No separate start
+  kick: a fresh start IS a frozen wheel (ramp stalled at low duty), so the same detector
+  catches it — on easy floor the wheel ticks immediately and no push ever fires. Push
+  direction keys off the RAMPED duty (a push only ever starts ≥250 ms after the ramp left
+  the deadzone, so the ramp already carries the command's sign — the old
+  copysign-of-commanded-duty fallback for the ramp-start pulse is gone). Keyed off the
+  RAMPED duty like the stray gating. Flashed 2026-09-20 morning from the dev PC
+  (`upload_speed = 115200` was added to `platformio.ini` — the default 460800 handshake
+  failed to verify); the push rewrite still needs `pio run -t upload` + on-robot
+  re-validation (crawl-start lag target <0.5 s, no judder) — see docs/TODO.md.
+  NOTE 2026-09-20: a wheel pressed against an obstacle freezes hard (full duty can't
+  break it away — expected physics; the capped push backs off rather than ramming), and
+  manual-driving feel on this robot also depends on the web gateway's intermittent
+  1-9 s POST stalls (dead-man cuts mid-drive → stop → lurch on recovery) — a /proc-based
+  stall trap runs on the board (see docs/TODO.md).
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,

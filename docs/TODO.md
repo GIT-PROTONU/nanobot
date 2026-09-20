@@ -52,6 +52,18 @@ in this checkout.
       quadrature); the true counts/rev can only be confirmed by driving a measured
       distance on the robot (ties into the odom-autocal backlog item and the
       map-skew item above).
+- [ ] **Flash the 2026-09-20 breakaway PUSH rewrite** (`MOTOR_PUSH_*` in main.cpp —
+      IN REPO, UNFLASHED; compiled + size-checked on the dev PC, RAM 8.4 % / Flash
+      35.6 %): `pio run -t upload` from `firmware/nanobot_coprocessor` with the ESP32
+      USB tethered to the dev PC (as for the 2026-09-20 morning flash). Then
+      re-validate on carpet with an instrumented drive (RELIABLE-QoS /wheel_ticks
+      recorder, 15 Hz): **crawl-start lag target <0.5 s with no stall-kick-stall
+      judder** (the flashed 80 ms-kick build measured 1-2 s of judder then a lurch —
+      pulses don't sustain enough torque to break static friction; mid-run crawl at
+      0.79 duty is already smooth and stops ramp cleanly), then spins + the SLAM
+      re-validation item above. Watch the push-cap behavior against a deliberate
+      wall/obstacle: the capped push should nudge-and-back-off (doubling to 1.6 s),
+      not ram.
 - [ ] **Post-flash ESP32 verification** (firmware FLASHED 2026-09-20 on the dev PC —
       `/wheel_stray_ticks` + `/reset_ticks` (built 2026-07-15), the 2026-09-17
       `TRIM_AUTOCAL 1` re-enable, and the 2026-09-19 low-duty breakaway kick;
@@ -68,6 +80,26 @@ in this checkout.
         the phase (my test ran full timeouts with the robot frozen). Fix (now flashed):
         `MOTOR_MIN_DUTY 0.55 → 0.70` + a breakaway kick (start-from-stop + 350 ms
         no-ticks re-kick, `MOTOR_KICK_*` in main.cpp).
+      - **2026-09-20 carpet re-test (instrumented, RELIABLE /wheel_ticks @15 Hz)**: the
+        kick build judders at crawl starts — ~1.2 s of 80 ms pulses before breakaway
+        (sometimes 0.35 s — variance), then smooth continuous crawl (5.3 s at 0.79
+        duty, zero frozen windows) and clean ramp-down stops. Motivated the PUSH
+        rewrite above. Same session: a wheel pressed against an obstacle stays frozen
+        through sustained full-duty pushing (expected physics). NOTE: at this deadband
+        the slowest nonzero command ≈0.28 m/s physical (the [0.70..1] remap) — there is
+        no true slow crawl; manual "slow" driving would need either a lower floor
+        (stalls return) or the closed-loop WHEEL_PID path (OFF).
+- [ ] **Diagnose the web gateway's intermittent 1-9 s POST stalls** (they chop the
+      10 Hz /drive stream → dead-man cut mid-drive → stop → lurch on recovery —
+      manual-driving feel depends on this as much as the firmware): 2026-09-20
+      evidence — two `POST /drive` clients timed out on connect while TTS was
+      speaking (espeak-ng running), and one processed 2.2 s late; board load
+      reached 3.95/4 cores. A /proc-based stall trap (`/tmp/stall_trap.sh` on the
+      board, 15 min windows, snapshots every app_hub thread's wchan/state on a
+      >600 ms stall → `/tmp/stall_*.txt`) was deployed 2026-09-20 ~11:22 — review
+      dumps; py-spy needs root (board sudo is passworded), so if /proc wchan is too
+      coarse, add an in-process `faulthandler.register(SIGUSR1)` to app_hub (edit +
+      restart, no ptrace needed) and SIGUSR1 on stall.
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze

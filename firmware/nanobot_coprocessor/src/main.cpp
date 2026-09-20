@@ -120,19 +120,28 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // 0.55 was measured (2026-09-19 drive test) to still re-stick at crawl: wheels jerked,
 // ran 1.5-2.4 s at constant ~0.60-0.69 remapped duty, then seized mid-command (the
 // documented "low-duty turn stall"), on BOTH crawl speeds (0.12 m/s) and in-place
-// spins (0.5 rad/s). 0.70 + the breakaway kick below keeps them turning; the cost is
+// spins (0.5 rad/s). 0.70 + the breakaway push below keeps them turning; the cost is
 // coarser low-speed duty resolution ([0.70..1] spans 0..0.4 m/s).
 #define MOTOR_MIN_DUTY 0.70f
 #define MOTOR_DEADZONE 0.02f   // |duty| below this = intended stop, not a crawl
-// Breakaway kick: at crawl the wheel breaks away on the initial ramp, crawls ~1.5-2 s,
+// Breakaway push: at crawl the wheel breaks away on the initial ramp, crawls ~1.5-2 s,
 // then static friction re-seizes it at constant duty (it only restarts on a direction/
-// phase change). Two pulses fix it without hurting velocity resolution: a full-duty
-// START kick whenever a wheel's ramped duty leaves the deadzone, and a STALL re-kick
-// whenever it is powered but hasn't ticked for MOTOR_KICK_RECHECK. Keyed off the RAMPED
-// duty (same as the stray gating below); the kick bypasses the slew ramp (it IS the
-// jolt) but trim still applies, so it stays direction-correct.
-#define MOTOR_KICK_MS      80
-#define MOTOR_KICK_RECHECK 350
+// phase change). 2026-09-20 hardware re-test on carpet showed the previous 80 ms full-
+// duty kick PULSES judder without reliably breaking away (1-2 s of stall-kick-stall
+// before motion) — a pulse doesn't sustain enough torque to exceed static friction, and
+// each re-kick restarts from zero. Now: a SUSTAINED full-duty push whenever a wheel is
+// powered but hasn't ticked for MOTOR_PUSH_RECHECK — held until ticks resume (smooth
+// handoff back to the ramped duty), capped at MOTOR_PUSH_MAX_MS; a push that expires
+// without breakaway backs off before the next attempt (backoff doubles per failure up
+// to MOTOR_PUSH_MAX_BACKOFF, so a hard jam nudges occasionally instead of ramming).
+// There is no separate start kick: a fresh start from stop IS a frozen wheel (ramp
+// stalled at low duty), so the same detector catches it — on easy floor the wheel ticks
+// immediately and no push ever fires. Keyed off the RAMPED duty (same as the stray
+// gating below); the push bypasses the slew ramp (it IS the shove) but trim still
+// applies, so it stays direction-correct.
+#define MOTOR_PUSH_RECHECK    250   // powered-but-frozen this long -> start a push (also the post-failure backoff)
+#define MOTOR_PUSH_MAX_MS     700   // cap one continuous full-duty push
+#define MOTOR_PUSH_MAX_BACKOFF 1600 // capped doubling of the recheck after failed pushes
 // Acceleration control: duty (a step function of the latest /cmd_vel) used to be applied
 // to the motors instantly, so any joystick flick or direction reversal was a hard jolt.
 // MOTOR_SLEW_DEFAULT caps how fast the APPLIED duty may follow the commanded duty (duty
@@ -916,32 +925,52 @@ void loop(){   // Core 1: real-time control
       l_ramped = slewTo(l_ramped, g_left_duty, maxDelta);
       r_ramped = slewTo(r_ramped, g_right_duty, maxDelta);
     }
-    // Breakaway kick (see MOTOR_KICK_* above): full-duty pulse on start-from-stop and
-    // while powered-but-stalled. Ticks are the stall signal — at crawl they still flow
-    // every few 10 ms windows, so 350 ms of frozen counts under nonzero duty can only
-    // be a seized rotor, not quantization.
-    static float l_prev_ramped=0, r_prev_ramped=0;
+    // Breakaway push (see MOTOR_PUSH_* above): a SUSTAINED full-duty push while a wheel
+    // is powered-but-frozen, ending the instant ticks resume (smooth handoff back to the
+    // ramped duty). Capped per push; a push that expires without breakaway re-arms the
+    // frozen timer and doubles the wait before the next attempt (backoff resets the
+    // moment the wheel moves again), so a hard jam nudges occasionally instead of
+    // ramming. Ticks are the stall signal — at crawl they still flow every few 10 ms
+    // windows, so 250 ms of frozen counts under nonzero duty can only be a seized rotor
+    // (or a jam), not tick quantization.
     static int32_t l_kick_ticks=0, r_kick_ticks=0;
-    static uint32_t l_kick_until=0, r_kick_until=0;
     static uint32_t l_stall_since=0, r_stall_since=0;
+    static bool l_pushing=false, r_pushing=false;
+    static uint32_t l_push_start=0, r_push_start=0;
+    static uint32_t l_backoff=MOTOR_PUSH_RECHECK, r_backoff=MOTOR_PUSH_RECHECK;
     if (fabsf(l_ramped) > MOTOR_DEADZONE){
-      if (fabsf(l_prev_ramped) <= MOTOR_DEADZONE) l_kick_until = now + MOTOR_KICK_MS;
       if (l_stall_since && g_left_ticks == l_kick_ticks){
-        if (now - l_stall_since > MOTOR_KICK_RECHECK){ l_kick_until = now + MOTOR_KICK_MS; l_stall_since = now; }
-      } else { l_stall_since = now; l_kick_ticks = g_left_ticks; }
-    } else { l_kick_until = 0; l_stall_since = 0; }
+        if (l_pushing){
+          if (now - l_push_start > MOTOR_PUSH_MAX_MS){      // capped push failed -> back off
+            l_pushing = false; l_stall_since = now;
+            uint32_t b = l_backoff*2;
+            l_backoff = (b > MOTOR_PUSH_MAX_BACKOFF) ? MOTOR_PUSH_MAX_BACKOFF : b;
+          }
+        } else if (now - l_stall_since > l_backoff){
+          l_pushing = true; l_push_start = now;
+        }
+      } else { l_stall_since = now; l_kick_ticks = g_left_ticks;
+               l_pushing = false; l_backoff = MOTOR_PUSH_RECHECK; }
+    } else { l_pushing = false; l_stall_since = 0; l_backoff = MOTOR_PUSH_RECHECK; }
     if (fabsf(r_ramped) > MOTOR_DEADZONE){
-      if (fabsf(r_prev_ramped) <= MOTOR_DEADZONE) r_kick_until = now + MOTOR_KICK_MS;
       if (r_stall_since && g_right_ticks == r_kick_ticks){
-        if (now - r_stall_since > MOTOR_KICK_RECHECK){ r_kick_until = now + MOTOR_KICK_MS; r_stall_since = now; }
-      } else { r_stall_since = now; r_kick_ticks = g_right_ticks; }
-    } else { r_kick_until = 0; r_stall_since = 0; }
-    // Kick direction keys off the COMMANDED duty, not the ramp: at ramp start l_ramped
-    // is still 0.0 and copysign(1, 0.0) = +1, which would pulse the wrong way for one
-    // 10 ms tick on a reverse command.
-    float l_apply = (now < l_kick_until) ? copysignf(1.0f, (g_left_duty != 0.0f) ? g_left_duty : l_ramped) : l_ramped;
-    float r_apply = (now < r_kick_until) ? copysignf(1.0f, (g_right_duty != 0.0f) ? g_right_duty : r_ramped) : r_ramped;
-    l_prev_ramped = l_ramped; r_prev_ramped = r_ramped;
+        if (r_pushing){
+          if (now - r_push_start > MOTOR_PUSH_MAX_MS){      // capped push failed -> back off
+            r_pushing = false; r_stall_since = now;
+            uint32_t b = r_backoff*2;
+            r_backoff = (b > MOTOR_PUSH_MAX_BACKOFF) ? MOTOR_PUSH_MAX_BACKOFF : b;
+          }
+        } else if (now - r_stall_since > r_backoff){
+          r_pushing = true; r_push_start = now;
+        }
+      } else { r_stall_since = now; r_kick_ticks = g_right_ticks;
+               r_pushing = false; r_backoff = MOTOR_PUSH_RECHECK; }
+    } else { r_pushing = false; r_stall_since = 0; r_backoff = MOTOR_PUSH_RECHECK; }
+    // Push direction keys off the RAMPED duty: a push only ever starts >=MOTOR_PUSH_RECHECK
+    // after the ramp left the deadzone, so the ramp already carries the command's sign
+    // (the old immediate start-kick needed the commanded-duty fallback; that's gone).
+    float l_apply = l_pushing ? copysignf(1.0f, l_ramped) : l_ramped;
+    float r_apply = r_pushing ? copysignf(1.0f, r_ramped) : r_ramped;
     applyMotors(l_apply, r_apply);
     // Stray-tick gating: a wheel counts as "stopped" STRAY_SETTLE_MS after its APPLIED
     // (ramped) duty last went to exactly 0 (coast-down grace period), and un-stops the
