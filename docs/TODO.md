@@ -34,7 +34,7 @@ in this checkout.
         the board's no-RTC clock steps (~44 h at power-on, 2026-09-19 12:00:53)
         destroy live SLAM sessions — a bounded NTP wait now gates `unit_exec.sh`
         (deployed live; 20 s max, offline robots still boot).
-      - RE-VALIDATE after flashing the firmware kick (item above): restart
+      - RE-VALIDATE now that the firmware kick is flashed (2026-09-20): restart
         nano-slam (fresh map — no map_file_name is configured, so a restart IS a
         clear), drive a clean lap, confirm walls line up with the room, a second
         lap doesn't paint a shifted mask, and the out-and-back map-pose tracking
@@ -52,22 +52,22 @@ in this checkout.
       quadrature); the true counts/rev can only be confirmed by driving a measured
       distance on the robot (ties into the odom-autocal backlog item and the
       map-skew item above).
-- [ ] **Flash the ESP32 firmware** (`/wheel_stray_ticks` + `/reset_ticks`, built
-      2026-07-15; the 2026-09-17 `TRIM_AUTOCAL 1` re-enable; and the 2026-09-19
-      low-duty stall fix) — from the dev PC: `cd firmware/nanobot_coprocessor &&
-      pio run -t upload` (never build on the board). After flashing: reset trim to 0
-      (web Coprocessor card or `POST /motor_trim 0`), then drive straight a few seconds
+- [ ] **Post-flash ESP32 verification** (firmware FLASHED 2026-09-20 on the dev PC —
+      `/wheel_stray_ticks` + `/reset_ticks` (built 2026-07-15), the 2026-09-17
+      `TRIM_AUTOCAL 1` re-enable, and the 2026-09-19 low-duty breakaway kick;
+      `upload_speed = 115200` added to platformio.ini since the default 460800
+      handshake failed to verify): on the robot, reset trim to 0 (web Coprocessor
+      card or `POST /motor_trim 0`), then drive straight a few seconds
       and let autocal converge — verify it settles on a NEGATIVE trim (the known left veer) and
-      the robot tracks straight.
+      the robot tracks straight. Then re-validate crawl/spin maneuvers (Nav2 approach,
+      in-place turns) and the SLAM re-validation item above.
       - **2026-09-19 drive-test evidence (SLAM diagnosis session)**: with the flashed
         deadband build (`MOTOR_MIN_DUTY 0.55`), wheels seized ~1.4-2.4 s into every
         command at crawl/mid duty — 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins
         (remapped duty ~0.60-0.83): moved, crawled, froze mid-command for the rest of
-        the phase (my test ran full timeouts with the robot frozen). Fixed in-repo:
+        the phase (my test ran full timeouts with the robot frozen). Fix (now flashed):
         `MOTOR_MIN_DUTY 0.55 → 0.70` + a breakaway kick (start-from-stop + 350 ms
-        no-ticks re-kick, `MOTOR_KICK_*` in main.cpp) — **unflashed**. Until flashed,
-        slow/crawl maneuvers (Nav2 approach speeds, in-place turns) are unreliable and
-        every jerk-stall sequence feeds slam_toolbox jerk priors (bad locks, see below).
+        no-ticks re-kick, `MOTOR_KICK_*` in main.cpp).
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze
@@ -128,6 +128,11 @@ in this checkout.
 
 ## Resolved / retired (kept for the trail)
 
+- [x] **ESP32 firmware flashed** (2026-09-20, dev PC, `/dev/ttyUSB0` @115200 —
+      stray-tick diagnostic, `TRIM_AUTOCAL 1`, and the low-duty breakaway kick all
+      live on the coprocessor; follow-up verification is the open "Post-flash ESP32
+      verification" item above).
+
 - [x] **Nav2 migration deployed to the board** (DONE 2026-09-14/15 — build +
       `sbc-setup.sh` unit set + live-verified; see `docs/nav2-migration.md`).
 - [x] **Map view + click-to-goal + Locations rebuilt on Nav2** (2026-09-15,
@@ -165,8 +170,8 @@ in this checkout.
       gate only passed while the robot was LIFTED — tuning on free-spinning
       wheels). With the polarity flip verified, the gate means "both wheels on
       the ground" and the loop math is sound negative feedback → `TRIM_AUTOCAL 1`
-      re-set in firmware. Pending flash + straight-drive converge check (folded
-      into the flash item in "Open — needs the physical robot").
+      re-set in firmware. Flash done 2026-09-20; the straight-drive converge
+      check remains open (see "Post-flash ESP32 verification" above).
 - MOOT: re-enable `pickup_pause: true` — the param was slam_nav's and died with
   the Nav2 migration (2026-09-14); no SLAM pickup-freeze exists anymore and the
   remaining pickup consumers (mood_node reflex, web snapshot) need no config
