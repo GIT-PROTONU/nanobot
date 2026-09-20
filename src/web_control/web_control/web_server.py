@@ -10,7 +10,7 @@ the page talks exclusively to this server:
   `telemetry_rate` Hz. `POST /publish` + `POST /param` are the whitelisted write
   paths (goal, setpoints, OLED owners, tuning sliders). See telemetry.py.
 - `POST /drive` ({"v","w"}) — HTTP teleop. Publishes /cmd_vel directly with a
-  node-side 10 Hz keepalive + dead-man (see the drive_* params).
+  node-side ~3.3 Hz keepalive + dead-man (see the drive_* params).
 - `/scan.bin` — the /dev/shm blob lds_driver_py writes, served same-origin so
   the big message never crosses rosbridge. (The old /map blob died with the
   slam_nav migration — slam_toolbox serves /map as a real topic now; see
@@ -430,7 +430,7 @@ class WebServerNode(Node):
         # latency spikes that can outlast the ESP32's 500 ms /cmd_vel watchdog — the
         # motors cut out and the drive stutters. The page POSTs {v,w} here over its
         # existing kept-alive HTTP socket instead; we publish /cmd_vel immediately and
-        # then keep a steady 10 Hz keepalive from THIS node while the command is
+        # then keep a steady ~3.3 Hz keepalive from THIS node while the command is
         # non-zero, so the firmware sees fresh commands regardless of browser jank.
         # A dead-man zeroes the motors if the page stops refreshing (tab killed,
         # network drop). The page falls back to rosbridge if /drive is absent.
@@ -446,7 +446,7 @@ class WebServerNode(Node):
         self._last_drive_log = 0.0                      # throttle for the /drive log line
         self._cpu_quick_at = 0.0                        # memo TTL for _cpu_percent_quick
         self._cpu_quick_val = 0.0
-        # The 10 Hz keepalive runs on its OWN thread, NOT the ROS executor: under load
+        # The keepalive runs on its OWN thread, NOT the ROS executor: under load
         # (TTS/espeak, GPU vision, LLM calls) executor callbacks slip 1-9 s, the
         # re-assert misses the ESP32's 500 ms /cmd_vel watchdog, and the drive
         # dead-mans mid-motion -> stop -> lurch on recovery (2026-09-20 POST-stall
@@ -668,8 +668,11 @@ class WebServerNode(Node):
 
     # ---- HTTP teleop ---------------------------------------------------------
     def drive(self, data):
-        """POST /drive {"v","w"}: clamp, publish /cmd_vel now, and arm the 10 Hz
-        keepalive until the page stops refreshing (dead-man) or sends zero."""
+        """POST /drive {"v","w"}: clamp and arm the ~3.3 Hz keepalive until the page
+        stops refreshing (dead-man) or sends zero. NO direct publish here — the
+        keepalive thread is the sole /cmd_vel publisher: the web joystick POSTs at
+        10 Hz, and an immediate publish per POST would put 13 Hz/s onto the serial
+        link to the ESP32, which decays under sustained flow (see _drive_loop)."""
         g = self.get_parameter
         max_lin = float(g("drive_max_lin").value)
         max_ang = float(g("drive_max_ang").value)
@@ -688,7 +691,6 @@ class WebServerNode(Node):
         if (v or w) and time.monotonic() - self._last_drive_log > 2.0:
             self._last_drive_log = time.monotonic()
             self.get_logger().info(f"POST /drive v {v:.2f} w {w:.2f} (web teleop)")
-        self._publish_drive(v, w)
         return {"status": "ok", "v": v, "w": w}
 
     def _publish_drive(self, v, w):
@@ -698,16 +700,22 @@ class WebServerNode(Node):
         self._drive_pub.publish(tw)
 
     def _drive_loop(self):
-        """Dedicated 10 Hz keepalive thread (NOT the ROS executor — see the init
+        """Dedicated ~3.3 Hz keepalive thread (NOT the ROS executor — see the init
         comment): re-assert the active HTTP-teleop command (the ESP32 stops the
         motors if /cmd_vel goes stale) and dead-man-stop when the page vanishes
-        mid-drive. `wait(0.1)` doubles as the interruptible sleep for shutdown."""
+        mid-drive. `wait(0.1)` doubles as the interruptible sleep for shutdown.
+
+        3.3 Hz, NOT 10 Hz: sustained 10 Hz /cmd_vel over the 115200-baud serial
+        link to the ESP32 chokes the zenoh serial transport (tiny UART RX FIFO on
+        the coprocessor) — deliveries decay and the wheels stall mid-drive
+        (measured 2026-09-20; 3 Hz cruises, 10 Hz decays). The ESP32's
+        CMD_TIMEOUT_MS is 500 ms, so 300 ms keeps it comfortably fed."""
         try:
             os.nice(-5)             # best-effort per-thread priority bump (Linux nice
         except (PermissionError, OSError):   # is per-thread; unprivileged = EPERM)
             pass
         timeout = float(self.get_parameter("drive_timeout").value)
-        while not self._drive_stop.wait(0.1):
+        while not self._drive_stop.wait(0.3):
             with self._drive_lock:
                 if not self._drive_at:
                     continue

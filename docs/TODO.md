@@ -40,50 +40,54 @@ in this checkout.
         lap doesn't paint a shifted mask, and the out-and-back map-pose tracking
         has no bad locks (the BACK direction tracked perfectly both sessions;
         the stall-jerk FWD runs did not — recheck with working drive chain).
-      - Re-check `/odom` wheel scale against a measured rollout (ties into the
-        `ticks_per_rev` item below); if real tyre scale/slip is a few %, consider
-        `wheel_trim`/scale compensation — in manual driving the wheels are the only
-        truth, and the map skews by the same %.
+      - ~~Re-check `/odom` wheel scale against a measured rollout~~ **DONE 2026-09-20 —
+        the scale was 5.7× wrong, not a few %**: measured rollout (user-timed 5 s crawl)
+        gave 2235 ticks / 1.86 m = **1202 ticks/m => `ticks_per_rev` 253, not 1440** (the
+        1440 assumption was a quad-vs-single-channel counting error). Physical full-duty
+        cruise is ~0.37 m/s loaded — the drive hardware was healthy all along; `/odom`,
+        the PID's velocity feedback and `WHEEL_KFF`'s world were all mislabeled, which
+        also means every pre-fix "crawl at 0.1 m/s" was really a saturated ~0.37 m/s
+        lurch. Fixed in firmware + `robot.yaml` (both wheels' PIDs now regulate in true
+        m/s). The SLAM map built on the 5.7×-scaled odom is garbage geometry — a
+        `nano-slam` restart (fresh map) is mandatory, done with the 2026-09-20 deploy.
+      - ~~`ticks_per_rev` verification~~ **DONE** (253, see above) — and the scale is
+        now a LIVE parameter (firmware `/motor_params`, NVS-backed) so a future
+        recalibration needs a POST, never a reflash.
       - Park → pause: the pose must sit back on the wheel-integrated odom position
         within a few cm — re-check only on a cleanly-built fresh map (the old 9 cm
         idle gap was the boot-into-saved-map frame mis-load, fixed 2026-09-12).
-- [ ] **wheel_odometry: verify `ticks_per_rev: 1440` against measured travel.**
-      The comment already correctly says single-channel rising-edge (not
-      quadrature); the true counts/rev can only be confirmed by driving a measured
-      distance on the robot (ties into the odom-autocal backlog item and the
-      map-skew item above).
-- [ ] **Flash + hardware-tune the 2026-09-20 closed-loop wheel-PID motor control**
-      (supersedes the breakaway PUSH rewrite, which stays in the repo compiled out
-      behind `#if !WHEEL_PID_ENABLED` as the legacy open-loop path): `WHEEL_PID_ENABLED
-      1` — the I-term integrates through stiction so crawl holds deterministically
-      instead of riding on the stiction remap (removed: `writeSide` is now linear,
-      only `MOTOR_DEADZONE` zeroes an intended stop) + the breakaway push. Accel
-      limiting moved to a SETPOINT slew (`WHEEL_TGT_SLEW`, m/s per s) so the loop
-      stays lag-free; `/motor_accel` is compiled out under the PID (the web
-      Coprocessor card's dead "Accel ramp" slider was replaced by live PID
-      KP/KI/KD sliders). `MAX_ANGULAR_SPEED`
-      synced 3.0 → 0.8 (robot.yaml `drive_max_ang`, SLAM smear budget). Starting
-      gains KP 0 / KI 8.0 / KD 0 (`WHEEL_KFF` feedforward baseline): NEVER flash
-      with KP=KI=0 — feedforward-only will not crawl anymore (no remap). **Gains
-      are LIVE-TUNABLE once flashed (one last flash to get the feature)**:
-      `/motor_pid` (Float32MultiArray [kp,ki,kd], whitelisted) updates the running
-      PID instantly (integrators reset) and persists to ESP32 NVS once parked;
-      the web Coprocessor card's PID sliders drive it, re-seeded from the 1 Hz
-      `/wheel_pid` readback (`f.esp.wheel_pid`) — tuning iterations do NOT need a
-      reflash. Tuning
-      order on hardware (debug console prints vel/tgt/duty @3.3 Hz): KI until a
-      crawl breaks away <0.5 s without stick-slip hunting (halve if it oscillates),
-      then KP ~0.5·KFF for stiffness; KD stays 0 (tick quantization). Accepted
-      limit: feedback is single-channel (ticks signed by COMMANDED direction) —
-      blind on reverse-through-zero/stall/slip/being-pushed; the real fix is a 2nd
-      quadrature channel. Build verified both paths (`pio run` via
-      `pixi run ~/.local/bin/pio run` — the zenoh-pico build needs the pixi env's
-      cmake): RAM 8.5% / Flash 35.7%. Then re-validate on carpet with an
-      instrumented drive (RELIABLE-QoS /wheel_ticks recorder, 15 Hz): **crawl-start
-      lag <0.5 s, no judder, smooth continuous crawl, clean ramp-down stops**, then
-      spins + the SLAM re-validation item above, and a deliberate wall-press check
-      (full-duty hold, integral clamped — no backoff anymore, dead-man still cuts on
-      command loss).
+        REOPENED by the scale fix: the old odom fed SLAM a 5.7×-scaled world, so all
+        prior pose-tracking observations are void — re-validate on the fresh map.
+- [ ] **Retune the closed-loop wheel-PID in TRUE units (post-scale-fix).** The PID was
+      flashed 2026-09-20 (see the AGENTS.md closed-loop block for the full system
+      description: live gains + live `/motor_params` geometry, NVS-persisted). The
+      2026-09-20 tuning session established the current state: gains `[KP 1.1, KI 45,
+      KD 0]` in NVS, trim 0 — but those were tuned while the scale was still 5.7×
+      wrong, i.e. in a saturated ~0.37 m/s regime. In true units the same gains are a
+      starting point, not a finish: KI 45 gives a full-duty ramp in ~0.2 s at
+      standstill (err 0.1 m/s × KI 45), which should break away well under 0.5 s;
+      verify, then walk the reliability ladder 0.05 → 0.08 → 0.10 → 0.15 m/s (no
+      stalls, no hunting), then KP for stiffness only if cruise sags, KD stays 0.
+      KEEP THE SERIAL BUDGET: /cmd_vel at sustained 10 Hz chokes the 115200-baud
+      serial link (deliveries decay, wheels stall) — the web keepalive now runs
+      3.3 Hz and Nav2's controller_frequency is 4.0 for this reason; scripted tests
+      must also stay ≤3-4 Hz. Tuning knobs: `/motor_pid` [kp,ki,kd] (ki clamp now
+      0..100) + `/motor_params` (id,value) pairs — no reflash needed.
+- [ ] **OPEN BUG: /cmd_vel delivery to the ESP32 dies after a router/stack restart —
+      Twist-specific, other topics keep flowing.** After `deploy.sh`/`stack.sh`
+      restarts the zenoh router, the coprocessor's session re-attaches (heartbeat,
+      /wheel_ticks, /lds_* all flow) and SOME subscriptions still deliver
+      (/motor_pid write → /wheel_pid readback flips instantly), but /cmd_vel
+      specifically goes deaf — observed twice (2026-09-20 pre- and post-flash), with
+      web_control's keepalive, the board's `ros2 topic pub`, AND raw zenoh puts on
+      the exact keyexpr. A full ESP32 reboot (flash = reboot) restores it until the
+      next router restart; the 2026-09-20 fix-sequence was flash-then-deploy, which
+      ends with the ESP32 deaf again. Workaround: power-cycle the coprocessor after
+      any router restart. Diagnosis leads: the sub declare for the ONE multi-publisher
+      topic (cmd_vel has 6 publishers across sessions; every delivered topic has ≤1)
+      vs zenoh-pico's re-attach path; compare a router-restart vs ESP32-reboot
+      declare table. The old "ESP32 wedged after stack restart" gotcha and this are
+      likely the same root cause.
       - **2026-09-19 drive-test evidence (SLAM diagnosis session)**: with the flashed
         deadband build (`MOTOR_MIN_DUTY 0.55`), wheels seized ~1.4-2.4 s into every
         command at crawl/mid duty — 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins

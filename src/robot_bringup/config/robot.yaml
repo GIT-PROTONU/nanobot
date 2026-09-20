@@ -38,9 +38,9 @@ lds_driver:
 wheel_odometry:
   ros__parameters:
     ticks_topic: "wheel_ticks"  # from the ESP32 zenoh-pico coprocessor
-    ticks_per_rev: 1440       # encoder counts per wheel revolution (single-channel
-                              # rising edges; NOT quadrature — needs an on-hardware
-                              # check against measured travel, see docs/TODO.md)
+    ticks_per_rev: 253        # encoder counts per wheel revolution (single-channel
+                              # rising edges; MEASURED 2026-09-20 rollout: 2235 ticks /
+                              # 1.86 m = 1202 ticks/m => 253/rev; was 1440 = 5.7x error)
     wheel_radius: 0.0335      # metres
     wheel_separation: 0.16    # metres between wheel contact points
     invert_left: false
@@ -153,7 +153,7 @@ imu_driver:
 # exact contracts the real hardware nodes publish (see sim_hardware/sim_bridge_node.py).
 sim_bridge:
   ros__parameters:
-    ticks_per_rev: 1440       # MUST match wheel_odometry.ticks_per_rev above
+    ticks_per_rev: 253        # MUST match wheel_odometry.ticks_per_rev above
     left_wheel_joint: "left_wheel_joint"
     right_wheel_joint: "right_wheel_joint"
     invert_left: false

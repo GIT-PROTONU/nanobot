@@ -144,7 +144,11 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // gone), so never flash this path with both zero.
 #define WHEEL_PID_ENABLED 1
 #define WHEEL_RADIUS      0.0335f   // m  (matches robot.yaml wheel_odometry.wheel_radius)
-#define TICKS_PER_REV     1440.0f   // counts/wheel-rev as the ESP emits them (matches odom)
+#define TICKS_PER_REV     253.0f    // counts/wheel-rev as the ESP emits them (matches odom).
+                                    // MEASURED 2026-09-20 rollout: 2235 ticks / 1.86 m = 1202
+                                    // ticks/m => 253/rev (was 1440 — a 5.7x error that made
+                                    // /odom + the PID's velocity world fictional; drive was
+                                    // healthy all along, full duty = ~0.37 m/s loaded).
 #define WHEEL_PID_HZ      50        // PID rate; longer window than the 100 Hz loop => less tick-quantization noise
 // Full-scale wheel speed at duty=1 (the per-wheel max from the clamps above); KFF maps a
 // target m/s to the baseline duty the I-term corrects from.
@@ -327,12 +331,47 @@ static volatile float    g_trim = 0;
 // Changed at runtime via /motor_pid (Float32MultiArray [kp,ki,kd], duty units) — tune
 // without reflashing — and persisted to NVS rate-limited like the trim, so a tuning
 // session survives a reboot. Readback on /wheel_pid @1 Hz feeds the web sliders.
-// Clamps mirror motor_pid_cb (kp 0..20, ki 0..50, kd 0..5).
+// Clamps mirror motor_pid_cb (kp 0..20, ki 0..100, kd 0..5).
 static volatile float    g_wkp = WHEEL_KP, g_wki = WHEEL_KI, g_wkd = WHEEL_KD;
 static volatile bool     g_pid_reset = false; // cb -> PID block: reset integ/prev on a gain change
-static volatile bool     g_pid_save  = false; // cb -> 1 Hz block: gains changed, NVS write pending
+static volatile bool     g_pid_save = false; // cb -> 1 Hz block: gains changed, NVS write pending
 static float             g_pid_saved[3];      // last values written to NVS (Core 1 only)
 #endif
+
+// ---- Live drivetrain parameters (NVS-backed, settable via /motor_params — NO reflash
+// to recalibrate the geometry). Wire format: Float32MultiArray, empty layout, data =
+// (id,value) float pairs, ids:
+//   0 ticks_per_rev   1 wheel_radius_m   2 wheel_separation_m
+//   3 max_linear_ms   4 max_angular_rads 5 target_slew_mps2
+// Readback on /wheel_params @1 Hz uses the SAME (id,value) layout. A change recomputes
+// the derived ticks/meter + KFF full-scale map and resets the PID integrators (their
+// error units just changed meaning). Defaults are the defines above; both build paths
+// share cmd_cb's clamps/diff-drive, so this block is unconditional.
+static volatile float    g_tpr = TICKS_PER_REV, g_wrad = WHEEL_RADIUS, g_wsep = WHEEL_SEPARATION,
+                         g_maxlin = MAX_LINEAR_SPEED, g_maxang = MAX_ANGULAR_SPEED, g_slew = WHEEL_TGT_SLEW;
+static volatile float    g_tpm = TICKS_PER_REV/(2.0f*3.14159265f*WHEEL_RADIUS);   // derived: ticks/meter
+static volatile float    g_kff = WHEEL_KFF;                                       // derived: duty per m/s
+static volatile bool     g_par_save = false; // cb -> 1 Hz block: params changed, NVS write pending
+static uint32_t          g_par_saved_ms = 0;
+static float clampf(float v, float lo, float hi);   // defined below (shared helper)
+static void recalc_drive_params(){
+  float tpr = g_tpr, r = g_wrad;
+  if (tpr >= 1.0f && r >= 0.001f)                      // never adopt a broken scale
+    g_tpm = tpr / (2.0f*3.14159265f*r);
+  g_kff = 1.0f / (g_maxlin + g_maxang*g_wsep*0.5f);
+}
+static bool set_param(int id, float v){   // clamp + assign; false = unknown id
+  switch(id){
+    case 0: g_tpr   = clampf(v, 10,    5000); break;
+    case 1: g_wrad  = clampf(v, 0.005f, 0.5f); break;
+    case 2: g_wsep  = clampf(v, 0.05f,  1.0f); break;
+    case 3: g_maxlin= clampf(v, 0.05f,  2.0f); break;
+    case 4: g_maxang= clampf(v, 0.05f,  5.0f); break;
+    case 5: g_slew  = clampf(v, 0.05f, 10.0f); break;
+    default: return false;
+  }
+  return true;
+}
 #if !WHEEL_PID_ENABLED
 static volatile float    g_motor_slew = MOTOR_SLEW_DEFAULT;   // live /motor_accel setpoint
 #endif
@@ -389,6 +428,14 @@ static size_t cdr_f32arr3(uint8_t* b, float a, float c, float d){
   memcpy(b+16,&a,4); memcpy(b+20,&c,4); memcpy(b+24,&d,4);
   return 28;
 }
+// Float32MultiArray with n floats (empty layout) — the /wheel_params readback's
+// (id,value) pairs. Caller guarantees n*4 + 16 <= buffer size.
+static size_t cdr_f32arr_n(uint8_t* b, const float* v, int n){
+  memcpy(b,CDR_HDR,4);
+  uint32_t z=0, ln=(uint32_t)n; memcpy(b+4,&z,4); memcpy(b+8,&z,4); memcpy(b+12,&ln,4);
+  memcpy(b+16,v,4*n);
+  return 16+4*n;
+}
 
 // ============================ zenoh session (Core 0) ==========================
 #define DOMAIN "0"
@@ -440,14 +487,14 @@ static void declare_lv(const char* topic, const char* type, int eid){
 
 // one publisher + its rmw attachment identity
 struct ZPub { z_owned_publisher_t p; int64_t seq; uint8_t gid[16]; };
-static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim, P_pid;
+static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim, P_pid, P_params;
 
 // Single source of truth for every publisher: topic/type, the attachment GID tag
 // (last GID byte, unique per publisher) and the liveliness entity id (lv_eid, also
 // unique). The declare loop and the liveliness loop both walk this, so the two can't
 // drift. These wire identities are PROVEN-GOOD against the live graph — don't renumber
 // existing entries; new ones just take the next free tag/eid (14 is the g_lv[] limit,
-// so there are two spare slots left).
+// so there is one spare slot left after wheel_params).
 struct PubDef { ZPub* zp; const char* topic; const char* type; uint8_t gid_tag; int lv_eid; bool lds_only; };
 static const PubDef PUBS[] = {
   { &P_ticks, "wheel_ticks",           T_I64A, 1, 1, false },
@@ -462,6 +509,7 @@ static const PubDef PUBS[] = {
   { &P_duty,  "lds_duty",              T_F32,  8, 9, true  },
   { &P_trim,  "wheel_trim",            T_F32, 10, 10, false },
   { &P_pid,   "wheel_pid",             T_F32A, 12, 12, false },
+  { &P_params,"wheel_params",          T_F32A, 13, 13, false },
 };
 
 static void zpub_declare(ZPub& zp, const char* topic, const char* type, uint8_t tag){
@@ -513,9 +561,9 @@ static void cmd_cb(z_loaned_sample_t* sm, void*){
   double v, w;
   memcpy(&v, b+4,  8);                       // linear.x  (body offset 0)
   memcpy(&w, b+44, 8);                       // angular.z (body offset 40)
-  float fv = clampf((float)v, -MAX_LINEAR_SPEED,  MAX_LINEAR_SPEED);
-  float fw = clampf((float)w, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED);
-  float vl = fv - fw*WHEEL_SEPARATION*0.5f, vr = fv + fw*WHEEL_SEPARATION*0.5f;
+  float fv = clampf((float)v, -g_maxlin,  g_maxlin);
+  float fw = clampf((float)w, -g_maxang, g_maxang);
+  float vl = fv - fw*g_wsep*0.5f, vr = fv + fw*g_wsep*0.5f;
 #if WHEEL_PID_ENABLED
   g_left_tgt = vl; g_right_tgt = vr;            // the control loop's PID turns these into duty
 #else
@@ -588,10 +636,33 @@ static void motor_pid_cb(z_loaned_sample_t* sm, void*){
   float kp,ki,kd;
   memcpy(&kp,b+16+off,4); memcpy(&ki,b+20+off,4); memcpy(&kd,b+24+off,4);
   if (isnan(kp)||isnan(ki)||isnan(kd)) return;
-  g_wkp = clampf(kp,0,20); g_wki = clampf(ki,0,50); g_wkd = clampf(kd,0,5);
+  g_wkp = clampf(kp,0,20); g_wki = clampf(ki,0,100); g_wkd = clampf(kd,0,5);
   g_pid_reset = true; g_pid_save = true;
   Serial.printf("[nano] wheel PID kp=%.3f ki=%.3f kd=%.3f (integ reset)\n",
                 (double)g_wkp,(double)g_wki,(double)g_wkd);
+}
+
+// /motor_params: live drivetrain parameters as (id,value) float pairs — see the
+// g_tpr block above for ids/ranges. Any accepted change recomputes the derived
+// ticks/meter + KFF and resets the PID integrators, then persists to NVS
+// rate-limited like the gains (written once parked).
+static void motor_params_cb(z_loaned_sample_t* sm, void*){
+  uint8_t b[80]; size_t n = sample_bytes(sm,b,sizeof(b));
+  uint32_t dim=0, off=0;
+  if (n >= 16){ memcpy(&dim,b+4,4); memcpy(&off,b+8,4); }
+  if (dim != 0 || n < 16+off+8 || ((n-16-off) % 8)) return;   // empty layout, whole pairs
+  int cnt = (int)(n-16-off)/8; bool changed=false;
+  for (int i=0;i<cnt;i++){
+    float id, v; memcpy(&id,b+16+off+8*i,4); memcpy(&v,b+20+off+8*i,4);
+    if (isnan(id)||isnan(v)) continue;
+    if (set_param((int)id, v)) changed=true;
+  }
+  if (!changed) return;
+  recalc_drive_params();
+  g_pid_reset = true; g_par_save = true;
+  Serial.printf("[nano] params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f (tpm=%.1f kff=%.3f, integ reset)\n",
+    (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew,
+    (double)g_tpm,(double)g_kff);
 }
 #endif
 #if !WHEEL_PID_ENABLED
@@ -666,6 +737,11 @@ static bool zenohConnect(){
   z_closure_sample(&cl, motor_pid_cb, NULL, NULL);
   if (z_declare_subscriber(z_session_loan(&s), &sub_pid, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
     Serial.println("[nano] declare subscriber FAILED: sub_pid");
+  static z_owned_subscriber_t sub_params;
+  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_params",T_F32A));
+  z_closure_sample(&cl, motor_params_cb, NULL, NULL);
+  if (z_declare_subscriber(z_session_loan(&s), &sub_params, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+    Serial.println("[nano] declare subscriber FAILED: sub_params");
 #endif
 #if !WHEEL_PID_ENABLED
   z_view_keyexpr_from_str_unchecked(&ke, KE("motor_accel",T_F32));
@@ -712,7 +788,7 @@ static void zenohTask(void*){
     static uint32_t t_ticks=0, t_lds=0, t_slow=0;
     uint32_t now = millis();
 
-    uint8_t buf[40];
+    uint8_t buf[80];                                        // 64 needed by the /wheel_params readback
     if (now - t_ticks >= 66){                                // wheel_ticks @~15 Hz (was
                                                               // ~30 Hz; odom integrates
                                                               // cumulative counts, so the
@@ -751,6 +827,12 @@ static void zenohTask(void*){
       zpub_put(P_trim, buf, cdr_f32(buf, g_trim));
 #if WHEEL_PID_ENABLED
       zpub_put(P_pid,  buf, cdr_f32arr3(buf, g_wkp, g_wki, g_wkd));
+      {   // /wheel_params readback: (id,value) pairs, same layout /motor_params writes
+        float pv[12]; int k=0;
+        pv[k++]=0; pv[k++]=g_tpr;   pv[k++]=1; pv[k++]=g_wrad;  pv[k++]=2; pv[k++]=g_wsep;
+        pv[k++]=3; pv[k++]=g_maxlin; pv[k++]=4; pv[k++]=g_maxang; pv[k++]=5; pv[k++]=g_slew;
+        zpub_put(P_params, buf, cdr_f32arr_n(buf, pv, k));
+      }
 #endif
     }
     delay(2);
@@ -819,7 +901,7 @@ struct WPid { float integ, prev; };
 static float wheelPid(WPid& st, float tgt, float meas, float dt){
   float err = tgt - meas;
   float deriv = dt>0 ? (err - st.prev)/dt : 0; st.prev = err;
-  float u = WHEEL_KFF*tgt + g_wkp*err + g_wki*st.integ + g_wkd*deriv;
+  float u = g_kff*tgt + g_wkp*err + g_wki*st.integ + g_wkd*deriv;
   float duty = clampf(u,-1,1);
   if (duty == u)   // integrate only when not saturated (anti-windup), then clamp the integral
     st.integ = clampf(st.integ + err*dt, -WHEEL_INTEG_MAX, WHEEL_INTEG_MAX);
@@ -871,8 +953,16 @@ void setup(){
   // Live-tuned PID gains (motor_pid_cb) persist like the trim — a tuning session
   // survives reboot/reflash. Clamped to the same ranges the cb enforces.
   g_wkp = clampf(g_prefs.getFloat("kp", WHEEL_KP), 0, 20);
-  g_wki = clampf(g_prefs.getFloat("ki", WHEEL_KI), 0, 50);
+  g_wki = clampf(g_prefs.getFloat("ki", WHEEL_KI), 0, 100);
   g_wkd = clampf(g_prefs.getFloat("kd", WHEEL_KD), 0, 5);
+  // Live drivetrain parameters (fall back to the corrected defines when absent).
+  set_param(0, g_prefs.getFloat("tpr",   TICKS_PER_REV));
+  set_param(1, g_prefs.getFloat("wrad",  WHEEL_RADIUS));
+  set_param(2, g_prefs.getFloat("wsep",  WHEEL_SEPARATION));
+  set_param(3, g_prefs.getFloat("maxlin",MAX_LINEAR_SPEED));
+  set_param(4, g_prefs.getFloat("maxang",MAX_ANGULAR_SPEED));
+  set_param(5, g_prefs.getFloat("slew",  WHEEL_TGT_SLEW));
+  recalc_drive_params();
   g_pid_saved[0]=g_wkp; g_pid_saved[1]=g_wki; g_pid_saved[2]=g_wkd;
   Serial.printf("[nano] wheel PID gains kp=%.3f ki=%.3f kd=%.3f (NVS)\n",
                 (double)g_wkp,(double)g_wki,(double)g_wkd);
@@ -987,8 +1077,8 @@ void loop(){   // Core 1: real-time control
   if (now-last_wpid >= (uint32_t)(1000/WHEEL_PID_HZ)){     // wheel velocity PID @WHEEL_PID_HZ
     float dt=(now-last_wpid)/1000.0f; last_wpid=now;
     int32_t l=g_left_ticks, r=g_right_ticks;               // atomic 32-bit reads
-    g_left_vel  = (l-wp_l)/TICKS_PER_METER/dt; wp_l=l;
-    g_right_vel = (r-wp_r)/TICKS_PER_METER/dt; wp_r=r;
+    g_left_vel  = (l-wp_l)/g_tpm/dt; wp_l=l;
+    g_right_vel = (r-wp_r)/g_tpm/dt; wp_r=r;
     if (g_pid_reset){                                      // live gain change (motor_pid_cb):
       g_pid_reset = false;                                 // stale integ/prev must not leak
       wpid_l.integ=wpid_l.prev=0; wpid_r.integ=wpid_r.prev=0;   // into the new tuning
@@ -1003,7 +1093,7 @@ void loop(){   // Core 1: real-time control
       // stays lag-free (slewing the PID output instead would lag the plant response and
       // wind the integrator). A fresh command snaps the slewed setpoint's course; the
       // dead-man above snaps it to 0 instantly.
-      float maxDv = WHEEL_TGT_SLEW*dt;
+      float maxDv = g_slew*dt;
       l_tgt_s = slewTo(l_tgt_s, g_left_tgt,  maxDv);
       r_tgt_s = slewTo(r_tgt_s, g_right_tgt, maxDv);
       g_left_duty  = wheelPid(wpid_l, l_tgt_s,  g_left_vel,  dt);
@@ -1177,6 +1267,21 @@ void loop(){   // Core 1: real-time control
       g_pid_save = false;
       Serial.printf("[nano] wheel PID gains %.3f/%.3f/%.3f saved to NVS\n",
                     (double)g_pid_saved[0],(double)g_pid_saved[1],(double)g_pid_saved[2]);
+    }
+    // Same deal for the live drivetrain parameters (g_par_save set by motor_params_cb).
+    static uint32_t last_par_save=0;
+    if (g_par_save && now-g_last_cmd_ms > CMD_TIMEOUT_MS
+        && now-g_par_saved_ms > TRIM_SAVE_MS){
+      g_par_saved_ms = now;
+      g_prefs.putFloat("tpr",   g_tpr);
+      g_prefs.putFloat("wrad",  g_wrad);
+      g_prefs.putFloat("wsep",  g_wsep);
+      g_prefs.putFloat("maxlin",g_maxlin);
+      g_prefs.putFloat("maxang",g_maxang);
+      g_prefs.putFloat("slew",  g_slew);
+      g_par_save = false;
+      Serial.printf("[nano] drive params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f saved to NVS\n",
+        (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew);
     }
 #endif
   }

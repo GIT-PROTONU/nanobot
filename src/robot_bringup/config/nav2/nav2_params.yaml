@@ -91,7 +91,10 @@ slam_toolbox:
 # ---- controller_server (Regulated Pure Pursuit) ------------------------------
 controller_server:
   ros__parameters:
-    controller_frequency: 10.0
+    controller_frequency: 4.0   # LOW on purpose: /cmd_vel crosses the 115200-baud
+                                # serial link to the ESP32, which decays under sustained
+                                # 10 Hz flow (UART RX choke, measured 2026-09-20); 4 Hz
+                                # cruises clean and still feeds the 500 ms dead-man
     odom_topic: /odom
     min_x_velocity_threshold: 0.0
     min_y_velocity_threshold: 0.0

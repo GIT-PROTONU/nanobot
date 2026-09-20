@@ -128,6 +128,7 @@ class TelemetryHub:
         self._hall = None
         self._wheel_trim = None     # live straight-line trim from the ESP32 (/wheel_trim)
         self._wheel_pid = None      # live wheel-PID gains [kp,ki,kd] from the ESP32 (/wheel_pid)
+        self._wheel_params = None   # live drivetrain params (id,value) pairs (/wheel_params)
         self._lds = {}                # rpm / hz / duty
         self._lds_at = None           # monotonic ts of the last /lds_* arrival
         self._fan = None
@@ -189,6 +190,10 @@ class TelemetryHub:
             # resets its integrators on change, and persists to NVS. Readback on /wheel_pid
             # (f.esp.wheel_pid) re-seeds the web sliders.
             "/motor_pid": (pub(Float32MultiArray, "motor_pid", 5), self._mk_motor_pid),
+            # Live drivetrain parameters (id,value) pairs — scale/geometry, NO reflash:
+            # 0 ticks_per_rev, 1 wheel_radius_m, 2 wheel_separation_m, 3 max_linear_ms,
+            # 4 max_angular_rads, 5 target_slew. Readback on /wheel_params (f.esp.wheel_params).
+            "/motor_params": (pub(Float32MultiArray, "motor_params", 5), self._mk_motor_params),
             # ESP32 line lasers 1-2 (GPIO 23/32): [v1,v2] PWM 0..255 each.
             "/laser_pwm": (pub(Int32MultiArray, "laser_pwm", 5), self._mk_laser),
             "/oled_face": (node._face_pub, self._mk_face),
@@ -438,7 +443,8 @@ class TelemetryHub:
                     "stray": self._stray,
                     "tick_hz": round(self._tick_hz, 1),
                     "wheel_trim": self._wheel_trim,
-                    "wheel_pid": self._wheel_pid},
+                    "wheel_pid": self._wheel_pid,
+                    "wheel_params": self._wheel_params},
             "lds": dict(self._lds, age=round(now - self._lds_at, 1)
                         if self._lds_at is not None else None),
             "oled": self._oled,
@@ -577,6 +583,7 @@ class TelemetryHub:
         s(sub(Int32, "esp32_hall", self._on_hall, 2))
         s(sub(Float32, "wheel_trim", self._on_wheel_trim, 2))
         s(sub(Float32MultiArray, "wheel_pid", self._on_wheel_pid, 2))
+        s(sub(Float32MultiArray, "wheel_params", self._on_wheel_params, 2))
         s(sub(Float32, "lds_rpm", self._mk_lds("rpm"), 2))
         s(sub(Float32, "lds_hz", self._mk_lds("hz"), 2))
         s(sub(Float32, "lds_duty", self._mk_lds("duty"), 2))
@@ -684,6 +691,28 @@ class TelemetryHub:
         # Float32MultiArray [kp, ki, kd] readback from the ESP32's live PID gains
         d = list(msg.data) if msg.data else []
         self._wheel_pid = [round(float(x), 4) for x in d[:3]] if len(d) >= 3 else None
+
+    def _on_wheel_params(self, msg):
+        # Float32MultiArray (id,value)-pair readback of the ESP32's live drivetrain
+        # parameters — ids: 0 ticks_per_rev, 1 wheel_radius, 2 wheel_separation,
+        # 3 max_linear, 4 max_angular, 5 target_slew (see firmware g_tpr block).
+        d = list(msg.data) if msg.data else []
+        self._wheel_params = ([round(float(x), 5) for x in d[:12]]
+                              if len(d) >= 2 and len(d) % 2 == 0 else None)
+
+    @staticmethod
+    def _mk_motor_params(v):
+        # (id,value) pairs for /motor_params: flat even-length list, at most 6 pairs,
+        # ids 0..5. Values are clamped firmware-side; here we only sanity-gate the shape.
+        if not isinstance(v, (list, tuple)) or not v or len(v) % 2 or len(v) > 12:
+            raise ValueError("expected a flat (id,value) pair list, max 6 pairs")
+        out = []
+        for i in range(0, len(v), 2):
+            pid, val = int(v[i]), float(v[i + 1])
+            if not 0 <= pid <= 5:
+                raise ValueError(f"param id {pid} out of range 0..5")
+            out.extend([float(pid), val])
+        return Float32MultiArray(data=out)
 
     def _mk_lds(self, key):
         def cb(msg):
@@ -854,7 +883,7 @@ class TelemetryHub:
             raise ValueError("expected a 3-element list [kp, ki, kd]")
         kp, ki, kd = (float(x) for x in v)
         return Float32MultiArray(data=[min(20.0, max(0.0, kp)),
-                                       min(50.0, max(0.0, ki)),
+                                       min(100.0, max(0.0, ki)),
                                        min(5.0, max(0.0, kd))])
 
     @staticmethod
