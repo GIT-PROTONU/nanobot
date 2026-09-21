@@ -120,10 +120,13 @@ in this checkout.
       baseline 0.011-0.060 (worst outlier gone), fwd≈|rev| distances clean,
       NO lunge across 10+ fwd→rev transitions -> maxlin restored 0.4
       (lunge guard retired — the flip-stale-ring fix held). NO ESP drops
-      during the whole suite (/esp32_reset stable). REMAINING: spin-band
+      during the whole suite (/esp32_reset stable).       REMAINING: spin-band
       SAG (mean 0.024-0.034 vs 0.041 at ±0.8 rad/s) = the rate-limited
       I-term recovering spin-band stick-slip slowly — WHEEL_I_WIND_RATE
-      1.2 → 2.5 built, FLASH PENDING (30 s tether); then re-verify spins.
+      1.2 → 2.5 **FLASHED + VERIFIED 2026-09-21 pm III: 0.65 rad/s p2p
+      0.027 → 0.015 (mean 85 → 88%), 0.8 best leg 95% of target; the band
+      remains partly stiction-bound (single-channel + carpet) — accepted
+      until a 2nd quadrature channel. THREAD CLOSED.**
       The braked-stop keepalive fix is deployed (firm stops). Spin-band
       map (2026-09-21 pm, dither 0, 5/60/0): 0.5 rad/s (wheels ±0.025)
       mean 92% of target p2p 0.031; 0.65 mean 85% p2p 0.027; 0.8 mean
