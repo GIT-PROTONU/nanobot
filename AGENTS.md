@@ -341,6 +341,10 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   process — `/map` + `map→odom` TF), `app_hub` (expression/web/brain) — plus the zenoh
   router and the one-shot `nano-nav-loader` that attaches the components.
   app_hub's main also preserves the OLED SIGTERM end-screen (restart/shutdown glyph).
+  It also registers an in-process **SIGUSR1 faulthandler** (`_install_stackdump`,
+  2026-09-21): `kill -USR1 <pid>` dumps EVERY thread's stack to stderr → journald,
+  no ptrace/root needed — the executor-stall diagnosis (`/tmp/stall_trap.sh` signals
+  it; read `journalctl -u nano-app`). Verified live 2026-09-21.
 
 ### ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
 - **Native zenoh-pico over a direct UART link** (PlatformIO + Arduino) — NO micro-ROS,
@@ -352,7 +356,11 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   curve, web-overridable), `/motor_trim` (Float32 manual straight-line trim set/reset —
   see below), `/motor_pid` (Float32MultiArray `[kp,ki,kd]` — LIVE wheel-PID gains, see
   the closed-loop note below; **the web Coprocessor card's PID sliders drive it**, so
-  tuning needs no reflash). **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
+   tuning needs no reflash). **All subscriptions live in ONE table** (`SUBS` in
+   main.cpp) and are **periodically undeclared + re-declared** (45 s, `SUB_REDECLARE_MS`)
+   — the only known healing path for a router restart that wipes zenohd's remote-sub
+   table while the session keeps flowing (the 2026-09-20 `/cmd_vel`-deaf bug; built
+   2026-09-21, flash pending — see the gotcha below). **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
   a dropped link, or the SBC genuinely powered off — same `linkAlive()`-gated treatment as
   the LDS spin-motor park below; there's no SBC heat to move if the SBC isn't running, and
   it resumes the instant `sys_monitor` reconnects (2026-07-15 fix — it used to hold its last
@@ -429,20 +437,22 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   slewing the PID OUTPUT would add loop lag + integral windup, so the old duty slew +
   `/motor_accel` live knob are compiled out under the PID (the web Coprocessor card's
   dead "Accel ramp" slider was replaced by the live PID KP/KI/KD sliders,
-  2026-09-20). Starting gains
-  KP 0 / KI 8.0 / KD 0 (`WHEEL_KFF` = 1/full-scale feedforward; NEVER flash with
-  KP=KI=0 — feedforward-only will NOT crawl without the remap). **The gains are
-  LIVE-TUNABLE — no reflash per iteration**: publish `/motor_pid`
-  (Float32MultiArray `[kp,ki,kd]`, whitelisted via `telemetry.py`'s `_mk_motor_pid`;
-  firmware clamps kp 0..20 / ki 0..100 / kd 0..5 — ki widened from 50 for true-unit
-  tuning, see below) and the running PID picks them up
-  instantly, resetting its integrators; the web Coprocessor card's PID KP/KI/KD
-  sliders drive it and re-seed from the 1 Hz `/wheel_pid` Float32MultiArray readback
-  (`f.esp.wheel_pid`). Gains persist to ESP32 NVS (`kp`/`ki`/`kd` keys) rate-limited
-  like the trim — but only while parked, so gains tuned mid-drive save once the robot
-  stops. Tuning on hardware
-  (debug console prints vel/tgt/duty): KI until crawl breaks away <0.5 s without
-  stick-slip hunting, then KP ~0.5·KFF; KD stays 0 (tick quantization). Accepted
+  2026-09-20). **The gains are LIVE-TUNABLE — no reflash per iteration**: publish
+  `/motor_pid` (Float32MultiArray `[kp,ki,kd]`, whitelisted via `telemetry.py`'s
+  `_mk_motor_pid`; firmware clamps kp 0..20 / ki 0..100 / kd 0..5), the running PID
+  picks them up instantly (integrators reset), the web Coprocessor card's PID sliders
+  re-seed from the 1 Hz `/wheel_pid` readback (`f.esp.wheel_pid`), and gains persist
+  to ESP32 NVS rate-limited **while parked**.
+  **Tuned gains (2026-09-21, live sweep via `scripts/pid_tune.py` —
+  see the "PID retune prep" note in docs/TODO.md): KP 5.0 / KI 60.0 / KD 0**, NVS-
+  persisted (`kp`/`ki`/`kd` keys, rate-limited while parked — verify they survived the
+  next reboot). The sweep walked the ladder 0.05/0.08/0.10/0.15 m/s ×3+ repeats per
+  config over {baseline 1.1/46, KP 3-5 × KI 45-80}: baseline hunted everywhere
+  (crawl p2p up to 0.05 m/s), KI 60 alone amplified the mid-speed limit cycle, KP is
+  the damper. KP 5 + KI 60 won the aggregate (crawl p2p avg 0.009 m/s vs 0.017;
+  0.08/0.10/0.15 rungs clean-to-marginal). Residual carpet-stiction limit-cycling is
+  band- and run-dependent (single-rung verdicts flip run-to-run — judge aggregates;
+  `pid_tune.py --repeat N` exists for exactly this). Accepted
   limit: feedback is single-channel (ticks signed by COMMANDED direction) — blind on
   reverse-through-zero/stall/slip/being-pushed; the real fix is a 2nd quadrature
   channel. Also `MAX_ANGULAR_SPEED` synced 3.0 → 0.8 (robot.yaml `drive_max_ang`,
@@ -453,7 +463,9 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   anymore — the dead-man still cuts on command loss; DRV8871 `nFAULT` wiring remains
   the proper hardware fix), and manual-driving feel on this robot also depends on the
   web gateway's intermittent 1-9 s POST stalls (dead-man cuts mid-drive → stop →
-  lurch on recovery) — a /proc-based stall trap runs on the board (see docs/TODO.md);
+  lurch on recovery) — a /proc-based stall trap runs on the board, and since 2026-09-21
+  an in-process SIGUSR1 faulthandler dumps every app_hub thread's stack (see
+  docs/TODO.md);
   the keepalive half of that problem is fixed (see the HTTP teleop note below).
 - **The wheel-encoder scale was 5.7× WRONG (found + fixed 2026-09-20, live-verified
   by rollout).** The PID's first tuning session exposed it: "0.06 m/s" cruises with
@@ -475,6 +487,23 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   operation; if a consistent pull remains after the scale fix, suspect per-wheel
   encoder bias (candidate fix: a firmware straight-line differential assist, NOT
   yet implemented).
+- **The wheel SEPARATION was ~1.57× WRONG (found + fixed 2026-09-21, lidar-verified).**
+  Both configs carried `wheel_separation 0.16` — a chassis-width guess, never
+  measured (same failure class as the 2026-09-20 scale error). Symptom: web canned
+  rotations overshot 1.5-1.62× (115°→~180°, 60°→~90° as seen from the seat) while
+  DISTANCE stayed exact — odom yaw = diff-travel/sep, so a too-large sep compresses
+  yaw only. Ground truth: cross-correlating two `/scan.bin` range profiles before/
+  after a canned 90° turn (the lidar is independent of wheels AND of the SLAM
+  pose's odom prior) measured 146°/139°/144° physical ⇒ true track ≈ **0.102 m**;
+  set in firmware (live `/motor_params` id 2, NVS) + `robot.yaml`
+  (`wheel_odometry.wheel_separation`; the board's install config symlinks through to
+  src — rsync the file + restart the stack). Post-fix verification, same lidar
+  method: 90° request → **89°** physical, 60° → **57°**, drive 0.3 m → 0.302 m with
+  ~2° drift. Bonus: `/odom` yaw is now in true units, so slam_toolbox's motion
+  prior and Nav2's rotation handling no longer fight a compressed heading. The
+  pre-fix "90.2°" canned-turn verification (2026-09-21 morning) was CIRCULAR — it
+  divided the tick differential by the same wrong sep; only the lidar correlation
+  is a valid rotation ruler.
 - **Drivetrain geometry is LIVE-TUNABLE — `/motor_params`, no reflash (2026-09-20).**
   The scale lesson generalized: `TICKS_PER_REV`, `wheel_radius`, `wheel_separation`,
   `max_linear_speed`, `max_angular_speed` and `WHEEL_TGT_SLEW` are now NVS-backed
@@ -962,6 +991,32 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
   thread-safe; the thread only touches the lock-protected (v,w) state + publish(),
   gets a best-effort `os.nice(-5)`, and is joined in `destroy_node`. The dev
   harness accepts it as a no-op.
+- **Canned moves (`POST /move` {"dist" m, "deg" deg, "cancel"?}, added 2026-09-21):**
+  relative, /odom-feedback maneuvers (drive N metres — signed, then rotate N°) for
+  the Drive card's two numeric fields beside the joystick. **No new /cmd_vel
+  publisher**: the maneuver thread (`web_server._man_loop`/`_run_maneuver`, 10 Hz)
+  only rewrites the keepalive's lock-protected (v,w) state — every byte on the wire
+  still goes out at the 3.3 Hz keepalive rate (serial budget). Feedback is
+  `telemetry._odom` (wheel-integrated, true units post-scale-fix); the drive phase
+  measures progress as the **projection on the phase-start heading** (trim veer pads
+  path length, not the target), the turn is a P law on wrapped yaw error toward the
+  re-snapshotted post-drive yaw. Guards: refuses while Nav2 is
+  planning/navigating/canceling (telemetry `_goal_status`), refuses without /odom,
+  one maneuver at a time (a new request replaces the running one), hard-abort
+  timeout = max(`move_timeout`, 1.5× duration estimate), and a **browser dead-man**
+  (SSE clients gone > `MOVE_BROWSER_GRACE` 5 s = abort — a canned move must not
+  outlive its page). ANY `/drive` POST (joystick, keyboard, STOP, tab-hide {0,0})
+  cancels the running maneuver (`drive()` sets `_man_cancel` — the keepalive's own
+  dead-man can't stop a maneuver because the maneuver keeps feeding `_drive_at`).
+  Progress rides the SSE frame as **`f.move`** `{active, phase driving|turning,
+  target, unit m|deg, progress, err}` + a terminal `{result: done|cancelled|failed,
+  error?}` latch. `POST /move {cancel:true}` is the explicit stop; drive speed/rate
+  are `move_lin_speed` (0.12 m/s) / `move_ang_speed` (0.5 rad/s — under the
+  `w·0.2 rad/scan` SLAM smear budget), clamps `move_max_dist` ±5 m / `move_max_deg`
+  ±720°; all in robot.yaml-able params, not live-tunable. The pure step math is
+  `_maneuver_step` (unit-tested in `test_maneuver.py`: projection/backward sign,
+  phase re-snapshot, P clamp + low-kp floor, wrap, full-loop on a fake node); the
+  dev harness stubs `/move` as a no-op (no odom, no motors).
   **~3.3 Hz, NOT 10 Hz — the serial budget (2026-09-20):** `/cmd_vel` crosses the
   115200-baud UART to the coprocessor, and SUSTAINED 10 Hz flow decays on that link
   (zenoh-pico's tiny UART RX FIFO + a busy zenoh task lose bytes → deliveries thin
@@ -1178,7 +1233,7 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **A differential robot's body yaw rate is bounded by its wheel command** — if `/imu/euler` Δyaw vastly exceeds what the wheels could have rolled (`(ΔL+ΔR)/2·m_per_tick`, ARC of both wheels), suspect an IMU scale/sign error, not an encoder undercount. Wheel-odom translation is correctly scaled; expect only small tire-slip gaps on spins.
 - **Low-duty turn commands can stall the wheels** — in-place turns map to tiny per-wheel speeds (±0.04 m/s at 0.5 rad/s) whose duty can stop the motors ~0.5-1 s in (wheels AND body both freeze mid-command; encoder counts + IMU plateau together). This is a drive-power issue, separate from sensing. The 2026-09-19 drive test sharpened it: with the flashed `MOTOR_MIN_DUTY 0.55` deadband the wheels still seized 1.4-2.4 s into EVERY command at 0.12 m/s, 0.25 m/s AND 0.5 rad/s spins (constant ~0.60-0.83 remapped duty), recovering only on a direction change — the firmware breakaway kick + 0.70 floor (above; flashed 2026-09-20) is the fix. Scripted teleop (`POST /drive`) still needs ~10 Hz re-POSTs; my 2026-09-19 test loop (~0.4 s period) kept `/cmd_vel` alive via web_server's 10 Hz re-assert, so freezes were real stalls, not cmd-timeouts.
 - **`config/robot.yaml` is the single config source** — all ports, pins, rates, LLM params live there. Its `slam_nav:` block uses the ROS param layout (`slam_nav.ros__parameters.<name>`). Indentation must match sibling keys exactly: a block one space off parses as a *nested map* and the whole `slam_nav` section silently returns `None` to nav_node (only the in-code default saves you). Always sanity-check with `python3 -c "import yaml,sys; print(yaml.safe_load(open('src/robot_bringup/config/robot.yaml'))['slam_nav']['ros__parameters']['recover_min_seen'])"` after editing, and remember the running stack reads it via the `build/ → src/` symlink, not a copied install.
-- **ESP32 link can wedge after a stack restart and needs a PHYSICAL power cycle** — after `stack.sh down/up` the coprocessor may never re-attach to the router's serial link (`/dev/ttyS1`): `esp32 DOWN: no heartbeat ever received`, `/wheel_ticks` silent, LDS motor dead (ESP32 drives its PID), scans stop. Service restarts, full `nano-robot.target` restarts, even a board `sudo systemctl reboot` do NOT reliably recover it — the firmware's auto-recovery watchdogs (`LINK_CONNECT_DEADLINE_MS`, `LINK_RX_TIMEOUT_MS` in `firmware/nanobot_coprocessor/src/main.cpp`) apparently can't re-sync a wedged UART. Symptom chain when it happens: `esp32 DOWN` → `lds DOWN: lidar not spinning` → `wheel_ticks SILENT` → map `feeds.scan: -1`. Diagnosis: `journalctl -u nano-sensors.service | grep -i esp32`, and confirm the router holds the fd (`ls -l /proc/$(pgrep -f zenohd-serial)/fd | grep ttyS1`). Fix = unplug/replug the ESP32's power. After a successful power cycle it comes back on its own (`esp32 UP after …`, `/wheel_ticks resumed`, `lds UP`), and `lds_idle_enable=false` + `lds_active_rpm=300` via `/param` wakes the lidar if it's parked. **2026-09-20 variant (open, see docs/TODO.md): a SNEAKIER partial wedge** — after a router restart the session re-attaches (heartbeat/ticks/LDS all flow) and SOME subscriptions still deliver (`/motor_pid` write→`/wheel_pid` readback flips), but **`/cmd_vel` specifically goes deaf** (observed with the web keepalive, `ros2 topic pub`, AND raw zenoh puts on the exact keyexpr) while a full ESP32 reboot restores it. Until root-caused: power-cycle the coprocessor after any router restart, or expect a motionless robot.
+- **ESP32 link can wedge after a stack restart and needs a PHYSICAL power cycle** — after `stack.sh down/up` the coprocessor may never re-attach to the router's serial link (`/dev/ttyS1`): `esp32 DOWN: no heartbeat ever received`, `/wheel_ticks` silent, LDS motor dead (ESP32 drives its PID), scans stop. Service restarts, full `nano-robot.target` restarts, even a board `sudo systemctl reboot` do NOT reliably recover it — the firmware's auto-recovery watchdogs (`LINK_CONNECT_DEADLINE_MS`, `LINK_RX_TIMEOUT_MS` in `firmware/nanobot_coprocessor/src/main.cpp`) apparently can't re-sync a wedged UART. Symptom chain when it happens: `esp32 DOWN` → `lds DOWN: lidar not spinning` → `wheel_ticks SILENT` → map `feeds.scan: -1`. Diagnosis: `journalctl -u nano-sensors.service | grep -i esp32`, and confirm the router holds the fd (`ls -l /proc/$(pgrep -f zenohd-serial)/fd | grep ttyS1`). Fix = unplug/replug the ESP32's power. After a successful power cycle it comes back on its own (`esp32 UP after …`, `/wheel_ticks resumed`, `lds UP`), and `lds_idle_enable=false` + `lds_active_rpm=300` via `/param` wakes the lidar if it's parked. **2026-09-20 variant (open, see docs/TODO.md): a SNEAKIER partial wedge** — after a router restart the session re-attaches (heartbeat/ticks/LDS all flow) and SOME subscriptions still deliver (`/motor_pid` write→`/wheel_pid` readback flips), but **`/cmd_vel` specifically goes deaf** (observed with the web keepalive, `ros2 topic pub`, AND raw zenoh puts on the exact keyexpr) while a full ESP32 reboot restores it. **2026-09-21 firmware fix (BUILT, FLASH PENDING — needs the ESP32 on the dev PC's USB)**: the firmware now periodically (45 s, `SUB_REDECLARE_MS`) undeclares + re-declares ALL subscriptions (`SUBS` table + `subsRedeclare()` in main.cpp), refreshing the router's remote-sub table in place — the deaf window is bounded at ≤45 s and the workaround above dies once flashed. Note for the next pico-API edit: zenoh-pico's Arduino build defines `ZENOH_C_STANDARD=99`, which compiles the `z_move`/`z_call` _Generic macros out — use the explicit generated functions (`z_subscriber_move()`, like the existing `z_config_move()`).
 - **`plink -m` on Windows:** the script text becomes the shell's argv. `pkill -f` patterns can kill the controlling shell. Fix: `pscp` script, run by path.
 - **ESP32 firmware:** PlatformIO from dev PC (`pio run -t upload`). Don't build on the board. Tunables are `#define`s at top of `src/main.cpp`.
 - **Deploy soul overwrite:** `DEPLOY_SOUL=1` pushes `memory/` personality to the board, discarding evolved drift. Default is `DEPLOY_SOUL=0` (keep the robot's soul) — matching deploy.sh.

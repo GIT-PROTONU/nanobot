@@ -40,6 +40,12 @@ in this checkout.
         lap doesn't paint a shifted mask, and the out-and-back map-pose tracking
         has no bad locks (the BACK direction tracked perfectly both sessions;
         the stall-jerk FWD runs did not — recheck with working drive chain).
+        **2026-09-21: DONE on a fresh map (post-sep-fix)** — see the lap-validation
+        bullet under the canned-moves item below: 97.4% scan-vs-map at zero
+        translation, no shifted second mask from the repeat lap, residual ~4° pose
+        yaw after ~540° of turning. What remains here is only the OPEN-FLOOR
+        variant (the exercise area is ~1×1.5 m; a full room-scale lap with longer
+        legs still wants more space).
       - ~~Re-check `/odom` wheel scale against a measured rollout~~ **DONE 2026-09-20 —
         the scale was 5.7× wrong, not a few %**: measured rollout (user-timed 5 s crawl)
         gave 2235 ticks / 1.86 m = **1202 ticks/m => `ticks_per_rev` 253, not 1440** (the
@@ -54,25 +60,52 @@ in this checkout.
         now a LIVE parameter (firmware `/motor_params`, NVS-backed) so a future
         recalibration needs a POST, never a reflash.
       - Park → pause: the pose must sit back on the wheel-integrated odom position
-        within a few cm — re-check only on a cleanly-built fresh map (the old 9 cm
-        idle gap was the boot-into-saved-map frame mis-load, fixed 2026-09-12).
-        REOPENED by the scale fix: the old odom fed SLAM a 5.7×-scaled world, so all
-        prior pose-tracking observations are void — re-validate on the fresh map.
-- [ ] **Retune the closed-loop wheel-PID in TRUE units (post-scale-fix).** The PID was
-      flashed 2026-09-20 (see the AGENTS.md closed-loop block for the full system
-      description: live gains + live `/motor_params` geometry, NVS-persisted). The
-      2026-09-20 tuning session established the current state: gains `[KP 1.1, KI 45,
-      KD 0]` in NVS, trim 0 — but those were tuned while the scale was still 5.7×
-      wrong, i.e. in a saturated ~0.37 m/s regime. In true units the same gains are a
-      starting point, not a finish: KI 45 gives a full-duty ramp in ~0.2 s at
-      standstill (err 0.1 m/s × KI 45), which should break away well under 0.5 s;
-      verify, then walk the reliability ladder 0.05 → 0.08 → 0.10 → 0.15 m/s (no
-      stalls, no hunting), then KP for stiffness only if cruise sags, KD stays 0.
-      KEEP THE SERIAL BUDGET: /cmd_vel at sustained 10 Hz chokes the 115200-baud
-      serial link (deliveries decay, wheels stall) — the web keepalive now runs
-      3.3 Hz and Nav2's controller_frequency is 4.0 for this reason; scripted tests
-      must also stay ≤3-4 Hz. Tuning knobs: `/motor_pid` [kp,ki,kd] (ki clamp now
-      0..100) + `/motor_params` (id,value) pairs — no reflash needed.
+        within a few cm — **2026-09-21 measured on a fresh map**: the map-vs-odom
+        gap grew ~5.7 cm per scripted circuit (map→odom absorbing wheel yaw
+        residual); the meaningful check is the scan-vs-map offset (97.4% at 0 cm —
+        recorded in the lap-validation bullet). Revisit only if Nav2 shows
+        pose-vs-room error in practice.
+- [x] **Hardware-verify the web canned moves (`POST /move`, 2026-09-21)** — DONE
+      same day on the robot: Drive 0.300 m → 362/1202 tpm ticks = **0.301 m
+      (+1.3 mm), L/R within 1 tick**; Turn 90° → 152/150 ticks = **90.2°**;
+      progress/error rode `f.move` as designed. Remaining eyeball item: the
+      replace-while-running + joystick-takeover + browser-dead-man paths are
+      logic-tested only (14 offline tests). NOTE: the morning "90.2°" tick check
+      was CIRCULAR (divided by the wrong separation — see the 2026-09-21 lidar
+      finding below); the turn's REAL physical rotation was ~1.58× over. After the
+      separation fix: 90° → **89°** and 60° → **57°** physical by lidar
+      self-correlation, so canned turns are genuinely true now.
+      - **WHEEL SEPARATION was 1.58× wrong (found + fixed 2026-09-21)** — reported
+        live by the user (115°→~180°, 60°→~90° while distance stayed exact), pinned
+        by cross-correlating two `/scan.bin` range profiles across canned turns
+        (146°/139°/144° physical for 90° requests) ⇒ true track **0.102 m**, not the
+        0.16 chassis-width guess. Fixed in firmware (live `/motor_params` id 2,
+        NVS-persisted while parked) + `robot.yaml` `wheel_odometry.wheel_separation`
+        (the board's install config symlinks through to src — rsync + restart).
+        Distance was never affected (scale is radius-side). VERIFY the 0.102
+        survived the ESP32's next reboot (`/wheel_params` id 2).
+      - **2026-09-21 fresh-map lap validation (post-sep-fix, scripted /move laps)**:
+        fresh slam map + 2 laps of {out-and-back 0.3 m, 90° turn, out-and-back}:
+        scan-vs-map hit-rate **97.4% at zero translation** (96-98% reference met —
+        the map is coherent, no shifted second mask from the repeat lap; map grew
+        557→711 occ cells as new headings were explored). Beam angles need the
+        back-mount **+π** when projecting scans for this check (73% vs 9% flip test
+        — same fact as the old heading_flip). Residual: the SLAM pose's yaw sits
+        ~2-4° off scan-truth after ~540° of commanded rotation (~0.7%/turn — carpet
+        slip in the odom prior; scans dominate for Nav2, so acceptable). Pose-chain
+        gap (map vs odom while parked) grew ~5.7 cm/circuit — expected to be
+        absorbed by map→odom; the meaningful metric is the scan-vs-map offset above.
+- [x] **Retune the closed-loop wheel-PID in TRUE units (post-scale-fix)** — DONE
+      2026-09-21 via `scripts/pid_tune.py` (new harness: serial-safe ladder +
+      gains/params pokes over the web gateway, `--repeat N` for the high
+      run-to-run variance). **Result: KP 5.0 / KI 60.0 / KD 0, NVS-persisted**
+      (baseline [1.1, 46] hunted at every rung, crawl p2p up to 0.05 m/s; KI 60
+      alone amplified the mid-speed limit cycle; KP is the damper — KP 5 + KI 60
+      won the aggregate: crawl p2p avg 0.009 vs 0.017, no stalls anywhere, all
+      rungs break away). Residual carpet-stiction limit-cycling is band- and
+      run-dependent (0.08 can be spotless while 0.10 flags on the next repeat) —
+      judge aggregates, not single runs. VERIFY the gains survived the next
+      reboot (`/wheel_pid` readback should read [5,60,0] after a power cycle).
 - [ ] **OPEN BUG: /cmd_vel delivery to the ESP32 dies after a router/stack restart —
       Twist-specific, other topics keep flowing.** After `deploy.sh`/`stack.sh`
       restarts the zenoh router, the coprocessor's session re-attaches (heartbeat,
@@ -88,6 +121,19 @@ in this checkout.
       vs zenoh-pico's re-attach path; compare a router-restart vs ESP32-reboot
       declare table. The old "ESP32 wedged after stack restart" gotcha and this are
       likely the same root cause.
+      - **2026-09-21 FIX IMPLEMENTED, FLASH PENDING (needs the ESP32 on the dev
+        PC's USB — the coprocessor is wired to the robot's rail, flashing is
+        physical)**: the firmware now **periodically UNDECLAREs + REDECLAREs every
+        subscription** (`SUB_REDECLARE_MS 45000`, `SUBS` table + `subsRedeclare()` in
+        main.cpp) — the fresh router instance's empty remote-sub table is refreshed
+        in place, bounding the worst deaf window at 45 s, no ESP reboot needed. Note:
+        zenoh-pico's Arduino build (`ZENOH_C_STANDARD=99` from its extra_script)
+        compiles the `z_move` macro out — use the explicit `z_subscriber_move()`
+        (same convention as the existing `z_config_move()`). Also confirmed live
+        2026-09-21: a full stack restart did NOT always reproduce the bug (cmd_vel
+        delivered after this one) — it's intermittent, consistent with a declare
+        race, which the periodic re-declare covers. After flashing, verify: restart
+        the router a few times and confirm /cmd_vel revives within ≤45 s if dropped.
       - **2026-09-19 drive-test evidence (SLAM diagnosis session)**: with the flashed
         deadband build (`MOTOR_MIN_DUTY 0.55`), wheels seized ~1.4-2.4 s into every
         command at crawl/mid duty — 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins
@@ -124,9 +170,37 @@ in this checkout.
       speaking (espeak-ng running), and one processed 2.2 s late; board load
       reached 3.95/4 cores. A /proc-based stall trap (`/tmp/stall_trap.sh` on the
       board, 15 min windows, snapshots every app_hub thread's wchan/state on a >600 ms stall → `/tmp/stall_*.txt`) was deployed 2026-09-20 ~11:22 — review
-      dumps; py-spy needs root (board sudo is passworded), so if /proc wchan is too
-      coarse, add an in-process `faulthandler.register(SIGUSR1)` to app_hub (edit +
-      restart, no ptrace needed) and SIGUSR1 on stall.
+      dumps; py-spy needs root (board sudo is passworded).
+      - **2026-09-21: the in-process dump is DONE + live** — app_hub now
+        `faulthandler.register(SIGUSR1, all_threads=True)` (`app_hub._install_stackdump`),
+        so `kill -USR1 <pid>` dumps every thread's stack to journald without ptrace/root
+        (verified live: the dump showed the `_man_loop` thread). The stall trap can now
+        signal USR1 on a stall and read `journalctl -u nano-app`. Remaining open: WHY
+        executor callbacks slip that far under load, and whether POST /drive handling
+        itself (HTTP thread) still stalls under load.
+      - **2026-09-21 stress reproduction: CLEAN** — 90 s all-core stress + a 16 s
+        spoken line while timing `POST /drive {0,0}` at 2 Hz from the dev PC: 191/103
+        POSTs, median 32 ms, p95 49-51 ms, max 79 ms, ZERO over 600 ms. The
+        2026-09-20 1-9 s POST stalls did NOT reproduce under CPU+TTS load. Also
+        caught in the act by the v2 trap (a 1.5 s D-state in an HTTP thread's
+        `handle_one_request → readinto`): that one was a benign wifi-path socket
+        read — the handler already bounds such reads (`_Handler.timeout = 30`), so
+        half-open connections can't pin threads forever; the trap threshold was
+        raised to 5 s D-state to cut false positives (trap lives at `/tmp/stall_trap.sh`
+        on the board, re-run with nohup after a reboot). Remaining open: the
+        executor-side slips under LLM/vision load (the 2026-09-20 wchan dumps), and
+        any stall needing BOTH TTS AND heavy vision — next repro attempt should
+        combine stress + an active camera/GPU-vision pass.
+      - **2026-09-21: the IMU interference self-test was NEVER startable — deadlock
+        found + fixed.** `IMUInterferenceTest.start()` held a plain `threading.Lock`
+        across its checks + thread spawn and then returned `self.status()`, which
+        re-acquires the same non-reentrant lock → self-deadlock (the start POST
+        hangs forever, the run thread queues behind it, every status call piles
+        up). Found live via the SIGUSR1 faulthandler dump (start handler parked in
+        `status()` while holding the with-block). Fix: `RLock` (deployed +
+        verified live — the full 5-phase test now runs to completion). Regression
+        test: `test_imu_interference.py::test_start_returns_without_deadlock` (+ 3
+        more).
       - **The /cmd_vel chop component is FIXED 2026-09-20**: the 10 Hz drive
         keepalive moved OFF app_hub's ROS executor into a dedicated thread
         (`web_server._drive_loop`, os.nice(-5) best-effort, daemon, joined in
@@ -148,23 +222,54 @@ in this checkout.
       (memory note `selftest-spin-imu-mismatch`, still OPEN). No protocol readback
       exists — verification is eyeballing |accel|≈9.8 + a smooth mag sweep via
       `/imu_calibrate` cmds + `/imu_calibrate_status`.
-      - **2026-09-19: device attitude is GARBAGE right now** — parked robot reads
-        roll ≈ +91° / pitch ≈ −134° (SSE `eul`), and device-fused yaw moved only
-        ±2° across a session where the robot yawed 69°+ (drive test). Not in the
-        SLAM chain (slam_toolbox consumes only /scan + TF) so mapping is unaffected,
-        but the web IMU card / drift tool are junk until fixed. Suspect the device
-        got into a bad mode (post mag-cal experiments?); try a USB replug /
-        power-cycle of the BWT901CL first, then re-check |accel|≈9.8.
+      - **2026-09-21: device attitude is HEALTHY again** — parked reads roll ~1.5°
+        / pitch ~-2.6° (yesterday's garbage +91°/-134° gone after the power
+        cycles); |a| = 9.80, |g| = 0.009 @22 Hz. The accel cal looks good.
+      - **2026-09-21: the interference self-test now RUNS end-to-end (deadlock
+        fixed — see its own bullet) and is CLEAN on the gyro axis**: 5 phases
+        (baseline/LDS/fan/LED/motor wiggle) all read yaw wobble <=0.18° — no
+        actuator disturbs the gyro. CAVEAT: the mag_noise column read 0.0 in every
+        phase because **the mag vector is frozen** ([−487,380,−96] constant) —
+        EXPECTED in **6-axis mode** (`imu_driver.axis6_mode` defaults TRUE: no
+        magnetometer in yaw by design, the mag near motors/LDS was the old 9-axis
+        disturbance source). So the old spin-interference hypothesis is moot in
+        this mode; the mag-sweep calibration eyeball only applies if 9-axis is
+        ever re-enabled. The test could flag "mag frozen (6-axis)" instead of a
+        misleading 0.0 (small code tweak, low priority).
 - [ ] **Test cross-host zenoh discovery end-to-end** — `rviz_remote.sh --connect
       <ip>` (the `ZENOH_SESSION_CONFIG_URI` path) was written without a way to test
-      it from the dev PC. If `ros2 topic list` on the dev PC doesn't show the
-      robot's topics, check the installed `rmw_zenoh_cpp` version's docs for the
-      current session-config env var/schema.
+      it from the dev PC.
+      - **2026-09-21 first live test (robot online, dev PC)**: the config schema is
+        CONFIRMED (`ZENOH_SESSION_CONFIG_URI` is the right env var for this
+        rmw_zenoh_cpp build — grep the .so) and cross-host TCP connect + DATA
+        routing WORK: a dev-PC session pointed at `tcp/<robot-ip>:7447` receives
+        `/wheel_ticks` (ESP32 publisher) end-to-end. But DISCOVERY is broken
+        one-sided: `ros2 topic list` from the dev PC shows ONLY the ESP32's topics
+        (+system) — the robot's zenoh-rust ROS nodes (mode: peer, attached to the
+        router via loopback) are invisible, so rviz_remote has no /scan, /odom,
+        /tf, /map yet. Same blindness on the BOARD itself: a fresh `ros2 topic
+        list` there saw 0-2 topics while the ESTABLISHED stack (telemetry's subs,
+        made post-boot) flows fine — i.e. the router propagates the zenoh-pico
+        CLIENT's declarations to later joiners but not the ROS PEERs'.
+        Diagnosis leads: (a) zenoh peer-declaration propagation via the router
+        (gossip locators are loopback-only — the "Unable to connect to any locator
+        of scouted peer ... tcp/[::1]:..." warnings are the visible symptom); (b)
+        the router's peer-table handling after re-attaches (the 2026-09-20
+        /cmd_vel-dead family — a router journal line "Read error on Serial link:
+        Unexpected Init flag in message" was caught 2026-09-21 = the ESP32
+        re-handshaking into a still-established transport). Candidate fix to TEST:
+        run the robot's units in CLIENT mode (export a session config with
+        `mode: "client"` in unit_exec.sh) so every declaration routes through the
+        router exactly like the ESP32's — client-mode sessions demonstrably
+        propagate. Also: the ros2 CLI's persistent DAEMON caches a stale graph —
+        always `ros2 daemon stop` before trusting a CLI graph view.
 
 ## Open — dev-PC / scripts
 
-- [ ] **Create `ros2 topic echo /odom` drift script**: compare odom drift against
-      ground truth.
+- [x] **`ros2 topic echo /odom` drift script** — DONE 2026-09-21:
+      `scripts/odom_drift.py` (rclpy, runs on the board or any session that can see
+      the graph) reports parked-drift rate (cm/min + degrees while /odom's twist
+      says stationary) over streaks, with a summary. Board-run verified end-to-end.
 
 ## Deferred / excluded (not planned)
 
