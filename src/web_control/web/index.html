@@ -3383,7 +3383,17 @@ connect();   // auto-connect on load
   async function poll(){
     try{
       const r=await fetch("/map?t="+Date.now());
-      if(!r.ok) return;                        // 503 until slam_toolbox published a grid
+      if(!r.ok){
+        // No grid server-side: never arrived (slam down) OR just cleared. Reset the
+        // hero so a stale map can't linger under the mapWait overlay (a clear that
+        // failed server-side then refills ~5 s later — slam's periodic republish —
+        // reads as: wait → old map back = the restart didn't happen).
+        $("mapWait").style.display="flex";
+        lastGrid=lastMeta=null;
+        ctx.setTransform(1,0,0,1,0,0);
+        ctx.clearRect(0,0,cv.width,cv.height);
+        return;
+      }
       const buf=new Uint8Array(await r.arrayBuffer());
       const nl=buf.indexOf(10);                // end of the JSON header line
       if(nl<0) return;
@@ -3468,11 +3478,17 @@ connect();   // auto-connect on load
   // clear. The server cancels any active goal first (its map-frame target stops
   // existing); the page resets the local goal ring + trail and shows mapWait
   // until the fresh (transient-local) grid lands.
-  $("mapWipe").onclick=()=>{
+  $("mapWipe").onclick=async()=>{
     if(!confirm("Wipe the SLAM map and build a fresh one?\n(restarts nano-slam; any navigation in progress is cancelled)")) return;
     mapGoal=null;
     navTrail.length=0; lastTrailPt=null;
-    fetch("/map/clear",{method:"POST"}).catch(()=>{});
+    try{
+      const r=await fetch("/map/clear",{method:"POST"});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok || j.ok===false){
+        alert("Map clear FAILED — the old map stays up.\n"+(j.error||("HTTP "+r.status)));
+      }
+    }catch(e){ alert("Map clear request failed: "+e); }
   };
   $("mapShade").addEventListener("change",e=>{ sharpShade=e.target.checked; shadeMap(); repaint(); });
 

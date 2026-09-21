@@ -2165,12 +2165,32 @@ class WebServerNode(Node):
         cached grid + goal mirror drop first so the page shows its mapWait overlay
         immediately; any active navigation is cancelled since its map-frame target
         stops existing. Needs deploy/sudoers' scoped restart rule for nano-slam.
-        No OLED end-screen / spoken line — app_hub isn't touched (unlike /system/*)."""
+        No OLED end-screen / spoken line — app_hub isn't touched (unlike /system/*).
+        Also arms telemetry's lidar rebuild window (note_map_clear): a parked lidar
+        would otherwise leave slam sitting on no-map until someone drives.
+        The restart runs SYNCHRONOUSLY (bounded) so a sudoers/sudo failure is
+        reported to the page instead of silently leaving the old map up — a failed
+        restart is invisible otherwise: slam keeps republishing the old grid every
+        map_update_interval and refills the cache within seconds."""
         self.cancel_goal()
         self.telemetry.clear_map()
+        self.telemetry.note_map_clear()   # wake the parked lidar: no scans = no fresh map
         self.get_logger().info("POST /map/clear (web Map card) -> restarting nano-slam")
-        self._run_detached("sudo -n /usr/bin/systemctl restart nano-slam", delay=1)
-        return {"ok": True, "reply": "clearing map (nano-slam restart)"}
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "/usr/bin/systemctl", "restart", "nano-slam"],
+                capture_output=True, text=True, timeout=20)
+        except FileNotFoundError:
+            return {"ok": False, "error": "sudo not found"}
+        except subprocess.TimeoutExpired:
+            self.get_logger().error("POST /map/clear: nano-slam restart timed out")
+            return {"ok": False, "error": "systemctl restart nano-slam timed out"}
+        if r.returncode != 0:
+            err = (r.stderr or "").strip() or f"exit {r.returncode}"
+            self.get_logger().error(f"POST /map/clear: nano-slam restart FAILED: {err}")
+            return {"ok": False, "error": f"restart failed: {err} "
+                    "(is the nano-slam sudoers rule installed? see deploy/sudoers/nano-power)"}
+        return {"ok": True, "reply": "clearing map (nano-slam restarted)"}
 
     def _brain_health_tick(self):
         """Publish cognition-layer health as JSON on /brain/cognition_health (~1 Hz)."""

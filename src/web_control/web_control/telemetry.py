@@ -273,6 +273,7 @@ class TelemetryHub:
         except Exception:
             self._lds_user_rpm = LDS_DEFAULT_RPM
         self._lds_manual_until = 0.0   # monotonic until a manual owner holds the topic
+        self._lds_rebuild_until = 0.0  # monotonic until: map-clear rebuild window
         self._lds_sent = None          # last setpoint published (any owner), or None
         self._lds_sent_at = STALE
         self._lds_hold = 0             # >0 while the IMU interference test owns the spin motor
@@ -934,6 +935,18 @@ class TelemetryHub:
         self._goal = None
         self._goal_status = "idle"
 
+    def note_map_clear(self):
+        """POST /map/clear companion: a wiped map can only REBUILD if scans flow,
+        but the idle controller may have just parked the lidar (quiet robot) — it
+        would then sit on no-map until the user drives. Arm a rebuild window of
+        one idle period (lds_idle_secs) that the 1 Hz controller treats as recent
+        motion: the lidar wakes at the user's spin-when-active rpm, and the normal
+        quiet-park resumes when the window lapses (or real motion keeps it up).
+        A manual owner (slider/skill latch) or lds_hold still outranks this via
+        the controller's usual paths; /lds_jam + the firmware clamp still bound it."""
+        self._lds_rebuild_until = time.monotonic() + max(
+            5.0, float(self._lds_param("lds_idle_secs", LDS_IDLE_SECS_DEFAULT)))
+
     # ---- LDS idle spin-down controller (2026-09-21) ------------------------------
     def _lds_param(self, name, default):
         """Live param read with a safe fallback (fake/dev nodes may not declare)."""
@@ -963,8 +976,16 @@ class TelemetryHub:
         # lidar awake on a parked robot forever. A live goal is held up by /cmd_vel.
         nav_busy = (self._goal_status in NAV_BUSY
                     and (now - self._goal_status_at) < LDS_NAV_STALE)
+        last_move = self._last_move_at
+        # A map clear (POST /map/clear) explicitly asks for a FRESH map, which can
+        # only build if scans flow — a parked lidar would leave slam stuck at no-map
+        # until the user drives. Treat the rebuild window as recent motion so the
+        # controller spins at the user's spin-when-active rpm; it lapses back to the
+        # normal quiet-park after ~lds_idle_secs (or real motion keeps it up).
+        if now < self._lds_rebuild_until:
+            last_move = now
         rpm = lds_idle_target(
-            now, self._last_move_at,
+            now, last_move,
             float(self._lds_param("lds_idle_secs", LDS_IDLE_SECS_DEFAULT)),
             bool(self._lds_param("lds_idle_enable", True)),
             nav_busy,

@@ -15,6 +15,8 @@ and is pinned here:
       re-asserts after LDS_REASSERT_SECS (ESP32 reboot recovery), never fights a
       manual owner (slider/skill latch, IMU-test hold)
     * note_lds_manual / lds_hold: the two "another owner" mechanisms
+    * note_map_clear: the POST /map/clear rebuild window — the parked lidar wakes
+      for one idle period so the wiped map can actually rebuild (2026-09-21)
     * _lds_ctrl_state: the f.lds frame section (age/tgt/idle/state), jam wins
 
     pixi run test
@@ -390,3 +392,38 @@ def test_boot_uses_default_target_without_the_param():
 def test_boot_reads_lds_active_rpm_param():
     hub = _hub({"lds_active_rpm": 250.0})
     assert hub._lds_user_rpm == 250.0
+
+
+# ---- the map-clear rebuild window ------------------------------------------------------
+
+def test_map_clear_wakes_the_lidar_without_motion():
+    # POST /map/clear: the fresh map can only build if scans flow, but a quiet
+    # robot's lidar is parked — the rebuild window must count as recent motion.
+    hub = _hub({"lds_idle_secs": 60.0})
+    hub.note_map_clear()
+    hub._lds_ctrl_tick()
+    pubs = hub._node.pubs["lds_target_rpm"].published
+    assert len(pubs) == 1 and pubs[0].data == 300.0
+
+
+def test_map_clear_window_lapses_back_to_park():
+    hub = _hub({"lds_idle_secs": 60.0})
+    hub.note_map_clear()
+    hub._lds_rebuild_until = time.monotonic() - 1.0   # window over, still quiet
+    hub._lds_ctrl_tick()
+    pubs = hub._node.pubs["lds_target_rpm"].published
+    assert len(pubs) == 1 and pubs[0].data == 0.0
+
+
+def test_map_clear_does_not_override_a_manual_owner():
+    hub = _hub({"lds_idle_secs": 60.0})
+    hub.note_lds_manual(150.0, set_target=True)       # slider/skill holds the topic
+    hub.note_map_clear()
+    hub._lds_ctrl_tick()
+    assert hub._node.pubs["lds_target_rpm"].published == []
+
+
+def test_map_clear_window_uses_the_idle_secs_param():
+    hub = _hub({"lds_idle_secs": 600.0})
+    hub.note_map_clear()
+    assert hub._lds_rebuild_until > time.monotonic() + 500.0
