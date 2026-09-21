@@ -124,7 +124,12 @@ in this checkout.
       SAG (mean 0.024-0.034 vs 0.041 at ±0.8 rad/s) = the rate-limited
       I-term recovering spin-band stick-slip slowly — WHEEL_I_WIND_RATE
       1.2 → 2.5 built, FLASH PENDING (30 s tether); then re-verify spins.
-      The braked-stop keepalive fix is deployed (firm stops).**) Pre-flash
+      The braked-stop keepalive fix is deployed (firm stops). Spin-band
+      map (2026-09-21 pm, dither 0, 5/60/0): 0.5 rad/s (wheels ±0.025)
+      mean 92% of target p2p 0.031; 0.65 mean 85% p2p 0.027; 0.8 mean
+      60-85% p2p 0.015-0.029 — stiction-bound at EVERY rate; kp 6.5 A/B'd
+      no decisive spin gain (reverted to the swept 5) — the I-rate bump is
+      the structural fix, not gains. Pre-flash
       baselines for reference (2026-09-21 pm, tuned 5/60/0, maxlin guard
       0.15 for the linear runs): crawl 0.05 p2p 0.011-0.013; spin 0.8 p2p
       0.014-0.032 SAG (mean 0.036-0.038 vs 0.041); straight 0.12 p2p 0.011-0.060.
