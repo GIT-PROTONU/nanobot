@@ -145,7 +145,10 @@ BRAKE_GRACE = 1.0            # s   keepalive keeps publishing {0,0} after a stop
 # to move_settings_path). The turn ceiling mirrors drive_max_ang — the SLAM rotation-
 # smear budget (a turn at w rad/s blurs each 0.2 s lidar scan by w*0.2 rad).
 MOVE_LIN_RANGE = (0.05, 0.40)  # m/s clamp range for move_lin_speed
-MOVE_ANG_RANGE = (0.10, 0.80)  # rad/s clamp range for move_ang_speed
+MOVE_ANG_RANGE = (0.10, 1.00)  # rad/s clamp range for move_ang_speed (2026-09-21 pm:
+                               # was (0.10, 0.80) — the user found 0.8-rad/s canned
+                               # turns slow; 1.0 = 11.5 deg/scan SLAM smear vs the
+                               # 9.2 at 0.8, accepted trade, reversible)
 
 
 def _clamp_move_cfg(lin, ang):

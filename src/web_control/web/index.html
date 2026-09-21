@@ -154,8 +154,8 @@
             </div>
             <div class="field"><label>Canned speed <span id="moveLinV">0.12</span> m/s</label>
               <input id="moveLin" type="range" min="0.05" max="0.4" step="0.01" value="0.12"></div>
-            <div class="field"><label>Canned turn <span id="moveAngV">0.80</span> rad/s</label>
-              <input id="moveAng" type="range" min="0.1" max="0.8" step="0.05" value="0.8"></div>
+            <div class="field"><label>Canned turn <span id="moveAngV">1.00</span> rad/s</label>
+              <input id="moveAng" type="range" min="0.1" max="1.0" step="0.05" value="1.0"></div>
             <p class="hint">Drag the joystick to drive (speed scales with how far you push),
               or use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrow keys on a keyboard.
               Release or <kbd>Space</kbd> stops. Publishes <b>/cmd_vel</b>. <b>Drive</b> /
@@ -1955,7 +1955,7 @@ const HINTS = {
   moveStop: "Cancels the running canned move and stops (same as touching the joystick or pressing STOP).",
   moveStatus: "Live progress of the canned move (phase, target, % done) and its result after it finishes. The maneuver aborts if /odom is lost or the browser disconnects for >5 s.",
   moveLin: "Cruise speed for the canned Drive maneuvers (m/s). Live-tunes the server and persists across reboots. The approach still ramps down into the target, so very short moves peak below this.",
-  moveAng: "Turn-rate cap for the canned Turn maneuvers (rad/s). Live-tunes the server and persists across reboots. Keep at/below 0.8 -- faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
+  moveAng: "Turn-rate cap for the canned Turn maneuvers (rad/s). Live-tunes the server and persists across reboots. Keep at/below 1.0 -- faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
   sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",

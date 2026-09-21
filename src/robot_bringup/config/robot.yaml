@@ -334,7 +334,10 @@ web_control:
     # 0.8 = 9 deg/scan, still a visible blur during spins but survivable). Keep any raise
     # tied to a map-quality check, and note the ESP32's low-duty stall: spins around
     # 0.3-0.5 rad/s can re-stick the wheels (see MOTOR_MIN_DUTY / the firmware kick).
-    drive_max_ang: 0.8        # rad/s clamp
+    drive_max_ang: 1.0        # rad/s clamp (2026-09-21 pm: was 0.8 — the user found turns
+                              # slow; 1.0 = 11.5 deg/scan SLAM smear (no deskew in
+                              # slam_toolbox 2.6.10), up from the 9.2 at 0.8 — accepted
+                              # trade, reversible; watch map quality after heavy spin use)
     drive_timeout: 0.6        # s without a fresh POST -> publish one stop
     # Canned-move (/move) pace — live sliders on the Drive card ("Canned speed" /
     # "Canned turn", GET/POST /move/config). A slider change persists to
@@ -342,11 +345,8 @@ web_control:
     # Keep move_ang_speed <= drive_max_ang: a turn at w rad/s smears each 0.2 s
     # lidar scan by w*0.2 rad (slam_toolbox 2.6.10 has no deskew).
     move_lin_speed: 0.12      # m/s cruise for canned drives
-    move_ang_speed: 0.8       # rad/s cap for canned turns (2026-09-21: was 0.5 — the
-                              # user found turns slow; 0.8 = the accepted smear ceiling,
-                              # same as drive_max_ang, and DOUBLE the per-wheel speed of
-                              # the stickiest PID regime (wheels ±w*0.051 m/s), so turns
-                              # are faster AND smoother)
+    move_ang_speed: 1.0       # rad/s cap for canned turns (2026-09-21 pm: was 0.8 —
+                              # the user found turns slow; see drive_max_ang note)
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"

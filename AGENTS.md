@@ -556,6 +556,15 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   partly stiction-bound (single-channel ticks + carpet at ±0.04 m/s per-wheel — the
   accepted limit until a 2nd quadrature channel). The canned-turn speed is capped by
   move_ang_speed 0.8 (the smear budget); a 90° canned turn measured 90.2° in 3.56 s.**
+  **2026-09-21 pm IV — the turn ceiling was raised 0.8 → 1.0 rad/s at the user's
+  "still slow" report (firmware maxang id 4 LIVE via /motor_params + robot.yaml
+  drive_max_ang/move_ang_speed + MOVE_ANG_RANGE (0.10, 1.00) + the Drive-card
+  slider max). 90° canned turn: 4.09 s → 3.52 s (peak rate rides the 1.0 cap; the
+  remaining time is wheel breakaway + the P-taper tail — stiction-bound). Smear
+  trade: 1.0 rad/s = 11.5°/scan vs the 9.2 at 0.8 (slam_toolbox 2.6.10 has no
+  deskew) — reversible via the same knobs; watch map quality after heavy spin
+  use. NOTE the board's persisted ~/.local/state/nanobot/move.json WINS over
+  robot.yaml defaults — the live bump went through POST /move/config.**
   **Web-side pressure fix (same session): the page's /scan.bin poll ran every 80 ms on
   the lidar hero view (the DEFAULT view while driving) = 12.5 fetches/s against ~5 Hz
   data — 60% no-op fetches churning the gateway. Now 200 ms (5 Hz = the data rate) with

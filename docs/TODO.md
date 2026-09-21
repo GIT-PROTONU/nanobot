@@ -127,6 +127,14 @@ in this checkout.
       0.027 → 0.015 (mean 85 → 88%), 0.8 best leg 95% of target; the band
       remains partly stiction-bound (single-channel + carpet) — accepted
       until a 2nd quadrature channel. THREAD CLOSED.**
+      **2026-09-21 pm IV: turn ceiling 0.8 → 1.0 rad/s (all three clamps:
+      firmware maxang id 4 live, robot.yaml drive_max_ang/move_ang_speed,
+      MOVE_ANG_RANGE + slider) — 90° canned turn 4.09 → 3.52 s; smear trade
+      11.5°/scan, watch map quality. The 0.4 m/s "stutter" measured = the
+      saturation cliff (loaded full-duty ≈ 0.37 m/s; at 0.4 the loop has zero
+      authority — reverse leg p2p 0.277 vs 0.028-0.085 at 0.3): the smooth
+      cruise band is ≤0.15 m/s, 0.3 acceptable, AVOID 0.35+ — a slider note
+      or a web-side soft warning is an option if the user keeps hitting it.**
       The braked-stop keepalive fix is deployed (firm stops). Spin-band
       map (2026-09-21 pm, dither 0, 5/60/0): 0.5 rad/s (wheels ±0.025)
       mean 92% of target p2p 0.031; 0.65 mean 85% p2p 0.027; 0.8 mean
