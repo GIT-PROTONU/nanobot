@@ -260,6 +260,22 @@ static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RAD
 #define LDS_PID_KI     0.0015f
 #define LDS_PID_KD     0.0f
 
+// Jam guard (2026-09-21): a physically blocked rotor — string wrapped around the
+// turret, debris — can't reach speed, so the PID pins at full duty trying to reach
+// the target and the motor cooks. If the measured rpm stays under
+// LDS_JAM_FRAC*target (or UART1 is stale, i.e. we can't see the tach at all) for
+// LDS_JAM_MS continuously while a target is set, latch a jam and cut the PWM. The
+// latch clears ONLY on target<=0 (the SBC idle controller's park after its idle
+// timeout, or the web slider's 0) — so a continuously jammed motor is simply OFF
+// (no periodic grind), each wake-from-idle retries at most once, and the web Lidar
+// card shows the JAM state via /lds_jam. Spin-up from rest typically reaches
+// 40% of target well inside 6 s, so a healthy motor never trips this; a dead/
+// disconnected LDS (no UART1 frames at all) also latches — that is deliberate:
+// driving the motor blind is the same overheat risk.
+#define LDS_JAM_MS     6000
+#define LDS_JAM_FRAC   0.40f
+#define LDS_RPM_MAX    400.0f  // /lds_target_rpm clamp (mirrors web_control's LDS_RPM_MAX)
+
 // LDS spin-lidar. We only want the current RPM to close the spin PID, so UART1 is drained
 // once per PID tick (not every loop) — see loop(). Enabling adds a 2nd active UART; if the
 // zenoh link (UART2) turns flaky under load, set back to 0 (all code stays compiled out).
@@ -333,6 +349,8 @@ static volatile uint32_t g_last_cmd_ms = 0;
 static volatile float    g_lds_rpm = 0, g_lds_duty = 0, g_lds_hz = 0;
 static volatile uint32_t g_lds_frames = 0, g_lds_last_ms = 0;
 static volatile float    g_lds_target = LDS_TARGET_RPM;
+static volatile bool     g_lds_tgt_save = false; // cb -> 1 Hz block: target changed, NVS write pending
+static volatile bool     g_lds_jam = false;   // jam guard latched (Core1 ldsControl, Core0 publishes)
 static volatile float    g_fan_duty = FAN_BOOT_DUTY;   // /fan_pwm 0..1 (Core0 write, Core1 apply)
 static volatile uint16_t g_laser[2] = {0,0};                 // /laser_pwm 0..255 per laser (Core0 write, Core1 apply)
 // Straight-line trim: loaded from NVS in setup(), adapted on Core 1 (autocal), manually
@@ -486,7 +504,7 @@ static inline bool linkAlive(){ return ready; }
 #endif
 // rmw_zenoh liveliness token = makes a publisher visible in the ROS graph. Format:
 // @ros2_lv/<domain>/<zid>/<nid>/<eid>/MP/%/%/<node>/%<topic>/<type>/<typehash>/<qos>
-static z_owned_liveliness_token_t g_lv[14]; static int g_lv_n = 0;
+static z_owned_liveliness_token_t g_lv[16]; static int g_lv_n = 0;
 static void declare_lv(const char* topic, const char* type, int eid){
   char ke[260];
   snprintf(ke, sizeof(ke),
@@ -499,14 +517,14 @@ static void declare_lv(const char* topic, const char* type, int eid){
 
 // one publisher + its rmw attachment identity
 struct ZPub { z_owned_publisher_t p; int64_t seq; uint8_t gid[16]; };
-static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim, P_pid, P_params;
+static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim, P_pid, P_params, P_jam;
 
 // Single source of truth for every publisher: topic/type, the attachment GID tag
-// (last GID byte, unique per publisher) and the liveliness entity id (lv_eid, also
-// unique). The declare loop and the liveliness loop both walk this, so the two can't
-// drift. These wire identities are PROVEN-GOOD against the live graph — don't renumber
-// existing entries; new ones just take the next free tag/eid (14 is the g_lv[] limit,
-// so there is one spare slot left after wheel_params).
+// (last GID byte, unique per publisher) and the liveliness entity id (lv_eid). The
+// declare loop and the liveliness loop both walk this, so the two can't drift. These
+// wire identities are PROVEN-GOOD against the live graph — don't renumber existing
+// entries; new ones take the next free tag/eid (g_lv[] currently has 2 spare slots
+// after lds_jam).
 struct PubDef { ZPub* zp; const char* topic; const char* type; uint8_t gid_tag; int lv_eid; bool lds_only; };
 static const PubDef PUBS[] = {
   { &P_ticks, "wheel_ticks",           T_I64A, 1, 1, false },
@@ -519,6 +537,7 @@ static const PubDef PUBS[] = {
   { &P_rpm,   "lds_rpm",               T_F32,  6, 7, true  },
   { &P_hz,    "lds_hz",                T_F32,  7, 8, true  },
   { &P_duty,  "lds_duty",              T_F32,  8, 9, true  },
+  { &P_jam,   "lds_jam",               T_BOOL, 14, 14, true },
   { &P_trim,  "wheel_trim",            T_F32, 10, 10, false },
   { &P_pid,   "wheel_pid",             T_F32A, 12, 12, false },
   { &P_params,"wheel_params",          T_F32A, 13, 13, false },
@@ -604,7 +623,14 @@ static void reset_ticks_cb(z_loaned_sample_t* sm, void*){
   }
 }
 static void ldstgt_cb(z_loaned_sample_t* sm, void*){
-  uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_lds_target = f>0?f:0; }
+  uint8_t b[8];
+  if (sample_bytes(sm,b,sizeof(b)) >= 8){
+    float f; memcpy(&f,b+4,4);
+    if (isnan(f)) return;                    // clampf can't order NaN — reject outright
+    float t = clampf(f,0,LDS_RPM_MAX);       // 0 = park; >LDS_RPM_MAX is a glitch, not a setpoint
+    if (t != g_lds_target) g_lds_tgt_save = true;
+    g_lds_target = t;
+  }
 }
 static void fan_cb(z_loaned_sample_t* sm, void*){
   uint8_t b[8]; if (sample_bytes(sm,b,sizeof(b)) >= 8){ float f; memcpy(&f,b+4,4); g_fan_duty = clampf(f,0,1); }
@@ -844,6 +870,7 @@ static void zenohTask(void*){
       zpub_put(P_rpm,  buf, cdr_f32(buf, stale?0.0f:g_lds_rpm));
       zpub_put(P_hz,   buf, cdr_f32(buf, g_lds_hz));
       zpub_put(P_duty, buf, cdr_f32(buf, g_lds_duty));
+      zpub_put(P_jam,  buf, cdr_bool(buf, g_lds_jam));
     }
 #else
     (void)t_lds;
@@ -915,8 +942,30 @@ static void ldsFeed(uint8_t byte){
   }
 }
 static void ldsControl(float dt){
-  static float integ=0, prev=0; float target=g_lds_target;
-  if (target<=0){ integ=0; prev=0; g_lds_duty=0; ledcWrite(CH_LDS,0); return; }
+  static float integ=0, prev=0;
+  static uint32_t stall_ms=0;   // start of the current continuous "can't reach speed" stretch
+  static bool jam=false;        // latched: only target<=0 clears (no periodic grind)
+  float target=g_lds_target;
+  if (target<=0){
+    integ=0; prev=0; g_lds_duty=0; ledcWrite(CH_LDS,0);
+    if (jam){ jam=false; g_lds_jam=false; stall_ms=0;
+              Serial.println("[nano] lds jam latch cleared (target 0)"); }
+    return;
+  }
+  if (jam){ g_lds_duty=0; ledcWrite(CH_LDS,0); return; }  // parked until something sends target 0
+  // Stalled = rpm far under target (threshold scales with the setpoint so a low
+  // cruise target can't false-trip) OR no valid tach frames at all — a blocked
+  // rotor and a dead UART1 both mean "driving blind", i.e. the same overheat risk.
+  bool stale = (millis()-g_lds_last_ms) > LDS_TIMEOUT_MS;
+  bool stalled = stale || (g_lds_rpm < LDS_JAM_FRAC*target);
+  if (!stalled) stall_ms=0;
+  else if (stall_ms==0) stall_ms=millis();
+  else if (millis()-stall_ms > LDS_JAM_MS){
+    jam=true; g_lds_jam=true; g_lds_duty=0; ledcWrite(CH_LDS,0);
+    Serial.printf("[nano] LDS JAM: rpm %.0f (stale=%d) vs target %.0f for %u ms — motor parked, clears on target 0\n",
+                  (double)g_lds_rpm, (int)stale, (double)target, (unsigned)LDS_JAM_MS);
+    return;
+  }
   float ff=LDS_PID_KFF*target, duty;
   if (millis()-g_lds_last_ms > LDS_TIMEOUT_MS){ integ=0; prev=0; duty=clampf(ff,0,1); }
   else {
@@ -987,6 +1036,14 @@ void setup(){
   // Straight-line trim from NVS (falls back to TRIM_DEFAULT if never calibrated / saved).
   g_prefs.begin("nano", false);
   g_trim = g_trim_saved = clampf(g_prefs.getFloat("trim", TRIM_DEFAULT), -TRIM_MAX, TRIM_MAX);
+#if LDS_ENABLED
+  // Last /lds_target_rpm setpoint persists like the trim: web_control's idle
+  // controller owns the value, so an ESP32 reboot/power-cycle restores whatever the
+  // SBC last said (usually 0 while idle) instead of spinning at the LDS_TARGET_RPM
+  // boot default until the SBC's next re-assert. Clamped to the cb's range.
+  g_lds_target = clampf(g_prefs.getFloat("ldstgt", LDS_TARGET_RPM), 0, LDS_RPM_MAX);
+  Serial.printf("[nano] lds target %.0f rpm (NVS)\n", (double)g_lds_target);
+#endif
 #if WHEEL_PID_ENABLED
   // Live-tuned PID gains (motor_pid_cb) persist like the trim — a tuning session
   // survives reboot/reflash. Clamped to the same ranges the cb enforces.
@@ -1337,6 +1394,19 @@ void loop(){   // Core 1: real-time control
       g_prefs.putFloat("trim", g_trim_saved);
       Serial.printf("[nano] trim %.3f saved to NVS\n", (double)g_trim_saved);
     }
+#if LDS_ENABLED
+    // Same rate-limited NVS write for the LDS spin setpoint (g_lds_tgt_save set by
+    // ldstgt_cb) — so an ESP32 reboot/power-cycle restores the SBC's last command
+    // (usually 0 while idle) instead of the LDS_TARGET_RPM boot default. No
+    // while-stopped gate needed: this isn't a drive motor, and a few ms of flash
+    // stall can't overflow the 1 KB UART1 tach buffer at 115200 baud.
+    static uint32_t last_lds_save=0;
+    if (g_lds_tgt_save && now-last_lds_save > TRIM_SAVE_MS){
+      last_lds_save=now; g_lds_tgt_save=false;
+      g_prefs.putFloat("ldstgt", g_lds_target);
+      Serial.printf("[nano] lds target %.0f saved to NVS\n", (double)g_lds_target);
+    }
+#endif
 #if WHEEL_PID_ENABLED
     // Same deal for the live-tuned wheel-PID gains (g_pid_save set by motor_pid_cb).
     // Shares the trim's rate limit + while-stopped gate; the flag survives until a
@@ -1374,9 +1444,9 @@ void loop(){   // Core 1: real-time control
   static uint32_t last_dbg=0;
   if (now-last_dbg >= STATUS_PRINT_MS){                     // debug-console health line
     last_dbg=now;
-    Serial.printf("[nano] ticks L=%ld R=%ld | trim %+.3f | lds rpm=%.0f hz=%.0f duty=%.2f | susp %d/%d\n",
+    Serial.printf("[nano] ticks L=%ld R=%ld | trim %+.3f | lds rpm=%.0f hz=%.0f duty=%.2f jam=%d | susp %d/%d\n",
       (long)g_left_ticks,(long)g_right_ticks, (double)g_trim,
-      g_lds_rpm, g_lds_hz, g_lds_duty, (int)g_susp_l,(int)g_susp_r);
+      g_lds_rpm, g_lds_hz, g_lds_duty, (int)g_lds_jam, (int)g_susp_l,(int)g_susp_r);
 #if WHEEL_PID_ENABLED
     Serial.printf("[nano] wheel vel L=%.3f R=%.3f m/s | tgt L=%.3f R=%.3f | duty L=%.2f R=%.2f\n",
       g_left_vel, g_right_vel, g_left_tgt, g_right_tgt, g_left_duty, g_right_duty);

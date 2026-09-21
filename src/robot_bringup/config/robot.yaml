@@ -346,6 +346,20 @@ web_control:
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"
+    # LDS idle spin-down (telemetry.py's 1 Hz controller owns /lds_target_rpm): the
+    # spin motor runs at lds_active_rpm while the robot is active — commanded /cmd_vel
+    # motion (teleop keepalive, Nav2, canned moves, skills) or a Nav2 goal in flight —
+    # and parks (0 rpm) after lds_idle_secs without either. The web Lidar card's Spin
+    # slider live-updates the remembered active rpm; a manual topic post holds the
+    # topic for lds_manual_secs before the controller takes it back. A physically
+    # jammed rotor is protected firmware-side (main.cpp's LDS_JAM_* guard + /lds_jam):
+    # the ESP32 parks the motor after 6 s of "target set but can't spin" and only
+    # retries after it sees target 0 (which the idle timeout provides naturally).
+    # All three are live-tunable via POST /param (telemetry.py PARAM_WHITELIST).
+    lds_idle_enable: true
+    lds_idle_secs: 60.0       # s of quiet (no motion, no goal) before the spin-down
+    lds_manual_secs: 300.0    # s a manual slider/skill post owns the topic
+    lds_active_rpm: 300.0     # boot spin-when-active rpm (the slider re-syncs from the frame)
     # GPU vision (Mali-450/GLES2 via lima, gpu_vision.py): continuous on-device motion
     # detection ("PIR") + colour-blob tracking, off the camera feed. OFF by default —
     # when off, /stream.mjpg + /snapshot.jpg use the original hardware-MJPEG passthrough

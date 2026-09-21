@@ -61,11 +61,17 @@ class _FakeNode:
     def get_logger(self):
         return _FakeLog()
 
+    def get_parameter(self, name):
+        raise KeyError(name)     # the hub falls back to its module-level defaults
+
     def create_publisher(self, type_, name, qos):
         return _FakePub()
 
     def create_client(self, srv, name):
         return _FakeClient()
+
+    def create_subscription(self, type_, name, cb, qos):
+        return object()          # the always-on controller subs (cmd_vel, goal status)
 
     def create_timer(self, period, cb):
         pass

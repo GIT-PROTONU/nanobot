@@ -698,20 +698,32 @@
               <span>spin</span><b id="espLdsRpm">–</b>
               <span>spin frames</span><b id="espLdsHz">–</b>
               <span>spin duty</span><b id="espLdsDuty">–</b>
+              <span>last move</span><b id="ldsIdle">–</b>
+              <span>spin state</span><b id="ldsState">–</b>
             </div>
             <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
               <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
             <div class="field"><label>Spin target <span id="ldsTgtV">300</span> rpm</label>
               <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
+            <label class="switch"><input type="checkbox" id="ldsIdleEn" checked><span class="track"></span>
+              Idle spin-down</label>
+            <div class="field"><label>Spin down after <span id="ldsIdleSecsV">60</span> s idle</label>
+              <input id="ldsIdleSecs" type="range" min="10" max="600" step="10" value="60"></div>
             <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
               <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
               bad-checksum packets since start (climbing fast = degraded serial RX wiring).
               When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
               UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.
-              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets
-              the rpm the ESP32 spins at (published straight to <b>/lds_target_rpm</b>).
-              0 = park the spin motor (the old idle auto-spin-down died with slam_nav —
-              use this manually if you want the lidar quiet).</p>
+              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> is the
+              rpm the ESP32 spins at while the robot is <b>active</b> (published straight to
+              <b>/lds_target_rpm</b>; 0 = never spin). With <b>Idle spin-down</b> on, the robot
+              parks the spin motor after <b>spin down after</b> seconds without commanded
+              motion (teleop, Nav2 goals, canned moves) and wakes it on the next move —
+              <b>last move</b> is that timer counting live. Dragging Spin target overrides the
+              automation for 5 min. <b>spin state</b>: spinning / parked / manual / held /
+              <b>JAM</b> (the ESP32 saw the motor commanded but unable to spin — e.g. string
+              wrapped around the turret — and parked it so it can't overheat; clear the
+              obstruction, then set Spin target 0 and back to retry).</p>
           </div>
           <div class="group">👁️ Vision</div>
           <div class="card">
@@ -1385,12 +1397,22 @@ $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
 $("odoRate").onchange=()=>setNodeRate("wheel_odometry",Number($("odoRate").value));
 // publish a navigation goal in the map frame (Nav2's bt_navigator navigates to it).
 function mapSetGoal(wx,wy){ pub("/goal_pose",{x:wx,y:wy}); mapGoal=[wx,wy]; }
-// Lidar spin-speed setpoint -> /lds_target_rpm (Float32) on the ESP32. The old
-// slam_nav-owned param path (lds_active_rpm + idle spin-down) is gone with
-// slam_nav; this publishes the topic directly.
-$("ldsTgt").oninput=()=>$("ldsTgtV").textContent=$("ldsTgt").value;
-$("ldsTgt").onchange=()=>publishLdsTgt();
+// Lidar spin-speed setpoint -> /lds_target_rpm (Float32) on the ESP32. The web
+// gateway's idle controller owns the topic (spin-while-active, park after
+// `lds idle secs`); dragging the slider publishes the target AND latches a 5-min
+// manual window so the controller doesn't fight the user. The page NEVER publishes
+// on SSE (re)connect — that used to force-wake the parked lidar (2026-07-14 bug);
+// the slider instead follows the live setpoint back from the frame (f.lds.tgt).
+let ldsTgtDrag=false;
+$("ldsTgt").oninput=()=>{ ldsTgtDrag=true; $("ldsTgtV").textContent=$("ldsTgt").value; };
+$("ldsTgt").onchange=()=>{ publishLdsTgt(); setTimeout(()=>{ ldsTgtDrag=false; },1500); };
 function publishLdsTgt(){ pub("/lds_target_rpm",Number($("ldsTgt").value)); }
+// Idle spin-down automation: the web gateway owns /lds_target_rpm and parks the spin
+// motor after N seconds without commanded motion (teleop/Nav2/canned moves); these
+// toggle + tune it live (web_control params, whitelisted in telemetry.py).
+$("ldsIdleEn").onchange=()=>setParam("web_control","lds_idle_enable",$("ldsIdleEn").checked);
+$("ldsIdleSecs").oninput=()=>$("ldsIdleSecsV").textContent=$("ldsIdleSecs").value;
+$("ldsIdleSecs").onchange=()=>setParam("web_control","lds_idle_secs",Number($("ldsIdleSecs").value));
 // Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
 $("pickupOv").onchange=()=>publishPickupOv();
 function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value)); }
@@ -1452,10 +1474,11 @@ $("fanFloor").onchange=()=>setParam("sys_monitor","fan_min_duty",Number($("fanFl
 $("fanSmooth").oninput=()=>$("fanSmoothV").textContent=$("fanSmooth").value;
 $("fanSmooth").onchange=()=>setParam("sys_monitor","fan_smooth_alpha",Number($("fanSmooth").value)/100);
 // On (re)connect, push the current Auto/override state once so the node matches the UI.
+// NOTE: the LDS spin target is deliberately NOT pushed on (re)connect — the gateway's
+// idle controller owns /lds_target_rpm now, and a connect-time re-assert used to
+// force-woke a parked lidar every time anyone opened the page (the 2026-07-14 bug).
+// The Spin slider follows the live setpoint back from the frame instead.
 function syncFan(){ setFanOverride($("fanAuto").checked?-1:Number($("fanOv").value)/100); }
-// On (re)connect, push the slider's current value once so the ESP32's spin target
-// matches the UI without a manual drag.
-function syncLdsTgt(){ publishLdsTgt(); }
 
 // Webcam MJPEG: the <img> streams /stream.mjpg (same-origin, served by the web
 // server). Toggling off drops the connection so the camera stops (ref-counted).
@@ -1799,10 +1822,11 @@ function connect(){
   es.onopen=()=>{
     connected=true; reconnDelay=1000; setConn(true);
     OLED.tel({ip:location.hostname||"robot"});
-    // Re-assert the page's authoritative state on every (re)connect: LDS setpoint,
-    // fan override, pickup override (a fresh load publishes auto = clears stale
-    // overrides), and the OLED dashboard/words toggles.
-    syncLdsTgt(); syncFan(); publishPickupOv(); sendDash(); sendWords();
+    // Re-assert the page's authoritative state on every (re)connect: fan override,
+    // pickup override (a fresh load publishes auto = clears stale overrides), and
+    // the OLED dashboard/words toggles. The LDS spin target is intentionally NOT
+    // re-asserted — the gateway's idle controller owns that topic (see syncFan).
+    syncFan(); publishPickupOv(); sendDash(); sendWords();
   };
   es.onmessage=e=>{ try{ onFrame(JSON.parse(e.data)); }catch(err){} };
   es.onerror=()=>{
@@ -1887,6 +1911,13 @@ function onFrame(f){
     for(const [id,ok] of feeds){
       const el=$(id);
       if(el) el.style.background=ok?"var(--green)":"var(--red)";
+    }
+    // An intentionally parked lidar (the idle spin-down) isn't a broken feed: the
+    // ESP32's tach reads 0 rpm so the raw test above paints it red. Amber instead,
+    // so the diagnosis table doesn't send someone hunting a broken wire while the
+    // robot is just resting.
+    if(f.lds && f.lds.state==="park" && !(f.lds.rpm>0 && f.lds.age!=null && f.lds.age<3)){
+      const el=$("feedLds"); if(el) el.style.background="var(--amber)";
     }
     if(mapOnNav) mapOnNav(f.nav);
   }
@@ -2316,11 +2347,36 @@ function onEsp(e, susp){
     $("pidKd").value=String(kd); $("pidKdV").textContent=kd.toFixed(2);
   }
 }
+// LDS card + the live last-move timer. `idle` (s since the last commanded motion,
+// from the gateway's idle controller) is re-rendered every second so it ticks even
+// between SSE frames; `state` comes from f.lds (spin/park/manual/hold/jam); `tgt`
+// (the live setpoint) re-syncs the Spin slider unless the user is mid-drag.
+let ldsIdleVal, ldsFrameAt=0;   // undefined = no frame yet; null = no commanded motion since boot
 function onLds(l){
   if(l.rpm!=null) $("espLdsRpm").textContent=l.rpm.toFixed(0)+" rpm";
   if(l.hz!=null){ $("espLdsHz").textContent=l.hz.toFixed(1)+" Hz"; OLED.tel({lds:l.hz}); }
   if(l.duty!=null) $("espLdsDuty").textContent=(l.duty*100).toFixed(0)+"%";
+  ldsIdleVal = l.idle==null ? null : Math.max(0,l.idle);
+  ldsFrameAt = performance.now();
+  if(l.tgt!=null && !ldsTgtDrag){
+    const v=Math.round(l.tgt/10)*10;
+    if(String($("ldsTgt").value)!==String(v)){ $("ldsTgt").value=String(v); $("ldsTgtV").textContent=v; }
+  }
+  const st=$("ldsState");
+  const s = l.state==="hold" ? "held" : (l.state||"–");
+  st.textContent = s==="jam" ? "JAM" : s;
+  st.style.color = s==="jam" ? "var(--red)"
+                 : s==="spin" ? "var(--green)"
+                 : (s==="manual"||s==="hold") ? "var(--amber)" : "";
 }
+setInterval(()=>{
+  const el=$("ldsIdle");
+  if(ldsIdleVal===undefined){ el.textContent="–"; el.style.color=""; return; }
+  if(ldsIdleVal==null){ el.textContent="never"; el.style.color=""; return; }
+  const s=Math.max(0, ldsIdleVal+(performance.now()-ldsFrameAt)/1000);
+  el.textContent = s<60 ? s.toFixed(0)+" s ago"
+                 : Math.floor(s/60)+"m "+String(Math.floor(s%60)).padStart(2,"0")+"s ago";
+},1000);
 // suspension: green = on the ground (ready to drive), amber = up/suspended.
 function suspTxt(id,val){
   const el=$(id);

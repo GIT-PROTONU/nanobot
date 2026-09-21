@@ -155,9 +155,15 @@ class IMUInterferenceTest:
 
     def _run(self, include_motor, base_secs, lds_secs, fan_secs, led_secs, motor_secs):
         n = self._node
+        # Hold the LDS idle controller (telemetry.py's lds_hold) for the whole run:
+        # this test publishes /lds_target_rpm itself (lds phase) and must not be
+        # fought by the controller re-asserting its own spin/park setpoint. Released
+        # in the finally below — afterwards the controller resumes and parks the
+        # lidar on its own if the robot stays idle (it's the topic's owner again).
+        n.telemetry.lds_hold(True)
         # (name, on, off, duration, check_cmd) -- `off` is None where the actuator is
-        # deliberately left as-is afterward (the LDS spin-down is slam_nav's own idle-
-        # park logic's job, not this test's).
+        # deliberately left as-is afterward (the LDS spin-down is telemetry.py's idle
+        # controller's job once the hold releases, not this test's).
         phases = [
             ("baseline", None, None, base_secs, True),
             ("lds", lambda: self._lds_pub.publish(Float32(data=self.lds_rpm)),
@@ -206,6 +212,7 @@ class IMUInterferenceTest:
                         "yaw_wobble_deg": round(yaw_wobble, 2)})
             self._finish("")
         finally:
+            n.telemetry.lds_hold(False)
             self._safe_all()
 
     def _safe_all(self):

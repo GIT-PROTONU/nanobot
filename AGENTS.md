@@ -383,6 +383,12 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   (hardware tuning tracked in `docs/TODO.md`) holds `/lds_target_rpm` by driving the motor PWM, output on
   `/lds_duty`. The LDS path is gated by `LDS_ENABLED` (currently 1; UART1 is drained once
   per PID tick, not every loop, since only the RPM is needed). WiFi/BT kept off.
+  **The setpoint is OWNED by web_control's idle controller** (see the LDS idle spin-down
+  section) — the firmware is a clamp-holding follower (NaN-reject + 0..400 clamp on
+  `/lds_target_rpm`, default 300 at boot, corrected within ≤30 s by the SBC re-assert).
+  **Jam guard** (`ldsControl`, 2026-09-21): rpm < 0.4×target or stale UART1 tach for
+  6 s while a target is set ⇒ latched motor park (`/lds_jam` Bool @5 Hz), cleared only
+  on target ≤ 0 — a blocked rotor can't cook the motor; see the LDS idle spin-down section.
 - **Line lasers**: subscribes `/laser_pwm`
   (`std_msgs/Int32MultiArray [v1,v2]`, each 0..255) and drives two line-laser PWM
   outputs on **GPIO 23/32** (`LASER1..2_PIN`). 10-bit duty =
@@ -1000,6 +1006,63 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
   `msg.pose.pose` (the Odometry layout) on the actually-`PoseStamped` `/slam_pose`
   was an `AttributeError` respawn loop (fixed 2026-08-10). New callbacks must
   match the real message type and be JSON-safe end-to-end after the zenoh round-trip.
+### LDS idle spin-down + jam guard (2026-09-21)
+
+The old slam_nav-era `_update_lds_idle` died with slam_nav (2026-09-14) and for a week
+NOTHING owned `/lds_target_rpm` — the ESP32 held its last setpoint (boot default 300
+rpm) forever, so the lidar spun whenever the robot sat idle ("the lds spindown isn't
+reliable"). Rebuilt as THREE coordinated pieces:
+
+- **Idle controller (`telemetry.py`, the OWNER of `/lds_target_rpm`)** — a 1 Hz
+  ALWAYS-ON node timer (`_lds_ctrl_tick`, pure decision in `lds_idle_target`,
+  unit-tested in `test_lds_idle.py`): spin at the user's target while the robot is
+  **active** (commanded `/cmd_vel` above `vision_bumper_cmd_eps` within
+  `lds_idle_secs`, OR a Nav2 goal in flight — `planning` counts, the planner needs
+  fresh costmap scans BEFORE moving), park it (0) after that quiet stretch. A busy
+  nav status is trusted only within `LDS_NAV_STALE` (90 s) of its last arrival — the
+  status topic is event-driven, so a live goal is really held up by `/cmd_vel`, and
+  the age bound stops a mid-navigation `nano-nav` death from freezing "navigating"
+  and keeping the lidar awake on a parked robot forever.
+  `lds_idle_enable=false` = always spin; `lds_manual_secs` (300) = how long a manual
+  topic post (slider drag, skill action) holds the topic before the controller takes
+  it back. Every 30 s (`LDS_REASSERT_SECS`) it re-publishes an unchanged setpoint —
+  an ESP32 reboot resets its setpoint to the firmware default, so the re-assert
+  corrects it with no user action. `note_lds_manual(rpm)` is the outside-publisher
+  hook (browser `publish_json` sets the remembered spin-when-active target
+  `_lds_user_rpm` too — the slider IS that value; skills only borrow the topic).
+  The controller's signals (`/cmd_vel` + `navigate_to_pose/_action/status`) are
+  **always-on subscriptions moved OUT of the lazy browser-only set** (`__init__`,
+  not `_make_subs`) — the lazy set drops `SUB_LINGER` after the last browser, which
+  would park the lidar MID-NAVIGATION. They also feed the optical bumper + the web
+  map's status chip (one sub, three consumers). Params: `lds_idle_enable`,
+  `lds_idle_secs` (60), `lds_manual_secs` (300), `lds_active_rpm` (300) in
+  robot.yaml `web_control`, all live-tunable via `/param` (web Lidar card).
+  **The page no longer re-publishes the Spin slider on SSE (re)connect** — that
+  `syncLdsTgt()` was the 2026-07-14 force-wake bug (opening the page woke the parked
+  lidar); the slider instead follows the live setpoint back from `f.lds.tgt`
+  (skipped mid-drag). The IMU interference test calls `telemetry.lds_hold(True/False)`
+  for its whole run so the controller never fights its own LDS phase.
+- **Jam guard (firmware, `main.cpp` `ldsControl`)** — a physically blocked rotor
+  (string wrapped around the turret, debris) can't reach speed, so the PID pins at
+  full duty and the motor cooks. If rpm stays under `LDS_JAM_FRAC`*target (0.4 —
+  scales with the setpoint so a low cruise target can't false-trip) OR UART1 is
+  stale (no tach frames = driving blind = same risk) continuously for
+  `LDS_JAM_MS` (6000) while a target is set, the firmware LATCHES a jam and cuts
+  the PWM. The latch clears ONLY on target ≤ 0 (which the SBC idle timeout provides
+  naturally at the next quiet stretch, or the slider's 0) — no periodic grind, each
+  wake-from-idle retries at most once. Published on **`/lds_jam`** (Bool, @5 Hz
+  with the other lds topics; PubDef tag/eid 14, `g_lv[]` bumped to 16) →
+  `f.lds.jam` → the Lidar card shows **JAM** red with the remedy in the hint
+  (clear the obstruction, set Spin 0, then back up). `ldstgt_cb` now also clamps
+  to `LDS_RPM_MAX` 400 and rejects NaN.
+- **Web UI (Lidar card)**: new readouts **`last move`** (the live seconds-since-last-
+  commanded-motion timer, ticking every second between frames — this is the idle
+  clock) and **`spin state`** (spinning/parked/manual/held/JAM, colour-coded), plus
+  the **Idle spin-down** toggle and the **Spin down after N s** slider (both
+  `/param` → web_control). The Map card's feeds-health strip paints the LDS dot
+  **amber** when `f.lds.state == "park"` — an intentionally parked lidar is not a
+  broken feed. `f.lds` is now `{rpm, hz, duty, jam, age, tgt, idle, state}`.
+
 ### HTTP teleop
 
 - **HTTP teleop (`POST /drive`)**: the page POSTs `{v,w}` same-origin; `web_server`
@@ -1128,7 +1191,7 @@ held 0.84-0.86 (one bad-lock strip from the FWD jerk; the reverse run tracked ma
 exactly). **There is no deskew in slam_toolbox 2.6.10 — keep every rotation rate (teleop clamp,
 RPP cap, skill motion) tied to the `w·0.2 rad/scan` smear budget, and note the map resets on any
 `nano-slam` restart (no `map_file_name` is configured — restart IS the map clear).**
-- **Dead web-UI features** (scrapped per the plan): the old Map hero view + click-to-goal, wall guard + keep-away bubble, map buttons (Home/Save/Clear/Self-test), no-go brush, the Motion-chain and EKF cards, slam_nav/track_* sliders, LDS idle auto-spin-down (set Spin target 0 manually on the Lidar card instead). **The Map view + click-to-goal + Locations were REBUILT 2026-09-15 — see the block below.**
+- **Dead web-UI features** (scrapped per the plan): the old Map hero view + click-to-goal, wall guard + keep-away bubble, map buttons (Home/Save/Clear/Self-test), no-go brush, the Motion-chain and EKF cards, slam_nav/track_* sliders, LDS idle auto-spin-down (set Spin target 0 manually on the Lidar card instead). **The Map view + click-to-goal + Locations were REBUILT 2026-09-15 — see the block below.** (The LDS idle spin-down was itself REBUILT 2026-09-21 in `web_control/telemetry.py` — see the "LDS idle spin-down + jam guard" section.)
 
 **Map view + click-to-goal REBUILT (2026-09-15, dev-verified):** the web Map hero view is back on top of Nav2, built resource-light (the 1 GB board budget):
 - **`GET /map` HTTP route** (NOT the SSE frame): telemetry lazily subscribes to slam_toolbox's `/map` (OccupancyGrid, **transient-local QoS** → the current grid arrives the instant a browser connects), caches ONE copy (`telemetry._on_map` → `get_map_payload()`), and `_serve_map` serves it in the old slam_nav blob wire format: one JSON header line (`w,h,res,ox,oy,t`), `\n`, then raw int8 cells (-1 unknown / 0..100; row 0 = origin_y). The browser polls it at **1 Hz** while the Map view is on (slam_toolbox republishes at most every `map_update_interval: 5.0` s), so worst case ~230 KB/s per open browser; idle cost zero (subs drop with the other browser-only subs after `SUB_LINGER`).
@@ -1261,7 +1324,7 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **A differential robot's body yaw rate is bounded by its wheel command** — if `/imu/euler` Δyaw vastly exceeds what the wheels could have rolled (`(ΔL+ΔR)/2·m_per_tick`, ARC of both wheels), suspect an IMU scale/sign error, not an encoder undercount. Wheel-odom translation is correctly scaled; expect only small tire-slip gaps on spins.
 - **Low-duty turn commands can stall the wheels** — in-place turns map to tiny per-wheel speeds (±0.04 m/s at 0.5 rad/s) whose duty can stop the motors ~0.5-1 s in (wheels AND body both freeze mid-command; encoder counts + IMU plateau together). This is a drive-power issue, separate from sensing. The 2026-09-19 drive test sharpened it: with the flashed `MOTOR_MIN_DUTY 0.55` deadband the wheels still seized 1.4-2.4 s into EVERY command at 0.12 m/s, 0.25 m/s AND 0.5 rad/s spins (constant ~0.60-0.83 remapped duty), recovering only on a direction change — the firmware breakaway kick + 0.70 floor (above; flashed 2026-09-20) is the fix. Scripted teleop (`POST /drive`) still needs ~10 Hz re-POSTs; my 2026-09-19 test loop (~0.4 s period) kept `/cmd_vel` alive via web_server's 10 Hz re-assert, so freezes were real stalls, not cmd-timeouts.
 - **`config/robot.yaml` is the single config source** — all ports, pins, rates, LLM params live there. Its `slam_nav:` block uses the ROS param layout (`slam_nav.ros__parameters.<name>`). Indentation must match sibling keys exactly: a block one space off parses as a *nested map* and the whole `slam_nav` section silently returns `None` to nav_node (only the in-code default saves you). Always sanity-check with `python3 -c "import yaml,sys; print(yaml.safe_load(open('src/robot_bringup/config/robot.yaml'))['slam_nav']['ros__parameters']['recover_min_seen'])"` after editing, and remember the running stack reads it via the `build/ → src/` symlink, not a copied install.
-- **ESP32 link can wedge after a stack restart and needs a PHYSICAL power cycle** — after `stack.sh down/up` the coprocessor may never re-attach to the router's serial link (`/dev/ttyS1`): `esp32 DOWN: no heartbeat ever received`, `/wheel_ticks` silent, LDS motor dead (ESP32 drives its PID), scans stop. Service restarts, full `nano-robot.target` restarts, even a board `sudo systemctl reboot` do NOT reliably recover it — the firmware's auto-recovery watchdogs (`LINK_CONNECT_DEADLINE_MS`, `LINK_RX_TIMEOUT_MS` in `firmware/nanobot_coprocessor/src/main.cpp`) apparently can't re-sync a wedged UART. Symptom chain when it happens: `esp32 DOWN` → `lds DOWN: lidar not spinning` → `wheel_ticks SILENT` → map `feeds.scan: -1`. Diagnosis: `journalctl -u nano-sensors.service | grep -i esp32`, and confirm the router holds the fd (`ls -l /proc/$(pgrep -f zenohd-serial)/fd | grep ttyS1`). Fix = unplug/replug the ESP32's power. After a successful power cycle it comes back on its own (`esp32 UP after …`, `/wheel_ticks resumed`, `lds UP`), and `lds_idle_enable=false` + `lds_active_rpm=300` via `/param` wakes the lidar if it's parked. **2026-09-20 variant (open, see docs/TODO.md): a SNEAKIER partial wedge** — after a router restart the session re-attaches (heartbeat/ticks/LDS all flow) and SOME subscriptions still deliver (`/motor_pid` write→`/wheel_pid` readback flips), but **`/cmd_vel` specifically goes deaf** (observed with the web keepalive, `ros2 topic pub`, AND raw zenoh puts on the exact keyexpr) while a full ESP32 reboot restores it. **2026-09-21 firmware fix (FLASHED 2026-09-21 — deployed + robot live)**: the firmware now periodically (45 s, `SUB_REDECLARE_MS`) undeclares + re-declares ALL subscriptions (`SUBS` table + `subsRedeclare()` in main.cpp), refreshing the router's remote-sub table in place — the deaf window is bounded at ≤45 s and the workaround above dies once flashed. VERIFY after a few router restarts: /cmd_vel revives within ≤45 s if dropped (tracked in docs/TODO.md). Note for the next pico-API edit: zenoh-pico's Arduino build defines `ZENOH_C_STANDARD=99`, which compiles the `z_move`/`z_call` _Generic macros out — use the explicit generated functions (`z_subscriber_move()`, like the existing `z_config_move()`).
+- **ESP32 link can wedge after a stack restart and needs a PHYSICAL power cycle** — after `stack.sh down/up` the coprocessor may never re-attach to the router's serial link (`/dev/ttyS1`): `esp32 DOWN: no heartbeat ever received`, `/wheel_ticks` silent, LDS motor dead (ESP32 drives its PID), scans stop. Service restarts, full `nano-robot.target` restarts, even a board `sudo systemctl reboot` do NOT reliably recover it — the firmware's auto-recovery watchdogs (`LINK_CONNECT_DEADLINE_MS`, `LINK_RX_TIMEOUT_MS` in `firmware/nanobot_coprocessor/src/main.cpp`) apparently can't re-sync a wedged UART. Symptom chain when it happens: `esp32 DOWN` → `lds DOWN: lidar not spinning` → `wheel_ticks SILENT` → map `feeds.scan: -1`. Diagnosis: `journalctl -u nano-sensors.service | grep -i esp32`, and confirm the router holds the fd (`ls -l /proc/$(pgrep -f zenohd-serial)/fd | grep ttyS1`). Fix = unplug/replug the ESP32's power. After a successful power cycle it comes back on its own (`esp32 UP after …`, `/wheel_ticks resumed`, `lds UP`), and `lds_idle_enable=false` via `/param` (or a Spin-slider drag) wakes the lidar if the idle controller has it parked. **2026-09-20 variant (open, see docs/TODO.md): a SNEAKIER partial wedge** — after a router restart the session re-attaches (heartbeat/ticks/LDS all flow) and SOME subscriptions still deliver (`/motor_pid` write→`/wheel_pid` readback flips), but **`/cmd_vel` specifically goes deaf** (observed with the web keepalive, `ros2 topic pub`, AND raw zenoh puts on the exact keyexpr) while a full ESP32 reboot restores it. **2026-09-21 firmware fix (FLASHED 2026-09-21 — deployed + robot live)**: the firmware now periodically (45 s, `SUB_REDECLARE_MS`) undeclares + re-declares ALL subscriptions (`SUBS` table + `subsRedeclare()` in main.cpp), refreshing the router's remote-sub table in place — the deaf window is bounded at ≤45 s and the workaround above dies once flashed. VERIFY after a few router restarts: /cmd_vel revives within ≤45 s if dropped (tracked in docs/TODO.md). Note for the next pico-API edit: zenoh-pico's Arduino build defines `ZENOH_C_STANDARD=99`, which compiles the `z_move`/`z_call` _Generic macros out — use the explicit generated functions (`z_subscriber_move()`, like the existing `z_config_move()`).
 - **`plink -m` on Windows:** the script text becomes the shell's argv. `pkill -f` patterns can kill the controlling shell. Fix: `pscp` script, run by path.
 - **ESP32 firmware:** PlatformIO from dev PC (`pio run -t upload`). Don't build on the board. Tunables are `#define`s at top of `src/main.cpp`.
 - **Deploy soul overwrite:** `DEPLOY_SOUL=1` pushes `memory/` personality to the board, discarding evolved drift. Default is `DEPLOY_SOUL=0` (keep the robot's soul) — matching deploy.sh.

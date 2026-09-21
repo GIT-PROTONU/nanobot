@@ -54,6 +54,32 @@ SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the la
 # alert's threshold is a web UI slider from day one, not a hardcoded guess. All are
 # informational only so far; nothing autonomous acts on them yet.
 LDS_RPM_MAX = 400.0      # clamp on the /lds_target_rpm setpoint a browser may publish
+# LDS idle spin-down controller (2026-09-21; the old slam_nav-era _update_lds_idle died
+# with slam_nav and NOTHING owned /lds_target_rpm afterwards — the ESP32 just held its
+# last setpoint, default 300, forever). telemetry.py now owns the topic: spin at the
+# user's target while the robot is active (recent commanded /cmd_vel motion or a Nav2
+# goal in flight), park it after LDS_IDLE_SECS_DEFAULT of quiet. Runs on an always-on
+# 1 Hz timer so it works with the page CLOSED — which is the whole point, and why the
+# page no longer re-publishes the slider value on SSE (re)connect (that reconnect
+# re-assert used to force-woke the lidar; see the 2026-07-14 memory).
+LDS_DEFAULT_RPM = 300.0   # boot spin-when-active target (slider + firmware default)
+LDS_IDLE_SECS_DEFAULT = 60.0   # quiet stretch before the spin-down (lds_idle_secs)
+LDS_MANUAL_SECS_DEFAULT = 300.0  # a manual topic post holds the topic this long
+LDS_IDLE_TICK = 1.0       # controller period (s)
+LDS_REASSERT_SECS = 30.0  # re-publish an unchanged setpoint after this long — an ESP32
+                          # reboot resets its setpoint to the firmware default, so a
+                          # periodic re-assert corrects it without any user action
+# Nav2 goal states that count as "the lidar must stay up" for the idle controller.
+# "planning" matters: Nav2 needs fresh scans for its costmap BEFORE it starts moving.
+NAV_BUSY = ("planning", "navigating", "canceling")
+# A busy status is trusted only this long since its last ARRIVAL: the status topic is
+# event-driven (bt_navigator publishes on transitions, not periodically), so a long
+# goal rides on /cmd_vel keeping the motion clock alive instead. The age bound exists
+# for the failure mode where nano-nav dies mid-navigation and the last "navigating"
+# status would otherwise freeze the lidar awake forever on a parked robot. During a
+# genuinely active goal, cmd_vel refreshes the clock, so this never parks a moving
+# robot; a goal silently stuck >90 s with no motion loses only the ~2 s spin-up.
+LDS_NAV_STALE = 90.0
 MOTOR_ACCEL_MIN = 0.3    # clamp on the /motor_accel ramp rate (duty/s) -- matches the
 MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.cpp)
 TRIM_MAX = 0.30          # ESP32 firmware's TRIM_MAX -- |wheel_trim| rebalance range (main.cpp)
@@ -96,8 +122,30 @@ PARAM_WHITELIST = {
                     "vision_novelty_alert", "vision_camera_stall_secs",
                     "vision_vibration_ratio", "vision_vibration_confirm_secs",
                     "vision_glare_derate", "vision_approach_rate", "vision_approach_band",
-                    "imu_drift_min_secs"},
+                    "imu_drift_min_secs",
+                    # LDS idle spin-down controller (telemetry.py's _lds_ctrl_tick)
+                    "lds_idle_enable", "lds_idle_secs", "lds_manual_secs",
+                },
 }
+
+
+def lds_idle_target(now, last_move_at, idle_secs, idle_enable, nav_busy,
+                    manual_active, active_rpm):
+    """The /lds_target_rpm setpoint the idle controller wants on the wire right now.
+
+    None = hands off (another owner — the browser slider or a skill — holds the
+    topic via the manual latch). A Nav2 goal in flight, `idle_enable` off, or
+    commanded motion within the last `idle_secs` keeps the lidar at `active_rpm`;
+    a quiet stretch past it parks the motor (0.0 — the firmware's target<=0 branch).
+    Pure + unit-tested; see test_lds_idle.py. Note `last_move_at=None` (no commanded
+    motion since boot) counts as idle, so a freshly booted idle robot parks the
+    lidar instead of leaving the firmware's boot default spinning."""
+    if manual_active:
+        return None
+    if not idle_enable or nav_busy or (
+            last_move_at is not None and now - last_move_at < idle_secs):
+        return max(0.0, float(active_rpm))
+    return 0.0
 
 
 class TelemetryHub:
@@ -167,6 +215,8 @@ class TelemetryHub:
         # through publish_json); _goal_status comes from the action status sub.
         self._goal = None              # [x, y] in the map frame, or None
         self._goal_status = "idle"
+        self._goal_status_at = STALE   # monotonic ts of the last status arrival — the
+                                       # busy-state trust window (LDS_NAV_STALE)
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._latched_qos = latched
@@ -213,9 +263,38 @@ class TelemetryHub:
             n: node.create_client(SetParameters, f"/{n}/set_parameters")
             for n in PARAM_WHITELIST
         }
+        # --- LDS idle spin-down controller state (see lds_idle_target) ---------
+        # The remembered spin-when-active rpm: the browser's Spin slider IS this
+        # value (each drag publishes the topic AND updates it); it boots from the
+        # lds_active_rpm param. _lds_sent tracks the last setpoint published by ANY
+        # owner so the SSE frame's tgt/state stay truthful.
+        try:
+            self._lds_user_rpm = float(node.get_parameter("lds_active_rpm").value)
+        except Exception:
+            self._lds_user_rpm = LDS_DEFAULT_RPM
+        self._lds_manual_until = 0.0   # monotonic until a manual owner holds the topic
+        self._lds_sent = None          # last setpoint published (any owner), or None
+        self._lds_sent_at = STALE
+        self._lds_hold = 0             # >0 while the IMU interference test owns the spin motor
+        self._last_move_at = None      # monotonic ts of the last commanded motion (/cmd_vel)
         # One always-on timer: builds/notifies frames while clients exist, manages the
         # lazy subscriptions, and is a single cheap early-out when nobody's watching.
         node.create_timer(self._period, self._tick)
+        # ...plus the idle controller's own 1 Hz tick (runs regardless of browsers —
+        # the spin-down must work with the page closed).
+        node.create_timer(LDS_IDLE_TICK, self._lds_ctrl_tick)
+        # The controller's ALWAYS-ON subscriptions: /cmd_vel (commanded motion — the
+        # teleop keepalive, Nav2's controller, canned moves and skill actions all
+        # publish it) + bt_navigator's goal status. Both are tiny and MUST be seen
+        # with no browser connected (the lazy browser-only subs vanish after
+        # SUB_LINGER, which would make the controller park the lidar mid-navigation).
+        # They also feed the optical bumper and the web map's status chip — one sub,
+        # three consumers.
+        self._ctrl_subs = [
+            node.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, 5),
+            node.create_subscription(GoalStatusArray, "navigate_to_pose/_action/status",
+                                     self._on_goal_status, 5),
+        ]
 
     # ---- client lifecycle (called from HTTP handler threads) -------------------
     def add_client(self):
@@ -445,8 +524,7 @@ class TelemetryHub:
                     "wheel_trim": self._wheel_trim,
                     "wheel_pid": self._wheel_pid,
                     "wheel_params": self._wheel_params},
-            "lds": dict(self._lds, age=round(now - self._lds_at, 1)
-                        if self._lds_at is not None else None),
+            "lds": dict(self._lds, **self._lds_ctrl_state(now)),
             "oled": self._oled,
         }
         # Canned-move (POST /move) progress — web_server's maneuver state, a plain
@@ -592,6 +670,10 @@ class TelemetryHub:
         s(sub(Float32, "lds_rpm", self._mk_lds("rpm"), 2))
         s(sub(Float32, "lds_hz", self._mk_lds("hz"), 2))
         s(sub(Float32, "lds_duty", self._mk_lds("duty"), 2))
+        # ESP32 jam guard (main.cpp ldsControl): latched true when the spin motor is
+        # commanded but can't reach speed (physically blocked / no tach frames) — the
+        # firmware parks the motor so it can't overheat; surfaced in f.lds.jam.
+        s(sub(Bool, "lds_jam", self._on_lds_jam, 2))
         s(sub(Float32, "fan_pwm", self._on_fan, 2))
         s(sub(MagneticField, "imu/mag", self._on_mag, 2))
         # Direct sub (not the 1 Hz vitals blob) -- the 3D orientation view needs eul
@@ -601,7 +683,10 @@ class TelemetryHub:
         s(sub(Vector3Stamped, "imu/euler", self._on_eul, 5))
         s(sub(String, "imu_calibrate_status", self._mk_str("_imu_cal_status"), self._latched_qos))
         s(sub(String, "imu_mount_settings", self._mk_str("_imu_mount_settings"), self._latched_qos))
-        s(sub(Twist, "cmd_vel", self._on_cmd_vel, 5))   # optical virtual bumper correlation
+        # NOTE: /cmd_vel + /navigate_to_pose/_action/status are NOT here — they moved
+        # to __init__ as ALWAYS-ON subscriptions (the LDS idle controller must see
+        # them with no browser connected; they also feed the optical bumper + the
+        # web map's status chip). See __init__.
         # OLED mirror inputs (the page renders a client-side copy of the panel)
         s(sub(String, "oled_face", self._mk_oled("face"), 5))
         s(sub(String, "oled_word", self._mk_oled("word"), 5))
@@ -618,10 +703,8 @@ class TelemetryHub:
         # map_update_interval). The OccupancyGrid is cached once (see _on_map);
         # the browser polls it over the /map HTTP route.
         s(sub(OccupancyGrid, "map", self._on_map, self._latched_qos))
-        # bt_navigator's goal status: the state machine behind the web chip
-        # (idle/planning/navigating/arrived/failed). Tiny messages, and empty
-        # between goals.
-        s(sub(GoalStatusArray, "navigate_to_pose/_action/status", self._on_goal_status, 5))
+        # NOTE: bt_navigator's goal status sub moved to __init__ (always-on) — see the
+        # cmd_vel note above.
         # map->base_link TF (map->odom: slam_toolbox @10 Hz; odom->base_link:
         # wheel_odometry) — the pose dot + "save current spot". tf subs are kept
         # OUT of self._subs (TransformListener.unregister handles teardown).
@@ -725,6 +808,11 @@ class TelemetryHub:
             self._lds_at = time.monotonic()   # staleness for the feeds strip
         return cb
 
+    def _on_lds_jam(self, msg):
+        # bool(msg.data) also normalizes the rmw_zenoh bytes paranoia class
+        # (b'\x00'/b'\x01' are falsy/truthy exactly like False/True).
+        self._lds["jam"] = bool(msg.data)
+
     def _on_fan(self, msg):
         self._fan = round(msg.data, 3)
 
@@ -737,7 +825,18 @@ class TelemetryHub:
         self._eul = (v.x, v.y, v.z, time.monotonic())
 
     def _on_cmd_vel(self, msg):
-        self._cmd_vel = (msg.linear.x, msg.angular.z)
+        lin, ang = msg.linear.x, msg.angular.z
+        self._cmd_vel = (lin, ang)
+        # "Last commanded motion" — the LDS idle controller's spin-down clock (and
+        # the web UI's live last-move timer). Uses the same commanded floor as the
+        # optical bumper, so there's ONE definition of "being driven": the keepalive's
+        # steady {0,0} re-asserts and Nav2's between-goal silence never reset it.
+        try:
+            eps = float(self._node.get_parameter("vision_bumper_cmd_eps").value)
+        except Exception:
+            eps = 0.03
+        if abs(lin) > eps or abs(ang) > eps:
+            self._last_move_at = time.monotonic()
 
     def _mk_oled(self, key):
         def cb(msg):
@@ -767,10 +866,12 @@ class TelemetryHub:
         self._map_arrival = time.monotonic()
 
     def _on_goal_status(self, msg):
-        """Track bt_navigator's action status (the web chip). status_list gains an
-        entry per goal state transition; the LAST entry is the current goal. On a
-        terminal state the goal mirror is dropped too, so the browser's goal ring
-        doesn't resurrect from every subsequent frame."""
+        """Track bt_navigator's action status (the web chip + the LDS idle
+        controller's busy signal). status_list gains an entry per goal state
+        transition; the LAST entry is the current goal. On a terminal state the
+        goal mirror is dropped too, so the browser's goal ring doesn't resurrect
+        from every subsequent frame."""
+        self._goal_status_at = time.monotonic()   # arrival time (LDS_NAV_STALE window)
         if msg.status_list:
             code = msg.status_list[-1].status
             if isinstance(code, bytes):      # rmw_zenoh int8 paranoia (see _on_diag)
@@ -820,6 +921,7 @@ class TelemetryHub:
         topic will corroborate with CANCELED/UNKNOWN on the next tick."""
         self._goal = None
         self._goal_status = "idle"
+        self._goal_status_at = time.monotonic()
 
     def clear_map(self):
         """Drop the cached /map grid + goal mirror (POST /map/clear). The /map
@@ -831,6 +933,85 @@ class TelemetryHub:
         self._map_arrival = STALE
         self._goal = None
         self._goal_status = "idle"
+
+    # ---- LDS idle spin-down controller (2026-09-21) ------------------------------
+    def _lds_param(self, name, default):
+        """Live param read with a safe fallback (fake/dev nodes may not declare)."""
+        try:
+            return self._node.get_parameter(name).value
+        except Exception:
+            return default
+
+    def _lds_manual_secs(self):
+        try:
+            return float(self._lds_param("lds_manual_secs", LDS_MANUAL_SECS_DEFAULT))
+        except (TypeError, ValueError):
+            return LDS_MANUAL_SECS_DEFAULT
+
+    def _lds_ctrl_tick(self):
+        """Own /lds_target_rpm when nobody else does: spin at the user's target while
+        the robot is active (recent commanded motion or a Nav2 goal in flight), park
+        it after `lds_idle_secs` of quiet, and re-assert periodically so an ESP32
+        reboot (which resets its setpoint to the firmware default) is corrected
+        within a tick. Runs on an always-on 1 Hz timer — the spin-down must work
+        with the page closed. Manual owners (browser slider / skill action latch,
+        IMU interference test hold) are never fought; the controller resumes after
+        their window."""
+        now = time.monotonic()
+        # A busy nav status is trusted only within its arrival window (LDS_NAV_STALE):
+        # nano-nav dying mid-goal would otherwise freeze "navigating" and keep the
+        # lidar awake on a parked robot forever. A live goal is held up by /cmd_vel.
+        nav_busy = (self._goal_status in NAV_BUSY
+                    and (now - self._goal_status_at) < LDS_NAV_STALE)
+        rpm = lds_idle_target(
+            now, self._last_move_at,
+            float(self._lds_param("lds_idle_secs", LDS_IDLE_SECS_DEFAULT)),
+            bool(self._lds_param("lds_idle_enable", True)),
+            nav_busy,
+            now < self._lds_manual_until, self._lds_user_rpm)
+        if rpm is None or self._lds_hold:
+            return
+        if rpm != self._lds_sent or (now - self._lds_sent_at) > LDS_REASSERT_SECS:
+            self._pubs["/lds_target_rpm"][0].publish(Float32(data=rpm))
+            self._lds_sent = rpm
+            self._lds_sent_at = now
+
+    def note_lds_manual(self, rpm, set_target=False):
+        """Record a /lds_target_rpm published OUTSIDE the controller (browser slider
+        via POST /publish, or a skill action): latch the manual window so the
+        controller hands the topic over for `lds_manual_secs`, and track the value
+        for the frame. `set_target` (browser slider only) also makes it the
+        remembered spin-when-active rpm; skills merely borrow the topic."""
+        rpm = max(0.0, float(rpm))
+        self._lds_manual_until = time.monotonic() + self._lds_manual_secs()
+        self._lds_sent = rpm
+        self._lds_sent_at = time.monotonic()
+        if set_target:
+            self._lds_user_rpm = rpm
+        return rpm
+
+    def lds_hold(self, on):
+        """Suspend/resume the idle controller (reference-counted). The IMU
+        interference test drives the spin motor itself and must not be fought."""
+        self._lds_hold = max(0, self._lds_hold + (1 if on else -1))
+
+    def _lds_ctrl_state(self, now):
+        """The controller's view of the world, folded into f.lds: `age` (moved here
+        so the whole section is built in one place), `tgt` (last setpoint published
+        by any owner), `idle` (s since the last commanded motion — the web UI's live
+        last-move timer; null = nothing commanded since boot) and `state`."""
+        age = round(now - self._lds_at, 1) if self._lds_at is not None else None
+        idle = (now - self._last_move_at) if self._last_move_at is not None else None
+        if self._lds.get("jam"):
+            state = "jam"         # firmware latched a blocked rotor; motor is parked
+        elif now < self._lds_manual_until:
+            state = "manual"      # browser slider / skill holds the topic
+        elif self._lds_hold:
+            state = "hold"        # IMU interference test owns the spin motor
+        else:
+            state = "spin" if (self._lds_sent or 0.0) > 0.0 else "park"
+        return {"age": age, "state": state, "tgt": self._lds_sent,
+                "idle": round(idle, 1) if idle is not None else None}
 
     # ---- POST /publish ----------------------------------------------------------
     def publish_json(self, data):
@@ -856,10 +1037,16 @@ class TelemetryHub:
             # via the action status topic within a tick or two; set "planning"
             # here so the chip reacts to the click immediately.
             self.note_goal(msg.pose.position.x, msg.pose.position.y)
+        if topic == "/lds_target_rpm":
+            # The browser's Spin slider: remember it as the spin-when-active target
+            # AND latch the manual window so the idle controller doesn't fight the
+            # user for lds_manual_secs.
+            self._lds_user_rpm = self.note_lds_manual(msg.data, set_target=True)
         # Diagnosability: log map-click goals + LDS rpm etc. so "who told the robot to
         # go there / spin" is in the app log. Throttle the chatty spin-down? No — these
         # are discrete user actions, not a hot loop; every one is a meaningful event.
-        if topic in ("/goal_pose", "/reset_ticks", "/laser_pwm", "/motor_pid"):
+        if topic in ("/goal_pose", "/reset_ticks", "/laser_pwm", "/motor_pid",
+                     "/lds_target_rpm"):
             self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
         return {"status": "ok", "topic": topic}
 
@@ -868,6 +1055,7 @@ class TelemetryHub:
         web map's goal ring + status chip stay in sync with those too."""
         self._goal = [round(float(x), 3), round(float(y), 3)]
         self._goal_status = "planning"
+        self._goal_status_at = time.monotonic()
 
     @staticmethod
     def _mk_goal(v):

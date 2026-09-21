@@ -15,6 +15,91 @@ in this checkout.
 
 ## Open — needs the physical robot
 
+- [ ] **NEW 2026-09-21: LDS idle spin-down + jam guard — built + unit/smoke-tested,
+      needs the robot.** The spin-down controller (`web_control/telemetry.py`
+      `_lds_ctrl_tick`, owns `/lds_target_rpm` again after a week of nobody) and
+      the firmware jam guard (`main.cpp` `ldsControl` — 6 s of "target set but
+      can't spin" ⇒ latched motor park, `/lds_jam`) are code-complete; see the
+      "LDS idle spin-down + jam guard (2026-09-21)" block in AGENTS.md. VERIFY on
+      the robot: (1) deploy + `pio run -t upload`, then let it sit ≥90 s — `f.lds`
+      state goes parked, spin 0 rpm, Lidar-card **last move** timer keeps counting,
+      `/scan.bin` goes stale, Map feeds LDS dot amber (not red); (2) drive by
+      hand (or send a goal) — lidar wakes to ~300 rpm within ~1 s of the first
+      `/cmd_vel`, last-move resets; (3) block the rotor gently with a finger/
+      string at Spin 300 → within ~6 s `f.lds.jam` true, state **JAM**, motor CUT
+      (duty 0) — confirm no grind, and that setting Spin 0 clears the latch (a
+      motion resumption retries at most once); (4) the IMU interference test
+      still runs its lds phase cleanly (the controller is held for the whole
+      run); (5) ESP32 power-cycle while parked → NVS-restored target 0 → no boot
+      spin (first flash ever writes `ldstgt` on the first setpoint change).
+      NVS note: `pio run -t upload` does NOT erase NVS — the new `ldstgt` key
+      just appears on first save.
+- [ ] **NEW 2026-09-21: intermittent full-duty lunges on corrupted `/cmd_vel` — firmware
+      reject-gate + flip-state guard (user deferred: "later TODO", robot manually
+      speed-limited).** Symptom (user-confirmed): the robot lunges at ~0.4-0.45 m/s
+      (the firmware's ±max_linear clamp regime) in bursts of ~1.5 s, 2-3× in a
+      ~40 min session — including **from standstill with NO source** (web drive
+      journal shows no POST; Nav2 idle; `/move` inactive; only app_hub's keepalive
+      publishes `/cmd_vel`, process list clean). Mechanism: **UART line noise**
+      (fan-MOSFET + LDS-motor + drive PWM switching near the 2.4 m ttyS1 link —
+      9-s-apart COBS decode bursts in the router journal even while parked,
+      10:40/10:57) corrupts an SBC→ESP32 `/cmd_vel` frame **in a still-decodable
+      way**; zenoh's serial transport has no payload checksum, rmw_zenoh deserializes
+      the garbage Twist, and the firmware's `clampf(±max_linear)` then EXECUTES the
+      garbage as a full-speed command. The same noise explains today's repeated
+      link drops + ESP32 RX-watchdog `esp_restart()` self-resets (5× today, each
+      self-recovered unattended — no power cycle; the old "needs physical power
+      cycle" gotcha is partially obsolete on this build). Chained: full-duty lunge
+      → worst PWM noise → corruption burst → link drop → watchdog reset.
+      **Planned fix (firmware, ~10 lines, deferred by the user):** (1) in `cmd_cb`
+      reject any Twist that is non-finite or |linear.x|/|angular.z| beyond a sane
+      envelope (e.g. > 2.0 m/s / > 2.0 rad/s — beyond every legit publisher incl.
+      the 0.4 web clamp) BEFORE the maxlin/maxang clamp, keep the previous target,
+      and count+println rejects on the USB debug serial (UART0, visible via
+      `pio device monitor`) so the noise rate becomes observable; (2) in the PID
+      tick, re-seed the wheel PID state when |measured vel| > 1.5×g_maxlin
+      (physically impossible → catches the direction-flip lock too); (3) ALSO zero
+      `wpd_l/wpd_r` in the 2026-09-21 direction-flip reset branches (the 2-window
+      velocity history is left stale there — ~40 ms of wrong-sign velocity after
+      every flip; at KP 5 + imax=1/ki it can wind to full duty in ~100 ms and lock
+      via the commanded-direction tick signing until the wheel physically stops —
+      the "instant 0.38 m/s" fwd→rev repro). VERIFY after flash: 5× fwd→rev
+      transitions at 0.1 m/s + a ≥5 min drive soak with no lunge, and rejects
+      visible on the debug serial when noise hits. **SAFETY STATE LEFT IN PLACE:
+      `/motor_params` ids 3/4 (maxlin/maxang) were clamped to 0.15 m/s / 0.3 rad/s
+      (2026-09-21, live POST, NVS-persists while parked — survives reboot!);
+      restore with `POST /publish /motor_params [3, 0.4, 4, 0.8]` (or
+      `pid_tune.py params --set 3=0.4,4=0.8`) once the guard is flashed.** KFF
+      recomputes on param change so the PID still regulates correctly at the lower
+      clamp. Related hardware follow-up (not started): the noise SOURCE itself —
+      fan/LDS/drive PWM vs the ttyS1 routing (same family as the earlier
+      esp32-hardware-fried-ground-fix ground-bounce failure); options: routing/
+      shielding/decoupling, or a slower baud — current link is 115200.
+- [ ] **Verify the 2026-09-21 wheel-PID smoothness pass on hardware** (flashed +
+      deployed 2026-09-21 — five structural fixes, NO gain changes; see the
+      "2026-09-21 smoothness pass" block in AGENTS.md). **2026-09-21 first-pass
+      results (web-gateway harness, dev PC):**
+      - (1) parked-at-zero bleed: **PASS** — fwd 2.5 s @0.10 → stop → 3 s watch:
+        zero ticks after coast-down, /odom delta (0.0, 0.0); no rollback/nudge.
+      - (4) `/reset_ticks` while parked: **PASS** — no lurch, ticks re-seed to
+        fresh small counts, /odom delta (0.0, 0.0), stray [0,0] untouched.
+      - hold-still-on-flat-floor with the page/keepalive open: **PASS** — 90 s +
+        30 s soaks, ZERO tick movement (the bleed holds the flat floor).
+      - (2) fwd→rev (direction-flip reset): **BLOCKED by the lunge item above** —
+        clean runs regulate -0.10 m/s perfectly (flip within one frame, no frozen
+        gap, no overshoot), but intermittent runs hit the instant-0.4 m/s
+        full-duty event (now its own TODO item; the flip-reset's stale `wpd` is
+        suspect). Re-run this check after the guard is flashed.
+      - (3) crawl limit-cycling ×3 aggregates: **NOT YET RUN** (session ended on
+        the lunge work). Run `pid_tune.py ladder --vlist 0.05 --repeat 3 --secs 6`
+        and judge the aggregate vs the 0.009 m/s sweep baseline.
+      - (5) boot baseline seed: exercised by today's post-flash driving (no
+        first-drive jerk reported); a definitive check needs the next flash/power
+        cycle.
+      - gains note: live gains read **[5, 50, 0]** (the user's deliberate KI
+        60→50 change) and **survived an in-session ESP32 self-reset reboot** —
+        gains NVS persistence verified end-to-end. separation id2 **0.102** also
+        survived (NVS OK).
 - [ ] **Map-vs-room alignment + wheel-odometry scale, validated on open floor**
       (from the AGENTS.md 2026-09-11 "map still skews" thread — the matcher-side
       causes were fixed there, and the slam_nav matcher itself is gone since the
@@ -108,18 +193,9 @@ in this checkout.
       reboot (`/wheel_pid` readback should read [5,60,0] after a power cycle).
       NOTE 2026-09-21: the smoothness pass re-flashed the firmware (`pio run -t
       upload` does NOT erase NVS) — confirm the readback still shows [5,60,0].
-- [ ] **Verify the 2026-09-21 wheel-PID smoothness pass on hardware** (flashed +
-      deployed 2026-09-21 — five structural fixes, NO gain changes; see the
-      "2026-09-21 smoothness pass" block in AGENTS.md): (1) stops must not roll
-      back / nudge backwards (parked-at-zero integrator bleed); (2) forward→reverse
-      must not pause-then-lurch (direction-flip reset); (3) crawl limit-cycling
-      should shrink vs the 2026-09-21 sweep baseline (2-window velocity average —
-      re-judge with `pid_tune.py --repeat 3` aggregates, not single runs; gains may
-      now tolerate retuning since kp noise-injection is halved); (4) `POST
-      /reset_ticks` while parked must not lurch; (5) first drive after a flash must
-      not jerk (boot baseline seed). Also spot-check that a stopped robot holds
-      still on the flat floor indefinitely with the page open (the bleed only fires
-      at rest — a slope would now let it creep).
+      (The original five-check list for this item now lives merged with today's
+      results in the "Verify the 2026-09-21 wheel-PID smoothness pass" item near
+      the top of this section.)
 - [ ] **OPEN BUG: /cmd_vel delivery to the ESP32 dies after a router/stack restart —
       Twist-specific, other topics keep flowing.** After `deploy.sh`/`stack.sh`
       restarts the zenoh router, the coprocessor's session re-attaches (heartbeat,
@@ -148,6 +224,25 @@ in this checkout.
         race, which the periodic re-declare covers. VERIFY: restart the router a few
         times and confirm /cmd_vel revives within ≤45 s if dropped — until then keep
         the power-cycle workaround in mind.
+      - **2026-09-21 live-session observations (testing the smoothness pass)**: the
+        ESP32 link dropped 5× in ~40 min and **self-recovered every time
+        unattended** — the RX watchdog (`LINK_RX_TIMEOUT_MS 8000` → `esp_restart()`)
+        re-handshakes on its own (heartbeat counter restarts, ticks resume ~15 Hz);
+        NO physical power cycle was needed, unlike the old gotcha. BUT the drops
+        today were **noise-driven, not router-restart-driven** (see the new lunge
+        item: UART corruption bursts from fan/LDS/drive PWM, 9-s-apart COBS errors
+        in the router journal even while parked) — so the controlled
+        restart-router-and-time-the-revival test for the ≤45 s re-declare bound is
+        STILL open. Also: the 10:05-10:08 router restarts that day were clean
+        systemd deactivations (`NRestarts=0` — something REQUESTED them; not
+        crashes, not the ExecStartPost probe), with a
+        "clock not NTP-synced after 20s" stale-clock window in between; origin
+        unidentified. And one CLI gotcha found the hard way: a bare `ros2 topic
+        info/echo` from ssh runs under **fastrtps** (the CLI daemon's default) and
+        sees NOTHING on the zenoh island — "Unknown topic" is the wrong-RMW
+        symptom, not proof a topic is absent; the CLI needs
+        `RMW_IMPLEMENTATION=rmw_zenoh_cpp` (and `ros2 daemon stop` after changing
+        it).
       - **2026-09-19 drive-test evidence (SLAM diagnosis session)**: with the flashed
         deadband build (`MOTOR_MIN_DUTY 0.55`), wheels seized ~1.4-2.4 s into every
         command at crawl/mid duty — 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins
@@ -177,6 +272,12 @@ in this checkout.
         check here only applies while the legacy open-loop path is flashed. Under the
         PID, verify straight tracking directly (equal commanded wheel speeds → equal
         measured tick rates).
+      - **2026-09-21: straight tracking VERIFIED under the PID** — fwd 0.10 m/s
+        ×6 s: per-wheel cruise means L 0.104 / R 0.104 m/s (identical within
+        quantization), L/R equal through the whole ramp; a second fwd→rev run
+        showed L/R -0.097..-0.110 vs -0.089..-0.102 (≤±5%). Stray ticks [0,0],
+        trim 0.0. Remaining sub-items (crawl/spin re-validation) ride on the
+        smoothness-pass item above.
 - [ ] **Diagnose the web gateway's intermittent 1-9 s POST stalls** (they chop the
       10 Hz /drive stream → dead-man cut mid-drive → stop → lurch on recovery —
       manual-driving feel depends on this as much as the firmware): 2026-09-20
@@ -276,7 +377,11 @@ in this checkout.
         `mode: "client"` in unit_exec.sh) so every declaration routes through the
         router exactly like the ESP32's — client-mode sessions demonstrably
         propagate. Also: the ros2 CLI's persistent DAEMON caches a stale graph —
-        always `ros2 daemon stop` before trusting a CLI graph view.
+        always `ros2 daemon stop` before trusting a CLI graph view, and a bare
+        ssh `ros2` runs under **fastrtps** (the CLI daemon's default RMW) which
+        sees NOTHING on the zenoh island — "Unknown topic" is the wrong-RMW
+        symptom, not proof of absence; export `RMW_IMPLEMENTATION=rmw_zenoh_cpp`
+        first (hit live 2026-09-21 while hunting the /cmd_vel publisher list).
 
 ## Open — dev-PC / scripts
 

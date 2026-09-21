@@ -35,6 +35,7 @@ class _FakeNode:
         self._eul = (0.0, 0.0, 0.0)
         self._cmd_vel = (0.0, 0.0)
         self._susp = (False, False)
+        self.lds_hold_calls = []   # (on/off) sequence, from the idle-controller hold
         self._params = {"vision_bumper_cmd_eps": _FakeParam(0.02),
                         "interference_lds_rpm": _FakeParam(300.0),
                         "interference_motor_ang": _FakeParam(0.3)}
@@ -50,6 +51,9 @@ class _FakeNode:
 
     def set_param_json(self, d):
         pass
+
+    def lds_hold(self, on):
+        self.lds_hold_calls.append(bool(on))
 
     def get_logger(self):
         return self
@@ -106,6 +110,9 @@ def test_status_advances_and_finishes(monkeypatch):
     assert st["active"] is False
     assert st["phase"] == "done"
     assert len(st["results"]) == 4            # baseline + lds + fan + led
+    # The LDS idle controller must be held for the run and released afterward
+    # (the lds phase publishes /lds_target_rpm itself and can't be fought).
+    assert n.lds_hold_calls == [True, False]
 
 
 def test_picked_up_refuses(monkeypatch):
@@ -114,6 +121,7 @@ def test_picked_up_refuses(monkeypatch):
     n._susp = (True, False)
     r = t.start()
     assert "error" in r and "picked up" in r["error"]
+    assert n.lds_hold_calls == []             # refused before the run: no hold
 
 
 def test_driven_refuses(monkeypatch):

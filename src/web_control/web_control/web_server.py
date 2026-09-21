@@ -279,6 +279,18 @@ class WebServerNode(Node):
         self.declare_parameter("vision_glare_derate", 0.0)           # blob confidence *= 1-k*highlight_fraction (0 = off)
         self.declare_parameter("vision_approach_rate", 0.5)          # motion growth (/s) above this = approaching
         self.declare_parameter("vision_approach_band", 0.25)         # AND motion centred within +-this of frame centre
+        # LDS idle spin-down controller (telemetry.py's _lds_ctrl_tick, 1 Hz, always
+        # on): owns /lds_target_rpm and parks the spin motor after `lds_idle_secs`
+        # without commanded motion (/cmd_vel — teleop, Nav2, canned moves, skills) or
+        # an active Nav2 goal. The web Lidar card's Spin slider sets the remembered
+        # spin-when-active rpm (lds_active_rpm is just the boot default); a manual
+        # topic post holds the topic for `lds_manual_secs` before the controller
+        # takes it back. A physically jammed rotor is protected firmware-side
+        # (main.cpp's LDS_JAM_* guard + /lds_jam) — this side only decides spin/park.
+        self.declare_parameter("lds_idle_enable", True)
+        self.declare_parameter("lds_idle_secs", 60.0)     # s of quiet before the spin-down
+        self.declare_parameter("lds_manual_secs", 300.0)  # s a manual post owns the topic
+        self.declare_parameter("lds_active_rpm", 300.0)   # boot spin-when-active rpm
         # Named colour-target palette: calibrations persist here and survive a restart
         # (previously a picked colour was lost on every stack restart).
         self.declare_parameter("vision_targets_path", "")   # "" -> ~/.local/state/nanobot/vision_targets.json
@@ -1482,6 +1494,9 @@ class WebServerNode(Node):
             if topic == "/lds_target_rpm":
                 rpm = clamp(float(val), 0.0, 400.0)
                 pub.publish(Float32(data=rpm))
+                # Latch the manual window so the LDS idle controller (telemetry.py)
+                # doesn't re-assert its own setpoint over the skill's request.
+                self.telemetry.note_lds_manual(rpm)
                 return True, "/lds_target_rpm=%.0f" % rpm
             if topic == "/cmd_vel":
                 v = val if isinstance(val, dict) else {}
