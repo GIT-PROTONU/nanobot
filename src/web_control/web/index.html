@@ -154,8 +154,8 @@
             </div>
             <div class="field"><label>Canned speed <span id="moveLinV">0.12</span> m/s</label>
               <input id="moveLin" type="range" min="0.05" max="0.4" step="0.01" value="0.12"></div>
-            <div class="field"><label>Canned turn <span id="moveAngV">0.50</span> rad/s</label>
-              <input id="moveAng" type="range" min="0.1" max="0.8" step="0.05" value="0.5"></div>
+            <div class="field"><label>Canned turn <span id="moveAngV">0.80</span> rad/s</label>
+              <input id="moveAng" type="range" min="0.1" max="0.8" step="0.05" value="0.8"></div>
             <p class="hint">Drag the joystick to drive (speed scales with how far you push),
               or use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrow keys on a keyboard.
               Release or <kbd>Space</kbd> stops. Publishes <b>/cmd_vel</b>. <b>Drive</b> /
@@ -2999,12 +2999,18 @@ async function pollScan(){
 // view is up AND the tab is visible — every poll is an HTTP round-trip the board serves
 // from /dev/shm, so there's no point hammering it when nobody's looking at the lidar.
 // Off-view we still tick ~1 Hz to keep the header scan-Hz / pts readouts alive; when the
-// tab is backgrounded we stop entirely.
-let scanTick=0;
+// tab is backgrounded we stop entirely. The lidar view polls at 5 Hz (the scan's own
+// rate — the scan blob updates ~5 Hz, so faster fetches are no-op seq skips) with an
+// overlap guard: a fetch slower than the interval must NOT spawn a pile-up of concurrent
+// fetches (gateway thread/GIL churn while driving = the intermittent POST stalls).
+let scanTick=0, scanBusy=false;
 setInterval(()=>{
-  if(document.hidden) return;
-  if(curHeroView==="lidar" || (++scanTick % 12)===0) pollScan();
-},80);
+  if(document.hidden || scanBusy) return;
+  if(curHeroView==="lidar" || (++scanTick % 5)===0){   // off-view ~1 Hz header refresh
+    scanBusy=true;
+    Promise.resolve(pollScan()).finally(()=>{ scanBusy=false; });
+  }
+},200);
 function onOdom(o){
   const [x,y,yaw]=o;
   $("px").textContent=x.toFixed(2); $("py").textContent=y.toFixed(2);

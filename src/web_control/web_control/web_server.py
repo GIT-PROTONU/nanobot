@@ -138,6 +138,9 @@ MOVE_DECEL_A = 0.12          # m/s^2 sqrt(2*a*r) approach ramp into the finish b
 MOVE_TURN_MIN_W = 0.05       # rad/s floor while |err| > tol (else the P law crawls forever)
 MOVE_ODOM_MAX_AGE = 1.0      # s   /odom older than this = feed lost, abort
 MOVE_BROWSER_GRACE = 5.0     # s   SSE clients gone this long = browser-dead-man abort
+BRAKE_GRACE = 1.0            # s   keepalive keeps publishing {0,0} after a stop so the
+                             #     firmware's PID brakes (see _drive_loop) instead of the
+                             #     ESP dead-man's unpowered coast
 # Live-tunable cruise/turn caps (Drive card sliders, GET/POST /move/config; persisted
 # to move_settings_path). The turn ceiling mirrors drive_max_ang — the SLAM rotation-
 # smear budget (a turn at w rad/s blurs each 0.2 s lidar scan by w*0.2 rad).
@@ -541,6 +544,7 @@ class WebServerNode(Node):
         self._drive_lock = threading.Lock()
         self._drive_v = self._drive_w = 0.0
         self._drive_at = 0.0                            # monotonic of last POST; 0 = idle
+        self._zero_until = 0.0                          # braked-stop grace window end (see BRAKE_GRACE)
         self._last_drive_log = 0.0                      # throttle for the /drive log line
         self._cpu_quick_at = 0.0                        # memo TTL for _cpu_percent_quick
         self._cpu_quick_val = 0.0
@@ -563,7 +567,7 @@ class WebServerNode(Node):
         self.declare_parameter("move_max_dist", 5.0)    # m  clamp on POST /move dist
         self.declare_parameter("move_max_deg", 720.0)   # deg clamp on POST /move deg
         self.declare_parameter("move_lin_speed", 0.12)  # m/s cruise for canned drives
-        self.declare_parameter("move_ang_speed", 0.5)   # rad/s cap for canned turns
+        self.declare_parameter("move_ang_speed", 0.8)   # rad/s cap for canned turns
         self.declare_parameter("move_turn_kp", 2.5)     # w = kp * yaw_err (1/s)
         self.declare_parameter("move_timeout", 45.0)    # s hard abort for a maneuver
         self.declare_parameter("move_settings_path", "")  # "" = ~/.local/state/nanobot/move.json
@@ -817,6 +821,9 @@ class WebServerNode(Node):
         with self._drive_lock:
             self._drive_v, self._drive_w = v, w
             self._drive_at = time.monotonic() if (v or w) else 0.0
+            if not (v or w):
+                # explicit stop: arm the braked-stop grace window (see _drive_loop)
+                self._zero_until = time.monotonic() + BRAKE_GRACE
         # ANY explicit /drive POST — including {0,0} from the STOP button / tab-hide —
         # takes over from a canned move (the maneuver keeps feeding _drive_at, so the
         # keepalive's own dead-man can't stop it; only cancel or finish can).
@@ -849,7 +856,16 @@ class WebServerNode(Node):
         link to the ESP32 chokes the zenoh serial transport (tiny UART RX FIFO on
         the coprocessor) — deliveries decay and the wheels stall mid-drive
         (measured 2026-09-20; 3 Hz cruises, 10 Hz decays). The ESP32's
-        CMD_TIMEOUT_MS is 500 ms, so 300 ms keeps it comfortably fed."""
+        CMD_TIMEOUT_MS is 500 ms, so 300 ms keeps it comfortably fed.
+
+        Braked stop (2026-09-21): after the command goes zero (explicit {0,0} POST
+        or the dead-man), keep publishing the zero for BRAKE_GRACE s before going
+        idle. Going idle immediately meant the ESP's 500 ms cmd watchdog cut DUTY
+        (an unpowered coast) — a 0.05 m/s crawl rolled ~1.4 s / ~7 cm past the stop
+        (blip-test 2026-09-21). With the cmd kept fresh at zero, the firmware's PID
+        actively brakes (kp on the negative error + integrator unwind) and the
+        parked-bleed resets state at rest — a firm stop in ~0.3 s instead.
+        Serial cost: 3-4 extra frames per stop, nothing against the budget."""
         try:
             os.nice(-5)             # best-effort per-thread priority bump (Linux nice
         except (PermissionError, OSError):   # is per-thread; unprivileged = EPERM)
@@ -858,12 +874,16 @@ class WebServerNode(Node):
         while not self._drive_stop.wait(0.3):
             with self._drive_lock:
                 if not self._drive_at:
-                    continue
-                stale = time.monotonic() - self._drive_at > timeout
-                if stale:
-                    self._drive_v = self._drive_w = 0.0
-                    self._drive_at = 0.0
-                v, w = self._drive_v, self._drive_w
+                    if time.monotonic() >= self._zero_until:
+                        continue
+                    v = w = 0.0                    # grace window: keep braking
+                else:
+                    stale = time.monotonic() - self._drive_at > timeout
+                    if stale:
+                        self._drive_v = self._drive_w = 0.0
+                        self._drive_at = 0.0
+                        self._zero_until = time.monotonic() + BRAKE_GRACE
+                    v, w = self._drive_v, self._drive_w
             self._publish_drive(v, w)                      # a stale drive publishes one stop
 
     # ---- canned moves (POST /move) --------------------------------------------

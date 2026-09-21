@@ -495,6 +495,84 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   an in-process SIGUSR1 faulthandler dumps every app_hub thread's stack (see
   docs/TODO.md);
   the keepalive half of that problem is fixed (see the HTTP teleop note below).
+  **2026-09-21 smoothness pass II (FLASHED + VERIFIED 2026-09-21 pm)** — two more
+  structural changes in the PID block, plus a tuning-harness `outback` mode:
+  (6) **ADAPTIVE velocity filter (`WHEEL_VEL_FILT_MAX 8` / `WHEEL_VEL_QUANT 0.25`)**
+  replaces the fixed 2-window average: per-window tick deltas go into a ring and the
+  velocity is the average of the last N windows, N re-picked EVERY tick so the 1-tick
+  quantization step (1/(N·dt) m/s) stays ≤0.25× the wheel's moving setpoint — crawl
+  (0.05 m/s) gets N=4 (step 0.010 vs the fixed-2 0.021), turn wheels (±w·0.051 m/s)
+  get N=5-8, fast cruise keeps N=2 (lag still matters there). The ring is zeroed on the
+  jump guard AND on a commanded-direction flip (its entries carry the OLD sign
+  convention). This is the anti-chatter fix: kp injects duty ripple ∝ kp×step, and the
+  step now scales WITH the setpoint instead of being a fixed 0.021 m/s floor.
+  (7) **Stiction-aware I-term (`WHEEL_STUCK_FRAC 0.30` / `WHEEL_I_WIND_RATE 1.2
+  duty/s`)**: while a wheel is commanded but |meas| < 0.30×|tgt_s| (fighting static
+  friction), the I-CONTRIBUTION (ki·integ, duty units) may move at most 1.2 duty/s —
+  the tuned ki=60 turns a 0.05 m/s crawl error into 3 duty/s of push, a hammer that
+  breaks away violently, overshoots, re-sticks (the stick-slip limit cycle); a rate-
+  capped ramp breaks away firmly instead. Integration is UNRESTRICTED while tracking or
+  braking (stuck=false there — |meas| ≥ 0.30×|tgt|), so stopping/normal control are
+  untouched; conditional integration + the 1/ki clamp still apply. No new state (the
+  cap recomputes from ki·integ inside `wheelPid`, which gained a `stuck` arg).
+  **`scripts/pid_tune.py outback`** — the in-place test mode (fwd leg → 1.2 s settle →
+  reverse leg, optional alternating ±spin legs; the robot nets ~zero travel, walls stay
+  far away): per-leg mean/p2p/stall + **breakaway seconds** (first 3 ticks after the leg
+  command, ~0.2 s SSE resolution) + **distance** (fwd ≈ |rev| symmetry check) + a
+  **freeze/deadman detector** (both-wheels-frozen ≥0.4 s while commanded = the 500 ms cmd
+  watchdog's stop+re-breakaway signature — an input-delivery failure the controller can
+  never tune away; controller-level stick-slip never fully freezes).
+  **2026-09-21 trace diagnosis (ticktrace probe, live robot): the residual stutter is a
+  PLANT-level stick-slip limit cycle, not dead-man resets and not gains.** A 15 s crawl
+  at 0.05 m/s (and 8 s at 0.12) shows NO mid-leg freezes (serial/dead-man ruled out at
+  the 3.3 Hz keepalive) but rhythmic speed dips (12 → 7-8 ticks per 0.2 s SSE frame) in
+  0.4-0.6 s clusters every ~1 s, both wheels together, at BOTH speed bands — the wheel
+  seizes between I-term surges as carpet static friction re-engages. A/B'ing KI 60 → 30
+  live changed the shape, not the amplitude (and stretched breakaway past 1 s) — so
+  gains are not the fix. **The pass-II answer at the plant level is a stiction DITHER**
+  (`WHEEL_DITHER 0.05` duty, `WHEEL_DITHER_IN 0.02` / `WHEEL_DITHER_FADE 0.15` m/s
+  gates, toggled every `WHEEL_DITHER_TICKS 2` PID windows ≈12.5 Hz): a small alternating
+  duty keeps the gear mesh micro-moving so static friction never re-engages; added
+  OUTSIDE the PID (the integrator never sees it), zero when parked or cmd-stale.
+  Live-tunable via **/motor_params id 6** (0..0.2, 0 = off, NVS key "dith", readback in
+  /wheel_params — so the amplitude is tunable from the web Coprocessor card's future
+  slider or `pid_tune.py params --set 6=0.05` without a reflash). **VERDICT (2026-09-21
+  pm A/B on hardware): the dither was COUNTERPRODUCTIVE — at dither 0.05 the crawl p2p
+  read 0.016-0.018 (pure injected ripple) vs 0.007 with it OFF, and spins showed no
+  benefit either; the setting is now id 6 = 0** (the mechanism stays compiled-in and
+  live-tunable for future experiments; the adaptive filter + rate-limited I alone beat
+  both the baseline and the dither).
+  **PASS-II VERIFIED NUMBERS (in-place outback suite, dither off): crawl 0.05 m/s
+  p2p 0.007 (~2× better than the pre-pass-II baseline 0.011-0.013), instant clean
+  breakaway; 0.12 m/s p2p 0.018-0.037 (baseline's worst rung 0.060 gone); 10+ fwd→rev
+  transitions with ZERO lunge events → the linear lunge guard was retired (maxlin
+  restored 0.4; the flip-stale-ring zero held); no ESP drops across the whole suite.**
+  REMAINING (flash pending): spin-band SAG — mean 0.024-0.034 vs 0.041 at ±0.8 rad/s =
+  the rate-limited I recovering spin-band stick-slip slowly, so **`WHEEL_I_WIND_RATE`
+  was raised 1.2 → 2.5 duty/s** (built; re-verify spins after the next flash).
+  **Web-side pressure fix (same session): the page's /scan.bin poll ran every 80 ms on
+  the lidar hero view (the DEFAULT view while driving) = 12.5 fetches/s against ~5 Hz
+  data — 60% no-op fetches churning the gateway. Now 200 ms (5 Hz = the data rate) with
+  an overlap guard (`scanBusy`) so a slow fetch can't pile up concurrent fetches; the
+  off-view header refresh stays ~1 Hz. This is a candidate contributor to the
+  intermittent 1-9 s POST stalls felt as manual-drive stutter/lag.**
+- **GOTCHA — the ESP32 NVS gains/params DRIFT (found 2026-09-21): the documented "tuned"
+  values are only true if the LAST tuning session parked cleanly.** A `gains --set`/
+  `params --set` writes NVS rate-limited while parked — an abandoned session leaves
+  whatever it last set. The board was live on **KP 6.8 / KI 10.0 / maxlin 0.15 /
+  maxang 0.3** (an old session) — i.e. the firmware was clamping every drive to 0.15 m/s
+  and every turn to 0.3 rad/s, the spin legs wouldn't break away at all (KI 10 vs the
+  needed 60), and "turning is slow" was mostly THIS, not the web slider. FIRST check the
+  readback before diagnosing smoothness: `pid_tune.py state` (wheel_pid + wheel_params
+  ids 3/4 must read 5/60/0 + 0.4/0.8). Restored live via `gains --set 5,60,0` +
+  `params --set 3=0.4,4=0.8` (2026-09-21; the rate-limited while-parked save re-persists
+  them). The canned-turn default was also raised **`move_ang_speed` 0.5 → 0.8**
+  (web_server.py + robot.yaml + the Drive-card slider placeholder — 0.8 = the accepted
+  w·0.2 rad/scan smear ceiling, same as drive_max_ang, and doubles the turn wheels'
+  per-wheel speed out of the stickiest PID regime); NOTE the board's persisted
+  `~/.local/state/nanobot/move.json` WINS over robot.yaml defaults on boot — the live
+  value was bumped to 0.8 via POST /move/config (persists there too). A 90° canned turn
+  measured 90.2° physical in 3.56 s after the change (turntest probe).
 - **The wheel-encoder scale was 5.7× WRONG (found + fixed 2026-09-20, live-verified
   by rollout).** The PID's first tuning session exposed it: "0.06 m/s" cruises with
   duty pinned at 1.0 are impossible for this drivetrain — a user-measured rollout
@@ -1079,7 +1157,14 @@ reliable"). Rebuilt as THREE coordinated pieces:
   dead-manned the drive mid-motion (stop → lurch on recovery). rclpy publishers are
   thread-safe; the thread only touches the lock-protected (v,w) state + publish(),
   gets a best-effort `os.nice(-5)`, and is joined in `destroy_node`. The dev
-  harness accepts it as a no-op.
+  harness accepts it as a no-op. **Braked stop (2026-09-21): after the command goes
+  zero (explicit `{0,0}` POST or the dead-man), the keepalive keeps publishing the
+  zero for `BRAKE_GRACE` (1.0 s) before going idle — going idle immediately meant the
+  ESP's 500 ms cmd watchdog cut DUTY (an unpowered coast): a 0.05 m/s crawl rolled
+  ~1.4 s / ~7 cm past the stop (blip-test). With the cmd kept fresh at zero the
+  firmware's PID actively brakes (kp on the negative error + integrator unwind +
+  the parked-bleed reset at rest) — a firm ~0.3 s stop. Serial cost: 3-4 extra
+  frames per stop.**
 - **Canned moves (`POST /move` {"dist" m, "deg" deg, "cancel"?}, added 2026-09-21):**
   relative, /odom-feedback maneuvers (drive N metres — signed, then rotate N°) for
   the Drive card's two numeric fields beside the joystick. **No new /cmd_vel
@@ -1313,6 +1398,7 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 ## Gotchas
 
 - **`stack.sh restart` is unreliable** — can leave stale processes holding ports. Clean `down` → verify via `/proc` → `up`.
+- **A hung `nano-nav-loader` oneshot blocks the whole `nano-robot.target` start job** (seen 2026-09-21: an interrupted `systemctl restart` left the loader's `nav2.launch.py load_only` waiting on a mid-bounce router forever; the target's start job sat in "start waiting" behind it). The loader is a plain user process — `pkill -f nav2.launch.py` clears the block (CAREFUL: quote the pattern so the ssh shell's own cmdline doesn't match — the AGENTS plink gotcha applies over ssh too), then `sudo -n systemctl start nano-robot.target`. NOTE the sudoers rules are EXACT-command matches: `systemctl start nano-robot.target` is allowed, `--no-block` appended makes sudo ask for a password.
 - **A missing `/dev/shm/nano_nogo.bin` right around a restart is teardown, not a bug** — during a `deploy.sh`/`stack.sh restart` window the old processes + the `user@1000` session teardown transiently remove blobs (even a hand-created dummy `/dev/shm/nano_nogo.bin` vanished within that window). Nothing in code deletes it (no `os.remove`/`unlink`/`os.replace` to that path anywhere; tmpfiles.d/crons/timers are clean). Re-check once the stack is quiet before hunting a "deleter" — the blob persists indefinitely after a clear once settled. See `web-map-clear-buttons-nogo` memory.
 - **`brain_timeout` must stay well above `reflect_period`** (invariant: timeouts shorter than the reflection gap cause the chart to revert accumulated drift).
 - **Heavy data paths bypass the ROS graph and the SSE frame:** `/scan.bin` (+ the other `nano_*` blobs) live in `/dev/shm` and are served over HTTP; `/map` is served by the `GET /map` HTTP route (telemetry holds a transient-local sub to slam_toolbox). (rosbridge was removed 2026-07-06 — there is no bridge at all.)
@@ -1329,6 +1415,8 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **Low-duty turn commands can stall the wheels** — in-place turns map to tiny per-wheel speeds (±0.04 m/s at 0.5 rad/s) whose duty can stop the motors ~0.5-1 s in (wheels AND body both freeze mid-command; encoder counts + IMU plateau together). This is a drive-power issue, separate from sensing. The 2026-09-19 drive test sharpened it: with the flashed `MOTOR_MIN_DUTY 0.55` deadband the wheels still seized 1.4-2.4 s into EVERY command at 0.12 m/s, 0.25 m/s AND 0.5 rad/s spins (constant ~0.60-0.83 remapped duty), recovering only on a direction change — the firmware breakaway kick + 0.70 floor (above; flashed 2026-09-20) is the fix. Scripted teleop (`POST /drive`) still needs ~10 Hz re-POSTs; my 2026-09-19 test loop (~0.4 s period) kept `/cmd_vel` alive via web_server's 10 Hz re-assert, so freezes were real stalls, not cmd-timeouts.
 - **`config/robot.yaml` is the single config source** — all ports, pins, rates, LLM params live there. Its `slam_nav:` block uses the ROS param layout (`slam_nav.ros__parameters.<name>`). Indentation must match sibling keys exactly: a block one space off parses as a *nested map* and the whole `slam_nav` section silently returns `None` to nav_node (only the in-code default saves you). Always sanity-check with `python3 -c "import yaml,sys; print(yaml.safe_load(open('src/robot_bringup/config/robot.yaml'))['slam_nav']['ros__parameters']['recover_min_seen'])"` after editing, and remember the running stack reads it via the `build/ → src/` symlink, not a copied install.
 - **ESP32 link can wedge after a stack restart and needs a PHYSICAL power cycle** — after `stack.sh down/up` the coprocessor may never re-attach to the router's serial link (`/dev/ttyS1`): `esp32 DOWN: no heartbeat ever received`, `/wheel_ticks` silent, LDS motor dead (ESP32 drives its PID), scans stop. Service restarts, full `nano-robot.target` restarts, even a board `sudo systemctl reboot` do NOT reliably recover it — the firmware's auto-recovery watchdogs (`LINK_CONNECT_DEADLINE_MS`, `LINK_RX_TIMEOUT_MS` in `firmware/nanobot_coprocessor/src/main.cpp`) apparently can't re-sync a wedged UART. Symptom chain when it happens: `esp32 DOWN` → `lds DOWN: lidar not spinning` → `wheel_ticks SILENT` → map `feeds.scan: -1`. Diagnosis: `journalctl -u nano-sensors.service | grep -i esp32`, and confirm the router holds the fd (`ls -l /proc/$(pgrep -f zenohd-serial)/fd | grep ttyS1`). Fix = unplug/replug the ESP32's power. After a successful power cycle it comes back on its own (`esp32 UP after …`, `/wheel_ticks resumed`, `lds UP`), and `lds_idle_enable=false` via `/param` (or a Spin-slider drag) wakes the lidar if the idle controller has it parked. **2026-09-20 variant (open, see docs/TODO.md): a SNEAKIER partial wedge** — after a router restart the session re-attaches (heartbeat/ticks/LDS all flow) and SOME subscriptions still deliver (`/motor_pid` write→`/wheel_pid` readback flips), but **`/cmd_vel` specifically goes deaf** (observed with the web keepalive, `ros2 topic pub`, AND raw zenoh puts on the exact keyexpr) while a full ESP32 reboot restores it. **2026-09-21 firmware fix (FLASHED 2026-09-21 — deployed + robot live)**: the firmware now periodically (45 s, `SUB_REDECLARE_MS`) undeclares + re-declares ALL subscriptions (`SUBS` table + `subsRedeclare()` in main.cpp), refreshing the router's remote-sub table in place — the deaf window is bounded at ≤45 s and the workaround above dies once flashed. VERIFY after a few router restarts: /cmd_vel revives within ≤45 s if dropped (tracked in docs/TODO.md). Note for the next pico-API edit: zenoh-pico's Arduino build defines `ZENOH_C_STANDARD=99`, which compiles the `z_move`/`z_call` _Generic macros out — use the explicit generated functions (`z_subscriber_move()`, like the existing `z_config_move()`).
+  **2026-09-21 pm VERIFICATION — the redeclare fix FAILED its verify; the reliable heal is the ping-watchdog reboot.** After the smoothness-pass-II flash + a `deploy.sh web_control` (full stack restart), the robot drove NOWHERE for minutes: ESP session half-attached (hb/ticks/LDS-flowing, `nano_esp32` visible as the /wheel_ticks publisher), but the router wasn't routing SBC→ESP at all — and the 45 s redeclare (which printed `subs re-declared (10)` on the console every period) did NOT revive delivery over that half-dead session. Diagnosis chain, all motion-free: gateway journal shows POST /drive landed → `ros2 topic info /cmd_vel -v` on the board shows only behavior+web_control subs → the console (USB) shows the ESP believes all is well. **Heal that worked (no power cycle): `sudo -n systemctl restart nano-robot.target` → pings stop → the ESP's own LINK_RX watchdog (8 s) esp_restart()s → fully fresh session BOTH ends → console shows clean boot + `zenoh CONNECTED` + `subs re-declared`, no declare failures.** Motion-free RX proof: POST `/motor_params [6, <current dither>]` (a physical no-op) → the console prints `drive params … saved to NVS` within ~10 s = the ESP received a put (telemetry's id gate had to widen to 0..6 first). LESSON: after any stack/router bounce, if the robot ignores /drive but hb/ticks flow, bounce the target once (a forced clean ESP re-handshake) before suspecting firmware or motors; the USB console + a no-op param echo discriminates without moving a wheel.
+  **2026-09-21 pm II — redeclare DISABLED + drop triage is now remote.** The load-correlated ESP drops (deaf legs → ping-watchdog esp_restart, ~every test run) landed ON redeclare moments and the burst had already failed its one job, so `SUB_REDECLARE_MS` is now **0 (off)** — `subsRedeclare()` remains compiled for manual reuse. The firmware now publishes **`/esp32_reset` (Int32, 1 Hz, `esp_reset_reason()`)**: after ANY drop, `ros2 topic echo /esp32_reset` triages it — 9=brownout (power), 3=SW (the ping watchdog), 4/5/6=panic (code), 1/2=power-on/external — no console needed. (Context: the user reported "didn't have this problem before the PID update"; with battery+regs declared good and connections reseated, the open suspects are motor-noise coupling into the ESP feed/UART2 (the known ground-bounce family) vs the redeclare burst — the latter is now gone and `/esp32_reset` will attribute the next drop definitively. Same session: a full BOARD reboot also happened during power fiddling.)
 - **`plink -m` on Windows:** the script text becomes the shell's argv. `pkill -f` patterns can kill the controlling shell. Fix: `pscp` script, run by path.
 - **ESP32 firmware:** PlatformIO from dev PC (`pio run -t upload`). Don't build on the board. Tunables are `#define`s at top of `src/main.cpp`.
 - **Deploy soul overwrite:** `DEPLOY_SOUL=1` pushes `memory/` personality to the board, discarding evolved drift. Default is `DEPLOY_SOUL=0` (keep the robot's soul) — matching deploy.sh.

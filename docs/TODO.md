@@ -65,11 +65,14 @@ in this checkout.
       via the commanded-direction tick signing until the wheel physically stops —
       the "instant 0.38 m/s" fwd→rev repro). VERIFY after flash: 5× fwd→rev
       transitions at 0.1 m/s + a ≥5 min drive soak with no lunge, and rejects
-      visible on the debug serial when noise hits. **SAFETY STATE LEFT IN PLACE:
-      `/motor_params` ids 3/4 (maxlin/maxang) were clamped to 0.15 m/s / 0.3 rad/s
-      (2026-09-21, live POST, NVS-persists while parked — survives reboot!);
-      restore with `POST /publish /motor_params [3, 0.4, 4, 0.8]` (or
-      `pid_tune.py params --set 3=0.4,4=0.8`) once the guard is flashed.** KFF
+      visible on the debug serial when noise hits. **SAFETY STATE 2026-09-21 (pm
+      session): maxlin back to 0.15 m/s (the lunge is a LINEAR full-duty event —
+      this clamp is its guard) but maxang restored to 0.8 rad/s (the user's
+      "turning is slow" was mostly the stale 0.3 NVS clamp + the 0.5 canned-turn
+      default; spins/transitions in 8 outback legs fired no lunge with 0.8 live).
+      Re-set via `pid_tune.py params --set 3=0.15,4=0.8`; the smoothness-pass-II
+      flash (zeroes the flip-stale velocity RING) is the real fix — re-verify the
+      5× fwd→rev transition check after flashing, then restore maxlin 0.4.** KFF
       recomputes on param change so the PID still regulates correctly at the lower
       clamp. Related hardware follow-up (not started): the noise SOURCE itself —
       fan/LDS/drive PWM vs the ttyS1 routing (same family as the earlier
@@ -99,7 +102,32 @@ in this checkout.
       - gains note: live gains read **[5, 50, 0]** (the user's deliberate KI
         60→50 change) and **survived an in-session ESP32 self-reset reboot** —
         gains NVS persistence verified end-to-end. separation id2 **0.102** also
-        survived (NVS OK).
+        survived (NVS OK). **pm session 2026-09-21: gains found drifted back to
+        [6.8, 10.0, 0] (abandoned-session NVS writes — see the AGENTS.md gotcha)
+        and maxlin/maxang at the lunge-guard 0.15/0.3; restored [5, 60, 0] +
+        0.15/0.8 via pid_tune.py (verify survived the NEXT flash/reboot).**
+- [ ] **Flash + verify the 2026-09-21 smoothness pass II** (**FLASHED 2026-09-21 pm**
+      — adaptive velocity filter + stiction-aware I-term + DITHER; gains NVS
+      survived the flash: 5/60/0 + params incl. dith id 6 = 0.05. The post-flash
+      "robot drove nowhere" event was the ESP32 half-attached-session wedge (NOT
+      the firmware) — see the AGENTS.md gotcha: healed by a target bounce
+      (ping-watchdog ESP reboot), RX proven motion-free via a no-op
+      /motor_params echo. **2026-09-21 pm VERIFICATION (on battery, in-place
+      outback suite): crawl 0.05 p2p 0.007 — ~2x BETTER than the pre-flash
+      baseline (0.011-0.013) with the DITHER OFF (dither 0.05 measured p2p
+      0.016-0.018 = pure added ripple, zero spin benefit -> dith id 6 = 0 is
+      the setting; it stays live-tunable); 0.12 band p2p 0.018-0.037 vs
+      baseline 0.011-0.060 (worst outlier gone), fwd≈|rev| distances clean,
+      NO lunge across 10+ fwd→rev transitions -> maxlin restored 0.4
+      (lunge guard retired — the flip-stale-ring fix held). NO ESP drops
+      during the whole suite (/esp32_reset stable). REMAINING: spin-band
+      SAG (mean 0.024-0.034 vs 0.041 at ±0.8 rad/s) = the rate-limited
+      I-term recovering spin-band stick-slip slowly — WHEEL_I_WIND_RATE
+      1.2 → 2.5 built, FLASH PENDING (30 s tether); then re-verify spins.
+      The braked-stop keepalive fix is deployed (firm stops).**) Pre-flash
+      baselines for reference (2026-09-21 pm, tuned 5/60/0, maxlin guard
+      0.15 for the linear runs): crawl 0.05 p2p 0.011-0.013; spin 0.8 p2p
+      0.014-0.032 SAG (mean 0.036-0.038 vs 0.041); straight 0.12 p2p 0.011-0.060.
 - [ ] **Map-vs-room alignment + wheel-odometry scale, validated on open floor**
       (from the AGENTS.md 2026-09-11 "map still skews" thread — the matcher-side
       causes were fixed there, and the slam_nav matcher itself is gone since the

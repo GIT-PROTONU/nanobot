@@ -242,7 +242,7 @@ class TelemetryHub:
             "/motor_pid": (pub(Float32MultiArray, "motor_pid", 5), self._mk_motor_pid),
             # Live drivetrain parameters (id,value) pairs — scale/geometry, NO reflash:
             # 0 ticks_per_rev, 1 wheel_radius_m, 2 wheel_separation_m, 3 max_linear_ms,
-            # 4 max_angular_rads, 5 target_slew. Readback on /wheel_params (f.esp.wheel_params).
+            # 4 max_angular_rads, 5 target_slew, 6 dither. Readback on /wheel_params (f.esp.wheel_params).
             "/motor_params": (pub(Float32MultiArray, "motor_params", 5), self._mk_motor_params),
             # ESP32 line lasers 1-2 (GPIO 23/32): [v1,v2] PWM 0..255 each.
             "/laser_pwm": (pub(Int32MultiArray, "laser_pwm", 5), self._mk_laser),
@@ -784,22 +784,23 @@ class TelemetryHub:
     def _on_wheel_params(self, msg):
         # Float32MultiArray (id,value)-pair readback of the ESP32's live drivetrain
         # parameters — ids: 0 ticks_per_rev, 1 wheel_radius, 2 wheel_separation,
-        # 3 max_linear, 4 max_angular, 5 target_slew (see firmware g_tpr block).
+        # 3 max_linear, 4 max_angular, 5 target_slew, 6 stiction dither amplitude
+        # (see firmware set_param). Keep in step with the firmware's pair count.
         d = list(msg.data) if msg.data else []
-        self._wheel_params = ([round(float(x), 5) for x in d[:12]]
+        self._wheel_params = ([round(float(x), 5) for x in d[:14]]
                               if len(d) >= 2 and len(d) % 2 == 0 else None)
 
     @staticmethod
     def _mk_motor_params(v):
-        # (id,value) pairs for /motor_params: flat even-length list, at most 6 pairs,
-        # ids 0..5. Values are clamped firmware-side; here we only sanity-gate the shape.
-        if not isinstance(v, (list, tuple)) or not v or len(v) % 2 or len(v) > 12:
-            raise ValueError("expected a flat (id,value) pair list, max 6 pairs")
+        # (id,value) pairs for /motor_params: flat even-length list, at most 7 pairs,
+        # ids 0..6. Values are clamped firmware-side; here we only sanity-gate the shape.
+        if not isinstance(v, (list, tuple)) or not v or len(v) % 2 or len(v) > 14:
+            raise ValueError("expected a flat (id,value) pair list, max 7 pairs")
         out = []
         for i in range(0, len(v), 2):
             pid, val = int(v[i]), float(v[i + 1])
-            if not 0 <= pid <= 5:
-                raise ValueError(f"param id {pid} out of range 0..5")
+            if not 0 <= pid <= 6:
+                raise ValueError(f"param id {pid} out of range 0..6")
             out.extend([float(pid), val])
         return Float32MultiArray(data=out)
 

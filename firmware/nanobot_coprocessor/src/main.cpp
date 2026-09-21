@@ -146,7 +146,9 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // breaks away in <0.5 s without stick-slip hunting (halve KI if it oscillates), then KP
 // for stiffness (~0.5*KFF to start); KD stays 0 (tick quantization noise at 50 Hz makes
 // D jittery). KP=KI=0 is feedforward only — it will NOT crawl (the stiction remap is
-// gone), so never flash this path with both zero.
+// gone), so never flash this path with both zero. The adaptive velocity filter +
+// WHEEL_I_WIND_RATE (both above) already damp the two classic stutter sources —
+// feedback-quantization chatter and the I-term breakaway hammer.
 #define WHEEL_PID_ENABLED 1
 #define WHEEL_RADIUS      0.0335f   // m  (matches robot.yaml wheel_odometry.wheel_radius)
 #define TICKS_PER_REV     253.0f    // counts/wheel-rev as the ESP emits them (matches odom).
@@ -155,13 +157,18 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
                                     // /odom + the PID's velocity world fictional; drive was
                                     // healthy all along, full duty = ~0.37 m/s loaded).
 #define WHEEL_PID_HZ      50        // PID rate; longer window than the 100 Hz loop => less tick-quantization noise
-// Feedback smoothing: average the tick delta over the last TWO PID windows (40 ms) before
-// feeding the PID. One tick per 20 ms window is a 0.042 m/s quantization step (1202
-// ticks/m) — at a 0.05 m/s crawl that is 83% of the setpoint, so the raw per-window
-// feedback makes kp chatter the duty (±0.1 ripple = stick-slip excitation). The 2-window
-// average halves the step (0.021 m/s) for one window (~20 ms) of extra measurement lag.
-// 0 = raw per-window velocity (the pre-2026-09-21 behaviour).
-#define WHEEL_VEL_FILT    1
+// Feedback smoothing, ADAPTIVE (2026-09-21 smoothness pass II): per-window tick deltas go
+// into a ring buffer and the velocity is the average of the last N windows, where N is
+// chosen EACH TICK so the 1-tick quantization step (1/(N*dt) m/s) stays under
+// WHEEL_VEL_QUANT of the moving setpoint — fast command -> short filter (lag matters),
+// crawl -> long filter (the single-window step is 0.042 m/s (1202 ticks/m), 83% of a
+// 0.05 m/s crawl, and even the fixed 2-window average left 0.021 m/s of step that kp=5
+// turned into ±0.1 duty chatter = the felt stutter; N=4 at 0.05 m/s crushes it to
+// 0.010 m/s). Wheels in a spin see per-wheel targets of only ±w*sep/2, so they
+// automatically get the longest filter — that is what makes turns smooth too.
+// Never below 2 windows (the raw single window was the pre-2026-09-21 behaviour).
+#define WHEEL_VEL_FILT_MAX 8       // ring capacity = max averaged windows (8 * 20 ms = 160 ms)
+#define WHEEL_VEL_QUANT   0.25f    // keep the quantization step <= this fraction of |setpoint|
 // Full-scale wheel speed at duty=1 (the per-wheel max from the clamps above); KFF maps a
 // target m/s to the baseline duty the I-term corrects from.
 #define WHEEL_KFF   (1.0f/(MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f))
@@ -169,6 +176,32 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define WHEEL_KI    8.0f            // crawl breakaway <0.5 s (0.12 m/s stall -> +0.7 duty in ~0.46 s)
 #define WHEEL_KD    0.0f
 #define WHEEL_INTEG_MAX 1.0f        // anti-windup: integral clamp (duty units via KI)
+// Stiction-aware I-term (2026-09-21 smoothness pass II): while a wheel is COMMANDED but
+// badly lagging its setpoint (WHEEL_STUCK_FRAC), the tuned ki=60 turns a 0.05 m/s crawl
+// error into 60*0.05 = 3 duty/s of I-term push — a hammer that breaks the wheel away
+// violently, overshoots (nothing re-loads static friction as gently as a slow push) and
+// re-sticks: the stick-slip limit cycle. Capping how fast the I-CONTRIBUTION (ki*integ,
+// duty units) may move while stuck turns breakaway into a firm ~1 s ramp; integration is
+// UNRESTRICTED while the wheel is tracking or braking (stuck is false there), so
+// stopping and normal control are untouched.
+#define WHEEL_STUCK_FRAC  0.30f     // |meas| < frac*|tgt| while commanded = fighting stiction
+#define WHEEL_I_WIND_RATE 2.5f      // duty/s cap on the I-term ramp while stuck (2026-09-21:
+                                    // 1.2 measured too slow to recover spin-band stick-slip —
+                                    // turn SAG 0.036 -> 0.029 m/s mean; 2.5 keeps the ramp but
+                                    // halves the recovery lag. Re-verify spins after flash.)
+// Stiction DITHER (2026-09-21 smoothness pass II — the plant-level anti-stick-slip fix).
+// Traced on hardware 2026-09-21 (ticktrace at 0.05 + 0.12 m/s): steady cruise dips 12 -> 7
+// ticks/frame in 0.4-0.6 s clusters every ~1 s, both wheels together — the wheel SEIZES
+// between I-term surges (carpet static friction re-engages) and KI 30 vs 60 changed
+// nothing: it is the plant, not the gains. A small ALTERNATING duty keeps the gear mesh
+// micro-moving so static friction never fully re-engages — the classic servo dither.
+// Output-side only (added to the PID result, the integrator never sees it), gated:
+// fades in above WHEEL_DITHER_IN of setpoint, out by WHEEL_DITHER_FADE, zero when parked
+// or cmd-stale. Toggled every WHEEL_DITHER_TICKS PID windows (~12.5 Hz at 50 Hz PID).
+#define WHEEL_DITHER       0.05f    // duty amplitude (0 = off); live via /motor_params id 6
+#define WHEEL_DITHER_IN    0.02f    // m/s: full dither once |setpoint| passes this
+#define WHEEL_DITHER_FADE  0.15f    // m/s: fade out by here (higher speeds track smoothly)
+#define WHEEL_DITHER_TICKS 2
 // Command shaping: the per-wheel SETPOINT is slewed (m/s per s) before the PID — smooths
 // accel without lagging the loop (slewing the PID OUTPUT would add loop lag + integral
 // windup). ~the old open-loop 3.0 duty/s feel at the 0.464 m/s full scale.
@@ -378,7 +411,8 @@ static float             g_pid_saved[3];      // last values written to NVS (Cor
 // error units just changed meaning). Defaults are the defines above; both build paths
 // share cmd_cb's clamps/diff-drive, so this block is unconditional.
 static volatile float    g_tpr = TICKS_PER_REV, g_wrad = WHEEL_RADIUS, g_wsep = WHEEL_SEPARATION,
-                         g_maxlin = MAX_LINEAR_SPEED, g_maxang = MAX_ANGULAR_SPEED, g_slew = WHEEL_TGT_SLEW;
+                         g_maxlin = MAX_LINEAR_SPEED, g_maxang = MAX_ANGULAR_SPEED, g_slew = WHEEL_TGT_SLEW,
+                         g_dither = WHEEL_DITHER;
 static volatile float    g_tpm = TICKS_PER_REV/(2.0f*3.14159265f*WHEEL_RADIUS);   // derived: ticks/meter
 static volatile float    g_kff = WHEEL_KFF;                                       // derived: duty per m/s
 static volatile bool     g_par_save = false; // cb -> 1 Hz block: params changed, NVS write pending
@@ -398,6 +432,7 @@ static bool set_param(int id, float v){   // clamp + assign; false = unknown id
     case 3: g_maxlin= clampf(v, 0.05f,  2.0f); break;
     case 4: g_maxang= clampf(v, 0.05f,  5.0f); break;
     case 5: g_slew  = clampf(v, 0.05f, 10.0f); break;
+    case 6: g_dither= clampf(v, 0.0f,   0.20f); break;
     default: return false;
   }
   return true;
@@ -409,6 +444,9 @@ static Preferences       g_prefs;          // NVS handle (namespace "nano", key 
 static float             g_trim_saved = 0; // last value written to NVS (Core 1 only)
 static volatile float    g_temp = 0;
 static volatile int32_t  g_hall = 0;
+static volatile int32_t  g_reset_reason = 0;   // esp_reset_reason() latched at boot, pub @1 Hz
+                                               // (1=poweron 2=ext 3=sw 4=panic 5=int_wdt
+                                               // 6=task_wdt 9=brownout — remote drop triage)
 static volatile bool     g_susp_l = false, g_susp_r = false;
 static volatile bool     g_led = false, g_led_dirty = false;
 static volatile uint32_t g_last_ping_ms = 0;   // last /esp32_ping rx (runtime liveness watchdog)
@@ -517,7 +555,7 @@ static void declare_lv(const char* topic, const char* type, int eid){
 
 // one publisher + its rmw attachment identity
 struct ZPub { z_owned_publisher_t p; int64_t seq; uint8_t gid[16]; };
-static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim, P_pid, P_params, P_jam;
+static ZPub P_ticks, P_strayTicks, P_suspL, P_suspR, P_temp, P_hall, P_rpm, P_hz, P_duty, P_hb, P_trim, P_pid, P_params, P_jam, P_rst;
 
 // Single source of truth for every publisher: topic/type, the attachment GID tag
 // (last GID byte, unique per publisher) and the liveliness entity id (lv_eid). The
@@ -532,6 +570,7 @@ static const PubDef PUBS[] = {
   { &P_suspL, "left_wheel_suspended",  T_BOOL, 2, 2, false },
   { &P_suspR, "right_wheel_suspended", T_BOOL, 3, 3, false },
   { &P_temp,  "esp32_temp",            T_F32,  4, 4, false },
+  { &P_rst,   "esp32_reset",           T_I32, 15, 15, false },
   { &P_hall,  "esp32_hall",            T_I32,  5, 5, false },
   { &P_hb,    "esp32_heartbeat",       T_I32,  9, 6, false },
   { &P_rpm,   "lds_rpm",               T_F32,  6, 7, true  },
@@ -742,7 +781,13 @@ static bool zenohConnect();
 // (entity leak: the fresh declare supersedes; the old entity dies with the session).
 // The 45 s period bounds the worst deaf window at 45 s, and a single re-declare
 // burst (~10 small serial round-trips) is nothing against the 500 ms cmd watchdog.
-#define SUB_REDECLARE_MS 45000
+// DISABLED 2026-09-21 pm: the live verification FAILED — after a full stack restart
+// the ESP half-attached (hb/ticks flowed, /cmd_vel dead for 30+ min) and the burst
+// re-declared every 45 s over the dead session WITHOUT healing it; worse, the two
+// load-correlated ESP drops (2026-09-21 pm) landed ON redeclare moments. The
+// reliable heal is the ping-watchdog esp_restart() (LINK_RX_TIMEOUT_MS) — a fully
+// fresh session both ends. Set 0 = off; subsRedeclare() stays for manual reuse.
+#define SUB_REDECLARE_MS 0
 struct SubDef { const char* topic; const char* type; void (*cb)(z_loaned_sample_t*, void*); };
 static const SubDef SUBS[] = {
   { "cmd_vel",       T_TWIST, cmd_cb },
@@ -840,11 +885,13 @@ static void zenohTask(void*){
 
     // Periodic subscription re-declare (see SUB_REDECLARE_MS at the SUBS table):
     // the only known healing path for a router whose remote-sub table was wiped by
-    // a restart while our session kept flowing.
+    // a restart while our session kept flowing. (DISABLED — see SUB_REDECLARE_MS.)
+#if SUB_REDECLARE_MS
     if (t_subdecl && now - t_subdecl >= SUB_REDECLARE_MS){
       t_subdecl = now;
       subsRedeclare();
     }
+#endif
 
     uint8_t buf[80];                                        // 64 needed by the /wheel_params readback
     if (now - t_ticks >= 66){                                // wheel_ticks @~15 Hz (was
@@ -881,15 +928,18 @@ static void zenohTask(void*){
       zpub_put(P_temp, buf, cdr_f32(buf, g_temp));
       zpub_put(P_hall, buf, cdr_i32(buf, g_hall));
       zpub_put(P_hb,   buf, cdr_i32(buf, ++hb));
+      zpub_put(P_rst,  buf, cdr_i32(buf, (int32_t)g_reset_reason));  // boot reason, 1 Hz —
+                                     // readable remotely after ANY drop (brownout vs watchdog vs panic)
       zpub_put(P_suspL,buf, cdr_bool(buf, g_susp_l));
       zpub_put(P_suspR,buf, cdr_bool(buf, g_susp_r));
       zpub_put(P_trim, buf, cdr_f32(buf, g_trim));
 #if WHEEL_PID_ENABLED
       zpub_put(P_pid,  buf, cdr_f32arr3(buf, g_wkp, g_wki, g_wkd));
       {   // /wheel_params readback: (id,value) pairs, same layout /motor_params writes
-        float pv[12]; int k=0;
+        float pv[14]; int k=0;
         pv[k++]=0; pv[k++]=g_tpr;   pv[k++]=1; pv[k++]=g_wrad;  pv[k++]=2; pv[k++]=g_wsep;
         pv[k++]=3; pv[k++]=g_maxlin; pv[k++]=4; pv[k++]=g_maxang; pv[k++]=5; pv[k++]=g_slew;
+        pv[k++]=6; pv[k++]=g_dither;
         zpub_put(P_params, buf, cdr_f32arr_n(buf, pv, k));
       }
 #endif
@@ -978,19 +1028,28 @@ static void ldsControl(float dt){
 #if WHEEL_PID_ENABLED
 // Per-wheel velocity PID: feedforward + PI(+D) with conditional integration + clamp.
 // Gains are the LIVE g_wkp/g_wki/g_wkd (defaults = the defines; see motor_pid_cb).
+// `stuck` (caller-computed, see WHEEL_STUCK_FRAC) rate-limits the I-term's duty-slew
+// while the wheel fights stiction — no extra state, the cap recomputes from ki*integ.
 struct WPid { float integ, prev; };
-static float wheelPid(WPid& st, float tgt, float meas, float dt){
+static float wheelPid(WPid& st, float tgt, float meas, float dt, bool stuck){
   float err = tgt - meas;
   float deriv = dt>0 ? (err - st.prev)/dt : 0; st.prev = err;
+  float imax = g_wki > 1.0f ? 1.0f/g_wki : WHEEL_INTEG_MAX;
+  // Clamp scaled to the LIVE ki so the I-term alone can never exceed full duty: the
+  // fixed WHEEL_INTEG_MAX=1.0 was sized for ki~8 — at the tuned ki=60 one wound
+  // integrator held ±60 duty of authority, so a stop-parked brake bias could lurch the
+  // wheel on the next command before the loop could unwind it. 1/ki caps it at ±1 duty.
   float u = g_kff*tgt + g_wkp*err + g_wki*st.integ + g_wkd*deriv;
   float duty = clampf(u,-1,1);
   if (duty == u){   // integrate only when not saturated (anti-windup)
-    // Clamp scaled to the LIVE ki so the I-term alone can never exceed full duty: the
-    // fixed WHEEL_INTEG_MAX=1.0 was sized for ki~8 — at the tuned ki=60 one wound
-    // integrator held ±60 duty of authority, so a stop-parked brake bias could lurch the
-    // wheel on the next command before the loop could unwind it. 1/ki caps it at ±1 duty.
-    float imax = g_wki > 1.0f ? 1.0f/g_wki : WHEEL_INTEG_MAX;
-    st.integ = clampf(st.integ + err*dt, -imax, imax);
+    float ni = clampf(st.integ + err*dt, -imax, imax);
+    float it = g_wki*ni;
+    if (stuck && g_wki > 1e-6f){
+      float old = g_wki*st.integ, dmax = WHEEL_I_WIND_RATE*dt;
+      if (it - old > dmax)       { it = old + dmax; ni = it/g_wki; }
+      else if (old - it > dmax)  { it = old - dmax; ni = it/g_wki; }
+    }
+    st.integ = ni;
   }
   return duty;
 }
@@ -1020,6 +1079,11 @@ void setup(){
 
   Serial.begin(115200); delay(300);
   Serial.println("\n[nano] zenoh-pico coprocessor boot");
+  // Reset reason on every boot: distinguishes a clean esp_restart() watchdog reboot
+  // (ESP_RST_SW) from a brownout/power glitch (ESP_RST_BROWNOUT) / panic / WDT — the
+  // 2026-09-21 load-correlated drops need exactly this discriminator on the console.
+  Serial.printf("[nano] boot reset_reason=%d (1=poweron 2=ext 3=sw 4=panic 5=int_wdt 6=task_wdt 9=brownout)\n",
+                (int)esp_reset_reason());
 
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
   // SBC cooling fan PWM — off until the SBC link is alive (see FAN_BOOT_DUTY above).
@@ -1057,6 +1121,7 @@ void setup(){
   set_param(3, g_prefs.getFloat("maxlin",MAX_LINEAR_SPEED));
   set_param(4, g_prefs.getFloat("maxang",MAX_ANGULAR_SPEED));
   set_param(5, g_prefs.getFloat("slew",  WHEEL_TGT_SLEW));
+  set_param(6, g_prefs.getFloat("dith",  WHEEL_DITHER));
   recalc_drive_params();
   g_pid_saved[0]=g_wkp; g_pid_saved[1]=g_wki; g_pid_saved[2]=g_wkd;
   Serial.printf("[nano] wheel PID gains kp=%.3f ki=%.3f kd=%.3f (NVS)\n",
@@ -1080,6 +1145,7 @@ void setup(){
 #endif
 
   g_temp = temperatureRead(); g_hall = hallRead();   // seed telemetry so first pub isn't 0
+  g_reset_reason = (int32_t)esp_reset_reason();
   g_last_cmd_ms = millis();
   g_boot_ms = millis();                              // link-connect watchdog reference (see loop())
 #if LINK_RX_TIMEOUT_MS && LINK_FIRST_PING_DEADLINE_MS
@@ -1169,7 +1235,8 @@ void loop(){   // Core 1: real-time control
 #if WHEEL_PID_ENABLED
   static uint32_t last_wpid=0; static int32_t wp_l=0, wp_r=0; static WPid wpid_l{0,0}, wpid_r{0,0};
   static float l_tgt_s=0, r_tgt_s=0;                     // slewed setpoints (command shaping)
-  static int32_t wpd_l=0, wpd_r=0;                       // prev-window tick deltas (WHEEL_VEL_FILT)
+  static int32_t vring_l[WHEEL_VEL_FILT_MAX], vring_r[WHEEL_VEL_FILT_MAX];  // per-window tick deltas
+  static uint8_t vridx=0, vrcnt=0;                       // ring cursor + filled count
   static bool vel_seed=false;                            // first-tick baseline (see below)
   static int8_t l_dir_seen=1, r_dir_seen=1;              // last commanded wheel direction
   if (now-last_wpid >= (uint32_t)(1000/WHEEL_PID_HZ)){     // wheel velocity PID @WHEEL_PID_HZ
@@ -1181,32 +1248,53 @@ void loop(){   // Core 1: real-time control
                                                            // huge fake velocity and full-duty-
                                                            // jerk the first PID tick
     int32_t dl=l-wp_l, dr=r-wp_r; wp_l=l; wp_r=r;
-    if (fabsf((float)dl) > 3.0f*g_tpm*dt || fabsf((float)dr) > 3.0f*g_tpm*dt){
+    bool jump = fabsf((float)dl) > 3.0f*g_tpm*dt || fabsf((float)dr) > 3.0f*g_tpm*dt;
+    if (jump){
       // Counter discontinuity (POST /reset_ticks while parked, or wrap) — not motion:
       // re-seed instead of letting the PID see a fake ±m/s velocity spike and lurch.
-      dl = 0; dr = 0; wpd_l = 0; wpd_r = 0;
+      dl = 0; dr = 0;
+      vridx = 0; vrcnt = 0;                                // nothing in the ring is valid
     }
-#if WHEEL_VEL_FILT
-    // 2-window (40 ms) average — see WHEEL_VEL_FILT: one tick per 20 ms window is a
-    // 0.042 m/s quantization step; halving it halves the duty ripple kp injects at crawl.
-    g_left_vel  = (float)(dl+wpd_l)/(2.0f*dt*g_tpm);
-    g_right_vel = (float)(dr+wpd_r)/(2.0f*dt*g_tpm);
-#else
-    g_left_vel  = dl/g_tpm/dt;
-    g_right_vel = dr/g_tpm/dt;
-#endif
-    wpd_l=dl; wpd_r=dr;
+    // Ring push (zeros too — the filter is a moving average over the last N windows).
+    vring_l[vridx]=dl; vring_r[vridx]=dr;
+    vridx=(uint8_t)((vridx+1)%WHEEL_VEL_FILT_MAX);
+    if (vrcnt < WHEEL_VEL_FILT_MAX) vrcnt++;
+    // Adaptive window count (WHEEL_VEL_FILT_MAX/WHEEL_VEL_QUANT above): pick N so the
+    // 1-tick quantization step (1/(N*dt) m/s) stays <= WHEEL_VEL_QUANT of the wheel's
+    // moving setpoint — crawl/turn wheels get the longest filter (ripple crush), fast
+    // commands the shortest (lag). Capped by what's actually in the ring.
+    float qstep = 1.0f/(dt*g_tpm);                         // one window's quantization step
+    uint8_t nl = 2, nr = 2;
+    if (qstep > 0.0f){
+      float want = WHEEL_VEL_QUANT*fabsf(l_tgt_s);
+      if (want > 1e-5f) nl = (uint8_t)ceilf(qstep/want);
+      want = WHEEL_VEL_QUANT*fabsf(r_tgt_s);
+      if (want > 1e-5f) nr = (uint8_t)ceilf(qstep/want);
+    }
+    auto velAvg = [&](const int32_t* ring, uint8_t n){
+      uint8_t cnt = vrcnt < n ? vrcnt : n;
+      if (!cnt) cnt = 1;
+      int32_t s = 0;
+      for (uint8_t i=1; i<=cnt; i++)
+        s += ring[(uint8_t)((vridx + WHEEL_VEL_FILT_MAX - i) % WHEEL_VEL_FILT_MAX)];
+      return (float)s/(cnt*dt*g_tpm);
+    };
+    g_left_vel  = velAvg(vring_l, nl);
+    g_right_vel = velAvg(vring_r, nr);
     // Commanded-direction flip reset: single-channel ticks are signed by the COMMANDED
     // direction, so the instant a reverse command lands the still-forward-rolling wheel
     // reads as ALREADY moving the other way (fabricated vel) — kp*err then drives the OLD
     // direction at (near) full duty until friction stalls the wheel, with the
     // forward-wound integrator adding to it (pause, then lurch into reverse). Zero the
-    // PID state so the reversal starts from feedforward alone; the I-term rebuilds in the
-    // new direction. (True fix is the 2nd quadrature channel — see the header note.)
+    // PID state AND the delta ring (its entries still carry the OLD sign convention) so
+    // the reversal starts from feedforward alone; the I-term rebuilds in the new
+    // direction. (True fix is the 2nd quadrature channel — see the header note.)
     int8_t ld = (g_left_tgt  > 1e-4f) ?  1 : (g_left_tgt  < -1e-4f) ? -1 : l_dir_seen;
     int8_t rd = (g_right_tgt > 1e-4f) ?  1 : (g_right_tgt < -1e-4f) ? -1 : r_dir_seen;
-    if (ld != l_dir_seen){ l_dir_seen = ld; wpid_l.integ = 0; wpid_l.prev = 0; }
-    if (rd != r_dir_seen){ r_dir_seen = rd; wpid_r.integ = 0; wpid_r.prev = 0; }
+    if (ld != l_dir_seen){ l_dir_seen = ld; wpid_l.integ = 0; wpid_l.prev = 0;
+                           memset(vring_l, 0, sizeof(vring_l)); }
+    if (rd != r_dir_seen){ r_dir_seen = rd; wpid_r.integ = 0; wpid_r.prev = 0;
+                           memset(vring_r, 0, sizeof(vring_r)); }
     // Parked-at-zero bleed: the web keepalive re-asserts {0,0} forever, so the command
     // never goes stale and the dead-man never resets the integrators — but a stop leaves
     // integ wound NEGATIVE (braking unwinds it below zero), which then holds a small
@@ -1238,8 +1326,33 @@ void loop(){   // Core 1: real-time control
       float maxDv = g_slew*dt;
       l_tgt_s = slewTo(l_tgt_s, g_left_tgt,  maxDv);
       r_tgt_s = slewTo(r_tgt_s, g_right_tgt, maxDv);
-      g_left_duty  = wheelPid(wpid_l, l_tgt_s,  g_left_vel,  dt);
-      g_right_duty = wheelPid(wpid_r, r_tgt_s, g_right_vel, dt);
+      // Stiction detection (WHEEL_STUCK_FRAC): commanded but barely turning = the wheel
+      // is fighting static friction -> the PID ramps its I-term (rate-limited) instead
+      // of hammering; tracking/braking integrate freely.
+      bool l_stuck = fabsf(l_tgt_s) > 0.01f
+                     && fabsf(g_left_vel)  < WHEEL_STUCK_FRAC*fabsf(l_tgt_s);
+      bool r_stuck = fabsf(r_tgt_s) > 0.01f
+                     && fabsf(g_right_vel) < WHEEL_STUCK_FRAC*fabsf(r_tgt_s);
+      g_left_duty  = wheelPid(wpid_l, l_tgt_s,  g_left_vel,  dt, l_stuck);
+      g_right_duty = wheelPid(wpid_r, r_tgt_s, g_right_vel, dt, r_stuck);
+      // Stiction dither (see WHEEL_DITHER above): alternating ±duty added OUTSIDE the
+      // PID so the integrator never sees it. Per-wheel amplitude from that wheel's own
+      // setpoint (a spin commands ±0.04 m/s wheels — full dither — while a fast drive
+      // fades it out).
+      static uint8_t dticks = 0; static bool dphase = false;
+      if (++dticks >= WHEEL_DITHER_TICKS){ dticks = 0; dphase = !dphase; }
+      float ds = dphase ? 1.0f : -1.0f;
+      g_left_duty += ds * g_dither
+        * clampf(fabsf(l_tgt_s)/WHEEL_DITHER_IN, 0.0f, 1.0f)
+        * clampf(1.0f - fabsf(l_tgt_s)/WHEEL_DITHER_FADE, 0.0f, 1.0f);
+      g_right_duty += ds * g_dither
+        * clampf(fabsf(r_tgt_s)/WHEEL_DITHER_IN, 0.0f, 1.0f)
+        * clampf(1.0f - fabsf(r_tgt_s)/WHEEL_DITHER_FADE, 0.0f, 1.0f);
+      // Keep the commanded duty inside ±1 — the dither on a saturated PID output
+      // could read 1.03 on the debug line (writeSide clamps again; this is cosmetic
+      // and keeps the conditional-integration bookkeeping honest).
+      g_left_duty  = clampf(g_left_duty,  -1.0f, 1.0f);
+      g_right_duty = clampf(g_right_duty, -1.0f, 1.0f);
     }
   }
 #endif
@@ -1434,9 +1547,10 @@ void loop(){   // Core 1: real-time control
       g_prefs.putFloat("maxlin",g_maxlin);
       g_prefs.putFloat("maxang",g_maxang);
       g_prefs.putFloat("slew",  g_slew);
+      g_prefs.putFloat("dith",  g_dither);
       g_par_save = false;
-      Serial.printf("[nano] drive params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f saved to NVS\n",
-        (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew);
+      Serial.printf("[nano] drive params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f dith=%.2f saved to NVS\n",
+        (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew,(double)g_dither);
     }
 #endif
   }

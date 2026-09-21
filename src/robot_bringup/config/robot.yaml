@@ -342,7 +342,11 @@ web_control:
     # Keep move_ang_speed <= drive_max_ang: a turn at w rad/s smears each 0.2 s
     # lidar scan by w*0.2 rad (slam_toolbox 2.6.10 has no deskew).
     move_lin_speed: 0.12      # m/s cruise for canned drives
-    move_ang_speed: 0.5       # rad/s cap for canned turns
+    move_ang_speed: 0.8       # rad/s cap for canned turns (2026-09-21: was 0.5 — the
+                              # user found turns slow; 0.8 = the accepted smear ceiling,
+                              # same as drive_max_ang, and DOUBLE the per-wheel speed of
+                              # the stickiest PID regime (wheels ±w*0.051 m/s), so turns
+                              # are faster AND smoother)
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"

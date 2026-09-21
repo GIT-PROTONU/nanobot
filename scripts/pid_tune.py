@@ -13,6 +13,8 @@ the wire.
     pixi run python scripts/pid_tune.py --host http://192.168.178.141:8080 ladder
     pixi run python scripts/pid_tune.py --host ... ladder --vlist 0.05,0.1 --secs 8
     pixi run python scripts/pid_tune.py --host ... ladder --spin 0.5        # in-place
+    pixi run python scripts/pid_tune.py --host ... outback                  # fwd+rev+spin,
+    pixi run python scripts/pid_tune.py --host ... outback --v 0.12 --secs 5 --spin 0.8
     pixi run python scripts/pid_tune.py --host ... gains --set 1.1,45,0
     pixi run python scripts/pid_tune.py --host ... params --set 0=253,1=0.05
     pixi run python scripts/pid_tune.py --mock                             # offline self-test
@@ -37,6 +39,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 POST_HZ = 2.5          # /drive refresh rate (HTTP-side; the keepalive still owns /cmd_vel)
 STALL_WIN = 0.45       # s of zero tick movement while commanded = stall
 HUNT_FRAC = 0.25       # peak-to-peak speed above this x target = hunting
+SETTLE_S = 1.2         # s stop between outback legs (let the PID bleed out, park-bleed path)
+BRK_TICKS = 3          # cumulative ticks on one wheel = "broke away" (SSE frames are
+                       # ~0.2 s apart, so this is a coarse but comparable measure)
+DEAD_RUN_S = 0.4       # s of BOTH-wheels-frozen while commanded = dead-man/serial-loss
+                       # signature (the ESP32 cmd watchdog is 500 ms; a reset stops the
+                       # motors + zeroes the PID state -> a full re-breakaway the tuning
+                       # can never fix. Controller-level stick-slip never fully freezes.)
 
 
 class Telemetry:
@@ -161,9 +170,11 @@ class RunSampler:
         self.gap = max(self.gap, time.monotonic() - prev[0] if prev else 0.0)
 
     def score(self, target_mps, tpm):
-        """-> dict with mean speed, p2p, stall flags (ok=False if no tick data)."""
+        """-> dict with mean speed, p2p, stall flags, breakaway time + distance
+        (ok=False if no tick data)."""
         if not self.rows or not tpm:
-            return {"mean": None, "p2p": None, "stall": [False, False], "ok": False}
+            return {"mean": None, "p2p": None, "stall": [False, False],
+                    "brk": None, "dist": None, "ok": False}
         # per-0.5 s bucket speed (m/s) per wheel — single-tick deltas at crawl speeds
         # quantize hard (1 tick = ~1.2 mm), which would fake "hunting"; bucketing
         # averages it out
@@ -190,7 +201,100 @@ class RunSampler:
         both_frozen = self.gap > STALL_WIN
         stall = [both_frozen or abs(m) < 1e-3 for m in moved] if tail \
             else [both_frozen, both_frozen]
-        return {"mean": mean, "p2p": p2p, "stall": stall, "ok": True}
+        # breakaway: wall-clock from the leg's first row until either wheel has moved
+        # BRK_TICKS; distance travelled (mean |L|,|R| — outback legs are co-directional).
+        brk, cl, cr = None, 0, 0
+        for t, (dl, dr) in self.rows:
+            cl += dl; cr += dr
+            if brk is None and (abs(cl) >= BRK_TICKS or abs(cr) >= BRK_TICKS):
+                brk = t - self.rows[0][0]
+        dist = (abs(cl) + abs(cr)) / 2.0 / tpm
+        # dead-man/serial-loss signature: BOTH wheels frozen >= DEAD_RUN_S while the
+        # leg was commanded (the 500 ms ESP32 cmd watchdog = stop + full re-breakaway,
+        # which the controller can never tune away — it's an input-delivery failure).
+        # Stick-slip never fully freezes: ticks keep trickling at the crawl rate.
+        runs, run_t, run_mv = 0, 0.0, 0
+        max_run = 0.0
+        for dt, (dl, dr) in self.rows:
+            if abs(dl) + abs(dr) < 2:
+                run_t += dt; run_mv += abs(dl) + abs(dr)
+            else:
+                if run_t >= DEAD_RUN_S:
+                    runs += 1; max_run = max(max_run, run_t)
+                run_t, run_mv = 0.0, 0
+        if run_t >= DEAD_RUN_S:
+            runs += 1; max_run = max(max_run, run_t)
+        return {"mean": mean, "p2p": p2p, "stall": stall, "brk": brk,
+                "dist": dist, "dz": (runs, round(max_run, 2)), "ok": True}
+
+
+def _leg(gw, tel, v, w, secs, label, tgt, tpm):
+    """Drive one leg (POST-refresh loop like the ladder), score + print it."""
+    print(f"-- leg {label} for {secs:.1f} s ...")
+    s = RunSampler(tel)
+    t_end = time.monotonic() + secs
+    try:
+        gw.drive(v, w)
+        while time.monotonic() < t_end:
+            gw.drive(v, w)                    # refresh the dead-man (~2.5 Hz)
+            s.sample(min(0.4, max(0.05, t_end - time.monotonic())))
+    finally:
+        gw.drive(0.0, 0.0)
+    r = s.score(tgt, tpm)
+    if not r["ok"]:
+        print("   ?? no tick data — telemetry/ESP link down?")
+        return r
+    stall = "".join(("L" if r["stall"][0] else "") + ("R" if r["stall"][1] else "")) or "-"
+    mean = r["mean"] if r["mean"] is not None else float("nan")
+    p2p = max(r["p2p"]) if r["p2p"] else 0.0
+    brk = r["brk"] if r["brk"] is not None else float("nan")
+    dz, dzmax = r["dz"] if r["ok"] else (0, 0.0)
+    flags = []
+    if stall != "-":
+        flags.append(f"STALL({stall})")
+    if mean < tgt * 0.75:
+        flags.append("SAG")
+    if p2p > HUNT_FRAC * max(tgt, 1e-6):
+        flags.append("HUNT")
+    if dz:
+        flags.append(f"DEADMAN({dz}x{dzmax:.1f}s)")
+    print(f"   mean {mean:+.3f} m/s (target {tgt:+.3f}), p2p {p2p:.3f}, "
+          f"brk {brk:.2f} s, dist {r['dist']:.3f} m, stall {stall}, "
+          f"freeze {dz}x/{dzmax:.1f}s"
+          f" -> {'OK' if not flags else ' '.join(flags)}")
+    return r
+
+
+def run_outback(gw, tel, v, secs, reps, spin, spin_secs=None):
+    """IN-PLACE test: forward leg -> settle -> reverse leg (net travel ~0), plus
+    alternating +/− spins so the robot never approaches a wall. Each leg is scored
+    (mean/p2p/stall) and the direction FLIP is timed (breakaway seconds after the
+    reverse command) — reversals are where single-channel ticks + the flip reset
+    used to lurch. Wheel speeds during spin legs = w*sep/2 (the slowest, stickiest
+    PID regime — exactly the turn-smoothness regime)."""
+    e = tel.esp()
+    tpm = ticks_per_meter(e)
+    if tpm is None:
+        print("  !! /wheel_params readback missing (is the coprocessor up?) — "
+              "scoring in ticks/s only")
+    p = e.get("wheel_params") or []
+    pd = {int(p[i]): p[i + 1] for i in range(0, len(p) - 1, 2)}
+    sep = pd.get(2, 0.102)
+    if spin and not spin_secs:
+        spin_secs = min(secs, 4.0)
+    for rep in range(reps):
+        if reps > 1:
+            print(f"== rep {rep + 1}/{reps}")
+        _leg(gw, tel, v, 0.0, secs, f"fwd {v:+.2f} m/s", abs(v), tpm)
+        time.sleep(SETTLE_S)
+        _leg(gw, tel, -v, 0.0, secs, f"REV {v:.2f} m/s", abs(v), tpm)
+        time.sleep(SETTLE_S)
+        if spin:
+            tgt = abs(spin) * sep / 2.0
+            for sg in (1, -1):
+                _leg(gw, tel, 0.0, sg * spin, spin_secs,
+                     f"spin {sg * spin:+.2f} rad/s (wheels ±{tgt:.3f})", tgt, tpm)
+                time.sleep(SETTLE_S)
 
 
 def run_ladder(gw, tel, speeds, secs, reverse=False, spin=None):
@@ -332,6 +436,12 @@ def main():
     lad.add_argument("--reverse", action="store_true")
     lad.add_argument("--spin", type=float, default=None, metavar="RAD_S")
     lad.add_argument("--repeat", type=int, default=1, help="runs per rung (flakiness)")
+    ob = sub.add_parser("outback", help="IN-PLACE fwd/rev/spin legs (walls stay far away)")
+    ob.add_argument("--v", type=float, default=0.12, help="leg speed m/s")
+    ob.add_argument("--secs", type=float, default=5.0, help="seconds per drive leg")
+    ob.add_argument("--reps", type=int, default=1, help="full fwd/rev(+spin) cycles")
+    ob.add_argument("--spin", type=float, default=0.0, metavar="RAD_S",
+                    help="alternating spin legs after the drives (0 = skip)")
     sub.add_parser("state", help="print wheel_pid/wheel_params/ticks readback")
     g = sub.add_parser("gains", help="set/show live PID gains")
     g.add_argument("--set", default=None, metavar="KP,KI,KD")
@@ -367,6 +477,17 @@ def main():
             print("set_params ->", gw.set_params(pairs))
         time.sleep(1.0)
         show_state(gw, tel)
+        return 0
+    if args.cmd == "outback":
+        try:
+            run_outback(gw, tel, args.v, args.secs, args.reps, args.spin)
+        except KeyboardInterrupt:
+            print("\n[interrupted] stopping")
+        finally:
+            try:
+                gw.drive(0.0, 0.0)                 # ALWAYS land stopped
+            except Exception:
+                pass
         return 0
     if args.cmd == "ladder":
         try:
