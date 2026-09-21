@@ -122,6 +122,79 @@ SKILL_MOTION_LIN_MAX = 0.15                    # m/s   cap on a skill's commande
 SKILL_MOTION_ANG_MAX = 0.8                     # rad/s cap on a skill's commanded yaw rate
 SKILL_MOTION_DUR_MAX = 3.0                     # s     cap on /cmd_vel drive time before auto-stop
 
+# ---- Canned moves (POST /move {"dist" m, "deg" deg}) --------------------------------
+# Odom-feedback relative maneuvers (drive N metres / rotate N degrees) for the web
+# Drive card. They do NOT add a /cmd_vel publisher: the maneuver thread only rewrites
+# the same lock-protected (v,w) state the /drive keepalive publishes at ~3.3 Hz (the
+# serial budget to the ESP32 — see _drive_loop), at a 10 Hz control rate, and lets the
+# keepalive own every byte that goes on the wire. Feedback is /odom (wheel-integrated,
+# true units since the 2026-09-20 ticks/metre fix) read from the telemetry hub's lazy
+# subscription — the browser that POSTs /move keeps it alive for the maneuver's life.
+MOVE_CTRL_HZ = 10.0          # maneuver control tick (state rewrite only, no publishes)
+MOVE_DIST_TOL = 0.015        # m   finish band (~19 encoder ticks at 253 tpr / 5 cm wheels)
+MOVE_TURN_TOL = 0.03         # rad finish band (~1.7°)
+MOVE_DECEL_A = 0.12          # m/s^2 sqrt(2*a*r) approach ramp into the finish band
+MOVE_TURN_MIN_W = 0.05       # rad/s floor while |err| > tol (else the P law crawls forever)
+MOVE_ODOM_MAX_AGE = 1.0      # s   /odom older than this = feed lost, abort
+MOVE_BROWSER_GRACE = 5.0     # s   SSE clients gone this long = browser-dead-man abort
+
+
+def _wrap_angle(a):
+    """Wrap to (-pi, pi]."""
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _maneuver_step(st, pose):
+    """One canned-move control tick (PURE — unit-tested in test_maneuver.py).
+
+    st (mutated): {"phase": "drive"|"turn", "dist": signed m (0 = skip),
+      "deg": signed deg (0 = skip), "x0","y0","th0": phase-start pose snapshot,
+      "v_max": m/s, "w_max": rad/s, "turn_kp": 1/s, "e0": |initial yaw err| rad}
+    pose: current (x, y, yaw) from /odom.
+
+    Returns (v, w, done, progress 0..1, err):
+      drive phase — progress along the phase-start heading (projection, so trim
+      veer doesn't pad the distance), trapezoid decel into MOVE_DIST_TOL;
+      turn phase — P law on the wrapped yaw error toward th0 + radians(deg),
+      clamped to w_max with a MOVE_TURN_MIN_W floor, done inside MOVE_TURN_TOL.
+    """
+    x, y, yaw = pose
+    if st["phase"] == "drive":
+        target = abs(st["dist"])
+        if target <= 0.0:                          # turn-only maneuver: skip the drive
+            st["phase"] = "turn"
+            st["x0"] = st["y0"] = st["th0"] = None  # th0=None: snapshot the turn-start yaw
+            return _maneuver_step(st, pose)
+        if st["x0"] is None:                       # first tick of the drive: snapshot
+            st["x0"], st["y0"], st["th0"] = x, y, yaw
+        u = st["th0"]
+        # signed along-heading progress (sign(dist): a backward drive's projection
+        # is negative in the world frame — measure it along the drive direction)
+        d = math.copysign(1.0, st["dist"]) * (
+            (x - st["x0"]) * math.cos(u) + (y - st["y0"]) * math.sin(u))
+        r = target - d
+        if r <= MOVE_DIST_TOL:
+            st["phase"] = "turn"
+            st["x0"] = st["y0"] = st["th0"] = None
+            return _maneuver_step(st, pose)
+        v = math.copysign(min(st["v_max"], math.sqrt(2.0 * MOVE_DECEL_A * r)),
+                          st["dist"])
+        return v, 0.0, False, min(1.0, max(0.0, d / target)), r
+
+    # turn phase
+    if st["th0"] is None:                          # first tick of the turn: snapshot
+        st["th0"] = yaw
+        st["e0"] = abs(math.radians(st["deg"]))
+    err = _wrap_angle(st["th0"] + math.radians(st["deg"]) - yaw) if st["deg"] else 0.0
+    if abs(err) <= MOVE_TURN_TOL:
+        return 0.0, 0.0, True, 1.0, err
+    w = st["turn_kp"] * err
+    w = max(-st["w_max"], min(st["w_max"], w))
+    if abs(w) < MOVE_TURN_MIN_W:
+        w = math.copysign(MOVE_TURN_MIN_W, err)
+    prog = 1.0 - abs(err) / st["e0"] if st["e0"] > 1e-9 else 0.0
+    return 0.0, w, False, max(0.0, min(1.0, prog)), err
+
 class WebServerNode(Node):
     def __init__(self):
         super().__init__("web_control")
@@ -457,6 +530,28 @@ class WebServerNode(Node):
             target=self._drive_loop, name="drive-keepalive", daemon=True)
         self._drive_thread.start()
 
+        # ---- canned moves (POST /move): drive N m / rotate N deg ----------------
+        # The maneuver thread only REWRITES the keepalive's (v,w) state at 10 Hz
+        # (see MOVE_* constants + _maneuver_step); the keepalive thread stays the
+        # sole /cmd_vel publisher, so the serial budget is untouched. /odom feeds
+        # the loop via the telemetry hub's (browser-lazy) subscription.
+        self.declare_parameter("move_max_dist", 5.0)    # m  clamp on POST /move dist
+        self.declare_parameter("move_max_deg", 720.0)   # deg clamp on POST /move deg
+        self.declare_parameter("move_lin_speed", 0.12)  # m/s cruise for canned drives
+        self.declare_parameter("move_ang_speed", 0.5)   # rad/s cap for canned turns
+        self.declare_parameter("move_turn_kp", 2.5)     # w = kp * yaw_err (1/s)
+        self.declare_parameter("move_timeout", 45.0)    # s hard abort for a maneuver
+        self._man_lock = threading.Lock()               # guards _man_req + _man_cancel
+        self._man_req = None                            # pending request dict (move())
+        self._man_cancel = False                        # joystick/STOP/cancel flag
+        self._man_running = False                       # a maneuver is executing
+        self._maneuver_state = {"active": False, "phase": "idle"}   # SSE snapshot
+        self._man_wake = threading.Event()
+        self._man_stop = threading.Event()
+        self._man_thread = threading.Thread(
+            target=self._man_loop, name="canned-moves", daemon=True)
+        self._man_thread.start()
+
         # ---- Stress test mode (POST /stress/start|stop, GET /stress/status) -----------
         # Deliberately loads every CPU core to validate the hardening tier (systemd
         # watchdogs, MemoryMax, the fan curve) under real load — see stress.py for why
@@ -685,12 +780,20 @@ class WebServerNode(Node):
         with self._drive_lock:
             self._drive_v, self._drive_w = v, w
             self._drive_at = time.monotonic() if (v or w) else 0.0
+        # ANY explicit /drive POST — including {0,0} from the STOP button / tab-hide —
+        # takes over from a canned move (the maneuver keeps feeding _drive_at, so the
+        # keepalive's own dead-man can't stop it; only cancel or finish can).
+        with self._man_lock:
+            takeover = self._man_running
+            self._man_cancel = True
         # Diagnosability: log the first non-zero /drive after an idle stretch (the hot
         # path runs ~10 Hz while driving, so a throttle keeps the log readable while a
         # single "who drove the robot" line still answers the question).
         if (v or w) and time.monotonic() - self._last_drive_log > 2.0:
             self._last_drive_log = time.monotonic()
-            self.get_logger().info(f"POST /drive v {v:.2f} w {w:.2f} (web teleop)")
+            self.get_logger().info(
+                f"POST /drive v {v:.2f} w {w:.2f} (web teleop"
+                + (" — canned move taken over" if takeover else "") + ")")
         return {"status": "ok", "v": v, "w": w}
 
     def _publish_drive(self, v, w):
@@ -725,6 +828,137 @@ class WebServerNode(Node):
                     self._drive_at = 0.0
                 v, w = self._drive_v, self._drive_w
             self._publish_drive(v, w)                      # a stale drive publishes one stop
+
+    # ---- canned moves (POST /move) --------------------------------------------
+    def move(self, data):
+        """POST /move {"dist": signed m, "deg": signed deg, "cancel"?: bool}: queue a
+        relative, /odom-feedback maneuver (drive then turn). Only ONE runs at a time —
+        a new request replaces a running one. Responds immediately; progress rides the
+        SSE frame's f.move (telemetry passthrough of _maneuver_state)."""
+        with self._man_lock:
+            if data.get("cancel"):
+                self._man_cancel = True
+                self.get_logger().info("POST /move cancel (canned move)")
+                return {"status": "cancelling"}
+            try:
+                dist = min(self.get_parameter("move_max_dist").value,
+                           max(-self.get_parameter("move_max_dist").value,
+                               float(data.get("dist", 0.0))))
+                deg = min(self.get_parameter("move_max_deg").value,
+                          max(-self.get_parameter("move_max_deg").value,
+                              float(data.get("deg", 0.0))))
+            except (TypeError, ValueError):
+                return {"error": "dist/deg must be numbers"}
+            if not (dist or deg):
+                return {"error": "dist and deg are both zero"}
+            if self.telemetry._goal_status in ("planning", "navigating", "canceling"):
+                return {"error": f"Nav2 is {self.telemetry._goal_status} — cancel the goal first"}
+            if self.telemetry._odom is None:
+                return {"error": "/odom not flowing (is wheel_odometry up?)"}
+            if self._man_running:
+                self._man_cancel = True     # a new request REPLACES the running one —
+            else:                           # the loop breaks it, then services this one
+                self._man_cancel = False    # fresh run
+            self._man_req = {
+                "dist": dist, "deg": deg,
+                "v_max": float(self.get_parameter("move_lin_speed").value),
+                "w_max": float(self.get_parameter("move_ang_speed").value),
+                "turn_kp": float(self.get_parameter("move_turn_kp").value),
+                "timeout": float(self.get_parameter("move_timeout").value),
+            }
+        self._man_wake.set()
+        self.get_logger().info(
+            f"POST /move dist {dist:+.2f} m deg {deg:+.0f} (canned move)")
+        return {"status": "started", "dist": dist, "deg": deg}
+
+    def _man_loop(self):
+        """One daemon thread servicing queued maneuvers (10 Hz control tick, see
+        MOVE_CTRL_HZ). Never touches the ROS executor or publishes /cmd_vel itself —
+        it only rewrites the /drive keepalive's shared (v,w) state, and hands the
+        final stop back to the keepalive by arming its stale path."""
+        while not self._man_stop.is_set():
+            if not self._man_wake.wait(timeout=0.5):
+                continue
+            self._man_wake.clear()
+            with self._man_lock:
+                req, self._man_req = self._man_req, None
+            if req is not None:
+                try:
+                    self._run_maneuver(req)
+                except Exception as e:             # never let the thread die silently
+                    self.get_logger().error(f"canned move crashed: {e!r}")
+                    with self._man_lock:
+                        self._man_cancel = True    # stop whatever it was commanding
+                    self._man_finish("error", {"error": repr(e)})
+
+    def _run_maneuver(self, req):
+        odo = self.telemetry._odom
+        if odo is None:
+            return self._man_finish("failed", {"error": "/odom not flowing"})
+        with self._man_lock:
+            self._man_running = True
+        st = {"phase": "drive", "dist": req["dist"], "deg": req["deg"],
+              "x0": None, "y0": None, "th0": None, "e0": 0.0,
+              "v_max": req["v_max"], "w_max": req["w_max"], "turn_kp": req["turn_kp"]}
+        # Hard-abort timer: move_timeout floors it, but a long request needs
+        # proportionally longer (a 5 m crawl at 0.12 m/s is 42 s on its own; the
+        # P-law turn averages well under its w_max cap).
+        est = (abs(req["dist"]) / max(req["v_max"], 0.01)
+               + abs(math.radians(req["deg"])) / max(req["w_max"] * 0.5, 0.01))
+        timeout = max(req["timeout"], 1.5 * est + 5.0)
+        t0 = time.monotonic()
+        dt = 1.0 / MOVE_CTRL_HZ
+        result = {"status": "done"}
+        last_browser = t0        # browser-dead-man: SSE clients gone > MOVE_BROWSER_GRACE
+        while not self._man_stop.is_set():
+            with self._man_lock:
+                cancelled = self._man_cancel
+            if cancelled:
+                result = {"status": "cancelled"}
+                break
+            odo = self.telemetry._odom
+            now = time.monotonic()
+            if self.telemetry._clients > 0:
+                last_browser = now
+            if (odo is None or now - t0 > timeout
+                    or now - last_browser > MOVE_BROWSER_GRACE):
+                result = {"status": "failed", "error": (
+                    "/odom lost" if odo is None else
+                    "browser gone" if now - last_browser > MOVE_BROWSER_GRACE
+                    else "timed out")}
+                break
+            v, w, done, prog, err = _maneuver_step(st, odo)
+            with self._drive_lock:
+                self._drive_v, self._drive_w = v, w
+                self._drive_at = time.monotonic()
+            turning = st["phase"] == "turn"
+            with self._man_lock:
+                self._maneuver_state = {
+                    "active": True, "phase": "turning" if turning else "driving",
+                    "target": round(math.radians(req["deg"]), 3) if turning
+                              else req["dist"],
+                    "unit": "deg" if turning else "m",
+                    "progress": round(prog, 2), "err": round(err, 3)}
+            if done:
+                break
+            time.sleep(dt)
+        self._man_finish(result.pop("status"), result)
+
+    def _man_finish(self, status, extra=None):
+        """End a maneuver: command one stop DIRECTLY (a single message — the sole-
+        publisher rule exists to cap sustained serial flow, not one stop) and disarm
+        the shared state so the keepalive goes idle."""
+        self._publish_drive(0.0, 0.0)
+        with self._drive_lock:
+            self._drive_v = self._drive_w = 0.0
+            self._drive_at = 0.0
+        with self._man_lock:
+            self._man_running = False
+            self._man_cancel = False
+            self._maneuver_state = {"active": False, "phase": "done",
+                                    "result": status, **(extra or {})}
+        self.get_logger().info(f"canned move {status}"
+                               + (f" ({extra['error']})" if extra and extra.get("error") else ""))
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -1940,6 +2174,9 @@ class WebServerNode(Node):
         try:
             self._drive_stop.set()
             self._drive_thread.join(timeout=1.0)    # stop the /cmd_vel keepalive first
+            self._man_stop.set()                    # canned-moves thread: wake + exit
+            self._man_wake.set()
+            self._man_thread.join(timeout=1.0)
         except Exception:
             pass
         try:
@@ -2040,6 +2277,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     }
     POST_JSON = {
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
+        "/move": lambda n, d: n.move(d),                # canned dist/deg maneuvers
         "/publish": lambda n, d: n.telemetry.publish_json(d),   # whitelisted topic pokes
         "/param": lambda n, d: n.telemetry.set_param_json(d),   # whitelisted live-tune params
         "/stress/start": lambda n, d: n.stress_start(d),

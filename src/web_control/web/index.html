@@ -138,9 +138,25 @@
               <input id="lin" type="range" min="0.05" max="0.4" step="0.01" value="0.25"></div>
             <div class="field"><label>Max turn <span id="angv">1.5</span> rad/s</label>
               <input id="ang" type="range" min="0.2" max="3.0" step="0.1" value="1.5"></div>
+            <div class="row" style="margin-top:10px">
+              <input id="moveDist" class="grow" type="number" step="0.05" min="-5" max="5" value="0.50">
+              <span class="hint" style="white-space:nowrap">m</span>
+              <button id="moveFwd" class="btn">↥ Drive</button>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <input id="moveDeg" class="grow" type="number" step="5" min="-720" max="720" value="90">
+              <span class="hint" style="white-space:nowrap">°</span>
+              <button id="moveTurn" class="btn">⟲ Turn</button>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <button id="moveStop" class="btn danger small">■ Stop move</button>
+              <span id="moveStatus" class="hint grow" style="text-align:right"></span>
+            </div>
             <p class="hint">Drag the joystick to drive (speed scales with how far you push),
               or use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrow keys on a keyboard.
-              Release or <kbd>Space</kbd> stops. Publishes <b>/cmd_vel</b>.</p>
+              Release or <kbd>Space</kbd> stops. Publishes <b>/cmd_vel</b>. <b>Drive</b> /
+              <b>Turn</b> run odom-feedback canned moves (distance in m, rotation in °;
+              negative = backward / clockwise) — any joystick touch or Stop takes over.</p>
           </div>
         </section>
 
@@ -1798,6 +1814,7 @@ function onFrame(f){
   if(f.imu) onImu(f.imu);
   if(f.eul) onEul(f.eul);
   if(f.diag) onDiag(f.diag);
+  if(f.move) onMove(f.move);
   onEsp(f.esp||{}, f.susp||[]);
   onLds(f.lds||{});
   if(f.fan!==undefined) $("fanDuty").textContent=(f.fan*100).toFixed(0)+"%";
@@ -1883,6 +1900,13 @@ function onFrame(f){
 // (#hintsToggle) and persisted across reloads via localStorage, since it's a pure
 // display preference, not robot state.
 const HINTS = {
+  // Drive card -- canned moves
+  moveDist: "Canned straight drive, in metres (negative = backward). Runs an /odom-feedback maneuver at the canned crawl speed -- distance is measured from wheel odometry, so walls/trim veer can add path length but the projection-on-heading target stays true.",
+  moveDeg: "Canned in-place rotation, in degrees (positive = counter-clockwise, negative = clockwise). Wheel-odom yaw feedback; expect ~2° of settle error.",
+  moveFwd: "Starts the canned drive (Drive N metres). A running canned move is replaced by a new one.",
+  moveTurn: "Starts the canned rotation (Turn N degrees). A running canned move is replaced by a new one.",
+  moveStop: "Cancels the running canned move and stops (same as touching the joystick or pressing STOP).",
+  moveStatus: "Live progress of the canned move (phase, target, % done) and its result after it finishes. The maneuver aborts if /odom is lost or the browser disconnects for >5 s.",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
   sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
@@ -2942,6 +2966,37 @@ document.addEventListener("visibilitychange",()=>{
   if(document.hidden && (curV||curW)){ setCmd(0,0); publishCmd(); }
 });
 $("stop").onclick=()=>{setCmd(0,0);publishCmd();};
+
+// ---- canned moves (POST /move) ----
+// Odom-feedback relative maneuvers served by web_control (drive N m / rotate N°).
+// Progress + result ride the SSE frame's f.move; any joystick/keyboard drive, STOP
+// or tab-hide POSTs /drive, which cancels the running maneuver server-side.
+let mvActive=false, mvDoneAt=0, mvUnit="m";
+function postMove(body){
+  fetch("/move",{method:"POST",body:JSON.stringify(body)}).catch(()=>{});
+}
+function onMove(mv){
+  const el=$("moveStatus");
+  if(mv.active){
+    mvActive=true; mvUnit=mv.unit||"m";
+    const t=mv.unit==="deg" ? (mv.target*180/Math.PI).toFixed(0)+"°"
+                            : Number(mv.target).toFixed(2)+" m";
+    el.textContent=mv.phase+" → "+t+" · "+Math.round((mv.progress||0)*100)+"%";
+  }else{
+    if(mvActive){ mvActive=false; mvDoneAt=Date.now();
+      const res=mv.result||"done";
+      const e=mv.err!=null ? (mvUnit==="deg" ? (mv.err*180/Math.PI).toFixed(1)+"°"
+                                             : (mv.err*100).toFixed(1)+" cm") : "";
+      el.textContent=res+(e?" · off by "+e:"")+(mv.error?" — "+mv.error:"");
+    }else if(mvDoneAt && Date.now()-mvDoneAt>4000){ mvDoneAt=0; el.textContent=""; }
+  }
+}
+$("moveFwd").onclick=()=>postMove({dist:Number($("moveDist").value)||0});
+$("moveTurn").onclick=()=>postMove({deg:Number($("moveDeg").value)||0});
+$("moveStop").onclick=()=>postMove({cancel:true});
+// Enter in a field triggers its button (typing(e) already keeps WASD out of teleop).
+$("moveDist").addEventListener("keydown",e=>{ if(e.key==="Enter") $("moveFwd").click(); });
+$("moveDeg").addEventListener("keydown",e=>{ if(e.key==="Enter") $("moveTurn").click(); });
 
 // keyboard
 const keys={};

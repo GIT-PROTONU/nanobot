@@ -1053,6 +1053,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # HTTP teleop no-op: accept the page's {v,w} POSTs (there are no motors
             # here to move) so the joystick UI behaves normally off-robot.
             return self._json({"status": "ok", "dev": True})
+        if p == "/move":
+            # Canned-move no-op (no /odom, no motors here): accept {dist,deg,cancel}
+            # so the Drive card's canned controls respond normally off-robot.
+            return self._json({"status": "started", "dev": True})
         if p == "/llm/say":
             if not s.llm.available():
                 return self._text(503, "llm unavailable")

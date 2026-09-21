@@ -449,6 +449,11 @@ class TelemetryHub:
                         if self._lds_at is not None else None),
             "oled": self._oled,
         }
+        # Canned-move (POST /move) progress — web_server's maneuver state, a plain
+        # JSON-safe dict it replaces atomically (getattr: the fake dev node has none).
+        mv = getattr(n, "_maneuver_state", None)
+        if mv is not None:
+            f["move"] = mv
         # IMU |accel|/|gyro| summary rides the vitals blob (numeric labels only, 1 Hz
         # is plenty); omitted entirely when sys_monitor isn't writing — the page shows
         # "lost". eul is its OWN direct sub (self._eul, not the blob) — the 3D
