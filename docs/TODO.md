@@ -134,7 +134,11 @@ in this checkout.
       saturation cliff (loaded full-duty ≈ 0.37 m/s; at 0.4 the loop has zero
       authority — reverse leg p2p 0.277 vs 0.028-0.085 at 0.3): the smooth
       cruise band is ≤0.15 m/s, 0.3 acceptable, AVOID 0.35+ — a slider note
-      or a web-side soft warning is an option if the user keeps hitting it.**
+      or a web-side soft warning is an option if the user keeps hitting it.
+      (2026-09-21 pm: the user hit it — their persisted slider was still 0.4
+      and "still stuttering"; set to 0.15 via POST /move/config — 0.15
+      measures p2p 0.024-0.056 / mean 91-98% vs 0.4's p2p 0.277. The user can
+      still drag it up; the cliff is hardware.)**
       The braked-stop keepalive fix is deployed (firm stops). Spin-band
       map (2026-09-21 pm, dither 0, 5/60/0): 0.5 rad/s (wheels ±0.025)
       mean 92% of target p2p 0.031; 0.65 mean 85% p2p 0.027; 0.8 mean
