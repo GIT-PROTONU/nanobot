@@ -55,7 +55,13 @@ class IMUInterferenceTest:
         self._led_pub = node.create_publisher(Bool, "led", 5)
         self._lds_pub = node.create_publisher(Float32, "lds_target_rpm", 5)
         self._cmd_pub = node.create_publisher(Twist, "cmd_vel", 5)
-        self._lock = threading.Lock()
+        # RLock, NOT Lock: start() holds this lock across its checks + thread spawn
+        # and then returns status() — which re-acquires. A plain Lock self-deadlocks
+        # here (found live 2026-09-21 via the app_hub SIGUSR1 stack dump: the start
+        # handler parked in status() while holding start()'s with-block, the run
+        # thread queued behind it — the interference test had literally never been
+        # startable on hardware).
+        self._lock = threading.RLock()
         self._active = False
         self._phase = ""
         self._phase_i = 0

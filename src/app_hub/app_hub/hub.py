@@ -78,9 +78,24 @@ def _disable_default_qos_event_callbacks():
     _patch(qos_event.PublisherEventCallbacks)
 
 
+def _install_stackdump():
+    """`kill -USR1 <pid>` dumps every thread's stack to stderr (-> journald) WITHOUT
+    ptrace/root — the in-process half of the 2026-09-20 POST-stall diagnosis (the
+    board's /tmp/stall_trap.sh snapshots thread states via /proc on a stall; for the
+    actual stack frames it now just signals USR1 and reads journalctl -u nano-app).
+    Never fires on its own — SIGUSR1 is otherwise unused by this process."""
+    try:
+        import faulthandler
+
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:       # e.g. signal not available / already registered
+        pass
+
+
 def main():
     rclpy.init()
     _disable_default_qos_event_callbacks()
+    _install_stackdump()
     nodes = []
     for cls in NODE_CLASSES:
         try:
