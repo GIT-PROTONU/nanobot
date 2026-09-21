@@ -38,6 +38,27 @@ FEED_GRACE = 20.0          # s of boot grace before "never seen" counts as DOWN
 
 BLOB_PATH = "/dev/shm/nano_scan.bin"
 
+# Clock-step watcher (see clock_step above): how big a step counts, and how long
+# the automatic nano-slam restart backs off (a flapping NTP must not loop-restart
+# SLAM — each restart IS a map clear).
+CLOCK_STEP_THRESH = 2.0
+CLOCK_STEP_RESTART_MIN = 300.0
+
+
+def clock_step(prev_drift, drift, thresh=2.0):
+    """True when the wall clock STEPPED between two ticks.
+
+    The board has no battery RTC: NTP can move the clock MID-SESSION (the unit_exec
+    NTP wait is best-effort and later corrections always remain possible). A step
+    future-dates every TF stamp already in flight — the 2026-09-21 pm instance
+    wrecked live NAV (failed map->base_link lookups -> Nav2 "collision ahead" ->
+    the recovery-spin loop). Between two adjacent ticks, epoch-minus-monotonic is
+    a constant offset; a jump beyond `thresh` seconds in EITHER direction means
+    the wall clock moved. graders of drift: both args are (epoch - monotonic)."""
+    if prev_drift is None or drift is None:
+        return False
+    return abs(drift - prev_drift) > thresh
+
 
 def read_scan_blob_header(path=BLOB_PATH):
     """Scan-blob JSON header + file age in seconds, or None if absent/unparsable."""

@@ -33,7 +33,8 @@ from geometry_msgs.msg import Vector3Stamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, Int32
 
-from .health_log import HealthWatch, FeedWatch, read_scan_blob_header
+from .health_log import HealthWatch, FeedWatch, read_scan_blob_header, \
+    clock_step, CLOCK_STEP_THRESH, CLOCK_STEP_RESTART_MIN
 
 VITALS_FILE = "/dev/shm/nano_vitals.json"
 
@@ -105,6 +106,13 @@ class MonitorNode(Node):
                                "~/.local/state/nanobot/health.log")
         self.watch = HealthWatch(
             os.path.expanduser(self.get_parameter("health_log_path").value))
+        # Clock-step watcher: epoch-minus-monotonic is a constant offset between
+        # adjacent ticks; a jump = the wall clock was stepped (no-RTC board + NTP).
+        # On a step, restart nano-slam so TF stamps + the pose graph reseed on the
+        # new clock (wheel_odometry heals itself — it stamps continuously). The
+        # scoped NOPASSWD sudoers rule allows exactly `systemctl restart nano-slam`.
+        self._clk_drift = None
+        self._clk_restart_at = 0.0
         self._hb_at = None                  # monotonic time of last /esp32_heartbeat
         self._rpm = (float("nan"), -1e9)    # (value, monotonic time received)
         self._hz = (float("nan"), -1e9)
@@ -296,8 +304,38 @@ class MonitorNode(Node):
         self.pub.publish(msg)
 
         self._publish_fan(cpu_t)
+        self._clock_step_tick(now)
         self._health_tick(now)
         self._write_vitals(cpu_pct, mem_pct, cpu_t, disk_pct, now)
+
+    def _clock_step_tick(self, now):
+        """Detect a mid-session wall-clock step and restart nano-slam (see the
+        clock_step detector in health_log.py for why). Rate-limited so a flapping
+        NTP can't loop-restart SLAM (each restart is a map clear)."""
+        try:
+            drift = time.time() - now
+        except OSError:
+            return
+        stepped = clock_step(self._clk_drift, drift, CLOCK_STEP_THRESH)
+        prev_drift = self._clk_drift
+        self._clk_drift = drift
+        if not stepped:
+            return
+        since = now - self._clk_restart_at
+        if since < CLOCK_STEP_RESTART_MIN:
+            self.watch.write([f"clock step detected (drift {prev_drift:.2f} -> "
+                              f"{drift:.2f}s) — restart rate-limited "
+                              f"({since:.0f}s < {CLOCK_STEP_RESTART_MIN:.0f}s)"])
+            return
+        self._clk_restart_at = now
+        self.watch.write([f"clock step detected (drift {prev_drift:.2f} -> "
+                          f"{drift:.2f}s) — restarting nano-slam for fresh TF stamps"])
+        try:
+            subprocess.run(["sudo", "-n", "systemctl", "restart", "nano-slam"],
+                           timeout=45, check=False)
+            self.watch.write(["nano-slam restart issued (clock step)"])
+        except Exception as e:                      # never hurt the sensor loop
+            self.watch.write([f"nano-slam restart failed: {e!r}"])
 
     def _pipeline_diagnostic(self, now):
         """A DiagnosticStatus summarising the localization-pipeline feed freshness —
