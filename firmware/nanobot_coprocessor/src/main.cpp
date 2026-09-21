@@ -689,6 +689,74 @@ static void ping_cb(z_loaned_sample_t*, void*){
 }
 #endif
 
+static bool zenohConnect();
+
+// ---- subscriptions: one table, re-declarable (see SUB_REDECLARE_MS) ----------
+// Subscriptions are the ONLY zenoh entities that must outlive a ROUTER restart on
+// the SBC side: the ESP keeps publishing fine after a router bounce (its data path
+// is self-sufficient), but the fresh router instance starts with an EMPTY remote-
+// subscription table, and zenoh-pico only sends the declare once per session —
+// z_declare_subscriber() here runs once at boot. Hit 2026-09-20 (open, docs/TODO.md):
+// after a router restart the ESP re-attaches (heartbeat/ticks flow, /motor_pid
+// write->readback flips) yet /cmd_vel specifically goes deaf — a subscriber the
+// router never re-learned. Fix: periodically UNDECLARE + REDECLARE every
+// subscription on the live session, so the router's table is refreshed in place
+// (entity leak: the fresh declare supersedes; the old entity dies with the session).
+// The 45 s period bounds the worst deaf window at 45 s, and a single re-declare
+// burst (~10 small serial round-trips) is nothing against the 500 ms cmd watchdog.
+#define SUB_REDECLARE_MS 45000
+struct SubDef { const char* topic; const char* type; void (*cb)(z_loaned_sample_t*, void*); };
+static const SubDef SUBS[] = {
+  { "cmd_vel",       T_TWIST, cmd_cb },
+  { "led",           T_BOOL,  led_cb },
+  { "fan_pwm",       T_F32,   fan_cb },
+  { "motor_trim",    T_F32,   trim_cb },
+  { "reset_ticks",   T_BOOL,  reset_ticks_cb },
+#if WHEEL_PID_ENABLED
+  { "motor_pid",     T_F32A,  motor_pid_cb },
+  { "motor_params",  T_F32A,  motor_params_cb },
+#else
+  { "motor_accel",   T_F32,   motor_slew_cb },
+#endif
+  { "laser_pwm",     T_I32A,  laser_cb },
+#if LINK_RX_TIMEOUT_MS
+  { "esp32_ping",    T_I32,   ping_cb },
+#endif
+#if LDS_ENABLED
+  { "lds_target_rpm",T_F32,   ldstgt_cb },
+#endif
+};
+static z_owned_subscriber_t g_subs[sizeof(SUBS) / sizeof(SUBS[0])];
+static int g_subs_n = 0;
+
+static void subDeclareAll(){
+  g_subs_n = 0;
+  for (auto& d : SUBS){
+    char keyexpr[160];
+    snprintf(keyexpr, sizeof(keyexpr), DOMAIN "/%s/%s/TypeHashNotSupported", d.topic, d.type);
+    z_view_keyexpr_t ke;
+    z_view_keyexpr_from_str_unchecked(&ke, keyexpr);
+    z_owned_closure_sample_t cl;
+    z_closure_sample(&cl, d.cb, NULL, NULL);
+    // A failed declare is otherwise silent — one topic would never appear. Log loudly;
+    // the ping watchdogs only catch a TOTAL session failure, not one missing feed.
+    if (z_declare_subscriber(z_session_loan(&s), &g_subs[g_subs_n],
+                             z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
+      Serial.printf("[nano] declare subscriber FAILED: %s\n", d.topic);
+    else
+      g_subs_n++;
+  }
+}
+static void subsRedeclare(){
+  // ZENOH_C_STANDARD=99 (zenoh-pico's Arduino extra_script) compiles the z_move
+  // macro out — use the explicit generated move (same convention as z_config_move).
+  for (int i = 0; i < g_subs_n; i++)
+    z_undeclare_subscriber(z_subscriber_move(&g_subs[i]));
+  g_subs_n = 0;
+  subDeclareAll();
+  Serial.printf("[nano] subs re-declared (%d) — router table refreshed\n", g_subs_n);
+}
+
 static bool zenohConnect(){
   z_owned_config_t cfg; z_config_default(&cfg);
   zp_config_insert(z_config_loan_mut(&cfg), Z_CONFIG_MODE_KEY, "client");
@@ -703,62 +771,8 @@ static bool zenohConnect(){
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) zpub_declare(*d.zp, d.topic, d.type, d.gid_tag);
 
-  static z_owned_subscriber_t sub_cmd, sub_led, sub_tgt, sub_fan, sub_trim, sub_reset, sub_laser;   // kept alive (static)
-#if WHEEL_PID_ENABLED
-  static z_owned_subscriber_t sub_pid;     // /motor_pid — live wheel-PID gains
-#endif
-#if !WHEEL_PID_ENABLED
-  static z_owned_subscriber_t sub_accel;   // /motor_accel — open-loop duty slew only
-#endif
-  z_owned_closure_sample_t cl;
-  z_view_keyexpr_t ke;
-  z_view_keyexpr_from_str_unchecked(&ke, KE("cmd_vel",T_TWIST));
-  z_closure_sample(&cl, cmd_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_cmd, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_cmd");
-  z_view_keyexpr_from_str_unchecked(&ke, KE("led",T_BOOL));
-  z_closure_sample(&cl, led_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_led, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_led");
-  z_view_keyexpr_from_str_unchecked(&ke, KE("fan_pwm",T_F32));
-  z_closure_sample(&cl, fan_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_fan, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_fan");
-  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_trim",T_F32));
-  z_closure_sample(&cl, trim_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_trim, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_trim");
-  z_view_keyexpr_from_str_unchecked(&ke, KE("reset_ticks",T_BOOL));
-  z_closure_sample(&cl, reset_ticks_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_reset, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_reset");
-#if WHEEL_PID_ENABLED
-  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_pid",T_F32A));
-  z_closure_sample(&cl, motor_pid_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_pid, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_pid");
-  static z_owned_subscriber_t sub_params;
-  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_params",T_F32A));
-  z_closure_sample(&cl, motor_params_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_params, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_params");
-#endif
-#if !WHEEL_PID_ENABLED
-  z_view_keyexpr_from_str_unchecked(&ke, KE("motor_accel",T_F32));
-  z_closure_sample(&cl, motor_slew_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_accel, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_accel");
-#endif
-  z_view_keyexpr_from_str_unchecked(&ke, KE("laser_pwm",T_I32A));
-  z_closure_sample(&cl, laser_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_laser, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_laser");
+  subDeclareAll();
 #if LINK_RX_TIMEOUT_MS
-  static z_owned_subscriber_t sub_ping;
-  z_view_keyexpr_from_str_unchecked(&ke, KE("esp32_ping",T_I32));
-  z_closure_sample(&cl, ping_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_ping, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_ping");
   g_last_ping_ms = millis(); g_ping_seen = false;   // (re)arm fresh on each (re)connect
 #endif
 
@@ -766,13 +780,6 @@ static bool zenohConnect(){
   // subscribers reliably receive its data. eid must be unique per entity.
   for (auto& d : PUBS)
     if (!d.lds_only || LDS_ENABLED) declare_lv(d.topic, d.type, d.lv_eid);
-
-#if LDS_ENABLED
-  z_view_keyexpr_from_str_unchecked(&ke, KE("lds_target_rpm",T_F32));
-  z_closure_sample(&cl, ldstgt_cb, NULL, NULL);
-  if (z_declare_subscriber(z_session_loan(&s), &sub_tgt, z_view_keyexpr_loan(&ke), z_closure_sample_move(&cl), NULL) < 0)
-    Serial.println("[nano] declare subscriber FAILED: sub_tgt");
-#endif
 
   Serial.println("[nano] zenoh CONNECTED");
   return true;
@@ -782,11 +789,24 @@ static bool zenohConnect(){
 // lease tasks; we only PUT (TX-mutex-serialized against them), so nothing blocks.
 static void zenohTask(void*){
   Serial.printf("[nano] zenoh task pinned to core %d\n", xPortGetCoreID());
+  static uint32_t t_subdecl = 0;             // SUB_REDECLARE_MS cadence (router-table refresh)
   for(;;){
-    if (!ready){ ready = zenohConnect(); if (!ready){ delay(1000); continue; } }
+    if (!ready){
+      ready = zenohConnect();
+      if (!ready){ delay(1000); continue; }
+      t_subdecl = millis();                  // first re-declare one full period after connect
+    }
 
     static uint32_t t_ticks=0, t_lds=0, t_slow=0;
     uint32_t now = millis();
+
+    // Periodic subscription re-declare (see SUB_REDECLARE_MS at the SUBS table):
+    // the only known healing path for a router whose remote-sub table was wiped by
+    // a restart while our session kept flowing.
+    if (t_subdecl && now - t_subdecl >= SUB_REDECLARE_MS){
+      t_subdecl = now;
+      subsRedeclare();
+    }
 
     uint8_t buf[80];                                        // 64 needed by the /wheel_params readback
     if (now - t_ticks >= 66){                                // wheel_ticks @~15 Hz (was
