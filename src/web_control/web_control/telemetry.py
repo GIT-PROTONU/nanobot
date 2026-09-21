@@ -821,6 +821,17 @@ class TelemetryHub:
         self._goal = None
         self._goal_status = "idle"
 
+    def clear_map(self):
+        """Drop the cached /map grid + goal mirror (POST /map/clear). The /map
+        route serves (None, None) until the fresh post-restart grid arrives
+        (slam_toolbox republishes transient-local the instant it's up), and
+        map_age reads null so the page's feeds strip shows SLAM as down meanwhile.
+        The goal mirror resets too — the map frame it points into is being reset."""
+        self._map_payload = None
+        self._map_arrival = STALE
+        self._goal = None
+        self._goal_status = "idle"
+
     # ---- POST /publish ----------------------------------------------------------
     def publish_json(self, data):
         """Publish `value` on the whitelisted `topic`. Every topic has its own

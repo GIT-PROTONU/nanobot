@@ -265,3 +265,14 @@ def test_run_maneuver_cancel(monkeypatch):
     assert n._maneuver_state["result"] == "cancelled"
     assert n._maneuver_state["active"] is False
     assert abs(n.telemetry._odom[0]) < 1.0            # nowhere near the 5 m target
+
+
+# ---- canned-move speed config (GET/POST /move/config) -----------------------------
+def test_clamp_move_cfg():
+    # in-range passes through; out-of-range clamps to the slider bounds
+    assert ws._clamp_move_cfg(0.2, 0.4) == (0.2, 0.4)
+    assert ws._clamp_move_cfg(0.0, 5.0) == (ws.MOVE_LIN_RANGE[0], ws.MOVE_ANG_RANGE[1])
+    assert ws._clamp_move_cfg(-1.0, 0.01) == (ws.MOVE_LIN_RANGE[0], ws.MOVE_ANG_RANGE[0])
+    # garbage is a ValueError (update_move_config turns it into an error reply)
+    with pytest.raises(ValueError):
+        ws._clamp_move_cfg("fast", 0.5)

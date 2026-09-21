@@ -336,6 +336,13 @@ web_control:
     # 0.3-0.5 rad/s can re-stick the wheels (see MOTOR_MIN_DUTY / the firmware kick).
     drive_max_ang: 0.8        # rad/s clamp
     drive_timeout: 0.6        # s without a fresh POST -> publish one stop
+    # Canned-move (/move) pace — live sliders on the Drive card ("Canned speed" /
+    # "Canned turn", GET/POST /move/config). A slider change persists to
+    # ~/.local/state/nanobot/move.json and WINS over these defaults on boot.
+    # Keep move_ang_speed <= drive_max_ang: a turn at w rad/s smears each 0.2 s
+    # lidar scan by w*0.2 rad (slam_toolbox 2.6.10 has no deskew).
+    move_lin_speed: 0.12      # m/s cruise for canned drives
+    move_ang_speed: 0.5       # rad/s cap for canned turns
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"

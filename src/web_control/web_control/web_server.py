@@ -40,6 +40,7 @@ from datetime import datetime
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, PoseStamped
@@ -137,6 +138,18 @@ MOVE_DECEL_A = 0.12          # m/s^2 sqrt(2*a*r) approach ramp into the finish b
 MOVE_TURN_MIN_W = 0.05       # rad/s floor while |err| > tol (else the P law crawls forever)
 MOVE_ODOM_MAX_AGE = 1.0      # s   /odom older than this = feed lost, abort
 MOVE_BROWSER_GRACE = 5.0     # s   SSE clients gone this long = browser-dead-man abort
+# Live-tunable cruise/turn caps (Drive card sliders, GET/POST /move/config; persisted
+# to move_settings_path). The turn ceiling mirrors drive_max_ang — the SLAM rotation-
+# smear budget (a turn at w rad/s blurs each 0.2 s lidar scan by w*0.2 rad).
+MOVE_LIN_RANGE = (0.05, 0.40)  # m/s clamp range for move_lin_speed
+MOVE_ANG_RANGE = (0.10, 0.80)  # rad/s clamp range for move_ang_speed
+
+
+def _clamp_move_cfg(lin, ang):
+    """Clamp the canned-move speeds to the web-slider ranges (pure — unit-tested).
+    Plain float clamp — tts.clamp rounds to int (it's for the % settings)."""
+    return (min(MOVE_LIN_RANGE[1], max(MOVE_LIN_RANGE[0], float(lin))),
+            min(MOVE_ANG_RANGE[1], max(MOVE_ANG_RANGE[0], float(ang))))
 
 
 def _wrap_angle(a):
@@ -541,6 +554,18 @@ class WebServerNode(Node):
         self.declare_parameter("move_ang_speed", 0.5)   # rad/s cap for canned turns
         self.declare_parameter("move_turn_kp", 2.5)     # w = kp * yaw_err (1/s)
         self.declare_parameter("move_timeout", 45.0)    # s hard abort for a maneuver
+        self.declare_parameter("move_settings_path", "")  # "" = ~/.local/state/nanobot/move.json
+        # The Drive card's Canned speed/turn sliders POST /move/config; those changes
+        # persist to move_settings_path and WIN over the robot.yaml defaults (the
+        # llm.json/tts.json pattern: persisted UI changes beat declared params).
+        try:
+            saved = read_json(self._move_settings_file()) or {}
+            self._set_move_cfg(saved.get("move_lin_speed",
+                                         self.get_parameter("move_lin_speed").value),
+                               saved.get("move_ang_speed",
+                                         self.get_parameter("move_ang_speed").value))
+        except (TypeError, ValueError) as e:
+            self.get_logger().warning(f"move: ignoring bad persisted speed config: {e!r}")
         self._man_lock = threading.Lock()               # guards _man_req + _man_cancel
         self._man_req = None                            # pending request dict (move())
         self._man_cancel = False                        # joystick/STOP/cancel flag
@@ -959,6 +984,40 @@ class WebServerNode(Node):
                                     "result": status, **(extra or {})}
         self.get_logger().info(f"canned move {status}"
                                + (f" ({extra['error']})" if extra and extra.get("error") else ""))
+
+    # ---- canned-move speed config (GET/POST /move/config) --------------------
+    # The /move cruise + turn caps as live Drive-card sliders. Values persist to
+    # move_settings_path so a slider change survives a restart (tts.json pattern).
+    def _move_settings_file(self):
+        p = self.get_parameter("move_settings_path").value
+        return p or os.path.expanduser("~/.local/state/nanobot/move.json")
+
+    def move_config(self):
+        return {"move_lin_speed": float(self.get_parameter("move_lin_speed").value),
+                "move_ang_speed": float(self.get_parameter("move_ang_speed").value)}
+
+    def _set_move_cfg(self, lin, ang):
+        lin, ang = _clamp_move_cfg(lin, ang)
+        self.set_parameters([Parameter("move_lin_speed", value=lin),
+                             Parameter("move_ang_speed", value=ang)])
+        return lin, ang
+
+    def update_move_config(self, data):
+        """PATCH-style: a missing key keeps the current value (the page sends both
+        sliders, but curl/one-slider PATCHes stay valid)."""
+        data = data or {}
+        cur = self.move_config()
+        try:
+            lin, ang = self._set_move_cfg(data.get("move_lin_speed", cur["move_lin_speed"]),
+                                          data.get("move_ang_speed", cur["move_ang_speed"]))
+        except (TypeError, ValueError):
+            return {"error": "speeds must be numbers"}
+        if not write_json(self._move_settings_file(),
+                          {"move_lin_speed": lin, "move_ang_speed": ang}):
+            self.get_logger().warning("move: could not persist speed config")
+        self.get_logger().info(
+            f"POST /move/config lin {lin:.2f} m/s turn {ang:.2f} rad/s (source: web UI)")
+        return {"status": "ok", **self.move_config()}
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
@@ -2083,6 +2142,21 @@ class WebServerNode(Node):
         self.get_logger().info("POST /nav/cancel (web map)")
         return {"ok": True}
 
+    def clear_map(self):
+        """POST /map/clear: wipe the SLAM map = restart nano-slam (web Map card).
+        slam_toolbox 2.6.10 async mode has no clear service (its only clear is the
+        sync-mode clear_queue, which drops queued scans, not the built map) and no
+        map_file_name is configured, so a nano-slam restart IS the map clear. The
+        cached grid + goal mirror drop first so the page shows its mapWait overlay
+        immediately; any active navigation is cancelled since its map-frame target
+        stops existing. Needs deploy/sudoers' scoped restart rule for nano-slam.
+        No OLED end-screen / spoken line — app_hub isn't touched (unlike /system/*)."""
+        self.cancel_goal()
+        self.telemetry.clear_map()
+        self.get_logger().info("POST /map/clear (web Map card) -> restarting nano-slam")
+        self._run_detached("sudo -n /usr/bin/systemctl restart nano-slam", delay=1)
+        return {"ok": True, "reply": "clearing map (nano-slam restart)"}
+
     def _brain_health_tick(self):
         """Publish cognition-layer health as JSON on /brain/cognition_health (~1 Hz)."""
         now = time.monotonic()
@@ -2261,6 +2335,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     # is belt-and-braces for tests.
     GET_JSON = {
         "/tts/config": lambda n: n.get_settings(),      # page restores controls on load
+        "/move/config": lambda n: n.move_config(),      # canned-move speed sliders seed
         "/llm/config": lambda n: n.get_llm_settings(),
         "/personality": lambda n: n.get_personality(),
         "/llm/log": lambda n: n.get_cog_log(),
@@ -2278,6 +2353,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     POST_JSON = {
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
         "/move": lambda n, d: n.move(d),                # canned dist/deg maneuvers
+        "/move/config": lambda n, d: n.update_move_config(d),   # canned speed sliders
         "/publish": lambda n, d: n.telemetry.publish_json(d),   # whitelisted topic pokes
         "/param": lambda n, d: n.telemetry.set_param_json(d),   # whitelisted live-tune params
         "/stress/start": lambda n, d: n.stress_start(d),
@@ -2304,6 +2380,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/locations/delete": lambda n, d: n.location_delete(d),
         "/locations/go": lambda n, d: n.location_go(d),
         "/nav/cancel": lambda n, d: n.cancel_goal(),
+        "/map/clear": lambda n, d: n.clear_map(),
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.

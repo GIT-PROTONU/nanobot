@@ -109,7 +109,12 @@
 #define PWM_RES_BITS  10
 static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 
-#define WHEEL_SEPARATION  0.16f
+#define WHEEL_SEPARATION  0.102f  // MEASURED 2026-09-21 (lidar cross-correlation): the old
+                                  // 0.16 was a chassis-width guess — canned 90° turns
+                                  // physically rotated 139-146°. This define is only the
+                                  // NVS-absent fallback (erased flash / fresh ESP32); the
+                                  // live value comes from NVS (/motor_params id 2) and
+                                  // robot.yaml wheel_odometry.wheel_separation matches.
 #define MAX_LINEAR_SPEED  0.4f
 // Synced with robot.yaml web_control.drive_max_ang (was 3.0): the SLAM rotation-smear
 // budget caps rotation at 0.8 rad/s (a scan spans ~0.2 s of lidar revolution, so a turn
@@ -150,6 +155,13 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
                                     // /odom + the PID's velocity world fictional; drive was
                                     // healthy all along, full duty = ~0.37 m/s loaded).
 #define WHEEL_PID_HZ      50        // PID rate; longer window than the 100 Hz loop => less tick-quantization noise
+// Feedback smoothing: average the tick delta over the last TWO PID windows (40 ms) before
+// feeding the PID. One tick per 20 ms window is a 0.042 m/s quantization step (1202
+// ticks/m) — at a 0.05 m/s crawl that is 83% of the setpoint, so the raw per-window
+// feedback makes kp chatter the duty (±0.1 ripple = stick-slip excitation). The 2-window
+// average halves the step (0.021 m/s) for one window (~20 ms) of extra measurement lag.
+// 0 = raw per-window velocity (the pre-2026-09-21 behaviour).
+#define WHEEL_VEL_FILT    1
 // Full-scale wheel speed at duty=1 (the per-wheel max from the clamps above); KFF maps a
 // target m/s to the baseline duty the I-term corrects from.
 #define WHEEL_KFF   (1.0f/(MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f))
@@ -923,8 +935,14 @@ static float wheelPid(WPid& st, float tgt, float meas, float dt){
   float deriv = dt>0 ? (err - st.prev)/dt : 0; st.prev = err;
   float u = g_kff*tgt + g_wkp*err + g_wki*st.integ + g_wkd*deriv;
   float duty = clampf(u,-1,1);
-  if (duty == u)   // integrate only when not saturated (anti-windup), then clamp the integral
-    st.integ = clampf(st.integ + err*dt, -WHEEL_INTEG_MAX, WHEEL_INTEG_MAX);
+  if (duty == u){   // integrate only when not saturated (anti-windup)
+    // Clamp scaled to the LIVE ki so the I-term alone can never exceed full duty: the
+    // fixed WHEEL_INTEG_MAX=1.0 was sized for ki~8 — at the tuned ki=60 one wound
+    // integrator held ±60 duty of authority, so a stop-parked brake bias could lurch the
+    // wheel on the next command before the loop could unwind it. 1/ki caps it at ±1 duty.
+    float imax = g_wki > 1.0f ? 1.0f/g_wki : WHEEL_INTEG_MAX;
+    st.integ = clampf(st.integ + err*dt, -imax, imax);
+  }
   return duty;
 }
 #endif
@@ -1094,11 +1112,58 @@ void loop(){   // Core 1: real-time control
 #if WHEEL_PID_ENABLED
   static uint32_t last_wpid=0; static int32_t wp_l=0, wp_r=0; static WPid wpid_l{0,0}, wpid_r{0,0};
   static float l_tgt_s=0, r_tgt_s=0;                     // slewed setpoints (command shaping)
+  static int32_t wpd_l=0, wpd_r=0;                       // prev-window tick deltas (WHEEL_VEL_FILT)
+  static bool vel_seed=false;                            // first-tick baseline (see below)
+  static int8_t l_dir_seen=1, r_dir_seen=1;              // last commanded wheel direction
   if (now-last_wpid >= (uint32_t)(1000/WHEEL_PID_HZ)){     // wheel velocity PID @WHEEL_PID_HZ
     float dt=(now-last_wpid)/1000.0f; last_wpid=now;
     int32_t l=g_left_ticks, r=g_right_ticks;               // atomic 32-bit reads
-    g_left_vel  = (l-wp_l)/g_tpm/dt; wp_l=l;
-    g_right_vel = (r-wp_r)/g_tpm/dt; wp_r=r;
+    if (!vel_seed){ wp_l=l; wp_r=r; vel_seed=true; }       // first tick after boot: seed the
+                                                           // baseline from the LIVE counts —
+                                                           // the delta from 0 would read as a
+                                                           // huge fake velocity and full-duty-
+                                                           // jerk the first PID tick
+    int32_t dl=l-wp_l, dr=r-wp_r; wp_l=l; wp_r=r;
+    if (fabsf((float)dl) > 3.0f*g_tpm*dt || fabsf((float)dr) > 3.0f*g_tpm*dt){
+      // Counter discontinuity (POST /reset_ticks while parked, or wrap) — not motion:
+      // re-seed instead of letting the PID see a fake ±m/s velocity spike and lurch.
+      dl = 0; dr = 0; wpd_l = 0; wpd_r = 0;
+    }
+#if WHEEL_VEL_FILT
+    // 2-window (40 ms) average — see WHEEL_VEL_FILT: one tick per 20 ms window is a
+    // 0.042 m/s quantization step; halving it halves the duty ripple kp injects at crawl.
+    g_left_vel  = (float)(dl+wpd_l)/(2.0f*dt*g_tpm);
+    g_right_vel = (float)(dr+wpd_r)/(2.0f*dt*g_tpm);
+#else
+    g_left_vel  = dl/g_tpm/dt;
+    g_right_vel = dr/g_tpm/dt;
+#endif
+    wpd_l=dl; wpd_r=dr;
+    // Commanded-direction flip reset: single-channel ticks are signed by the COMMANDED
+    // direction, so the instant a reverse command lands the still-forward-rolling wheel
+    // reads as ALREADY moving the other way (fabricated vel) — kp*err then drives the OLD
+    // direction at (near) full duty until friction stalls the wheel, with the
+    // forward-wound integrator adding to it (pause, then lurch into reverse). Zero the
+    // PID state so the reversal starts from feedforward alone; the I-term rebuilds in the
+    // new direction. (True fix is the 2nd quadrature channel — see the header note.)
+    int8_t ld = (g_left_tgt  > 1e-4f) ?  1 : (g_left_tgt  < -1e-4f) ? -1 : l_dir_seen;
+    int8_t rd = (g_right_tgt > 1e-4f) ?  1 : (g_right_tgt < -1e-4f) ? -1 : r_dir_seen;
+    if (ld != l_dir_seen){ l_dir_seen = ld; wpid_l.integ = 0; wpid_l.prev = 0; }
+    if (rd != r_dir_seen){ r_dir_seen = rd; wpid_r.integ = 0; wpid_r.prev = 0; }
+    // Parked-at-zero bleed: the web keepalive re-asserts {0,0} forever, so the command
+    // never goes stale and the dead-man never resets the integrators — but a stop leaves
+    // integ wound NEGATIVE (braking unwinds it below zero), which then holds a small
+    // REVERSE duty on the parked wheel: a rollback nudge at every stop and an asymmetric
+    // lurch on the next start. Once the slewed setpoint is ~0 AND the wheel has stopped,
+    // drop the PID state. Skipped while any target is commanded (the I-term must keep
+    // building through stiction). On a slope the reset lets the robot creep until the
+    // I-term rebuilds — flat floors only, which is this robot's contract.
+    if (fabsf(l_tgt_s) < 0.005f && fabsf(g_left_vel) < 0.03f){
+      wpid_l.integ = 0; wpid_l.prev = 0;
+    }
+    if (fabsf(r_tgt_s) < 0.005f && fabsf(g_right_vel) < 0.03f){
+      wpid_r.integ = 0; wpid_r.prev = 0;
+    }
     if (g_pid_reset){                                      // live gain change (motor_pid_cb):
       g_pid_reset = false;                                 // stale integ/prev must not leak
       wpid_l.integ=wpid_l.prev=0; wpid_r.integ=wpid_r.prev=0;   // into the new tuning

@@ -152,11 +152,113 @@
               <button id="moveStop" class="btn danger small">■ Stop move</button>
               <span id="moveStatus" class="hint grow" style="text-align:right"></span>
             </div>
+            <div class="field"><label>Canned speed <span id="moveLinV">0.12</span> m/s</label>
+              <input id="moveLin" type="range" min="0.05" max="0.4" step="0.01" value="0.12"></div>
+            <div class="field"><label>Canned turn <span id="moveAngV">0.50</span> rad/s</label>
+              <input id="moveAng" type="range" min="0.1" max="0.8" step="0.05" value="0.5"></div>
             <p class="hint">Drag the joystick to drive (speed scales with how far you push),
               or use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrow keys on a keyboard.
               Release or <kbd>Space</kbd> stops. Publishes <b>/cmd_vel</b>. <b>Drive</b> /
               <b>Turn</b> run odom-feedback canned moves (distance in m, rotation in °;
-              negative = backward / clockwise) — any joystick touch or Stop takes over.</p>
+              negative = backward / clockwise) — any joystick touch or Stop takes over.
+              The <b>Canned speed</b>/<b>Canned turn</b> sliders set those maneuvers' pace
+              live (persisted across reboots) — the joystick Max sliders don't affect them.</p>
+          </div>
+          <div class="group">🗺️ SLAM &amp; navigation</div>
+          <div class="card">
+            <h2>Map (Nav2)</h2>
+            <div class="kv">
+              <span>grid</span><b id="mapGrid">–</b>
+              <span>pose (map)</span><b id="mapPose">–</b>
+              <span>nav status</span><b id="mapNavTxt">–</b>
+              <span>map age</span><b id="mapAge">–</b>
+            </div>
+            <div class="chiprow">
+              <button id="mapWipe" class="btn">✕ Clear map</button>
+            </div>
+            <p class="hint">The SLAM grid + Nav2 state behind the hero <b>Map</b> view.
+              <b>pose</b> is the TF <b>map→base_link</b> fix (slam_toolbox + wheel_odometry);
+              it goes stale when either is down. <b>Clear map</b> wipes the grid and starts
+              building fresh — it restarts <b>nano-slam</b> (slam_toolbox 2.6.10 async mode has
+              no clear service, so a restart IS the map clear) and cancels any active
+              navigation; the page waits for the fresh grid to arrive.</p>
+          </div>
+          <div class="card">
+            <h2>Locations</h2>
+            <div class="row">
+              <input id="locName" type="text" placeholder="spot name (e.g. kitchen)" maxlength="32" style="flex:1;min-width:120px">
+              <button id="locSave" class="btn">💾 Save spot</button>
+            </div>
+            <div id="locList"></div>
+            <p class="hint"><b>Save spot</b> stores the robot's <i>current</i> map pose under the
+              name (needs a live pose — stand the robot where you want saved). <b>Go</b> publishes
+              that pose to <b>/goal_pose</b> exactly like a map click. Saved to
+              <b>~/.local/state/nanobot/locations.json</b>; skills can navigate to these names too.</p>
+          </div>
+          <div class="card">
+            <h2>Odometry</h2>
+            <div class="kv">
+              <span>x</span><b id="odoX">–</b>
+              <span>y</span><b id="odoY">–</b>
+              <span>θ</span><b id="odoTh">–</b>
+            </div>
+            <div class="field"><label>Publish rate <span id="odoRateV">15</span> Hz</label>
+              <input id="odoRate" type="range" min="1" max="50" step="1" value="15"></div>
+            <p class="hint"><b>/odom</b> + odom→base_link TF from <b>wheel_odometry</b>
+              (the pose chain slam_toolbox + Nav2 build on). Lower rate = less CPU.</p>
+          </div>
+          <div class="group">⚙️ Drive hardware</div>
+          <div class="card">
+            <h2>Coprocessor (ESP32)</h2>
+            <div class="kv">
+              <span>link</span><b id="espHb">–</b>
+              <span>ticks L/R</span><b id="espTicks">–</b>
+              <span>tick rate</span><b id="espTickHz">–</b>
+              <span>L wheel</span><b id="espSuspL">–</b>
+              <span>R wheel</span><b id="espSuspR">–</b>
+              <span>temp</span><b id="espTemp">–</b>
+              <span>hall</span><b id="espHall">–</b>
+              <span>stray ticks L/R</span><b id="espStray">–</b>
+            </div>
+            <button id="espResetTicks" class="btn">🔁 Reset ticks</button>
+            <div class="field"><label>Wheel trim <span id="motorTrimV">0.00</span> <span id="motorTrimLive" class="live"></span></label>
+              <input id="motorTrim" type="range" min="-0.30" max="0.30" step="0.01" value="0.00"></div>
+            <button id="motorTrimReset" class="btn">↺ Reset trim to 0</button>
+            <div class="field"><label>PID KP <span id="pidKpV">0.0</span></label>
+              <input id="pidKp" type="range" min="0" max="20" step="0.1" value="0"></div>
+            <div class="field"><label>PID KI <span id="pidKiV">8.0</span></label>
+              <input id="pidKi" type="range" min="0" max="50" step="0.1" value="8"></div>
+            <div class="field"><label>PID KD <span id="pidKdV">0.0</span></label>
+              <input id="pidKd" type="range" min="0" max="5" step="0.05" value="0"></div>
+            <p class="hint"><b>Wheel trim</b> rebalances the mismatched gearmotors so a forward
+              command goes straight. If the robot drifts <b>left</b>, push the slider
+              <b>negative</b> (boost left / cut right); if it drifts <b>right</b>, push
+              <b>positive</b>. The live value (in parentheses) is what the ESP32 is actually
+              using and is persisted to its flash, so it survives a reboot — the slider
+              re-syncs to it on load. <b>Reset trim to 0</b> clears the rebalance.</p>
+            <p class="hint"><b>PID KP/KI/KD</b> live-tune the ESP32's closed-loop wheel velocity
+              controller — no reflash needed. The firmware holds each wheel's commanded
+              speed; KI breaks static friction at crawl (raise until a slow crawl starts
+              within ~0.5 s without judder), KP stiffens tracking, KD stays 0 (encoder
+              quantization makes it jittery). Changes apply instantly, reset the
+              integrators, and persist to the ESP32's flash once the robot is parked.
+              Sliders re-sync to the live values (f.esp.wheel_pid) on load.</p>
+            <div class="field"><label>Wheels-up override</label>
+              <select id="pickupOv">
+                <option value="-1" selected>auto (real switches)</option>
+                <option value="0">force down — ignore pick-up</option>
+                <option value="1">force up — simulate pick-up</option>
+              </select></div>
+            <p class="hint">Live from the ESP32 (zenoh-pico over UART). LDS spin telemetry
+              + target rpm moved to the <b>Sensors tab's Lidar (LDS)</b> card. The override publishes
+              <b>/pickup_override</b> so pick-up-gated behaviour (mood reflex) can be tested
+              off the ground; the L/R rows keep showing the real switches.
+              Resets to auto on page reload. <b>Stray ticks</b> = ticks the ESP32 counted
+              while that wheel was commanded (and settled) stopped — should stay at 0;
+              a rising count with the robot motionless means encoder-line noise
+              (ground bounce, a loose signal wire), not real rotation. <b>Reset ticks</b>
+              zeros both counters (and the stray counters) for a clean baseline —
+              odometry re-seeds automatically so /odom doesn't jump.</p>
           </div>
         </section>
 
@@ -397,68 +499,7 @@
         <section id="panel-sensors" class="panel">
           <label class="switch"><input type="checkbox" id="hintsToggle" checked><span class="track"></span>
             💡 Show hints (hover explanations)</label>
-          <div class="group">🗺️ SLAM &amp; navigation</div>
-          <div class="card">
-            <h2>Map (Nav2)</h2>
-            <div class="kv">
-              <span>grid</span><b id="mapGrid">–</b>
-              <span>pose (map)</span><b id="mapPose">–</b>
-              <span>nav status</span><b id="mapNavTxt">–</b>
-              <span>map age</span><b id="mapAge">–</b>
-            </div>
-            <p class="hint">The SLAM grid + Nav2 state behind the hero <b>Map</b> view.
-              <b>pose</b> is the TF <b>map→base_link</b> fix (slam_toolbox + wheel_odometry);
-              it goes stale when either is down.</p>
-          </div>
-          <div class="card">
-            <h2>Locations</h2>
-            <div class="row">
-              <input id="locName" type="text" placeholder="spot name (e.g. kitchen)" maxlength="32" style="flex:1;min-width:120px">
-              <button id="locSave" class="btn">💾 Save spot</button>
-            </div>
-            <div id="locList"></div>
-            <p class="hint"><b>Save spot</b> stores the robot's <i>current</i> map pose under the
-              name (needs a live pose — stand the robot where you want saved). <b>Go</b> publishes
-              that pose to <b>/goal_pose</b> exactly like a map click. Saved to
-              <b>~/.local/state/nanobot/locations.json</b>; skills can navigate to these names too.</p>
-          </div>
-          <div class="card">
-            <h2>Lidar (LDS)</h2>
-            <div class="kv">
-              <span>rate</span><b id="ldsHz">–</b>
-              <span>points</span><b id="ldsPts">–</b>
-              <span>lost/rev</span><b id="ldsLost">–</b>
-              <span>rx errors</span><b id="ldsErr">–</b>
-              <span>spin</span><b id="espLdsRpm">–</b>
-              <span>spin frames</span><b id="espLdsHz">–</b>
-              <span>spin duty</span><b id="espLdsDuty">–</b>
-            </div>
-            <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
-              <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
-            <div class="field"><label>Spin target <span id="ldsTgtV">300</span> rpm</label>
-              <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
-            <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
-              <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
-              bad-checksum packets since start (climbing fast = degraded serial RX wiring).
-              When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
-              UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.
-              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets
-              the rpm the ESP32 spins at (published straight to <b>/lds_target_rpm</b>).
-              0 = park the spin motor (the old idle auto-spin-down died with slam_nav —
-              use this manually if you want the lidar quiet).</p>
-          </div>
-          <div class="card">
-            <h2>Odometry</h2>
-            <div class="kv">
-              <span>x</span><b id="odoX">–</b>
-              <span>y</span><b id="odoY">–</b>
-              <span>θ</span><b id="odoTh">–</b>
-            </div>
-            <div class="field"><label>Publish rate <span id="odoRateV">15</span> Hz</label>
-              <input id="odoRate" type="range" min="1" max="50" step="1" value="15"></div>
-            <p class="hint"><b>/odom</b> + odom→base_link TF from <b>wheel_odometry</b>
-              (the pose chain slam_toolbox + Nav2 build on). Lower rate = less CPU.</p>
-          </div>
+          <div class="group">🗺️ IMU &amp; orientation</div>
           <div class="card">
             <h2>IMU</h2>
             <div class="kv">
@@ -480,8 +521,9 @@
               load): hold the loose IMU near each candidate spot — motors, ESP32, wiring, metal
               chassis — and watch <b>mag magnitude</b>/<b>noise</b>; a jump means magnetic or
               electrical interference there. To find out WHICH nearby part is the culprit, hold
-              it close to one at a time and briefly toggle that part — spin the LDS (Lidar
-              card), flip the cooling fan override (Actuators card), or nudge the drive joystick —
+              it close to one at a time and briefly toggle that part — spin the LDS (Sensors
+              tab's Lidar card), flip the cooling fan override (Actuators card), or nudge the
+              drive joystick —
               watching for a spike here. <b>Worst noise seen</b> peak-holds the biggest jump
               since the last reset, so you don't have to stare at it while walking the sensor
               around. Raw sensor counts — useful only to compare spots, not an absolute field
@@ -644,6 +686,32 @@
               deliberate human-triggered action, not a skill). You'll be asked to confirm before it
               starts, and it aborts automatically (restoring every actuator) if the robot is picked
               up or driven mid-run.</p>
+          </div>
+          <div class="group">📡 Lidar</div>
+          <div class="card">
+            <h2>Lidar (LDS)</h2>
+            <div class="kv">
+              <span>rate</span><b id="ldsHz">–</b>
+              <span>points</span><b id="ldsPts">–</b>
+              <span>lost/rev</span><b id="ldsLost">–</b>
+              <span>rx errors</span><b id="ldsErr">–</b>
+              <span>spin</span><b id="espLdsRpm">–</b>
+              <span>spin frames</span><b id="espLdsHz">–</b>
+              <span>spin duty</span><b id="espLdsDuty">–</b>
+            </div>
+            <div class="field"><label>Publish rate <span id="ldsRateV">10</span> Hz</label>
+              <input id="ldsRate" type="range" min="1" max="10" step="1" value="10"></div>
+            <div class="field"><label>Spin target <span id="ldsTgtV">300</span> rpm</label>
+              <input id="ldsTgt" type="range" min="0" max="400" step="10" value="300"></div>
+            <p class="hint"><b>/scan</b> rate is motor-bound (~5 Hz max); the slider decimates lower.
+              <b>lost/rev</b> = readings missing from the last revolution; <b>rx errors</b> =
+              bad-checksum packets since start (climbing fast = degraded serial RX wiring).
+              When no scans arrive at all this shows why: "no RX data" = 0 bytes on the
+              UART (check the LDS→SBC wire), "RX garbled" = bytes but no valid packets.
+              <b>Spin</b> readouts are live from the ESP32's PID; <b>Spin target</b> sets
+              the rpm the ESP32 spins at (published straight to <b>/lds_target_rpm</b>).
+              0 = park the spin motor (the old idle auto-spin-down died with slam_nav —
+              use this manually if you want the lidar quiet).</p>
           </div>
           <div class="group">👁️ Vision</div>
           <div class="card">
@@ -838,58 +906,6 @@
             <p class="hint">Line-laser PWM on the ESP32 (<b>/laser_pwm</b>, GPIO 23/32).
               0 = off, 255 = full brightness. Publish-only, so a page reload resets to 0
               until the next drag; the lasers also cut out if the SBC link drops.</p>
-          </div>
-          <div class="card">
-            <h2>Coprocessor (ESP32)</h2>
-            <div class="kv">
-              <span>link</span><b id="espHb">–</b>
-              <span>ticks L/R</span><b id="espTicks">–</b>
-              <span>tick rate</span><b id="espTickHz">–</b>
-              <span>L wheel</span><b id="espSuspL">–</b>
-              <span>R wheel</span><b id="espSuspR">–</b>
-              <span>temp</span><b id="espTemp">–</b>
-              <span>hall</span><b id="espHall">–</b>
-              <span>stray ticks L/R</span><b id="espStray">–</b>
-            </div>
-            <button id="espResetTicks" class="btn">🔁 Reset ticks</button>
-            <div class="field"><label>Wheel trim <span id="motorTrimV">0.00</span> <span id="motorTrimLive" class="live"></span></label>
-              <input id="motorTrim" type="range" min="-0.30" max="0.30" step="0.01" value="0.00"></div>
-            <button id="motorTrimReset" class="btn">↺ Reset trim to 0</button>
-            <div class="field"><label>PID KP <span id="pidKpV">0.0</span></label>
-              <input id="pidKp" type="range" min="0" max="20" step="0.1" value="0"></div>
-            <div class="field"><label>PID KI <span id="pidKiV">8.0</span></label>
-              <input id="pidKi" type="range" min="0" max="50" step="0.1" value="8"></div>
-            <div class="field"><label>PID KD <span id="pidKdV">0.0</span></label>
-              <input id="pidKd" type="range" min="0" max="5" step="0.05" value="0"></div>
-            <p class="hint"><b>Wheel trim</b> rebalances the mismatched gearmotors so a forward
-              command goes straight. If the robot drifts <b>left</b>, push the slider
-              <b>negative</b> (boost left / cut right); if it drifts <b>right</b>, push
-              <b>positive</b>. The live value (in parentheses) is what the ESP32 is actually
-              using and is persisted to its flash, so it survives a reboot — the slider
-              re-syncs to it on load. <b>Reset trim to 0</b> clears the rebalance.</p>
-            <p class="hint"><b>PID KP/KI/KD</b> live-tune the ESP32's closed-loop wheel velocity
-              controller — no reflash needed. The firmware holds each wheel's commanded
-              speed; KI breaks static friction at crawl (raise until a slow crawl starts
-              within ~0.5 s without judder), KP stiffens tracking, KD stays 0 (encoder
-              quantization makes it jittery). Changes apply instantly, reset the
-              integrators, and persist to the ESP32's flash once the robot is parked.
-              Sliders re-sync to the live values (f.esp.wheel_pid) on load.</p>
-            <div class="field"><label>Wheels-up override</label>
-              <select id="pickupOv">
-                <option value="-1" selected>auto (real switches)</option>
-                <option value="0">force down — ignore pick-up</option>
-                <option value="1">force up — simulate pick-up</option>
-              </select></div>
-            <p class="hint">Live from the ESP32 (zenoh-pico over UART). LDS spin telemetry
-              + target rpm moved to the <b>Lidar (LDS)</b> card above. The override publishes
-              <b>/pickup_override</b> so pick-up-gated behaviour (mood reflex) can be tested
-              off the ground; the L/R rows keep showing the real switches.
-              Resets to auto on page reload. <b>Stray ticks</b> = ticks the ESP32 counted
-              while that wheel was commanded (and settled) stopped — should stay at 0;
-              a rising count with the robot motionless means encoder-line noise
-              (ground bounce, a loose signal wire), not real rotation. <b>Reset ticks</b>
-              zeros both counters (and the stray counters) for a clean baseline —
-              odometry re-seeds automatically so /odom doesn't jump.</p>
           </div>
         </section>
 
@@ -1893,8 +1909,8 @@ function onFrame(f){
 // readout works even with the video view never opened. The status numbers live in the
 // Sensors panel only (no on-video badge, per user preference) -- the crosshair is kept
 // on the video itself since it's a spatial indicator, not a text label.
-// Hover explanations for the Sensors + System tabs (both "System health" and "Camera (GPU
-// vision)" cards) -- readouts AND every tunable slider/toggle. Applied as plain
+// Hover explanations for the Drive + Sensors + System tabs (canned moves, "System health"
+// and "Camera (GPU vision)" cards) -- readouts AND every tunable slider/toggle. Applied as plain
 // native `title` attributes (zero new UI component, browser handles the hover) via
 // element ID, so this needed no changes to the HTML markup itself. Toggleable
 // (#hintsToggle) and persisted across reloads via localStorage, since it's a pure
@@ -1907,6 +1923,8 @@ const HINTS = {
   moveTurn: "Starts the canned rotation (Turn N degrees). A running canned move is replaced by a new one.",
   moveStop: "Cancels the running canned move and stops (same as touching the joystick or pressing STOP).",
   moveStatus: "Live progress of the canned move (phase, target, % done) and its result after it finishes. The maneuver aborts if /odom is lost or the browser disconnects for >5 s.",
+  moveLin: "Cruise speed for the canned Drive maneuvers (m/s). Live-tunes the server and persists across reboots. The approach still ramps down into the target, so very short moves peak below this.",
+  moveAng: "Turn-rate cap for the canned Turn maneuvers (rad/s). Live-tunes the server and persists across reboots. Keep at/below 0.8 -- faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
   sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
@@ -2998,6 +3016,22 @@ $("moveStop").onclick=()=>postMove({cancel:true});
 $("moveDist").addEventListener("keydown",e=>{ if(e.key==="Enter") $("moveFwd").click(); });
 $("moveDeg").addEventListener("keydown",e=>{ if(e.key==="Enter") $("moveTurn").click(); });
 
+// ---- canned-move speed sliders (GET/POST /move/config) ----
+// Live-tune the server's move_lin_speed/move_ang_speed; values persist server-side
+// (survive reboots), so the sliders re-seed from GET /move/config on page load.
+$("moveLin").oninput=()=>$("moveLinV").textContent=Number($("moveLin").value).toFixed(2);
+$("moveAng").oninput=()=>$("moveAngV").textContent=Number($("moveAng").value).toFixed(2);
+const postMoveCfg=()=>fetch("/move/config",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({move_lin_speed:Number($("moveLin").value),
+                       move_ang_speed:Number($("moveAng").value)})}).catch(()=>{});
+$("moveLin").onchange=postMoveCfg;
+$("moveAng").onchange=postMoveCfg;
+fetch("/move/config").then(r=>r.ok?r.json():null).then(c=>{
+  if(!c) return;
+  $("moveLin").value=c.move_lin_speed; $("moveLinV").textContent=Number(c.move_lin_speed).toFixed(2);
+  $("moveAng").value=c.move_ang_speed; $("moveAngV").textContent=Number(c.move_ang_speed).toFixed(2);
+}).catch(()=>{});
+
 // keyboard
 const keys={};
 const typing=e=>/^(input|textarea|select)$/i.test(e.target.tagName);
@@ -3335,7 +3369,7 @@ connect();   // auto-connect on load
     $("mapWait").style.display="none";    // got a real frame: drop the placeholder
     cv.style.cursor="crosshair";          // ...and arm click-to-go only now
     repaint();
-    // Sensors-card readout line (grid geometry + map staleness)
+    // Map-card readout line (Drive tab; grid geometry + map staleness)
     const age=(m.t!==undefined)? Math.max(0,(Date.now()-m.t)/1000) : null;
     $("mapGrid").textContent=`${w}×${h} @ ${m.res.toFixed(3)} m`;
     $("mapAge").textContent=age===null?"–":(age<90?`${age.toFixed(0)} s ago`:"stale");
@@ -3372,6 +3406,18 @@ connect();   // auto-connect on load
     fetch("/nav/cancel",{method:"POST"}).catch(()=>{});
     repaint();
   };
+  // Clear map (Drive tab Map card): POST /map/clear drops the server's cached
+  // grid + goal mirror and restarts nano-slam — slam_toolbox 2.6.10 async mode
+  // has no clear service and no map file is configured, so a restart IS the map
+  // clear. The server cancels any active goal first (its map-frame target stops
+  // existing); the page resets the local goal ring + trail and shows mapWait
+  // until the fresh (transient-local) grid lands.
+  $("mapWipe").onclick=()=>{
+    if(!confirm("Wipe the SLAM map and build a fresh one?\n(restarts nano-slam; any navigation in progress is cancelled)")) return;
+    mapGoal=null;
+    navTrail.length=0; lastTrailPt=null;
+    fetch("/map/clear",{method:"POST"}).catch(()=>{});
+  };
   $("mapShade").addEventListener("change",e=>{ sharpShade=e.target.checked; shadeMap(); repaint(); });
 
   // poll lifecycle: run only while the Map hero view is on (#mapOn, driven by the
@@ -3400,7 +3446,7 @@ connect();   // auto-connect on load
         if(navTrail.length>trailCap) navTrail.shift();
       }
     }
-    // Sensors-card readouts
+    // Map-card readouts (Drive tab)
     if(nav.pose){
       $("mapPose").textContent=`${nav.pose[0].toFixed(2)}, ${nav.pose[1].toFixed(2)}, ${(nav.pose[2]*180/Math.PI).toFixed(0)}°`;
     } else {
@@ -3420,7 +3466,7 @@ connect();   // auto-connect on load
     if($("mapOn").checked) repaint();
   };
 
-  // ---- Locations card (Sensors tab) -------------------------------------------
+  // ---- Locations card (Drive tab) ---------------------------------------------
   // Server persists to ~/.local/state/nanobot/locations.json. Save stores the
   // robot's CURRENT map pose (server-side TF fallback when x/y are omitted);
   // Go publishes the stored pose to /goal_pose exactly like a map click.

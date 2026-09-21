@@ -219,6 +219,9 @@ class DevState:
         # can reflect the exact same screen off-robot, polled via GET /oled/state.
         self.oled_face = ""
         self.oled_word = ""
+        # Canned-move speed sliders (GET/POST /move/config) — a dev-session dict (no
+        # persistence; there are no motors here, the page just needs a live round-trip).
+        self.move_cfg = {"move_lin_speed": 0.12, "move_ang_speed": 0.5}
         # Synthetic-sensor source: random (jittering, default) or manual (frozen, user-set). Loaded
         # from the persisted dev-state so a chosen manual reading survives restarts. See _sensor_values.
         self._sensors_lock = threading.Lock()
@@ -1024,6 +1027,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.stress_status())
         if p == "/tts/config":
             return self._json(self.state.get_tts_settings())
+        if p == "/move/config":
+            return self._json(self.state.move_cfg)
         if p == "/oled/state":
             return self._json(self.state.oled_state())
         if p == "/dev/sensors":
@@ -1057,6 +1062,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # Canned-move no-op (no /odom, no motors here): accept {dist,deg,cancel}
             # so the Drive card's canned controls respond normally off-robot.
             return self._json({"status": "started", "dev": True})
+        if p == "/move/config":
+            # Canned-speed sliders: accept + remember for this dev session.
+            d = self._body()
+            for k in ("move_lin_speed", "move_ang_speed"):
+                try:
+                    self.state.move_cfg[k] = float(d[k])
+                except (KeyError, TypeError, ValueError):
+                    pass
+            return self._json({"status": "ok", "dev": True, **self.state.move_cfg})
         if p == "/llm/say":
             if not s.llm.available():
                 return self._text(503, "llm unavailable")

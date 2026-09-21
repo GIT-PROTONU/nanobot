@@ -163,6 +163,29 @@ def main():
             echo_v = None
         check("drive accepted", st == 200 and echo_v == 0.1, body[:80])
 
+        # --- canned-move speed config (GET/POST /move/config; Drive card sliders) --
+        st, body = req("GET", "/move/config")
+        try:
+            cfg = json.loads(body)
+        except Exception:
+            cfg = {}
+        check("move/config GET has both speeds",
+              st == 200 and "move_lin_speed" in cfg and "move_ang_speed" in cfg, body[:80])
+        st, body = req("POST", "/move/config", {"move_lin_speed": 0.2})
+        try:
+            echo_lin = json.loads(body)["move_lin_speed"]
+        except Exception:
+            echo_lin = None
+        check("move/config POST applied+clamped", st == 200 and echo_lin == 0.2, body[:80])
+        st, body = req("POST", "/move/config", {"move_ang_speed": 99.0})
+        try:
+            echo_ang = json.loads(body)["move_ang_speed"]
+        except Exception:
+            echo_ang = None
+        check("move/config turn clamped to 0.8", st == 200 and echo_ang == 0.8, body[:80])
+        st, body = req("POST", "/move/config", {"move_lin_speed": "fast"})
+        check("move/config garbage refused", b"error" in body, body[:80])
+
         # --- GPU vision frame contract (gpu_vision_enable defaults true; no camera on
         # this dev host, so GpuVision degrades to idle defaults -- the KEYS must still
         # be present, that's the contract telemetry.py <-> the page share) ------------

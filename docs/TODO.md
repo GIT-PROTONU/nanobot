@@ -106,6 +106,20 @@ in this checkout.
       run-dependent (0.08 can be spotless while 0.10 flags on the next repeat) —
       judge aggregates, not single runs. VERIFY the gains survived the next
       reboot (`/wheel_pid` readback should read [5,60,0] after a power cycle).
+      NOTE 2026-09-21: the smoothness pass re-flashed the firmware (`pio run -t
+      upload` does NOT erase NVS) — confirm the readback still shows [5,60,0].
+- [ ] **Verify the 2026-09-21 wheel-PID smoothness pass on hardware** (flashed +
+      deployed 2026-09-21 — five structural fixes, NO gain changes; see the
+      "2026-09-21 smoothness pass" block in AGENTS.md): (1) stops must not roll
+      back / nudge backwards (parked-at-zero integrator bleed); (2) forward→reverse
+      must not pause-then-lurch (direction-flip reset); (3) crawl limit-cycling
+      should shrink vs the 2026-09-21 sweep baseline (2-window velocity average —
+      re-judge with `pid_tune.py --repeat 3` aggregates, not single runs; gains may
+      now tolerate retuning since kp noise-injection is halved); (4) `POST
+      /reset_ticks` while parked must not lurch; (5) first drive after a flash must
+      not jerk (boot baseline seed). Also spot-check that a stopped robot holds
+      still on the flat floor indefinitely with the page open (the bleed only fires
+      at rest — a slope would now let it creep).
 - [ ] **OPEN BUG: /cmd_vel delivery to the ESP32 dies after a router/stack restart —
       Twist-specific, other topics keep flowing.** After `deploy.sh`/`stack.sh`
       restarts the zenoh router, the coprocessor's session re-attaches (heartbeat,
@@ -121,9 +135,8 @@ in this checkout.
       vs zenoh-pico's re-attach path; compare a router-restart vs ESP32-reboot
       declare table. The old "ESP32 wedged after stack restart" gotcha and this are
       likely the same root cause.
-      - **2026-09-21 FIX IMPLEMENTED, FLASH PENDING (needs the ESP32 on the dev
-        PC's USB — the coprocessor is wired to the robot's rail, flashing is
-        physical)**: the firmware now **periodically UNDECLAREs + REDECLAREs every
+      - **2026-09-21 FIX FLASHED (deployed same day, robot live)**: the firmware
+        **periodically UNDECLAREs + REDECLAREs every
         subscription** (`SUB_REDECLARE_MS 45000`, `SUBS` table + `subsRedeclare()` in
         main.cpp) — the fresh router instance's empty remote-sub table is refreshed
         in place, bounding the worst deaf window at 45 s, no ESP reboot needed. Note:
@@ -132,8 +145,9 @@ in this checkout.
         (same convention as the existing `z_config_move()`). Also confirmed live
         2026-09-21: a full stack restart did NOT always reproduce the bug (cmd_vel
         delivered after this one) — it's intermittent, consistent with a declare
-        race, which the periodic re-declare covers. After flashing, verify: restart
-        the router a few times and confirm /cmd_vel revives within ≤45 s if dropped.
+        race, which the periodic re-declare covers. VERIFY: restart the router a few
+        times and confirm /cmd_vel revives within ≤45 s if dropped — until then keep
+        the power-cycle workaround in mind.
       - **2026-09-19 drive-test evidence (SLAM diagnosis session)**: with the flashed
         deadband build (`MOTOR_MIN_DUTY 0.55`), wheels seized ~1.4-2.4 s into every
         command at crawl/mid duty — 0.12 m/s, 0.25 m/s AND 0.5 rad/s in-place spins
