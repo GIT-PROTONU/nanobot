@@ -42,7 +42,13 @@ wheel_odometry:
                               # rising edges; MEASURED 2026-09-20 rollout: 2235 ticks /
                               # 1.86 m = 1202 ticks/m => 253/rev; was 1440 = 5.7x error)
     wheel_radius: 0.0335      # metres
-    wheel_separation: 0.16    # metres between wheel contact points
+    wheel_separation: 0.102   # metres between wheel contact points. MEASURED
+                              # 2026-09-21 by lidar self-correlation (90 deg canned
+                              # turns read 146/139 deg physical => 0.16/1.583): the
+                              # 0.16 was the chassis width, not the track — odom yaw
+                              # was compressing 1.58x and canned rotations overshot
+                              # (115->180, 60->90 as seen from the seat). Distance was
+                              # never affected (tick scale is radius-side).
     invert_left: false
     invert_right: false
     publish_rate: 15.0        # Hz, odom publish rate (retunable live via web UI slider;
