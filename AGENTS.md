@@ -72,8 +72,18 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   the board has no battery RTC, so a power-on boots with a days-stale fake-hwclock and
   NTP steps the clock mid-run while the stack is already up — under a live SLAM session
   that step drops every scan (slam_toolbox message filter: "earlier than all the data in
-  the transform cache", hit 2026-09-19). All units are `After=nano-router`, so the
-  router's wait orders the whole stack. Logs: `journalctl -u nano-app` etc.
+  the transform cache", hit 2026-09-19). **Second live instance (2026-09-21 pm, worse —
+  it wrecked NAV): after a mid-session board reboot the units started stale; NTP stepped
+  the clock ~64 s later; map→base_link TF stamps were future-dated vs the stepped clock →
+  pose lookups failed ("extrapolation into the past") → Nav2's RPP evaluated a garbage
+  pose → "detected collision ahead" ×2 → patience exceeded → the BT's backup ALSO aborted
+  ("Collision Ahead") → goal failed; the user saw the robot "spin around like crazy" (RPP
+  rotate-to-heading in place while collision checking refused to translate). HEAL = stack
+  bounce + wake the parked lidar (a fresh slam gets no scans on a quiet robot → /map stays
+  empty until the LDS spins).** The 20 s wait is evidently not enough — a LATER NTP
+  correction can always land mid-session; a sys_monitor clock-step watcher (restart
+  slam+nav on a detected step) is the candidate fix (docs/TODO.md). All units are
+  `After=nano-router`, so the router's wait orders the whole stack. Logs: `journalctl -u nano-app` etc.
 
 - Auto-starts on boot via systemd `nano-robot.target`. `nano-stack.service` + `nano-heal.timer` are retired. Restart/recovery is systemd's (`Restart=on-failure`); `stack.sh down` → verify via `/proc` → `up` is still the clean cycle after a deploy (`stack.sh restart` can leave stale processes holding ports — see Gotchas).
 - Zenoh needs a serial-capable `zenohd` binary (conda builds lack `transport_serial`). Build with `firmware/nanobot_coprocessor/tools/build_zenohd_serial.sh {x86_64|aarch64}`; the `nano-router` systemd unit (via `scripts/unit_exec.sh router`) runs it on the board so the ESP32 (serial) and the rmw_zenoh nodes (TCP) share a graph.

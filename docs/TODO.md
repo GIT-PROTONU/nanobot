@@ -166,7 +166,16 @@ in this checkout.
         out-and-back: 0.84-0.86 (one bad lock strip from the OUT jerk). Also:
         the board's no-RTC clock steps (~44 h at power-on, 2026-09-19 12:00:53)
         destroy live SLAM sessions — a bounded NTP wait now gates `unit_exec.sh`
-        (deployed live; 20 s max, offline robots still boot).
+        (deployed live; 20 s max, offline robots still boot). **2026-09-21 pm:
+        the wait is NOT enough — a later NTP correction landed mid-session and
+        wrecked NAV (future-dated TF stamps → failed map→base_link lookups →
+        RPP "collision ahead" ×2 → the "crazy spin" + BT backup failure → goal
+        aborted; heal = stack bounce + waking the parked lidar so a fresh slam
+        gets scans). Candidate fix: a sys_monitor clock-step watcher
+        (monotonic-vs-epoch drift between ticks; step > ~2 s = restart
+        nano-slam + nano-nav automatically, logged to health.log). Also:
+        arming the lidar rebuild window when /map goes stale while a fresh
+        slam runs.**
       - RE-VALIDATE now that the firmware kick is flashed (2026-09-20): restart
         nano-slam (fresh map — no map_file_name is configured, so a restart IS a
         clear), drive a clean lap, confirm walls line up with the room, a second
