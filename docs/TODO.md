@@ -34,6 +34,14 @@ in this checkout.
       spin (first flash ever writes `ldstgt` on the first setpoint change).
       NVS note: `pio run -t upload` does NOT erase NVS — the new `ldstgt` key
       just appears on first save.
+      **PERSISTENT (2026-09-21, dev-verified): the Lidar card's spin-down settings
+      survive a restart/reboot** — `web_server._persist_lds_params`
+      (`add_on_set_parameters_callback`) snapshots the whole cluster
+      (enable/secs/manual_secs + the Spin slider's active rpm) to
+      `~/.local/state/nanobot/lds.json` on any setter, boot re-applies it over
+      robot.yaml before TelemetryHub, and `f.lds` carries `enable`+`secs` so a
+      fresh page re-seeds its controls. Unit-tested (`test_lds_persist.py`) +
+      smoke-covered (`POST /param lds_idle_secs=123` → lds.json).
 - [ ] **NEW 2026-09-21: intermittent full-duty lunges on corrupted `/cmd_vel` — firmware
       reject-gate + flip-state guard (user deferred: "later TODO", robot manually
       speed-limited).** Symptom (user-confirmed): the robot lunges at ~0.4-0.45 m/s

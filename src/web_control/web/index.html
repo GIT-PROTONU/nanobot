@@ -522,8 +522,8 @@
               chassis — and watch <b>mag magnitude</b>/<b>noise</b>; a jump means magnetic or
               electrical interference there. To find out WHICH nearby part is the culprit, hold
               it close to one at a time and briefly toggle that part — spin the LDS (Sensors
-              tab's Lidar card), flip the cooling fan override (Actuators card), or nudge the
-              drive joystick —
+              tab's Lidar card), flip the cooling fan override (System tab's
+              Cooling fan card), or nudge the drive joystick —
               watching for a spike here. <b>Worst noise seen</b> peak-holds the biggest jump
               since the last reset, so you don't have to stare at it while walking the sensor
               around. Raw sensor counts — useful only to compare spots, not an absolute field
@@ -885,6 +885,31 @@
               <b>/led</b> from brightness with hysteresis (on/off thresholds must stay
               apart to avoid flicker).</p>
           </div>
+        </section>
+
+        <!-- ===== SYSTEM ===== -->
+        <section id="panel-system" class="panel">
+          <div class="card">
+            <h2>Connection</h2>
+            <button id="connect" class="btn primary">Connect</button>
+            <p class="hint">Live telemetry stream (same-origin /telemetry). The page
+              auto-connects on load and reconnects after a stack reset / reboot.</p>
+          </div>
+          <div class="card">
+            <h2>System health</h2>
+            <div class="kv">
+              <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
+              <div class="cores" id="sysCores"></div>
+              <span>load</span><b id="sysLoad">–</b>
+              <span>memory</span><b id="sysMem">–</b>
+              <span>temp</span><b id="sysTemp">–</b>
+              <span>disk</span><b id="sysDisk">–</b>
+              <span>wifi</span><b id="sysWifi">–</b>
+              <span>uptime</span><b id="sysUp">–</b>
+            </div>
+            <p class="hint">Board health from <b>/diagnostics</b>, 1 Hz. Tap <b>CPU</b> for per-core.
+              <b>wifi</b> = signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
+          </div>
           <div class="group">⚙️ Actuators</div>
           <div class="card">
             <h2>Cooling fan</h2>
@@ -918,31 +943,6 @@
             <p class="hint">Line-laser PWM on the ESP32 (<b>/laser_pwm</b>, GPIO 23/32).
               0 = off, 255 = full brightness. Publish-only, so a page reload resets to 0
               until the next drag; the lasers also cut out if the SBC link drops.</p>
-          </div>
-        </section>
-
-        <!-- ===== SYSTEM ===== -->
-        <section id="panel-system" class="panel">
-          <div class="card">
-            <h2>Connection</h2>
-            <button id="connect" class="btn primary">Connect</button>
-            <p class="hint">Live telemetry stream (same-origin /telemetry). The page
-              auto-connects on load and reconnects after a stack reset / reboot.</p>
-          </div>
-          <div class="card">
-            <h2>System health</h2>
-            <div class="kv">
-              <span class="exp" id="cpuToggle">▸ CPU</span><b id="sysCpu">–</b>
-              <div class="cores" id="sysCores"></div>
-              <span>load</span><b id="sysLoad">–</b>
-              <span>memory</span><b id="sysMem">–</b>
-              <span>temp</span><b id="sysTemp">–</b>
-              <span>disk</span><b id="sysDisk">–</b>
-              <span>wifi</span><b id="sysWifi">–</b>
-              <span>uptime</span><b id="sysUp">–</b>
-            </div>
-            <p class="hint">Board health from <b>/diagnostics</b>, 1 Hz. Tap <b>CPU</b> for per-core.
-              <b>wifi</b> = signal (green ≥ −60 dBm, amber ≥ −75, red below).</p>
           </div>
           <div class="card">
             <h2>View</h2>
@@ -2351,8 +2351,20 @@ function onEsp(e, susp){
 // from the gateway's idle controller) is re-rendered every second so it ticks even
 // between SSE frames; `state` comes from f.lds (spin/park/manual/hold/jam); `tgt`
 // (the live setpoint) re-syncs the Spin slider unless the user is mid-drag.
+// `enable`/`secs` are the persisted spin-down controller config — re-seed the
+// Idle-spin-down toggle + Spin-down-after slider ONCE on first arrival so a fresh
+// page matches the node's saved values (the f.esp.wheel_pid readback pattern);
+// the node persists changes via lds.json, not the page.
 let ldsIdleVal, ldsFrameAt=0;   // undefined = no frame yet; null = no commanded motion since boot
+let ldsCtlSynced=false;
 function onLds(l){
+  if(l.enable!=null && !ldsCtlSynced){
+    ldsCtlSynced=true;
+    $("ldsIdleEn").checked=!!l.enable;
+    const s=Math.round(l.secs);
+    $("ldsIdleSecs").value=String(s);
+    $("ldsIdleSecsV").textContent=s;
+  }
   if(l.rpm!=null) $("espLdsRpm").textContent=l.rpm.toFixed(0)+" rpm";
   if(l.hz!=null){ $("espLdsHz").textContent=l.hz.toFixed(1)+" Hz"; OLED.tel({lds:l.hz}); }
   if(l.duty!=null) $("espLdsDuty").textContent=(l.duty*100).toFixed(0)+"%";

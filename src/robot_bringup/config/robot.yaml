@@ -359,7 +359,10 @@ web_control:
     # jammed rotor is protected firmware-side (main.cpp's LDS_JAM_* guard + /lds_jam):
     # the ESP32 parks the motor after 6 s of "target set but can't spin" and only
     # retries after it sees target 0 (which the idle timeout provides naturally).
-    # All three are live-tunable via POST /param (telemetry.py PARAM_WHITELIST).
+    # All three are live-tunable via POST /param (telemetry.py PARAM_WHITELIST), and
+    # the Lidar card's spin-down settings (enable/secs + the Spin slider's active rpm)
+    # PERSIST to ~/.local/state/nanobot/lds.json and WIN over these defaults on boot
+    # (the move.json/tts.json pattern; delete the file to return to robot.yaml).
     lds_idle_enable: true
     lds_idle_secs: 60.0       # s of quiet (no motion, no goal) before the spin-down
     lds_manual_secs: 300.0    # s a manual slider/skill post owns the topic

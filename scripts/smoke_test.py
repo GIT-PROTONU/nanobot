@@ -13,7 +13,9 @@ Asserts:
   * GET /telemetry   -> SSE frames with the expected keys; OLED face echo after a
                         POST /publish; /diagnostics present when a router is up
   * POST /publish    -> whitelisted ok / non-whitelisted refused / bad value refused
-  * POST /param      -> non-whitelisted refused
+  * POST /param      -> non-whitelisted refused; an LDS spin-down param persists
+                        to ~/.local/state/nanobot/lds.json (Lidar card survives
+                        a restart)
   * POST /drive      -> clamped echo
   * vitals blob      -> sys_monitor writes /dev/shm/nano_vitals.json with cpu/mem/temp
   * SIGTERM app_hub  -> clean exit (OLED end-screen path), rc 0
@@ -182,9 +184,32 @@ def main():
             echo_ang = json.loads(body)["move_ang_speed"]
         except Exception:
             echo_ang = None
-        check("move/config turn clamped to 0.8", st == 200 and echo_ang == 0.8, body[:80])
+        # MOVE_ANG_RANGE top = 1.0 (the 2026-09-21 ceiling bump; was 0.8)
+        check("move/config turn clamped to 1.0", st == 200 and echo_ang == 1.0, body[:80])
         st, body = req("POST", "/move/config", {"move_lin_speed": "fast"})
         check("move/config garbage refused", b"error" in body, body[:80])
+
+        # --- LDS spin-down persistence (POST /param -> ~/.local/state/nanobot/lds.json;
+        # the Lidar card's spin-down settings must survive a restart) ----------------
+        LDS_JSON = os.path.join(os.path.expanduser("~"), ".local", "state",
+                                "nanobot", "lds.json")
+        st, body = req("POST", "/param",
+                       {"node": "web_control", "name": "lds_idle_secs", "value": 123.0})
+        check("lds param accepted", st == 200 and b"sent" in body, body[:80])
+        lds_saved = False
+        for _ in range(20):               # the /param call is fire-and-forget; the
+            try:                          # service + file write land within ~2 s
+                with open(LDS_JSON, encoding="utf-8") as fh:
+                    lds_saved = json.load(fh).get("lds_idle_secs") == 123.0
+            except Exception:
+                lds_saved = False
+            if lds_saved:
+                break
+            time.sleep(0.1)
+        check("lds param persisted to lds.json", lds_saved)
+        req("POST", "/param",            # restore the default so the dev host is clean
+            {"node": "web_control", "name": "lds_idle_secs", "value": 60.0})
+        time.sleep(0.5)
 
         # --- GPU vision frame contract (gpu_vision_enable defaults true; no camera on
         # this dev host, so GpuVision degrades to idle defaults -- the KEYS must still

@@ -32,6 +32,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.time import Time
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+from rclpy.parameter import Parameter as RclpyParameter
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, Float32MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, OccupancyGrid
@@ -1003,13 +1004,24 @@ class TelemetryHub:
         via POST /publish, or a skill action): latch the manual window so the
         controller hands the topic over for `lds_manual_secs`, and track the value
         for the frame. `set_target` (browser slider only) also makes it the
-        remembered spin-when-active rpm; skills merely borrow the topic."""
+        remembered spin-when-active rpm; skills merely borrow the topic. A
+        set_target also writes the lds_active_rpm param — web_control's on-set
+        callback persists it to lds.json, so the chosen spin speed survives a
+        restart (same flow as the toggle/secs sliders' POST /param)."""
         rpm = max(0.0, float(rpm))
         self._lds_manual_until = time.monotonic() + self._lds_manual_secs()
         self._lds_sent = rpm
         self._lds_sent_at = time.monotonic()
         if set_target:
             self._lds_user_rpm = rpm
+            try:
+                pv = ParameterValue()
+                pv.type = ParameterType.PARAMETER_DOUBLE
+                pv.double_value = rpm
+                self._node.set_parameters(
+                    [RclpyParameter("lds_active_rpm", value=pv)])
+            except Exception:
+                pass
         return rpm
 
     def lds_hold(self, on):
@@ -1021,7 +1033,10 @@ class TelemetryHub:
         """The controller's view of the world, folded into f.lds: `age` (moved here
         so the whole section is built in one place), `tgt` (last setpoint published
         by any owner), `idle` (s since the last commanded motion — the web UI's live
-        last-move timer; null = nothing commanded since boot) and `state`."""
+        last-move timer; null = nothing commanded since boot), `state`, and the
+        persisted controller config (`enable`/`secs` — the page re-seeds its
+        Lidar-card controls from them once on first arrival, like f.esp.wheel_pid
+        does for the PID sliders)."""
         age = round(now - self._lds_at, 1) if self._lds_at is not None else None
         idle = (now - self._last_move_at) if self._last_move_at is not None else None
         if self._lds.get("jam"):
@@ -1032,8 +1047,14 @@ class TelemetryHub:
             state = "hold"        # IMU interference test owns the spin motor
         else:
             state = "spin" if (self._lds_sent or 0.0) > 0.0 else "park"
+        try:
+            enable = bool(self._lds_param("lds_idle_enable", True))
+            secs = float(self._lds_param("lds_idle_secs", LDS_IDLE_SECS_DEFAULT))
+        except (TypeError, ValueError):
+            enable, secs = True, LDS_IDLE_SECS_DEFAULT
         return {"age": age, "state": state, "tgt": self._lds_sent,
-                "idle": round(idle, 1) if idle is not None else None}
+                "idle": round(idle, 1) if idle is not None else None,
+                "enable": enable, "secs": secs}
 
     # ---- POST /publish ----------------------------------------------------------
     def publish_json(self, data):

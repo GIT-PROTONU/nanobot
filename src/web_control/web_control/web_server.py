@@ -41,6 +41,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, PoseStamped
@@ -149,6 +150,13 @@ MOVE_ANG_RANGE = (0.10, 1.00)  # rad/s clamp range for move_ang_speed (2026-09-2
                                # was (0.10, 0.80) — the user found 0.8-rad/s canned
                                # turns slow; 1.0 = 11.5 deg/scan SLAM smear vs the
                                # 9.2 at 0.8, accepted trade, reversible)
+# LDS idle spin-down controller settings persisted to lds_settings_path so a Lidar-card
+# change survives a restart/reboot (the move.json/tts.json "persisted UI wins" pattern).
+# lds_active_rpm is written by the Spin slider through telemetry.note_lds_manual, which
+# sets the param; the other three arrive via POST /param. One on-set-parameters
+# callback catches both paths (any setter, same file).
+LDS_PERSIST_KEYS = ("lds_idle_enable", "lds_idle_secs", "lds_manual_secs",
+                    "lds_active_rpm")
 
 
 def _clamp_move_cfg(lin, ang):
@@ -297,6 +305,27 @@ class WebServerNode(Node):
         self.declare_parameter("lds_idle_secs", 60.0)     # s of quiet before the spin-down
         self.declare_parameter("lds_manual_secs", 300.0)  # s a manual post owns the topic
         self.declare_parameter("lds_active_rpm", 300.0)   # boot spin-when-active rpm
+        self.declare_parameter("lds_settings_path", "")   # "" = ~/.local/state/nanobot/lds.json
+        # The Lidar card's spin-down settings (Idle spin-down toggle + Spin-down-after
+        # slider + the Spin target the slider drags through note_lds_manual) persist to
+        # lds_settings_path and WIN over these robot.yaml defaults on boot — the
+        # move.json/tts.json pattern (declare → re-apply saved → register the persist
+        # callback; re-apply BEFORE TelemetryHub below, whose _lds_user_rpm seeds from
+        # the re-applied lds_active_rpm).
+        try:
+            saved = read_json(self._lds_settings_file()) or {}
+            applied = [Parameter(k, value=(bool(saved[k]) if k == "lds_idle_enable"
+                                           else float(saved[k])))
+                       for k in LDS_PERSIST_KEYS if k in saved]
+            if applied:
+                self.set_parameters(applied)
+        except (TypeError, ValueError, KeyError) as e:
+            self.get_logger().warning(f"lds: ignoring bad persisted spin-down config: {e!r}")
+        # Catch-ALL setter hook: persists the cluster whenever any of its params is
+        # written — POST /param (the toggle + secs slider), the Spin slider's param
+        # push, or an internal set_parameters. Registered after the boot re-apply so
+        # loading the saved file doesn't immediately rewrite it.
+        self.add_on_set_parameters_callback(self._persist_lds_params)
         # Named colour-target palette: calibrations persist here and survive a restart
         # (previously a picked colour was lost on every stack restart).
         self.declare_parameter("vision_targets_path", "")   # "" -> ~/.local/state/nanobot/vision_targets.json
@@ -1053,6 +1082,36 @@ class WebServerNode(Node):
         self.get_logger().info(
             f"POST /move/config lin {lin:.2f} m/s turn {ang:.2f} rad/s (source: web UI)")
         return {"status": "ok", **self.move_config()}
+
+    # ---- persisted LDS spin-down settings (lds.json) ---------------------------
+    # The Lidar card's Idle spin-down toggle + Spin-down-after slider arrive via
+    # POST /param; the Spin target arrives as a param set from telemetry's
+    # note_lds_manual. One on-set-parameters callback (registered in __init__ right
+    # after the boot re-apply) catches every setter and snapshots the whole cluster
+    # to lds_settings_path — so a card change survives a restart/reboot.
+    def _lds_settings_file(self):
+        p = self.get_parameter("lds_settings_path").value
+        return p or os.path.expanduser("~/.local/state/nanobot/lds.json")
+
+    def _persist_lds_params(self, params):
+        """on-set-parameters callback for the LDS spin-down cluster. Runs BEFORE the
+        values are applied and must return a result for every parameter it sees —
+        never vetoes (rclpy combines the results; one rejection fails the whole
+        batch). The snapshot overlays the proposed values onto the current ones so
+        the file holds what WILL be applied."""
+        names = {p.name for p in params}
+        if not names.intersection(LDS_PERSIST_KEYS):
+            return SetParametersResult(successful=True)
+        try:
+            snap = {k: self.get_parameter(k).value for k in LDS_PERSIST_KEYS}
+            for p in params:
+                if p.name in snap:
+                    snap[p.name] = p.value
+            if not write_json(self._lds_settings_file(), snap):
+                self.get_logger().warning("lds: could not persist spin-down config")
+        except Exception as e:
+            self.get_logger().warning(f"lds: could not persist spin-down config: {e!r}")
+        return SetParametersResult(successful=True)
 
     # ---- persisted TTS settings ---------------------------------------------
     def _settings_file(self):
