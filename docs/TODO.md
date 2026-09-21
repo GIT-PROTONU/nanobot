@@ -133,12 +133,21 @@ in this checkout.
       11.5°/scan, watch map quality. The 0.4 m/s "stutter" measured = the
       saturation cliff (loaded full-duty ≈ 0.37 m/s; at 0.4 the loop has zero
       authority — reverse leg p2p 0.277 vs 0.028-0.085 at 0.3): the smooth
-      cruise band is ≤0.15 m/s, 0.3 acceptable, AVOID 0.35+ — a slider note
+      cruise band is ≤0.15 m/s, 0.3 acceptable,       AVOID 0.35+ — a slider note
       or a web-side soft warning is an option if the user keeps hitting it.
       (2026-09-21 pm: the user hit it — their persisted slider was still 0.4
       and "still stuttering"; set to 0.15 via POST /move/config — 0.15
       measures p2p 0.024-0.056 / mean 91-98% vs 0.4's p2p 0.277. The user can
-      still drag it up; the cliff is hardware.)**
+      still drag it up; the cliff is hardware.)
+      **2026-09-21 pm: NAV made choppier by the same physics — Nav2's RPP
+      cruised at desired_linear_vel 0.25 (the rough band) and its in-place
+      rotate-to-heading (0.5 rad/s, translating nothing) tripped the progress
+      checker (15 cm / 10 s) → "Failed to make progress" → the BT recovery
+      (backup + 90° spin) = the "crazy spin" the user watched; a re-clicked
+      goal succeeded. Config fix (nav2_params.yaml, restart-only): desired 0.18
+      (smooth band), rotate_to_heading_angular_vel 0.5 → 0.8 (the accepted
+      teleop ceiling; tracks 85-95% and halves rotation time), progress
+      movement_time_allowance 10 → 15 s. Verified live via ros2 param get.****
       The braked-stop keepalive fix is deployed (firm stops). Spin-band
       map (2026-09-21 pm, dither 0, 5/60/0): 0.5 rad/s (wheels ±0.025)
       mean 92% of target p2p 0.031; 0.65 mean 85% p2p 0.027; 0.8 mean

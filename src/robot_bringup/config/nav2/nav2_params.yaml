@@ -105,7 +105,12 @@ controller_server:
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
       required_movement_radius: 0.15
-      movement_time_allowance: 10.0
+      movement_time_allowance: 15.0   # was 10 — in-place rotate-to-heading phases
+                                      # translate NOTHING and the progress checker
+                                      # killed a goal mid-rotation (2026-09-21 pm:
+                                      # "Failed to make progress" → the BT's
+                                      # backup+spin recovery = the "crazy spin")
+                                      # → 15 s still catches real stalls.
     goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
       stateful: true
@@ -118,16 +123,22 @@ controller_server:
     # inflation_cost_scaling_factor > 0 to be active).
     FollowPath:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
-      desired_linear_vel: 0.25
+      # desired_linear_vel: was 0.25 — INSIDE the drivetrain's rough band (loaded
+      # full-duty ~0.37 m/s; at 0.25 the loop is near-saturated and carpet
+      # variation shows through: measured p2p ~0.085 at 0.3 m/s vs 0.02-0.04 at
+      # <=0.15). 0.18 = smooth navigation. (2026-09-21 pm)
+      desired_linear_vel: 0.18
       lookahead_dist: 0.6
       min_lookahead_dist: 0.3
       max_lookahead_dist: 0.9
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 0.5
-      # (0.5 rad/s, was the 1.5 upstream default: the LDS sweep has NO deskew —
-      # each 0.2 s revolution smears w*0.2 rad; 1.5 rad/s = 17 deg of blur per
-      # scan = the wall-dust failure. Rotations are the map-quality bottleneck,
-      # not straight driving.)
+      rotate_to_heading_angular_vel: 0.8
+      # (0.8 rad/s, was the 1.5 upstream default: the LDS sweep has NO deskew —
+      # each 0.2 s revolution smears w*0.2 rad. 0.8 = 9.2 deg/scan, the level the
+      # teleop clamp has been running at. The old 0.5 made in-place rotations
+      # LONG (choppy at the ±0.026 m/s per-wheel stickiest band) and put the
+      # progress checker in play; 0.8 tracks 85-95% and halves rotation time.
+      # 2026-09-21 pm, after the spin-band re-verify.)
       rotate_to_heading_min_angle: 0.785
       max_angular_accel: 3.2
       use_velocity_scaled_lookahead_dist: true
