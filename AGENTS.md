@@ -490,10 +490,13 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   first PID tick after boot used a ticks-from-0 delta) and a `/reset_ticks` jump guard
   (>3 m/s equivalent delta = counter reset, re-seed, no lurch). Also the
   `WHEEL_SEPARATION` define fallback is now 0.102 (was the 0.16 guess — NVS masked it;
-  an erased flash would have booted the wrong geometry + wrong KFF). Accepted
-  limit: feedback is single-channel (ticks signed by COMMANDED direction) — blind on
-  reverse-through-zero/stall/slip/being-pushed; the real fix is a 2nd quadrature
-  channel. Also `MAX_ANGULAR_SPEED` synced 3.0 → 0.8 (robot.yaml `drive_max_ang`,
+  an erased flash would have booted the wrong geometry + wrong KFF). **Permanent
+  hardware fact (2026-09-21, user-decided): the encoders are and will stay
+  SINGLE-CHANNEL** — ticks signed by COMMANDED direction, blind on
+  reverse-through-zero/stall/slip/being-pushed. There is no 2nd channel to wire and
+  never will be — the software mitigations (commanded-direction signing, the
+  direction-flip PID reset + ring zero, the stiction-aware I-term) are the FINAL
+  design, not a stopgap. Also `MAX_ANGULAR_SPEED` synced 3.0 → 0.8 (robot.yaml `drive_max_ang`,
   SLAM rotation-smear budget — firmware backstop now matches). Trim: `TRIM_AUTOCAL`
   is compiled out under the PID (per-wheel control equalizes the wheels itself) — the
   manual `/motor_trim` offset still applies and the loop absorbs it. NOTE 2026-09-20:
@@ -563,8 +566,8 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   **2026-09-21 pm III — the 2.5 rate is FLASHED + VERIFIED: spin tracking tightened
   (0.65 rad/s p2p 0.027 → 0.015, mean 85 → 88%; 0.8 rad/s best leg 95% of target),
   aggregate spin mean 0.029-0.039 vs 0.024-0.034 at rate 1.2. The spin band remains
-  partly stiction-bound (single-channel ticks + carpet at ±0.04 m/s per-wheel — the
-  accepted limit until a 2nd quadrature channel). The canned-turn speed is capped by
+  partly stiction-bound (single-channel ticks + carpet at ±0.04 m/s per-wheel — a
+  PERMANENT accepted limit: there is no 2nd encoder channel and never will be). The canned-turn speed is capped by
   move_ang_speed 0.8 (the smear budget); a 90° canned turn measured 90.2° in 3.56 s.**
   **2026-09-21 pm IV — the turn ceiling was raised 0.8 → 1.0 rad/s at the user's
   "still slow" report (firmware maxang id 4 LIVE via /motor_params + robot.yaml

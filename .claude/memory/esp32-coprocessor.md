@@ -24,7 +24,9 @@ Wire contract: sub `cmd_vel`(Twist), `led`(Bool), `lds_target_rpm`(Float32); pub
 `lds_rpm`/`lds_hz`/`lds_duty`, `esp32_heartbeat`. Also closed-loop PID-controls the LDS02RR
 spin motor (reads its RPM off UART1 RX=GPIO14).
 
-**Encoders are SINGLE-CHANNEL** (no quadrature/PCNT) → no hardware direction. Fix applied
+**Encoders are SINGLE-CHANNEL** (no quadrature/PCNT) → no hardware direction, and this
+is PERMANENT (2026-09-21, user-decided — no 2nd channel will ever be wired; the
+commanded-direction signing + PID mitigations are the final design). Fix applied
 2026-06-21 (branch `slam`): ISR signs each tick by the last commanded wheel direction via an
 **int8 dir flag** (`g_left_dir/g_right_dir`, set in cmd_cb) — never read a float in the ISR
 (ESP32 FPU unsafe). Counts are now signed; `wheel_odometry` integrates them unchanged. This

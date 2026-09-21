@@ -23,8 +23,10 @@ signs each tick by the last commanded wheel direction (`g_left_dir`/`g_right_dir
 on the `slam` branch so reverse odometry integrates correctly for SLAM. Still blind during
 reverse-through-zero / stall / slip / being pushed (the known single-channel limitation).
 So the *signed-velocity feedback* the wheel PID needs now exists; the PID itself is still
-UNBUILT. Option (2) (wire the 2nd quadrature channel for true feedback) remains the only
-fix for the blind cases.
+UNBUILT. Option (2) (wire the 2nd quadrature channel for true feedback) is OFF THE
+TABLE permanently (2026-09-21, user-decided: the encoders stay single-channel; the
+blind cases are accepted limits, mitigated in software — see the 2026-09-21 wheel-PID
+smoothness work in AGENTS.md).
 
 **Also needed before implementing:** encoder CPR (counts per *wheel* rev, incl. gear
 ratio) and wheel radius, to map `/cmd_vel` (m/s) ↔ tick-rate setpoints.
@@ -45,8 +47,10 @@ else keeps the old open-loop duty path. Uses `WHEEL_RADIUS 0.0335` + `TICKS_PER_
 so KP=KI=KD=0 reproduces today's open-loop behavior (safe baseline). No `/wheel_vel` topic
 (would mean touching the proven publisher wire-identity table) — instead measured vel is on
 the **UART0 debug console** via STATUS_PRINT for tuning. **To use: set WHEEL_PID_ENABLED 1,
-flash, then tune KP/KI on hardware.** Still blind on reverse-through-zero/stall/slip (option
-(2), 2nd quadrature channel, remains the only fix). Not yet flashed/tuned as of this note.
+flash, then tune KP/KI on hardware.** Still blind on reverse-through-zero/stall/slip
+(accepted permanently — no 2nd channel will ever be wired; see AGENTS.md 2026-09-21).
+NOTE: this note predates the flash — the closed-loop wheel PID has been LIVE since
+2026-09-20 with tuned gains (KP 5 / KI 60, see AGENTS.md).
 
 **Why this matters:** the scaffolding is in; the remaining work is on-hardware tuning (and
 deciding whether the single-channel blind spots are acceptable). See [[esp32-zenoh-pico-integration]].

@@ -125,8 +125,9 @@ in this checkout.
       I-term recovering spin-band stick-slip slowly — WHEEL_I_WIND_RATE
       1.2 → 2.5 **FLASHED + VERIFIED 2026-09-21 pm III: 0.65 rad/s p2p
       0.027 → 0.015 (mean 85 → 88%), 0.8 best leg 95% of target; the band
-      remains partly stiction-bound (single-channel + carpet) — accepted
-      until a 2nd quadrature channel. THREAD CLOSED.**
+      remains partly stiction-bound (single-channel + carpet) — a PERMANENT
+      accepted limit (2026-09-21, user-decided: the encoders are and stay
+      single-channel; no 2nd quadrature channel will ever be wired). THREAD CLOSED.**
       **2026-09-21 pm IV: turn ceiling 0.8 → 1.0 rad/s (all three clamps:
       firmware maxang id 4 live, robot.yaml drive_max_ang/move_ang_speed,
       MOVE_ANG_RANGE + slider) — 90° canned turn 4.09 → 3.52 s; smear trade

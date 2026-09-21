@@ -140,8 +140,9 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // (any cadence up to the CMD_TIMEOUT_MS dead-man) and this fixed-rate loop owns the
 // dynamics deterministically, regardless of SBC load.
 // Feedback is single-channel (ticks signed by COMMANDED direction): blind on
-// reverse-through-zero / stall / slip / being pushed — accepted 2026-09-20; the only
-// real fix is wiring the 2nd quadrature channel.
+// reverse-through-zero / stall / slip / being pushed — accepted 2026-09-20, and
+// PERMANENT (2026-09-21, user-decided): there is no 2nd quadrature channel and
+// there never will be; the mitigations in this block are the final design.
 // Tuning (hardware, watch the debug console's vel/tgt line): raise KI until a crawl
 // breaks away in <0.5 s without stick-slip hunting (halve KI if it oscillates), then KP
 // for stiffness (~0.5*KFF to start); KD stays 0 (tick quantization noise at 50 Hz makes
@@ -1288,7 +1289,8 @@ void loop(){   // Core 1: real-time control
     // forward-wound integrator adding to it (pause, then lurch into reverse). Zero the
     // PID state AND the delta ring (its entries still carry the OLD sign convention) so
     // the reversal starts from feedforward alone; the I-term rebuilds in the new
-    // direction. (True fix is the 2nd quadrature channel — see the header note.)
+    // direction. (Single-channel feedback is permanent — see the header note; this
+    // reset + ring zero is the final mitigation, not a stopgap.)
     int8_t ld = (g_left_tgt  > 1e-4f) ?  1 : (g_left_tgt  < -1e-4f) ? -1 : l_dir_seen;
     int8_t rd = (g_right_tgt > 1e-4f) ?  1 : (g_right_tgt < -1e-4f) ? -1 : r_dir_seen;
     if (ld != l_dir_seen){ l_dir_seen = ld; wpid_l.integ = 0; wpid_l.prev = 0;
