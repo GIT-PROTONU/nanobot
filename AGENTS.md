@@ -666,6 +666,13 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   a "Feed fwd KFF" slider (0..10, 0 = auto) on the same card — the manual override for the
   derived feedforward duty-per-m/s gain (auto ≈ 2.24 with the current geometry); every
   accepted change resets the PID integrators and persists to NVS ("kff" key) while parked.
+  **Tgt slew is web-tunable too (2026-09-22, id 5 — deployed same day, web-only: the
+  flashed firmware already accepted id 5)**: a "Tgt slew" slider (0.05..10 m/s per s,
+  default 1.50) on the same card — the `WHEEL_TGT_SLEW` setpoint accel limiter (each
+  wheel's speed target is ramped at this rate before the PID sees it, so a /cmd_vel step
+  is a soft start, not a lurch; at crawl speeds even 1.5 reaches full speed in <0.1 s, so
+  it mostly matters at higher speeds). Same instant-apply/reseed-from-`f.esp.wheel_params`
+  id 5 pattern; NVS key "slew".
   The other ids stay script-only
   (`pid_tune.py params --set id=val`).
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no

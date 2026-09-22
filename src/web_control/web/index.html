@@ -142,6 +142,7 @@
               <input id="moveDist" class="grow" type="number" step="0.05" min="-5" max="5" value="0.50">
               <span class="hint" style="white-space:nowrap">m</span>
               <button id="moveFwd" class="btn">↥ Drive</button>
+              <button id="moveRev" class="btn">↧ Reverse</button>
             </div>
             <div class="row" style="margin-top:8px">
               <input id="moveDeg" class="grow" type="number" step="5" min="-720" max="720" value="90">
@@ -158,7 +159,7 @@
               <input id="moveAng" type="range" min="0.1" max="1.0" step="0.05" value="1.0"></div>
             <p class="hint">Drag the joystick to drive (speed scales with how far you push),
               or use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrow keys on a keyboard.
-              Release or <kbd>Space</kbd> stops. Publishes <b>/cmd_vel</b>. <b>Drive</b> /
+              Release or <kbd>Space</kbd> stops.               Publishes <b>/cmd_vel</b>. <b>Drive</b> / <b>Reverse</b> /
               <b>Turn</b> run odom-feedback canned moves (distance in m, rotation in °;
               negative = backward / clockwise) — any joystick touch or Stop takes over.
               The <b>Canned speed</b>/<b>Canned turn</b> sliders set those maneuvers' pace
@@ -232,6 +233,8 @@
               <input id="pidKd" type="range" min="0" max="5" step="0.05" value="0"></div>
             <div class="field"><label>Vel hyst <span id="velHystV">0.15</span></label>
               <input id="velHyst" type="range" min="0" max="0.5" step="0.01" value="0.15"></div>
+            <div class="field"><label>Tgt slew <span id="slewV">1.50</span></label>
+              <input id="slew" type="range" min="0.05" max="10" step="0.05" value="1.50"></div>
             <div class="field"><label>Feed fwd KFF <span id="kffV">0 (auto)</span></label>
               <input id="kff" type="range" min="0" max="10" step="0.05" value="0"></div>
             <p class="hint"><b>Wheel trim</b> rebalances the mismatched gearmotors so a forward
@@ -260,6 +263,14 @@
               has to build the whole push from a weak feedforward start); lower it if cruise
               overshoots on launch. Every change resets the integrators and persists to the
               ESP32's NVS while parked; the slider re-syncs from f.esp.wheel_params on load.</p>
+            <p class="hint"><b>Tgt slew</b> (m/s per second, id 5 in /motor_params) is the
+              acceleration limiter: the firmware ramps each wheel's speed target at this rate
+              before the PID sees it, so a step in /cmd_vel becomes a soft start instead of a
+              lurch. Raise it for snappier launches (the integrator still breaks static
+              friction), lower it for gentler starts — with a 0.05-0.12 m/s crawl even 1.5
+              ramps to full speed in under 0.1 s, so it mostly matters at higher speeds.
+              Applies instantly, resets the integrators, persists to the ESP32's NVS while
+              parked; the slider re-syncs from f.esp.wheel_params on load.</p>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>
@@ -1458,6 +1469,10 @@ $("velHyst").onchange=()=>pub("/motor_params",[7,Number($("velHyst").value)]);
 // (derived from the drive limits 1/(maxlin + maxang*sep/2)); firmware clamps 0..10.
 $("kff").oninput=()=>{const v=Number($("kff").value);$("kffV").textContent=v?v.toFixed(2):"0 (auto)";};
 $("kff").onchange=()=>pub("/motor_params",[8,Number($("kff").value)]);
+// Target slew (setpoint accel limiter, m/s per s): /motor_params (id,value) pair id 5 —
+// firmware clamps 0.05..10; readback re-syncs from f.esp.wheel_params on first arrival.
+$("slew").oninput=()=>$("slewV").textContent=Number($("slew").value).toFixed(2);
+$("slew").onchange=()=>pub("/motor_params",[5,Number($("slew").value)]);
 // ESP32 straight-line wheel trim: negative = boost left / cut right (robot veers left),
 // positive = the opposite. The slider only sends; the live value comes back from the
 // telemetry frame (f.esp.wheel_trim) and is shown in the readout + re-syncs the slider
@@ -1976,6 +1991,7 @@ const HINTS = {
   moveDist: "Canned straight drive, in metres (negative = backward). Runs an /odom-feedback maneuver at the canned crawl speed -- distance is measured from wheel odometry, so walls/trim veer can add path length but the projection-on-heading target stays true.",
   moveDeg: "Canned in-place rotation, in degrees (positive = counter-clockwise, negative = clockwise). Wheel-odom yaw feedback; expect ~2° of settle error.",
   moveFwd: "Starts the canned drive (Drive N metres). A running canned move is replaced by a new one.",
+  moveRev: "Starts the canned drive backwards (the negated field value, −N metres). A running canned move is replaced by a new one.",
   moveTurn: "Starts the canned rotation (Turn N degrees). A running canned move is replaced by a new one.",
   moveStop: "Cancels the running canned move and stops (same as touching the joystick or pressing STOP).",
   moveStatus: "Live progress of the canned move (phase, target, % done) and its result after it finishes. The maneuver aborts if /odom is lost or the browser disconnects for >5 s.",
@@ -2371,10 +2387,11 @@ function onEsp(e, susp){
     $("pidKi").value=String(ki); $("pidKiV").textContent=ki.toFixed(1);
     $("pidKd").value=String(kd); $("pidKdV").textContent=kd.toFixed(2);
   }
-  if(e.wheel_params && (!hystSynced || !kffSynced)){
-    // Drivetrain params come back as flat (id,value) pairs — id 7 is vel_hyst,
-    // id 8 the wheel-PID feedforward gain KFF (0 = auto-derive from drive limits).
-    // Re-seed the sliders once so the page matches the ESP32's NVS-persisted values.
+  if(e.wheel_params && (!hystSynced || !kffSynced || !slewSynced)){
+    // Drivetrain params come back as flat (id,value) pairs — id 5 the target slew,
+    // id 7 vel_hyst, id 8 the wheel-PID feedforward gain KFF (0 = auto-derive from
+    // drive limits). Re-seed the sliders once so the page matches the ESP32's
+    // NVS-persisted values.
     const p=e.wheel_params;
     for(let i=0;i+1<p.length;i+=2){
       const id=Math.round(p[i]);
@@ -2387,6 +2404,10 @@ function onEsp(e, susp){
         const v=Number(p[i+1]);
         $("kff").value=String(v);
         $("kffV").textContent=v?v.toFixed(2):"0 (auto)";
+      }else if(id===5 && !slewSynced){
+        slewSynced=true;
+        $("slew").value=String(p[i+1]);
+        $("slewV").textContent=Number(p[i+1]).toFixed(2);
       }
     }
   }
@@ -3084,6 +3105,7 @@ let motorTrimSynced=false;   // whether the wheel-trim slider has been seeded fr
 let pidSynced=false;         // whether the PID sliders have been seeded from f.esp.wheel_pid
 let hystSynced=false;        // whether the vel-hyst slider has been seeded from f.esp.wheel_params
 let kffSynced=false;         // whether the KFF slider has been seeded from f.esp.wheel_params
+let slewSynced=false;        // whether the tgt-slew slider has been seeded from f.esp.wheel_params
 function setCmd(v,w){ curV=v; curW=w; }
 function publishCmd(){
   const v=curV*Number($("lin").value), w=curW*Number($("ang").value);
@@ -3130,6 +3152,7 @@ function onMove(mv){
   }
 }
 $("moveFwd").onclick=()=>postMove({dist:Number($("moveDist").value)||0});
+$("moveRev").onclick=()=>postMove({dist:-(Number($("moveDist").value)||0)});
 $("moveTurn").onclick=()=>postMove({deg:Number($("moveDeg").value)||0});
 $("moveStop").onclick=()=>postMove({cancel:true});
 // Enter in a field triggers its button (typing(e) already keeps WASD out of teleop).
