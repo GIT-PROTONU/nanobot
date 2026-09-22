@@ -645,14 +645,21 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   `setup()`, saved rate-limited while parked exactly like the gains). Wire format:
   POST `/publish {topic:"/motor_params", value:[id,val, id,val, …]}` — Float32MultiArray
   (id,value) pairs, ids `0 ticks_per_rev · 1 wheel_radius_m · 2 wheel_separation_m ·
-  3 max_linear_ms · 4 max_angular_rads · 5 target_slew` (whitelisted via
-  `telemetry.py`'s `_mk_motor_params`, max 6 pairs). Any accepted change recomputes
+  3 max_linear_ms · 4 max_angular_rads · 5 target_slew · 6 dither · 7 vel_hyst (0..0.5)`
+  (whitelisted via
+  `telemetry.py`'s `_mk_motor_params`, max 8 pairs). Any accepted change recomputes
   the derived ticks/meter + KFF full-scale map and resets the PID integrators
   (their error units just changed meaning). Readback on `/wheel_params` @1 Hz in
   the SAME (id,value) layout → `f.esp.wheel_params` re-seeds any future web sliders.
   A future recalibration is a POST, never a flash. `clampf` ranges: tpr 10..5000,
   radius 0.005..0.5, separation 0.05..1.0, maxlin 0.05..2, maxang 0.05..5, slew
-  0.05..10.
+  0.05..10, dither 0..0.2, vel_hyst 0..0.5.
+  **Vel hyst is now web-tunable (2026-09-22)**: the Drive tab's Coprocessor card has a
+  "Vel hyst" slider (0..0.5) — release publishes `[/motor_params [7, v]]` (the same
+  instant-apply pattern as the PID sliders) and the slider re-seeds from
+  `f.esp.wheel_params` id 7 on first frame, so the page shows the NVS-persisted value
+  the firmware is actually running. The other ids stay script-only
+  (`pid_tune.py params --set id=val`).
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
   flags (enables `Z_FEATURE_LINK_SERIAL`). Pins (ESP32 GPIO): encoders L=19 R=5,

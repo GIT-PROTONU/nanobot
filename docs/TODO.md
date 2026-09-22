@@ -15,6 +15,19 @@ in this checkout.
 
 ## Open — needs the physical robot
 
+- [x] **2026-09-21 (code DONE + FLASHED + A/B'd 2026-09-22): wheel-PID adaptive-filter
+      N hysteresis.** Residual drive roughness ("better than this morning but still
+      not smooth"). IMPLEMENTED (main.cpp `hystN()` + id 7, telemetry.py gate
+      0..7/16-slice, AGENTS.md id list), flashed, A/B'd on the live robot:
+      **inconclusive** — crawl 0.05 p2p 0.0216 OFF vs 0.0242 ON, boundary 0.055 0.0335
+      vs 0.0285, 0.12 0.0218 vs 0.0290, no regression; worst legs both sides are
+      DEADMAN input-delivery freezes (not filter flicker). Keep id 7 = 0.15 (NVS).
+      Full detail in
+      [`docs/wheel-pid-hysteresis-plan.md`](wheel-pid-hysteresis-plan.md),
+      including the three REJECTED candidate fixes (#1 slew-lowering —
+      already in place via the 50 Hz `slewTo`; #2 KI-lowering — contradicts
+      the live sweep; #4 flip-reset deadband — costs sub-crawl reverses)
+      held in reserve with their tradeoffs. Do not apply those blindly.
 - [ ] **NEW 2026-09-21: LDS idle spin-down + jam guard — built + unit/smoke-tested,
       needs the robot.** The spin-down controller (`web_control/telemetry.py`
       `_lds_ctrl_tick`, owns `/lds_target_rpm` again after a week of nobody) and

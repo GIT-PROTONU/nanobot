@@ -203,6 +203,15 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define WHEEL_DITHER_IN    0.02f    // m/s: full dither once |setpoint| passes this
 #define WHEEL_DITHER_FADE  0.15f    // m/s: fade out by here (higher speeds track smoothly)
 #define WHEEL_DITHER_TICKS 2
+// Adaptive-filter N HYSTERESIS (2026-09-21 plan): N re-picked from the SLEWED setpoint
+// every tick has no hysteresis, so a held speed sitting at an N-threshold boundary can
+// flicker (4<->3), churning the filter's lag/phase tick-to-tag. Schmitt band (+/- 100*H %)
+// around each threshold below — monotonic ramps are unaffected (multi-step convergences
+// fire over consecutive ticks), single-step flicker is delayed. H=0 == the raw-ceil
+// baseline exactly. Max 0.5 so bands never overlap (N cannot deadlock).
+#define WHEEL_VEL_HYST 0.15f   // Schmitt band (+-15%) around each adaptive-filter N threshold —
+                               // stops N flickering when |setpoint| hovers at a boundary.
+                               // LIVE via /motor_params id 7 (0..0.5; 0=off)
 // Command shaping: the per-wheel SETPOINT is slewed (m/s per s) before the PID — smooths
 // accel without lagging the loop (slewing the PID OUTPUT would add loop lag + integral
 // windup). ~the old open-loop 3.0 duty/s feel at the 0.464 m/s full scale.
@@ -407,13 +416,14 @@ static float             g_pid_saved[3];      // last values written to NVS (Cor
 // (id,value) float pairs, ids:
 //   0 ticks_per_rev   1 wheel_radius_m   2 wheel_separation_m
 //   3 max_linear_ms   4 max_angular_rads 5 target_slew_mps2
+//   6 dither          7 vel_hyst
 // Readback on /wheel_params @1 Hz uses the SAME (id,value) layout. A change recomputes
 // the derived ticks/meter + KFF full-scale map and resets the PID integrators (their
 // error units just changed meaning). Defaults are the defines above; both build paths
 // share cmd_cb's clamps/diff-drive, so this block is unconditional.
 static volatile float    g_tpr = TICKS_PER_REV, g_wrad = WHEEL_RADIUS, g_wsep = WHEEL_SEPARATION,
                          g_maxlin = MAX_LINEAR_SPEED, g_maxang = MAX_ANGULAR_SPEED, g_slew = WHEEL_TGT_SLEW,
-                         g_dither = WHEEL_DITHER;
+                         g_dither = WHEEL_DITHER, g_vhyst = WHEEL_VEL_HYST;
 static volatile float    g_tpm = TICKS_PER_REV/(2.0f*3.14159265f*WHEEL_RADIUS);   // derived: ticks/meter
 static volatile float    g_kff = WHEEL_KFF;                                       // derived: duty per m/s
 static volatile bool     g_par_save = false; // cb -> 1 Hz block: params changed, NVS write pending
@@ -434,6 +444,7 @@ static bool set_param(int id, float v){   // clamp + assign; false = unknown id
     case 4: g_maxang= clampf(v, 0.05f,  5.0f); break;
     case 5: g_slew  = clampf(v, 0.05f, 10.0f); break;
     case 6: g_dither= clampf(v, 0.0f,   0.20f); break;
+    case 7: g_vhyst= clampf(v, 0.0f,   0.5f); break;
     default: return false;
   }
   return true;
@@ -894,7 +905,7 @@ static void zenohTask(void*){
     }
 #endif
 
-    uint8_t buf[80];                                        // 64 needed by the /wheel_params readback
+    uint8_t buf[80];                                        // 80 needed by the /wheel_params readback (16 floats)
     if (now - t_ticks >= 66){                                // wheel_ticks @~15 Hz (was
                                                               // ~30 Hz; odom integrates
                                                               // cumulative counts, so the
@@ -937,10 +948,10 @@ static void zenohTask(void*){
 #if WHEEL_PID_ENABLED
       zpub_put(P_pid,  buf, cdr_f32arr3(buf, g_wkp, g_wki, g_wkd));
       {   // /wheel_params readback: (id,value) pairs, same layout /motor_params writes
-        float pv[14]; int k=0;
+        float pv[16]; int k=0;
         pv[k++]=0; pv[k++]=g_tpr;   pv[k++]=1; pv[k++]=g_wrad;  pv[k++]=2; pv[k++]=g_wsep;
         pv[k++]=3; pv[k++]=g_maxlin; pv[k++]=4; pv[k++]=g_maxang; pv[k++]=5; pv[k++]=g_slew;
-        pv[k++]=6; pv[k++]=g_dither;
+        pv[k++]=6; pv[k++]=g_dither; pv[k++]=7; pv[k++]=g_vhyst;
         zpub_put(P_params, buf, cdr_f32arr_n(buf, pv, k));
       }
 #endif
@@ -969,6 +980,30 @@ static inline float slewTo(float cur, float target, float maxDelta){
   if (diff > maxDelta) diff = maxDelta; else if (diff < -maxDelta) diff = -maxDelta;
   return cur + diff;
 }
+#if WHEEL_PID_ENABLED
+// Adaptive-filter window-count N with SCHMITT HYSTERESIS (see WHEEL_VEL_HYST): raw =
+// ceil(qstep/(QUANT*|tgt|)) as before, but a change from the held `cur` only happens
+// once |tgt| crosses the relevant threshold past the +/-H band — so a setpoint hovering
+// on a boundary cannot flip N tick-to-tick. Up-switch (raw>cur) keys off the cur->cur+1
+// boundary, down-switch off the cur-1->cur boundary. `cur==2` down-branch never fires
+// (raw clamped >= 2). H=0 reduces EXACTLY to the old raw-ceil behavior (A/B baseline).
+static uint8_t hystN(uint8_t cur, float qstep, float tgtAbs){
+  if (tgtAbs <= 1e-5f || qstep <= 0.0f) return cur;
+  uint8_t raw = (uint8_t)ceilf(qstep / (WHEEL_VEL_QUANT * tgtAbs));
+  if (raw < 2) raw = 2;
+  if (raw > WHEEL_VEL_FILT_MAX) raw = WHEEL_VEL_FILT_MAX;
+  if (raw == cur) return cur;
+  float h = g_vhyst;
+  if (raw > cur){
+    float B = qstep / ((float)cur * WHEEL_VEL_QUANT);        // cur->cur+1 boundary
+    if (tgtAbs < B * (1.0f - h)) return raw;
+  } else {
+    float B = qstep / ((float)(cur - 1) * WHEEL_VEL_QUANT);  // cur-1->cur boundary
+    if (tgtAbs > B * (1.0f + h)) return raw;
+  }
+  return cur;
+}
+#endif
 static void applyMotors(float l, float r){
   // Straight-line trim: positive trim boosts RIGHT / cuts LEFT (robot was pulling right).
   // Open-loop: applied pre-remap so it stays monotonic through the stiction compensation.
@@ -1123,6 +1158,7 @@ void setup(){
   set_param(4, g_prefs.getFloat("maxang",MAX_ANGULAR_SPEED));
   set_param(5, g_prefs.getFloat("slew",  WHEEL_TGT_SLEW));
   set_param(6, g_prefs.getFloat("dith",  WHEEL_DITHER));
+  set_param(7, g_prefs.getFloat("vhyst", WHEEL_VEL_HYST));
   recalc_drive_params();
   g_pid_saved[0]=g_wkp; g_pid_saved[1]=g_wki; g_pid_saved[2]=g_wkd;
   Serial.printf("[nano] wheel PID gains kp=%.3f ki=%.3f kd=%.3f (NVS)\n",
@@ -1238,6 +1274,7 @@ void loop(){   // Core 1: real-time control
   static float l_tgt_s=0, r_tgt_s=0;                     // slewed setpoints (command shaping)
   static int32_t vring_l[WHEEL_VEL_FILT_MAX], vring_r[WHEEL_VEL_FILT_MAX];  // per-window tick deltas
   static uint8_t vridx=0, vrcnt=0;                       // ring cursor + filled count
+  static uint8_t nl_h=2, nr_h=2;                          // held adaptive-filter N (hysteresis state)
   static bool vel_seed=false;                            // first-tick baseline (see below)
   static int8_t l_dir_seen=1, r_dir_seen=1;              // last commanded wheel direction
   if (now-last_wpid >= (uint32_t)(1000/WHEEL_PID_HZ)){     // wheel velocity PID @WHEEL_PID_HZ
@@ -1255,6 +1292,7 @@ void loop(){   // Core 1: real-time control
       // re-seed instead of letting the PID see a fake ±m/s velocity spike and lurch.
       dl = 0; dr = 0;
       vridx = 0; vrcnt = 0;                                // nothing in the ring is valid
+      nl_h = 2; nr_h = 2;                                  // nor is the held filter length
     }
     // Ring push (zeros too — the filter is a moving average over the last N windows).
     vring_l[vridx]=dl; vring_r[vridx]=dr;
@@ -1265,13 +1303,9 @@ void loop(){   // Core 1: real-time control
     // moving setpoint — crawl/turn wheels get the longest filter (ripple crush), fast
     // commands the shortest (lag). Capped by what's actually in the ring.
     float qstep = 1.0f/(dt*g_tpm);                         // one window's quantization step
-    uint8_t nl = 2, nr = 2;
-    if (qstep > 0.0f){
-      float want = WHEEL_VEL_QUANT*fabsf(l_tgt_s);
-      if (want > 1e-5f) nl = (uint8_t)ceilf(qstep/want);
-      want = WHEEL_VEL_QUANT*fabsf(r_tgt_s);
-      if (want > 1e-5f) nr = (uint8_t)ceilf(qstep/want);
-    }
+    uint8_t nl = hystN(nl_h, qstep, fabsf(l_tgt_s));
+    uint8_t nr = hystN(nr_h, qstep, fabsf(r_tgt_s));
+    nl_h = nl; nr_h = nr;
     auto velAvg = [&](const int32_t* ring, uint8_t n){
       uint8_t cnt = vrcnt < n ? vrcnt : n;
       if (!cnt) cnt = 1;
@@ -1294,9 +1328,9 @@ void loop(){   // Core 1: real-time control
     int8_t ld = (g_left_tgt  > 1e-4f) ?  1 : (g_left_tgt  < -1e-4f) ? -1 : l_dir_seen;
     int8_t rd = (g_right_tgt > 1e-4f) ?  1 : (g_right_tgt < -1e-4f) ? -1 : r_dir_seen;
     if (ld != l_dir_seen){ l_dir_seen = ld; wpid_l.integ = 0; wpid_l.prev = 0;
-                           memset(vring_l, 0, sizeof(vring_l)); }
+                           memset(vring_l, 0, sizeof(vring_l)); nl_h = 2; }
     if (rd != r_dir_seen){ r_dir_seen = rd; wpid_r.integ = 0; wpid_r.prev = 0;
-                           memset(vring_r, 0, sizeof(vring_r)); }
+                           memset(vring_r, 0, sizeof(vring_r)); nr_h = 2; }
     // Parked-at-zero bleed: the web keepalive re-asserts {0,0} forever, so the command
     // never goes stale and the dead-man never resets the integrators — but a stop leaves
     // integ wound NEGATIVE (braking unwinds it below zero), which then holds a small
@@ -1550,9 +1584,10 @@ void loop(){   // Core 1: real-time control
       g_prefs.putFloat("maxang",g_maxang);
       g_prefs.putFloat("slew",  g_slew);
       g_prefs.putFloat("dith",  g_dither);
+      g_prefs.putFloat("vhyst", g_vhyst);
       g_par_save = false;
-      Serial.printf("[nano] drive params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f dith=%.2f saved to NVS\n",
-        (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew,(double)g_dither);
+      Serial.printf("[nano] drive params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f dith=%.2f vhyst=%.2f saved to NVS\n",
+        (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew,(double)g_dither,(double)g_vhyst);
     }
 #endif
   }

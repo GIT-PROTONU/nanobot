@@ -230,6 +230,8 @@
               <input id="pidKi" type="range" min="0" max="50" step="0.1" value="8"></div>
             <div class="field"><label>PID KD <span id="pidKdV">0.0</span></label>
               <input id="pidKd" type="range" min="0" max="5" step="0.05" value="0"></div>
+            <div class="field"><label>Vel hyst <span id="velHystV">0.15</span></label>
+              <input id="velHyst" type="range" min="0" max="0.5" step="0.01" value="0.15"></div>
             <p class="hint"><b>Wheel trim</b> rebalances the mismatched gearmotors so a forward
               command goes straight. If the robot drifts <b>left</b>, push the slider
               <b>negative</b> (boost left / cut right); if it drifts <b>right</b>, push
@@ -243,6 +245,12 @@
               quantization makes it jittery). Changes apply instantly, reset the
               integrators, and persist to the ESP32's flash once the robot is parked.
               Sliders re-sync to the live values (f.esp.wheel_pid) on load.</p>
+            <p class="hint"><b>Vel hyst</b> is the Schmitt band (fraction of the wheel's moving
+              setpoint, id 7 in /motor_params) around the adaptive velocity-filter's window
+              thresholds — it stops the filter length N from chattering between values right at
+              a boundary. Raise it if the crawl judder looks like the filter flipping; lower it
+              (0 = off) for the fastest filter response. Publishes /motor_params, persists to
+              the ESP32's NVS while parked, and re-syncs from f.esp.wheel_params on load.</p>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>
@@ -1433,6 +1441,10 @@ $("pidKd").oninput=()=>$("pidKdV").textContent=Number($("pidKd").value).toFixed(
 $("pidKp").onchange=pidPublish;
 $("pidKi").onchange=pidPublish;
 $("pidKd").onchange=pidPublish;
+// Vel hyst (adaptive-filter N Schmitt band): /motor_params (id,value) pair id 7 —
+// firmware clamps 0..0.5; readback re-syncs from f.esp.wheel_params on first arrival.
+$("velHyst").oninput=()=>$("velHystV").textContent=Number($("velHyst").value).toFixed(2);
+$("velHyst").onchange=()=>pub("/motor_params",[7,Number($("velHyst").value)]);
 // ESP32 straight-line wheel trim: negative = boost left / cut right (robot veers left),
 // positive = the opposite. The slider only sends; the live value comes back from the
 // telemetry frame (f.esp.wheel_trim) and is shown in the readout + re-syncs the slider
@@ -2346,6 +2358,19 @@ function onEsp(e, susp){
     $("pidKi").value=String(ki); $("pidKiV").textContent=ki.toFixed(1);
     $("pidKd").value=String(kd); $("pidKdV").textContent=kd.toFixed(2);
   }
+  if(e.wheel_params && !hystSynced){
+    // Drivetrain params come back as flat (id,value) pairs — id 7 is vel_hyst.
+    // Re-seed the slider once so the page matches the ESP32's NVS-persisted value.
+    const p=e.wheel_params;
+    for(let i=0;i+1<p.length;i+=2){
+      if(Math.round(p[i])===7){
+        hystSynced=true;
+        $("velHyst").value=String(p[i+1]);
+        $("velHystV").textContent=Number(p[i+1]).toFixed(2);
+        break;
+      }
+    }
+  }
 }
 // LDS card + the live last-move timer. `idle` (s since the last commanded motion,
 // from the gateway's idle controller) is re-rendered every second so it ticks even
@@ -3038,6 +3063,7 @@ function onOdom(o){
 let curV=0, curW=0, driveBusy=false;
 let motorTrimSynced=false;   // whether the wheel-trim slider has been seeded from live ESP state
 let pidSynced=false;         // whether the PID sliders have been seeded from f.esp.wheel_pid
+let hystSynced=false;        // whether the vel-hyst slider has been seeded from f.esp.wheel_params
 function setCmd(v,w){ curV=v; curW=w; }
 function publishCmd(){
   const v=curV*Number($("lin").value), w=curW*Number($("ang").value);
