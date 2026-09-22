@@ -219,7 +219,7 @@ input[type=range]:disabled::-moz-range-thumb{background:var(--muted)}
   color:var(--muted)}
 .field>label b,.field>label span{margin-left:auto;color:var(--txt);
   font-family:var(--mono);font-variant-numeric:tabular-nums}
-.field.inline{flex-direction:row;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.field.inline{flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
 .field.inline input{width:auto;flex:none;max-width:6em;min-height:40px}
 .row{display:flex;gap:8px;align-items:center}
 .grow{flex:1;min-width:0}
