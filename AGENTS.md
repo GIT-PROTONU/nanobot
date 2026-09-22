@@ -594,7 +594,9 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   readback before diagnosing smoothness: `pid_tune.py state` (wheel_pid + wheel_params
   ids 3/4 must read 5/60/0 + 0.4/0.8). Restored live via `gains --set 5,60,0` +
   `params --set 3=0.4,4=0.8` (2026-09-21; the rate-limited while-parked save re-persists
-  them). The canned-turn default was also raised **`move_ang_speed` 0.5 → 0.8**
+  them). **Hit AGAIN 2026-09-22** (found during the KFF deploy): the board was live on
+  **KP 1.0 / KI 0.0** (feedforward-only experiment leftovers) — restored 5/60/0 the same
+  way; the check must be the FIRST step of every tuning session, no exceptions. The canned-turn default was also raised **`move_ang_speed` 0.5 → 0.8**
   (web_server.py + robot.yaml + the Drive-card slider placeholder — 0.8 = the accepted
   w·0.2 rad/scan smear ceiling, same as drive_max_ang, and doubles the turn wheels'
   per-wheel speed out of the stickiest PID regime); NOTE the board's persisted
@@ -645,20 +647,26 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   `setup()`, saved rate-limited while parked exactly like the gains). Wire format:
   POST `/publish {topic:"/motor_params", value:[id,val, id,val, …]}` — Float32MultiArray
   (id,value) pairs, ids `0 ticks_per_rev · 1 wheel_radius_m · 2 wheel_separation_m ·
-  3 max_linear_ms · 4 max_angular_rads · 5 target_slew · 6 dither · 7 vel_hyst (0..0.5)`
+  3 max_linear_ms · 4 max_angular_rads · 5 target_slew · 6 dither · 7 vel_hyst (0..0.5) ·
+  8 kff_override (duty per m/s; 0 = derive from ids 3/4/2)`
   (whitelisted via
-  `telemetry.py`'s `_mk_motor_params`, max 8 pairs). Any accepted change recomputes
+  `telemetry.py`'s `_mk_motor_params`, max 9 pairs). Any accepted change recomputes
   the derived ticks/meter + KFF full-scale map and resets the PID integrators
   (their error units just changed meaning). Readback on `/wheel_params` @1 Hz in
   the SAME (id,value) layout → `f.esp.wheel_params` re-seeds any future web sliders.
   A future recalibration is a POST, never a flash. `clampf` ranges: tpr 10..5000,
   radius 0.005..0.5, separation 0.05..1.0, maxlin 0.05..2, maxang 0.05..5, slew
-  0.05..10, dither 0..0.2, vel_hyst 0..0.5.
+  0.05..10, dither 0..0.2, vel_hyst 0..0.5, kff 0..10 (values <0.1 = auto-derive).
   **Vel hyst is now web-tunable (2026-09-22)**: the Drive tab's Coprocessor card has a
   "Vel hyst" slider (0..0.5) — release publishes `[/motor_params [7, v]]` (the same
   instant-apply pattern as the PID sliders) and the slider re-seeds from
   `f.esp.wheel_params` id 7 on first frame, so the page shows the NVS-persisted value
-  the firmware is actually running. The other ids stay script-only
+  the firmware is actually running. **Wheel-PID KFF is web-tunable too (2026-09-22, id 8 — flashed + deployed + live-verified
+  same day)**:
+  a "Feed fwd KFF" slider (0..10, 0 = auto) on the same card — the manual override for the
+  derived feedforward duty-per-m/s gain (auto ≈ 2.24 with the current geometry); every
+  accepted change resets the PID integrators and persists to NVS ("kff" key) while parked.
+  The other ids stay script-only
   (`pid_tune.py params --set id=val`).
 - **Tunables are `#define`s inline at the top of `src/main.cpp`** (there is no
   `include/config.h`). `include/zenoh_generic_config.h` only holds zenoh-pico feature
@@ -1466,6 +1474,6 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
   **2026-09-21 pm VERIFICATION — the redeclare fix FAILED its verify; the reliable heal is the ping-watchdog reboot.** After the smoothness-pass-II flash + a `deploy.sh web_control` (full stack restart), the robot drove NOWHERE for minutes: ESP session half-attached (hb/ticks/LDS-flowing, `nano_esp32` visible as the /wheel_ticks publisher), but the router wasn't routing SBC→ESP at all — and the 45 s redeclare (which printed `subs re-declared (10)` on the console every period) did NOT revive delivery over that half-dead session. Diagnosis chain, all motion-free: gateway journal shows POST /drive landed → `ros2 topic info /cmd_vel -v` on the board shows only behavior+web_control subs → the console (USB) shows the ESP believes all is well. **Heal that worked (no power cycle): `sudo -n systemctl restart nano-robot.target` → pings stop → the ESP's own LINK_RX watchdog (8 s) esp_restart()s → fully fresh session BOTH ends → console shows clean boot + `zenoh CONNECTED` + `subs re-declared`, no declare failures.** Motion-free RX proof: POST `/motor_params [6, <current dither>]` (a physical no-op) → the console prints `drive params … saved to NVS` within ~10 s = the ESP received a put (telemetry's id gate had to widen to 0..6 first). LESSON: after any stack/router bounce, if the robot ignores /drive but hb/ticks flow, bounce the target once (a forced clean ESP re-handshake) before suspecting firmware or motors; the USB console + a no-op param echo discriminates without moving a wheel.
   **2026-09-21 pm II — redeclare DISABLED + drop triage is now remote.** The load-correlated ESP drops (deaf legs → ping-watchdog esp_restart, ~every test run) landed ON redeclare moments and the burst had already failed its one job, so `SUB_REDECLARE_MS` is now **0 (off)** — `subsRedeclare()` remains compiled for manual reuse. The firmware now publishes **`/esp32_reset` (Int32, 1 Hz, `esp_reset_reason()`)**: after ANY drop, `ros2 topic echo /esp32_reset` triages it — 9=brownout (power), 3=SW (the ping watchdog), 4/5/6=panic (code), 1/2=power-on/external — no console needed. (Context: the user reported "didn't have this problem before the PID update"; with battery+regs declared good and connections reseated, the open suspects are motor-noise coupling into the ESP feed/UART2 (the known ground-bounce family) vs the redeclare burst — the latter is now gone and `/esp32_reset` will attribute the next drop definitively. Same session: a full BOARD reboot also happened during power fiddling.)
 - **`plink -m` on Windows:** the script text becomes the shell's argv. `pkill -f` patterns can kill the controlling shell. Fix: `pscp` script, run by path.
-- **ESP32 firmware:** PlatformIO from dev PC (`pio run -t upload`). Don't build on the board. Tunables are `#define`s at top of `src/main.cpp`. **After ANY flash, expect the router's serial transport to be DESYNCED** (the ESP reboots mid-session and sends garbage; the router logs `Read error on Serial link ... Unexpected Init flag`) — the ESP then boot-loops on its 40 s connect deadline ("link not up within deadline") and only a `sudo -n systemctl restart nano-robot.target` (→ ping-watchdog ESP reboot → fresh handshake) clears it; the ESP's own retry loop cannot recover the half-dead router transport (hit 2026-09-21 pm twice). USB-tethering the ESP also means motors are unpowered in this setup (the ESP runs off USB) — flash first, then switch power, then test.
+- **ESP32 firmware:** PlatformIO from dev PC (`pio run -t upload`). Don't build on the board. Tunables are `#define`s at top of `src/main.cpp`. **After ANY flash, expect the router's serial transport to be DESYNCED** (the ESP reboots mid-session and sends garbage; the router logs `Read error on Serial link ... Unexpected Init flag`) — the ESP then boot-loops on its 40 s connect deadline ("link not up within deadline") and only a `sudo -n systemctl restart nano-robot.target` (→ ping-watchdog ESP reboot → fresh handshake) clears it; the ESP's own retry loop cannot recover the half-dead router transport (hit 2026-09-21 pm twice). USB-tethering the ESP also means motors are unpowered in this setup (the ESP runs off USB) — flash first, then switch power, then test. **Also (2026-09-22): a raw console read (`cat /dev/ttyUSB0`) REBOOT-RESETS the tethered coprocessor** — opening the port asserts DTR/RTS and the dev board's auto-reset circuit pulls EN (board logs `esp32 DOWN 9s → UP`, ROM-banner garbage at 74880 baud shows on the console instead of the app). Never read the USB console raw while the robot is live; use `pio device monitor` (it manages DTR/RTS) or deassert dtr/rts explicitly if you must capture the boot banner.
 - **Deploy soul overwrite:** `DEPLOY_SOUL=1` pushes `memory/` personality to the board, discarding evolved drift. Default is `DEPLOY_SOUL=0` (keep the robot's soul) — matching deploy.sh.
 - **Board has ~1 GB RAM and 7 GB rootfs** — watch memory, don't run heavy compiles.

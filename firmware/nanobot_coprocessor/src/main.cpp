@@ -171,7 +171,8 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 #define WHEEL_VEL_FILT_MAX 8       // ring capacity = max averaged windows (8 * 20 ms = 160 ms)
 #define WHEEL_VEL_QUANT   0.25f    // keep the quantization step <= this fraction of |setpoint|
 // Full-scale wheel speed at duty=1 (the per-wheel max from the clamps above); KFF maps a
-// target m/s to the baseline duty the I-term corrects from.
+// target m/s to the baseline duty the I-term corrects from. Manual override via
+// /motor_params id 8 (NVS "kff", 0 = derive from the drive limits).
 #define WHEEL_KFF   (1.0f/(MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f))
 #define WHEEL_KP    0.0f            // stiffness — tune after KI (start ~0.5*KFF)
 #define WHEEL_KI    8.0f            // crawl breakaway <0.5 s (0.12 m/s stall -> +0.7 duty in ~0.46 s)
@@ -416,7 +417,7 @@ static float             g_pid_saved[3];      // last values written to NVS (Cor
 // (id,value) float pairs, ids:
 //   0 ticks_per_rev   1 wheel_radius_m   2 wheel_separation_m
 //   3 max_linear_ms   4 max_angular_rads 5 target_slew_mps2
-//   6 dither          7 vel_hyst
+//   6 dither          7 vel_hyst         8 kff_override (0 = derive from ids 3/4/2)
 // Readback on /wheel_params @1 Hz uses the SAME (id,value) layout. A change recomputes
 // the derived ticks/meter + KFF full-scale map and resets the PID integrators (their
 // error units just changed meaning). Defaults are the defines above; both build paths
@@ -424,6 +425,7 @@ static float             g_pid_saved[3];      // last values written to NVS (Cor
 static volatile float    g_tpr = TICKS_PER_REV, g_wrad = WHEEL_RADIUS, g_wsep = WHEEL_SEPARATION,
                          g_maxlin = MAX_LINEAR_SPEED, g_maxang = MAX_ANGULAR_SPEED, g_slew = WHEEL_TGT_SLEW,
                          g_dither = WHEEL_DITHER, g_vhyst = WHEEL_VEL_HYST;
+static volatile float    g_kff_ov = 0.0f;   // manual KFF override, duty per m/s; 0 = derive
 static volatile float    g_tpm = TICKS_PER_REV/(2.0f*3.14159265f*WHEEL_RADIUS);   // derived: ticks/meter
 static volatile float    g_kff = WHEEL_KFF;                                       // derived: duty per m/s
 static volatile bool     g_par_save = false; // cb -> 1 Hz block: params changed, NVS write pending
@@ -433,7 +435,9 @@ static void recalc_drive_params(){
   float tpr = g_tpr, r = g_wrad;
   if (tpr >= 1.0f && r >= 0.001f)                      // never adopt a broken scale
     g_tpm = tpr / (2.0f*3.14159265f*r);
-  g_kff = 1.0f / (g_maxlin + g_maxang*g_wsep*0.5f);
+  float kff = 1.0f / (g_maxlin + g_maxang*g_wsep*0.5f);
+  if (g_kff_ov >= 0.1f) kff = g_kff_ov;    // manual override (0 = auto-derive)
+  g_kff = kff;
 }
 static bool set_param(int id, float v){   // clamp + assign; false = unknown id
   switch(id){
@@ -445,6 +449,7 @@ static bool set_param(int id, float v){   // clamp + assign; false = unknown id
     case 5: g_slew  = clampf(v, 0.05f, 10.0f); break;
     case 6: g_dither= clampf(v, 0.0f,   0.20f); break;
     case 7: g_vhyst= clampf(v, 0.0f,   0.5f); break;
+    case 8: g_kff_ov= clampf(v, 0.0f,  10.0f); break;   // duty per m/s; 0 (<0.1) = auto
     default: return false;
   }
   return true;
@@ -948,10 +953,10 @@ static void zenohTask(void*){
 #if WHEEL_PID_ENABLED
       zpub_put(P_pid,  buf, cdr_f32arr3(buf, g_wkp, g_wki, g_wkd));
       {   // /wheel_params readback: (id,value) pairs, same layout /motor_params writes
-        float pv[16]; int k=0;
+        float pv[18]; int k=0;
         pv[k++]=0; pv[k++]=g_tpr;   pv[k++]=1; pv[k++]=g_wrad;  pv[k++]=2; pv[k++]=g_wsep;
         pv[k++]=3; pv[k++]=g_maxlin; pv[k++]=4; pv[k++]=g_maxang; pv[k++]=5; pv[k++]=g_slew;
-        pv[k++]=6; pv[k++]=g_dither; pv[k++]=7; pv[k++]=g_vhyst;
+        pv[k++]=6; pv[k++]=g_dither; pv[k++]=7; pv[k++]=g_vhyst; pv[k++]=8; pv[k++]=g_kff_ov;
         zpub_put(P_params, buf, cdr_f32arr_n(buf, pv, k));
       }
 #endif
@@ -1159,6 +1164,7 @@ void setup(){
   set_param(5, g_prefs.getFloat("slew",  WHEEL_TGT_SLEW));
   set_param(6, g_prefs.getFloat("dith",  WHEEL_DITHER));
   set_param(7, g_prefs.getFloat("vhyst", WHEEL_VEL_HYST));
+  set_param(8, g_prefs.getFloat("kff",   0.0f));   // 0 = derive from drive limits
   recalc_drive_params();
   g_pid_saved[0]=g_wkp; g_pid_saved[1]=g_wki; g_pid_saved[2]=g_wkd;
   Serial.printf("[nano] wheel PID gains kp=%.3f ki=%.3f kd=%.3f (NVS)\n",
@@ -1585,9 +1591,10 @@ void loop(){   // Core 1: real-time control
       g_prefs.putFloat("slew",  g_slew);
       g_prefs.putFloat("dith",  g_dither);
       g_prefs.putFloat("vhyst", g_vhyst);
+      g_prefs.putFloat("kff",   g_kff_ov);
       g_par_save = false;
-      Serial.printf("[nano] drive params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f dith=%.2f vhyst=%.2f saved to NVS\n",
-        (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew,(double)g_dither,(double)g_vhyst);
+      Serial.printf("[nano] drive params tpr=%.1f rad=%.4f sep=%.3f maxlin=%.2f maxang=%.2f slew=%.2f dith=%.2f vhyst=%.2f kff=%.2f saved to NVS\n",
+        (double)g_tpr,(double)g_wrad,(double)g_wsep,(double)g_maxlin,(double)g_maxang,(double)g_slew,(double)g_dither,(double)g_vhyst,(double)g_kff_ov);
     }
 #endif
   }

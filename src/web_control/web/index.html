@@ -232,6 +232,8 @@
               <input id="pidKd" type="range" min="0" max="5" step="0.05" value="0"></div>
             <div class="field"><label>Vel hyst <span id="velHystV">0.15</span></label>
               <input id="velHyst" type="range" min="0" max="0.5" step="0.01" value="0.15"></div>
+            <div class="field"><label>Feed fwd KFF <span id="kffV">0 (auto)</span></label>
+              <input id="kff" type="range" min="0" max="10" step="0.05" value="0"></div>
             <p class="hint"><b>Wheel trim</b> rebalances the mismatched gearmotors so a forward
               command goes straight. If the robot drifts <b>left</b>, push the slider
               <b>negative</b> (boost left / cut right); if it drifts <b>right</b>, push
@@ -251,6 +253,13 @@
               a boundary. Raise it if the crawl judder looks like the filter flipping; lower it
               (0 = off) for the fastest filter response. Publishes /motor_params, persists to
               the ESP32's NVS while parked, and re-syncs from f.esp.wheel_params on load.</p>
+            <p class="hint"><b>Feed fwd KFF</b> (duty per m/s, id 8 in /motor_params) is the wheel
+              PID's feedforward gain — the duty a commanded speed maps to before KP/KI trim it.
+              <b>0 = auto</b>: derived from the drive limits (1/(maxlin + maxang·sep/2) ≈ 2.24 with
+              the current geometry). Raise it if crawl/reversal breakaway is slow (the integrator
+              has to build the whole push from a weak feedforward start); lower it if cruise
+              overshoots on launch. Every change resets the integrators and persists to the
+              ESP32's NVS while parked; the slider re-syncs from f.esp.wheel_params on load.</p>
             <div class="field"><label>Wheels-up override</label>
               <select id="pickupOv">
                 <option value="-1" selected>auto (real switches)</option>
@@ -1445,6 +1454,10 @@ $("pidKd").onchange=pidPublish;
 // firmware clamps 0..0.5; readback re-syncs from f.esp.wheel_params on first arrival.
 $("velHyst").oninput=()=>$("velHystV").textContent=Number($("velHyst").value).toFixed(2);
 $("velHyst").onchange=()=>pub("/motor_params",[7,Number($("velHyst").value)]);
+// Wheel-PID feedforward gain KFF (duty per m/s): /motor_params id 8 — 0 = auto
+// (derived from the drive limits 1/(maxlin + maxang*sep/2)); firmware clamps 0..10.
+$("kff").oninput=()=>{const v=Number($("kff").value);$("kffV").textContent=v?v.toFixed(2):"0 (auto)";};
+$("kff").onchange=()=>pub("/motor_params",[8,Number($("kff").value)]);
 // ESP32 straight-line wheel trim: negative = boost left / cut right (robot veers left),
 // positive = the opposite. The slider only sends; the live value comes back from the
 // telemetry frame (f.esp.wheel_trim) and is shown in the readout + re-syncs the slider
@@ -2358,16 +2371,22 @@ function onEsp(e, susp){
     $("pidKi").value=String(ki); $("pidKiV").textContent=ki.toFixed(1);
     $("pidKd").value=String(kd); $("pidKdV").textContent=kd.toFixed(2);
   }
-  if(e.wheel_params && !hystSynced){
-    // Drivetrain params come back as flat (id,value) pairs — id 7 is vel_hyst.
-    // Re-seed the slider once so the page matches the ESP32's NVS-persisted value.
+  if(e.wheel_params && (!hystSynced || !kffSynced)){
+    // Drivetrain params come back as flat (id,value) pairs — id 7 is vel_hyst,
+    // id 8 the wheel-PID feedforward gain KFF (0 = auto-derive from drive limits).
+    // Re-seed the sliders once so the page matches the ESP32's NVS-persisted values.
     const p=e.wheel_params;
     for(let i=0;i+1<p.length;i+=2){
-      if(Math.round(p[i])===7){
+      const id=Math.round(p[i]);
+      if(id===7 && !hystSynced){
         hystSynced=true;
         $("velHyst").value=String(p[i+1]);
         $("velHystV").textContent=Number(p[i+1]).toFixed(2);
-        break;
+      }else if(id===8 && !kffSynced){
+        kffSynced=true;
+        const v=Number(p[i+1]);
+        $("kff").value=String(v);
+        $("kffV").textContent=v?v.toFixed(2):"0 (auto)";
       }
     }
   }
@@ -3064,6 +3083,7 @@ let curV=0, curW=0, driveBusy=false;
 let motorTrimSynced=false;   // whether the wheel-trim slider has been seeded from live ESP state
 let pidSynced=false;         // whether the PID sliders have been seeded from f.esp.wheel_pid
 let hystSynced=false;        // whether the vel-hyst slider has been seeded from f.esp.wheel_params
+let kffSynced=false;         // whether the KFF slider has been seeded from f.esp.wheel_params
 function setCmd(v,w){ curV=v; curW=w; }
 function publishCmd(){
   const v=curV*Number($("lin").value), w=curW*Number($("ang").value);

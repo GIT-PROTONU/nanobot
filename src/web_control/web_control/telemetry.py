@@ -787,23 +787,24 @@ class TelemetryHub:
         # Float32MultiArray (id,value)-pair readback of the ESP32's live drivetrain
         # parameters — ids: 0 ticks_per_rev, 1 wheel_radius, 2 wheel_separation,
         # 3 max_linear, 4 max_angular, 5 target_slew, 6 stiction dither amplitude,
-        # 7 vel_hyst (adaptive-filter N Schmitt band; see firmware set_param).
+        # 7 vel_hyst (adaptive-filter N Schmitt band), 8 wheel-PID feedforward KFF
+        # override (0 = auto-derive from ids 3/4/2; see firmware set_param).
         # Keep in step with the firmware's pair count.
         d = list(msg.data) if msg.data else []
-        self._wheel_params = ([round(float(x), 5) for x in d[:16]]
+        self._wheel_params = ([round(float(x), 5) for x in d[:18]]
                               if len(d) >= 2 and len(d) % 2 == 0 else None)
 
     @staticmethod
     def _mk_motor_params(v):
-        # (id,value) pairs for /motor_params: flat even-length list, at most 8 pairs,
-        # ids 0..7. Values are clamped firmware-side; here we only sanity-gate the shape.
-        if not isinstance(v, (list, tuple)) or not v or len(v) % 2 or len(v) > 16:
-            raise ValueError("expected a flat (id,value) pair list, max 8 pairs")
+        # (id,value) pairs for /motor_params: flat even-length list, at most 9 pairs,
+        # ids 0..8. Values are clamped firmware-side; here we only sanity-gate the shape.
+        if not isinstance(v, (list, tuple)) or not v or len(v) % 2 or len(v) > 18:
+            raise ValueError("expected a flat (id,value) pair list, max 9 pairs")
         out = []
         for i in range(0, len(v), 2):
             pid, val = int(v[i]), float(v[i + 1])
-            if not 0 <= pid <= 7:
-                raise ValueError(f"param id {pid} out of range 0..7")
+            if not 0 <= pid <= 8:
+                raise ValueError(f"param id {pid} out of range 0..8")
             out.extend([float(pid), val])
         return Float32MultiArray(data=out)
 
