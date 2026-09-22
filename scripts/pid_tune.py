@@ -26,6 +26,10 @@ Judgements (per rung, cruise = the last 60% of the run):
   HUNT     peak-to-peak speed > hunt-frac x target (stick-slip oscillation) — KI too
            high or KP too low.
 All speeds are in TRUE m/s (ticks/metre from f.esp.wheel_params ids 0+1).
+Speeds are scored against the frames' BUILD time (frame "t", added 2026-09-22
+after a POST-stall burst of backlogged SSE frames collapsed parse-time dt and
+inflated speeds ~6x — the phantom "spin overspeed"); a parse-dt floor
+(BURST_MIN_DT) guards against gateways that don't stamp frames yet.
 """
 import argparse
 import json
@@ -46,6 +50,9 @@ DEAD_RUN_S = 0.4       # s of BOTH-wheels-frozen while commanded = dead-man/seri
                        # signature (the ESP32 cmd watchdog is 500 ms; a reset stops the
                        # motors + zeroes the PID state -> a full re-breakaway the tuning
                        # can never fix. Controller-level stick-slip never fully freezes.)
+BURST_MIN_DT = 0.15    # s floor on inter-frame dt: frames are built at telemetry_rate
+                       # (5 Hz = 0.2 s); a parse gap under this is a POST-stall BURST of
+                       # backlogged frames, not fast data (2026-09-22 spin-leg artifact)
 
 
 class Telemetry:
@@ -60,7 +67,7 @@ class Telemetry:
         self.alive = threading.Event()
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
-        self.hist = []          # [(monotonic, (l, r) ticks)] per parsed frame
+        self.hist = []          # [(parse_monotonic, build_t|None, (l, r) ticks)] per frame
         self._trim_at = 4000    # trim the history periodically (runs are short)
 
     def start(self):
@@ -92,6 +99,7 @@ class Telemetry:
                                     tk = (self.frame.get("esp") or {}).get("ticks")
                                     if tk is not None:
                                         self.hist.append((time.monotonic(),
+                                                          self.frame.get("t"),
                                                           (tk[0], tk[1])))
                                         if len(self.hist) > self._trim_at:
                                             del self.hist[:self._trim_at // 2]
@@ -160,13 +168,24 @@ class RunSampler:
             pos += 1                           # skip entries from before this rung
         prev = hist[pos - 1] if pos > 0 else None
         while pos < len(hist):
-            t, tk = hist[pos]
+            t, bt, tk = hist[pos]
             if prev is not None:
-                self.rows.append((t - prev[0], (tk[0] - prev[1][0],
-                                                tk[1] - prev[1][1])))
-            prev = (t, tk)
+                pt, pbt, ptk = prev
+                # dt from the frame's own BUILD stamp when the gateway provides one:
+                # after a gateway stall the backlogged frames arrive in one BURST and
+                # parse-time dt collapses (~0.02 s), dividing real motion by ~1/10 —
+                # speeds inflated ~6x and faked HUNT / spin-overspeed verdicts
+                # (2026-09-22). Fall back to parse dt (old gateway), floored at the
+                # telemetry period so a burst can't collapse it.
+                if bt is not None and pbt is not None and bt > pbt:
+                    dt = bt - pbt
+                else:
+                    dt = t - pt
+                if dt < BURST_MIN_DT:
+                    dt = BURST_MIN_DT
+                self.rows.append((dt, (tk[0] - ptk[0], tk[1] - ptk[1])))
+            prev = (t, bt, tk)
             pos += 1
-        self._pos = pos
         self.gap = max(self.gap, time.monotonic() - prev[0] if prev else 0.0)
 
     def score(self, target_mps, tpm):
@@ -412,7 +431,8 @@ class _Mock(BaseHTTPRequestHandler):
                             t[0] + int(round((v - w * sep / 2) * tpm * dtf)),
                             t[1] + int(round((v + w * sep / 2) * tpm * dtf))]
                     self.wfile.write(b"data: " + json.dumps(
-                        {"esp": {"ticks": _Mock.state["ticks"], "tick_hz": 15.0,
+                        {"t": round(time.time(), 3),
+                         "esp": {"ticks": _Mock.state["ticks"], "tick_hz": 15.0,
                                  "wheel_pid": _Mock.state["pid"],
                                  "wheel_params": _Mock.state["params"],
                                  "hb": 1, "hb_age": 0.1, "stray": [0, 0],

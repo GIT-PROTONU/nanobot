@@ -525,6 +525,12 @@ class TelemetryHub:
         esp_temp, esp_temp_at = self._esp_temp
         vitals = n.vitals()               # IMU motion/tilt/rate from the /dev/shm blob
         f = {
+            # Wall-clock BUILD stamp: consumers measuring inter-frame dt (pid_tune's
+            # tick-speed scoring) must divide motion by BUILD time, not parse time —
+            # after a gateway stall the backlogged frames arrive in one burst and
+            # parse-time dt collapses, inflating speeds ~6x (the 2026-09-22 "spin
+            # overspeed" that wasn't). Additive key; the page ignores it.
+            "t": round(time.time(), 3),
             "susp": [n._susp_l, n._susp_r],
             "pickup_override": n._susp_override,
             "esp": {"hb": hb, "hb_age": round(now - hb_at, 2) if hb is not None else None,

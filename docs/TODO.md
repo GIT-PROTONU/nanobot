@@ -412,6 +412,21 @@ in this checkout.
         WHY executor callbacks slip that far under load (the stall-trap dumps), and
         whether POST /drive handling itself (HTTP thread) still stalls under load —
         that part is ThreadingHTTPServer, not the executor.
+      - **2026-09-22: stalls CONFIRMED LIVE during PID tuning, post scan-poll fix** —
+        the outback suite caught real deadman events (both-wheels-freeze ≥0.4 s while
+        commanded) on 2 of 4 legs pre-scan-fix and on ~2 of 4 legs in the run right
+        after the 2026-09-22 deploy (the deploy's own post-restart settling made 4/4,
+        clearing on re-run), so the /scan.bin poll fix reduced but did not eliminate
+        them. NOTE the /proc stall trap (`/tmp/stall_trap.sh`) does NOT survive a
+        reboot — it was gone when checked this day (re-run with nohup per the note
+        above before the next repro attempt). Same session, the tuning instrument
+        itself was fixed: see the AGENTS.md ESP32-PID gotcha — after a stall the
+        backlogged SSE frames burst in and parse-time dt collapses, inflating
+        pid_tune speeds ~6-10× (phantom HUNT / spin-overspeed verdicts); the frame
+        now carries a build stamp `"t"` and pid_tune scores against it. One
+        unexplained episode (~12:57): spin legs read sustained ~10× tick advance with
+        correct 5/60/0 gains, no heartbeat reset, no recurrence in 12 recorded legs —
+        re-probe with a passive frame recorder alongside the outback if it repeats.
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze

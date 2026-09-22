@@ -468,7 +468,23 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   the damper. KP 5 + KI 60 won the aggregate (crawl p2p avg 0.009 m/s vs 0.017;
   0.08/0.10/0.15 rungs clean-to-marginal). Residual carpet-stiction limit-cycling is
   band- and run-dependent (single-rung verdicts flip run-to-run — judge aggregates;
-  `pid_tune.py --repeat N` exists for exactly this). **2026-09-21 smoothness pass
+  `pid_tune.py --repeat N` exists for exactly this). **GOTCHA — the tuning instrument
+  itself lied until 2026-09-22: after a gateway POST stall the backlogged SSE frames
+  arrive in one BURST, and pid_tune divided real motion by collapsed PARSE-time dt →
+  speeds inflated ~6-10× → phantom HUNT / "spin overspeed" verdicts (measured live:
+  spin legs "0.43 m/s vs 0.041 commanded", gone on re-run). The telemetry frame now
+  carries a build stamp `"t"` (telemetry.py `_build`, additive key) and pid_tune
+  scores against it (parse-dt floored at `BURST_MIN_DT` 0.15 s for stampless
+  gateways). Corollary: a run's verdicts are only trustworthy when its frame gaps
+  stayed small — a deadman/stall in the same run can also mean the numbers are burst
+  garbage; re-run before concluding anything about gains.** (Same session's real
+  findings: the live NVS had drifted to KP 0.7/KI 19.4/KFF 5.95 — the user's
+  feedforward-only experiments, third drift occurrence — and restoring 5/60/0 +
+  slew 1.5 + vhyst 0.15 + KFF auto re-verified clean: crawl p2p 0.005-0.029, mid
+  0.019-0.028, spins 0.028-0.038 of 0.041 across 16 legs. KFF 5.95 saturates duty at
+  ≥0.17 m/s — the loop can brake but not push; KI <30 can't break away. POST stalls
+  still deadman'd 2 legs even with the scan-poll fix deployed — delivery, not gains.)
+  **2026-09-21 smoothness pass
   (flashed + deployed same day)** — five structural fixes in the PID block, no gain
   changes: (1) **parked-at-zero integrator bleed** — the web keepalive re-asserts `{0,0}`
   forever, so the cmd never goes stale and the dead-man never resets the integrators; a
@@ -1114,7 +1130,10 @@ Each node subscribes to the other's health topic. If cognition ping is >5s stale
   of a compact JSON frame at `telemetry_rate` (5 Hz) with every light readout —
   odom, IMU, `/diagnostics`, ESP32 (hb/ticks/susp/temp/hall), LDS rpm/hz/duty, fan,
   plan (downsampled), latched brain strings (purpose/task/experiments), selftest,
-  and the OLED-mirror inputs (face/word/brand/system). The frame is built ONCE per
+   and the OLED-mirror inputs (face/word/brand/system). The frame carries a wall-clock
+   BUILD stamp `"t"` (added 2026-09-22 after the pid_tune burst artifact — see the
+   ESP32 PID gotcha; consumers must measure inter-frame dt from it, never from their
+   parse time, or a post-stall burst inflates speeds ~6-10×). The frame is built ONCE per
   tick and fanned out; the underlying subscriptions are **lazy** (created on the
   first client — on the executor thread via the tick timer — dropped `SUB_LINGER`
   after the last), so idle cost is ~zero. Writes: `POST /publish {topic,value}`
