@@ -96,9 +96,17 @@ def generate_launch_description():
 
     # The one heavy Nav2 process. Also spawned by scripts/unit_exec.sh nav
     # (systemd nano-nav.service); load_only:=true suppresses it for that pairing.
+    # The one heavy Nav2 process. Also spawned by scripts/unit_exec.sh nav
+    # (systemd nano-nav.service); load_only:=true suppresses it for that pairing.
+    # The container gets the FULL params file process-wide: launch_ros inlines
+    # only the per-component name sections into the load requests, so the
+    # double-nested local_costmap/global_costmap sections would never reach the
+    # child costmap nodes the servers create at runtime (they silently ran on
+    # Nav2 defaults — found 2026-09-22 when the web costmap overlay shipped).
     container = ComposableNodeContainer(
         package="rclcpp_components", executable="component_container_isolated",
         name=container_name, namespace="", output="screen",
+        parameters=[PARAMS],
         condition=UnlessCondition(load_only))
 
     # Attach the five components; retries the container's load_node service

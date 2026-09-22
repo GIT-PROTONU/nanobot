@@ -206,6 +206,15 @@ class TelemetryHub:
                                        #   one tuple so /map can never pair a new header
                                        #   with the previous grid
         self._map_arrival = STALE      # monotonic, for staleness surfacing
+        # Latest Nav2 costmaps, same shape as _map_payload and served the same
+        # way (GET /local_costmap + /global_costmap). The local costmap lives in
+        # the odom frame, so its origin is re-projected into the map frame at
+        # arrival time (see _on_costmap) — the page overlays both with plain
+        # map-frame coords. Cells are Nav2 COSTS (0 free .. 254 lethal, 255
+        # unknown), not -1/0/100 occupancy — the header carries kind:"costmap"
+        # + the grid yaw so the page shades/rotates accordingly.
+        self._local_costmap_payload = None
+        self._global_costmap_payload = None
         # map-frame pose via TF (map->odom from slam_toolbox + odom->base_link
         # from wheel_odometry). Listener is lazy — created with the other
         # browser-only subs, unregistered in _drop_subs.
@@ -706,6 +715,17 @@ class TelemetryHub:
         # map_update_interval). The OccupancyGrid is cached once (see _on_map);
         # the browser polls it over the /map HTTP route.
         s(sub(OccupancyGrid, "map", self._on_map, self._latched_qos))
+        # Nav2's costmaps (owned by controller_server = local, planner_server =
+        # global; published at publish_frequency 1 Hz). Subscribed VOLATILE on
+        # purpose: Nav2 Humble's costmap publisher durability has varied across
+        # releases, and a TRANSIENT_LOCAL request against a VOLATILE publisher
+        # is a silent QoS incompatibility (no data, ever). A volatile sub is
+        # compatible with either — we just wait <=1 s for the next publish,
+        # which the 1 Hz page poll consumes anyway.
+        s(sub(OccupancyGrid, "local_costmap/costmap",
+              lambda m: self._on_costmap("_local_costmap_payload", "odom", m), 1))
+        s(sub(OccupancyGrid, "global_costmap/costmap",
+              lambda m: self._on_costmap("_global_costmap_payload", "map", m), 1))
         # NOTE: bt_navigator's goal status sub moved to __init__ (always-on) — see the
         # cmd_vel note above.
         # map->base_link TF (map->odom: slam_toolbox @10 Hz; odom->base_link:
@@ -871,6 +891,45 @@ class TelemetryHub:
         }, data)
         self._map_arrival = time.monotonic()
 
+    def _on_costmap(self, attr, frame, msg):
+        """Cache the latest Nav2 costmap for the /local_costmap + /global_costmap
+        HTTP routes (same blob shape as /map). Nav2 cells are COSTS, not
+        occupancy: 0 free, 1..252 inflation gradient, 253 inscribed, 254 lethal,
+        255 unknown — served raw so the page shades the ramp. The local costmap
+        is a rolling window in the ODOM frame, so its origin is re-projected into
+        the map frame here (TF map->odom at the grid's stamp) and the header
+        carries `yaw` — the grid axes' rotation in the map frame (0 for the
+        global costmap, which IS the map frame). A TF miss keeps the previous
+        cache: a mis-placed overlay is worse than a stale one."""
+        info = msg.info
+        data = bytes(msg.data)               # int8[] cost bytes (0..255 unsigned)
+        if info.width <= 0 or info.height <= 0 or len(data) != info.width * info.height:
+            return
+        ox, oy, yaw = info.origin.position.x, info.origin.position.y, 0.0
+        if frame == "odom":
+            t = None
+            if self._tf_buf is not None:
+                for stamp in (msg.header.stamp, None):   # exact ts first, latest as fallback
+                    try:
+                        t = self._tf_buf.lookup_transform(
+                            "map", "odom", Time.from_msg(stamp) if stamp else Time())
+                        break
+                    except Exception:            # extrapolation/lookup — try the next
+                        pass
+            if t is None:
+                return
+            tr, q = t.transform.translation, t.transform.rotation
+            yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+            c, s = math.cos(yaw), math.sin(yaw)
+            ox, oy = c * ox - s * oy + tr.x, s * ox + c * oy + tr.y
+        if not (math.isfinite(ox) and math.isfinite(oy) and math.isfinite(yaw)):
+            return
+        setattr(self, attr, ({            # single atomic assignment (see __init__)
+            "w": info.width, "h": info.height, "res": round(info.resolution, 6),
+            "ox": round(ox, 6), "oy": round(oy, 6), "yaw": round(yaw, 6),
+            "t": time.time(), "kind": "costmap",
+        }, data))
+
     def _on_goal_status(self, msg):
         """Track bt_navigator's action status (the web chip + the LDS idle
         controller's busy signal). status_list gains an entry per goal state
@@ -921,6 +980,16 @@ class TelemetryHub:
         until slam_toolbox has published a grid. Atomic: meta and cells always
         come from the same /map message."""
         return self._map_payload or (None, None)
+
+    def get_local_costmap_payload(self):
+        """GET /local_costmap body, same shape as get_map_payload (meta carries
+        kind:"costmap" + yaw; cells are Nav2 costs 0..255). None until the
+        controller_server has published a grid."""
+        return self._local_costmap_payload or (None, None)
+
+    def get_global_costmap_payload(self):
+        """GET /global_costmap body, same shape as get_local_costmap_payload."""
+        return self._global_costmap_payload or (None, None)
 
     def clear_goal(self):
         """Drop the goal mirror + chip state (POST /nav/cancel). Nav2's own status

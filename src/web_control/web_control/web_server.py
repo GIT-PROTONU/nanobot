@@ -2545,6 +2545,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._serve_scan()
         if path == "/map":
             return self._serve_map()
+        if path == "/local_costmap":
+            return self._serve_costmap("local")
+        if path == "/global_costmap":
+            return self._serve_costmap("global")
         if path == "/brain/health":
             return self._respond_json(
                 self._node.get_brain_health() if self._node else {"error": "no node"})
@@ -2901,6 +2905,33 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             # ASCII-only message: send_error writes the error page as latin-1, so
             # non-latin1 characters here would raise inside it and drop the socket.
             self.send_error(503, "no map yet - is nano-slam up?")
+            return
+        body = json.dumps(meta).encode() + b"\n" + cells
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def _serve_costmap(self, which):
+        # Nav2 costmap view: the latest /local_costmap/costmap or
+        # /global_costmap/costmap OccupancyGrid cached by telemetry (lazy subs,
+        # browser-only — zero idle cost). Same wire format as /map: one JSON
+        # header line, '\n', then raw int8 cells — but the cells are Nav2 COSTS
+        # (0 free .. 254 lethal, 255 unknown), and the header carries
+        # kind:"costmap" + yaw (the grid axes' rotation in the map frame) so the
+        # page shades and rotates differently. The local costmap's origin is
+        # already re-projected into the map frame by telemetry (_on_costmap).
+        meta, cells = (self._node.telemetry.get_local_costmap_payload() if which == "local"
+                       else self._node.telemetry.get_global_costmap_payload())
+        if meta is None:
+            # ASCII-only message: send_error writes the error page as latin-1
+            # (see _serve_map).
+            self.send_error(503, "no %s costmap yet - is nano-nav up?" % which)
             return
         body = json.dumps(meta).encode() + b"\n" + cells
         self.send_response(200)

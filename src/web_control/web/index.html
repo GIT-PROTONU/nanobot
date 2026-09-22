@@ -99,6 +99,12 @@
           <div class="chiprow">
             <label class="switch"><input type="checkbox" id="mapShade" checked><span class="track"></span>
               Sharp walls</label>
+            <label class="switch"><input type="checkbox" id="mapCost"><span class="track"></span>
+              Costmap</label>
+            <span id="costPick" style="display:none">
+              <label style="margin-left:6px"><input type="radio" name="costSrc" id="costGlobal" checked> global</label>
+              <label style="margin-left:6px"><input type="radio" name="costSrc" id="costLocal"> local</label>
+            </span>
           </div>
           <div class="chiprow" id="mapFeeds">
             <span class="fdot" id="feedEsp32"></span>ESP32
@@ -114,7 +120,10 @@
             an accidental tap can't move the robot). <span class="map-dot robot"></span>red = robot,
             <span class="map-dot goal"></span>yellow = goal, <span class="map-dot trail"></span>cyan =
             trail, dashed circle = the costmap's inflation radius (how close Nav2 will pass to
-            walls). <b>✕ Cancel goal</b> aborts the active navigation.</p>
+            walls). <b>Costmap</b> overlays Nav2's actual costmap as a translucent heat map
+            (yellow→red = rising cost, solid red = lethal) — <b>global</b> is the full
+            24×24 m planning space, <b>local</b> is the 2×2 m rolling window of live obstacle
+            sensing that follows the robot. <b>✕ Cancel goal</b> aborts the active navigation.</p>
         </div>
       </div>
     </section>
@@ -3335,6 +3344,8 @@ connect();   // auto-connect on load
   let flash=null;                      // {x, y, t} click-feedback ring (world metres)
   let _goalClearT=undefined;           // pending "clear the goal ring" timer
   const trailCap=250;                  // breadcrumb ring buffer (world metres)
+  // Nav2 costmap overlay state (toggle-gated; see pollCost below)
+  let costCanvas=null, costMeta=null, costTimer=null;
 
   // ---- zoom / pan: the display canvas is sized to the wrap (× devicePixelRatio) and
   //      every frame re-renders it in SCREEN pixels. Smoothed drawImage is only used
@@ -3365,6 +3376,23 @@ connect();   // auto-connect on load
     ctx.imageSmoothingEnabled=false;
     const m=lastMeta;
     const W2P=(x,y)=>[x0+((x-m.ox)/m.res)*z, y0+((gh-1)-(y-m.oy)/m.res)*z]; // world -> screen px
+    // Nav2 costmap overlay (toggle): a translucent heat ramp painted UNDER the
+    // vectors. Grids come from /local_costmap + /global_costmap (same blob shape
+    // as /map but cells are Nav2 COSTS 0..255). The header carries `yaw` — the
+    // grid axes' rotation in the map frame (0 for global; the local costmap
+    // lives in odom and telemetry re-projects its origin) — so the overlay is
+    // placed with a rotated canvas transform: cols along R(yaw)(1,0), rows along
+    // R(yaw)(0,1), screen y flipped vs world y.
+    if(costCanvas && costMeta){
+      const cm=costMeta, zc=z*cm.res/m.res;          // screen px per costmap cell
+      const [gx,gy]=W2P(cm.ox,cm.oy);                // grid origin corner (map frame)
+      const yaw=cm.yaw||0, co=Math.cos(yaw), si=Math.sin(yaw);
+      ctx.save();
+      ctx.transform(zc*co, -zc*si, -zc*si, -zc*co, gx, gy);
+      ctx.imageSmoothingEnabled=true;                // soft gradient beats blocky cells
+      ctx.drawImage(costCanvas, 0, 0);
+      ctx.restore();
+    }
     // breadcrumb trail (cyan polyline) — where the robot has been (fed by the
     // SSE nav hook below)
     if(navTrail.length>1){
@@ -3383,14 +3411,14 @@ connect();   // auto-connect on load
     // Pose source: the SSE frame's nav pose (map->base_link TF via telemetry).
     const p=(navFrame&&navFrame.pose);
     if(p){
-      const [rx,ry]=W2P(p.x,p.y), R=3.5;
+      const [rx,ry]=W2P(p[0],p[1]), R=3.5;             // pose is [x, y, yaw_rad]
       ctx.fillStyle="#ff3b30";
       ctx.strokeStyle="rgba(10,10,14,0.6)"; ctx.lineWidth=1;   // thin dark halo on light map
       ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
       ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.fill();
       ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2; ctx.lineCap="round";
       ctx.beginPath(); ctx.moveTo(rx,ry);
-      ctx.lineTo(rx+9*Math.cos(p.th||0), ry-9*Math.sin(p.th||0)); ctx.stroke();
+      ctx.lineTo(rx+9*Math.cos(p[2]||0), ry-9*Math.sin(p[2]||0)); ctx.stroke();
       ctx.lineCap="butt";
       // inflation bubble: Nav2's inflation_radius — the distance the costmap keeps
       // from walls (a dashed circle around the robot, grey).
@@ -3489,6 +3517,49 @@ connect();   // auto-connect on load
     }catch(e){ /* transient: keep polling */ }
   }
 
+  // ---- costmap overlay poller (Nav2 local/global costmaps) --------------------
+  // Toggle-gated: fetches the active costmap at 1 Hz (Nav2 publishes the full
+  // grid at publish_frequency 1 Hz) into an offscreen canvas at native grid res,
+  // shading Nav2 COST cells: free (0) and unknown (255) stay transparent, the
+  // inflation gradient shades yellow->red with rising cost, lethal/inscribed
+  // (253/254) paints solid red. A 503 (nano-nav down / no grid yet) drops the
+  // overlay — a stale heat map could mislead.
+  function dropCost(){ costCanvas=costMeta=null; }
+  async function pollCost(){
+    if(!$("mapOn").checked) return;            // hero view off: nothing to feed
+    const src=costWhich(); if(!src) return;
+    try{
+      const r=await fetch("/"+src+"?t="+Date.now());
+      if(!r.ok){ dropCost(); repaint(); return; }   // nav down / not published yet
+      const buf=new Uint8Array(await r.arrayBuffer());
+      const nl=buf.indexOf(10); if(nl<0) return;
+      const m=JSON.parse(dec.decode(buf.subarray(0,nl)));
+      const cells=buf.subarray(nl+1);
+      if(!costCanvas || costCanvas.width!==m.w || costCanvas.height!==m.h){
+        costCanvas=document.createElement("canvas");
+        costCanvas.width=m.w; costCanvas.height=m.h;
+      }
+      const cctx=costCanvas.getContext("2d");
+      const im=cctx.createImageData(m.w,m.h), d=im.data;
+      for(let row=0;row<m.h;row++){
+        const base=row*m.w;
+        for(let c=0;c<m.w;c++){
+          const v=cells[base+c], o=base*4+c*4;     // NO y-flip: repaint()'s rotated
+          if(v===0||v===255){ d[o+3]=0; continue; } // transform places row 0 correctly
+          if(v>=253){ d[o]=255; d[o+1]=59; d[o+2]=48; d[o+3]=204; }
+          else{
+            const t=v/254;
+            d[o]=255; d[o+1]=Math.round(210*(1-t)); d[o+2]=0;
+            d[o+3]=Math.round(255*Math.min(0.7, 0.12+0.55*t));
+          }
+        }
+      }
+      cctx.putImageData(im,0,0);
+      costMeta=m;
+      repaint();
+    }catch(e){ /* transient: keep polling */ }
+  }
+
   function shadeMap(){
     if(!img || !lastGrid || !lastMeta) return;
     const w=lastMeta.w, h=lastMeta.h, d=img.data;
@@ -3579,15 +3650,39 @@ connect();   // auto-connect on load
   };
   $("mapShade").addEventListener("change",e=>{ sharpShade=e.target.checked; shadeMap(); repaint(); });
 
+  // Costmap overlay toggle + local/global source pick. The pick row only shows
+  // while the toggle is on; switching sources drops the old grid so a stale
+  // window can't linger until the first frame of the new one lands.
+  const costWhich=()=>$("mapCost").checked
+    ? ($("costLocal").checked ? "local_costmap" : "global_costmap") : null;
+  const costStart=()=>{
+    if(costTimer) return;
+    pollCost(); costTimer=setInterval(pollCost,1000);
+  };
+  const costStop=()=>{ if(costTimer){ clearInterval(costTimer); costTimer=null; } dropCost(); };
+  $("mapCost").addEventListener("change",()=>{
+    $("costPick").style.display=$("mapCost").checked?"inline":"none";
+    if($("mapCost").checked && $("mapOn").checked) costStart();
+    else costStop();
+    repaint();
+  });
+  for(const id of ["costLocal","costGlobal"])
+    $(id).addEventListener("change",()=>{ dropCost(); pollCost(); });
+
   // poll lifecycle: run only while the Map hero view is on (#mapOn, driven by the
-  // view switcher). 1 Hz — slam_toolbox republishes the grid every ~5 s.
+  // view switcher). 1 Hz — slam_toolbox republishes the grid every ~5 s. The
+  // costmap poller lives and dies with the same view switch.
   $("mapOn").addEventListener("change",e=>{
     const on=e.target.checked;
     $("mapHint").style.display=on?"block":"none";
     if(on){
       $("mapWait").style.display="flex"; cv.style.cursor="default"; // until a frame lands
       poll(); timer=setInterval(poll,1000);
-    } else { clearInterval(timer); timer=null; }
+      if($("mapCost").checked) costStart();
+    } else {
+      clearInterval(timer); timer=null;
+      costStop();
+    }
   });
 
   // ---- SSE nav hook: live robot pose + trail ----------------------------------

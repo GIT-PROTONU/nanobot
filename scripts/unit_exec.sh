@@ -109,9 +109,18 @@ PY
             # executor, upstream nav2's Humble choice) hosting planner_server +
             # controller_server + bt_navigator + behavior_server + their
             # lifecycle manager (see nav2.launch.py). Components are attached
-            # by the nano-nav-loader unit (load_only:=true).
+            # by the nano-nav-loader unit (load_only:=true). The container
+            # itself gets the FULL params file: launch_ros inlines only the
+            # sections matching each component's own name into the load
+            # request, so the DOUBLE-NESTED costmap sections
+            # (local_costmap.local_costmap.*) never reached the child costmap
+            # nodes those servers create at runtime — both costmaps silently
+            # ran on Nav2 defaults (inflation 0.55, robot_radius 0.1,
+            # always_send_full_costmap false; found 2026-09-22 when the web
+            # costmap overlay shipped). A process-wide --params-file applies
+            # by node FQN instead, so the child nodes match their sections.
     exec "$CONDA_PREFIX/lib/rclcpp_components/component_container_isolated" \
-      --ros-args -r __node:=nav2_container
+      --ros-args -r __node:=nav2_container --params-file "$NAV2_PARAMS"
     ;;
   nav-loader)
     # Wait for the container (up to ~30 s at 0.5 s steps) — the launch's

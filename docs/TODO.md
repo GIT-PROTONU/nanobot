@@ -520,6 +520,30 @@ in this checkout.
       `ESP32 · LDS · Odom · TF · SLAM`, one per map-chain link; motivated by a
       "only one scan, map never grew" session where the broken feed had to be
       hunted over SSH. See the AGENTS.md Map block for the diagnosis table).
+- [x] **Web costmap overlay + robot-pose fix + Nav2 params-file repair**
+      (2026-09-22, deployed + server-side verified; browser eyeball pending).
+      The Map view's red robot dot/heading/inflation bubble NEVER rendered —
+      `f.nav.pose` is an `[x, y, yaw]` array and `repaint()` read `p.x/p.y/p.th`
+      (undefined → NaN → silent canvas no-op); the trail + pose readout worked,
+      so the trail just ended in nothing. Fixed (array indexing). New **Costmap
+      toggle** (local/global) on the Map card overlays Nav2's actual costmaps
+      through `GET /local_costmap` + `/global_costmap` (telemetry lazy VOLATILE
+      subs; `_on_costmap` re-projects the odom-frame local origin into the map
+      frame via TF and carries `yaw` for the page's rotated draw; cells are
+      Nav2 COSTS 0..255 → yellow→red heat ramp). Deploying exposed that BOTH
+      costmaps had silently run on Nav2 DEFAULTS since the 2026-09-14
+      migration (launch_ros inlines only per-component name sections into the
+      load request, so the double-nested `local_costmap.local_costmap.*`
+      sections never reached the child nodes) — fixed with a process-wide
+      `--params-file "$NAV2_PARAMS"` on the container (`unit_exec.sh nav` +
+      launch parity), which then exposed the int `width`/`height` gotcha
+      (doubles abort the component constructors). Both documented in
+      AGENTS.md. Live-verified: robot_radius 0.16 / inflation 0.25 now real,
+      local costmap the true 40×40 rolling window, both routes fresh at ~1 Hz;
+      `always_send_full_costmap: true` on the global costmap added (else the
+      full-grid poll freezes on `_updates`). Also: `wheel_pid` had drifted to
+      `[0,0,0]` again (NVS gotcha, 3rd occurrence) — restored the tuned
+      KP 5 / KI 60 / KD 0 via POST, verified NVS-persisted across two restarts.
 - [x] **TTS shutdown-cutoff fix deployed** — `TtsEngine.wait(timeout=)` landed
       with the 2026-07 deploys (the 2026-07-15 "not yet deployed" note in the
       pre-consolidation CLAUDE.md was stale).
