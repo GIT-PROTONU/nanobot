@@ -354,7 +354,12 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   It also registers an in-process **SIGUSR1 faulthandler** (`_install_stackdump`,
   2026-09-21): `kill -USR1 <pid>` dumps EVERY thread's stack to stderr → journald,
   no ptrace/root needed — the executor-stall diagnosis (`/tmp/stall_trap.sh` signals
-  it; read `journalctl -u nano-app`). Verified live 2026-09-21.
+  it; read `journalctl -u nano-app`). Verified live 2026-09-21. **The OLED's panel
+  I2C runs on a dedicated worker thread** (`oled_display` bounded drop-oldest render
+  queue, 2026-09-22): the executor side only submits, so a wedged I2C bus (the
+  `mv64xxx` ≥5 s D-state that froze every executor callback under load, found live
+  2026-09-22) costs a stale panel — never the executor. `shutdown_sequence` renders
+  the end-screen inline after stopping that worker.
 
 ### ESP32 motor/encoder coprocessor (`firmware/nanobot_coprocessor/`)
 - **Native zenoh-pico over a direct UART link** (PlatformIO + Arduino) — NO micro-ROS,

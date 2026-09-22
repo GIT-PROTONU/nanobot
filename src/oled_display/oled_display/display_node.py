@@ -61,6 +61,7 @@ runs and just logs once, so the rest of the stack is unaffected.
 import json
 import math
 import os
+import queue
 import random
 import signal
 import socket
@@ -291,11 +292,50 @@ class DisplayNode(Node):
 
         # Dashboard ticks slowly; the face has its own faster timer that runs while a face is
         # shown (the default) and is cancelled (no wakeups) only while the dashboard is pinned.
+        # Render worker: ALL panel I2C writes happen on this dedicated thread, never on the
+        # executor. A wedged I2C bus (mv64xxx completion wait, observed >=5 s D-state under
+        # all-core load, 2026-09-22) then costs a stale panel — NOT the shared executor's
+        # callbacks (web_control + mood_node + health all froze with it before this thread).
+        # Bounded queue with drop-oldest: every render reads the CURRENT state, so a dropped
+        # frame is repainted by the next one; only the panel cadence degrades.
+        self._draw_q = queue.Queue(maxsize=4)
+        self._draw_stop = False         # set by shutdown_sequence: worker skips further renders
+        self._draw_thread = threading.Thread(target=self._draw_loop, daemon=True,
+                                             name="oled-draw")
+        self._draw_thread.start()
+
         self.create_timer(1.0 / g("refresh_rate").value, self._dashboard_tick)
         self._face_timer = self.create_timer(1.0 / max(1.0, g("anim_fps").value),
                                              self._face_tick)
         self._face_timer.cancel()
         self._recompute_mood()          # seed the effective mood (face by default) + face timer
+
+    # ---- render worker (the ONLY thread that touches the panel) ----
+    def _submit_draw(self, fn):
+        """Queue a render for the draw worker. Drop-oldest when the worker is backed up
+        (a wedged I2C bus): the queued item is a closure over the renderer, which reads
+        the node's CURRENT state at run time, so dropping just skips one panel update."""
+        try:
+            self._draw_q.put_nowait(fn)
+        except queue.Full:
+            try:
+                self._draw_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._draw_q.put_nowait(fn)
+            except queue.Full:
+                pass
+
+    def _draw_loop(self):
+        while True:
+            fn = self._draw_q.get()
+            if self._draw_stop:
+                continue                # shutdown_sequence renders inline from here on
+            try:
+                fn()
+            except Exception:           # _draw_guard latches panel death; never kill the worker
+                pass
 
     # ---- subscriptions (record value + arrival time only) ----
     def _on_text(self, msg: String):
@@ -432,9 +472,10 @@ class DisplayNode(Node):
             pass
         if self.device:
             if s == "shutdown":
-                self._shutdown_screen()
+                self._submit_draw(self._shutdown_screen)
             else:                           # 'restart' = stack only, 'reboot' = whole board
-                self._restart_screen("Restarting stack" if s == "restart" else "Restarting")
+                msg = "Restarting stack" if s == "restart" else "Restarting"
+                self._submit_draw(lambda: self._restart_screen(msg))
 
     def _refresh_vitals(self, now):
         """Fold the vitals blob into the telemetry fields (throttled file read; only
@@ -547,8 +588,12 @@ class DisplayNode(Node):
                      fill=255 if alive else 0)
         draw.text((48, y), value, font=self.font, fill=255)
 
-    @_draw_guard
     def _dashboard_tick(self):
+        """Executor-side timer callback: hand the dashboard render to the worker."""
+        self._submit_draw(self._dashboard_render)
+
+    @_draw_guard
+    def _dashboard_render(self):
         if not self.device or self._mood or self.speak_word or self._sys:
             return                                           # face/speech/system owns it
         now = time.monotonic()
@@ -601,8 +646,14 @@ class DisplayNode(Node):
                 draw.text((max(0, W - 3 - self._text_w(tilt)), 52), tilt, font=self.font, fill=255)
 
     # ---- TTS karaoke (one word, big + centred) ----
-    @_draw_guard
     def _draw_word(self, word):
+        """Executor-side (from _on_word): hand the word render to the worker. Words
+        arrive at speech rate; the queue is deep enough (4) that a healthy bus never
+        drops one, and a wedged bus drops the oldest word frame, not the executor."""
+        self._submit_draw(lambda: self._draw_word_render(word))
+
+    @_draw_guard
+    def _draw_word_render(self, word):
         """Render a single word as large as it'll fit, centred on the panel. The
         default luma font is tiny, so we draw the word once at 1x then nearest-scale
         it up (integer, mode '1') — no TTF file needed, so it costs no extra disk.
@@ -826,8 +877,12 @@ class DisplayNode(Node):
         draw.ellipse((bx - 9, by - 9, bx + 9, by + 9), fill=0)
         draw.ellipse((bx - 9, by - 9, bx + 9, by + 9), outline=255)
 
-    @_draw_guard
     def _face_tick(self):
+        """Executor-side timer callback: hand the face render to the worker."""
+        self._submit_draw(self._face_render)
+
+    @_draw_guard
+    def _face_render(self):
         if not self.device or not self._mood or self.speak_word or self._sys:
             return
         now = time.monotonic()
@@ -1003,6 +1058,16 @@ class DisplayNode(Node):
         try:
             self._face_timer.cancel()       # stop the animation owning the panel
         except Exception:
+            pass
+        # Render INLINE from here (the executor is already stopped; the daemon worker
+        # may die with the process): stop the worker, drain its queue, then draw the
+        # end-screen on this thread. An in-flight worker render can't be preempted —
+        # the window is one ~25 ms I2C flush.
+        self._draw_stop = True
+        try:
+            while True:
+                self._draw_q.get_nowait()
+        except queue.Empty:
             pass
         # Prefer the live signal from the web UI (/oled_system); fall back to the hint
         # file (e.g. CLI stop with no topic). Default to a safe shutdown.

@@ -34,7 +34,7 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, Int32
 
 from .health_log import HealthWatch, FeedWatch, read_scan_blob_header, \
-    clock_step, CLOCK_STEP_THRESH, CLOCK_STEP_RESTART_MIN
+    clock_step, CLOCK_STEP_THRESH, CLOCK_STEP_RESTART_MIN, CLOCK_STEP_RESTART_UNITS
 
 VITALS_FILE = "/dev/shm/nano_vitals.json"
 
@@ -309,9 +309,10 @@ class MonitorNode(Node):
         self._write_vitals(cpu_pct, mem_pct, cpu_t, disk_pct, now)
 
     def _clock_step_tick(self, now):
-        """Detect a mid-session wall-clock step and restart nano-slam (see the
-        clock_step detector in health_log.py for why). Rate-limited so a flapping
-        NTP can't loop-restart SLAM (each restart is a map clear)."""
+        """Detect a mid-session wall-clock step and restart the localization units
+        (CLOCK_STEP_RESTART_UNITS — see the clock_step detector in health_log.py for
+        why). Rate-limited so a flapping NTP can't loop-restart (each slam restart
+        is a map clear)."""
         try:
             drift = time.time() - now
         except OSError:
@@ -328,14 +329,24 @@ class MonitorNode(Node):
                               f"({since:.0f}s < {CLOCK_STEP_RESTART_MIN:.0f}s)"])
             return
         self._clk_restart_at = now
+        units = " + ".join(CLOCK_STEP_RESTART_UNITS)
         self.watch.write([f"clock step detected (drift {prev_drift:.2f} -> "
-                          f"{drift:.2f}s) — restarting nano-slam for fresh TF stamps"])
+                          f"{drift:.2f}s) — restarting {units} for fresh TF stamps"])
         try:
-            subprocess.run(["sudo", "-n", "systemctl", "restart", "nano-slam"],
-                           timeout=45, check=False)
-            self.watch.write(["nano-slam restart issued (clock step)"])
+            # Fire-and-forget, NEVER blocking the executor: nano-nav's STOP alone
+            # takes ~90 s (component-container shutdown — measured 14:58:20 ->
+            # 14:59:50), which would hold this executor callback past a sane
+            # timeout and past the 90 s systemd watchdog petting (WatchdogSec=90)
+            # — the 45 s subprocess.run timeout fired live 2026-09-22 16:22
+            # ("TimeoutExpired ... 45s") while the systemd job was still running.
+            # Detached Popen: the restart job survives us and systemd owns it.
+            subprocess.Popen(["sudo", "-n", "systemctl", "restart",
+                              *CLOCK_STEP_RESTART_UNITS],
+                             start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.watch.write([f"{units} restart issued (clock step)"])
         except Exception as e:                      # never hurt the sensor loop
-            self.watch.write([f"nano-slam restart failed: {e!r}"])
+            self.watch.write([f"clock-step restart failed: {e!r}"])
 
     def _pipeline_diagnostic(self, now):
         """A DiagnosticStatus summarising the localization-pipeline feed freshness —

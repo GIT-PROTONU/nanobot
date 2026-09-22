@@ -55,54 +55,46 @@ in this checkout.
       robot.yaml before TelemetryHub, and `f.lds` carries `enable`+`secs` so a
       fresh page re-seeds its controls. Unit-tested (`test_lds_persist.py`) +
       smoke-covered (`POST /param lds_idle_secs=123` → lds.json).
-- [ ] **NEW 2026-09-21: intermittent full-duty lunges on corrupted `/cmd_vel` — firmware
-      reject-gate + flip-state guard (user deferred: "later TODO", robot manually
-      speed-limited).** Symptom (user-confirmed): the robot lunges at ~0.4-0.45 m/s
-      (the firmware's ±max_linear clamp regime) in bursts of ~1.5 s, 2-3× in a
-      ~40 min session — including **from standstill with NO source** (web drive
-      journal shows no POST; Nav2 idle; `/move` inactive; only app_hub's keepalive
-      publishes `/cmd_vel`, process list clean). Mechanism: **UART line noise**
-      (fan-MOSFET + LDS-motor + drive PWM switching near the 2.4 m ttyS1 link —
-      9-s-apart COBS decode bursts in the router journal even while parked,
-      10:40/10:57) corrupts an SBC→ESP32 `/cmd_vel` frame **in a still-decodable
-      way**; zenoh's serial transport has no payload checksum, rmw_zenoh deserializes
-      the garbage Twist, and the firmware's `clampf(±max_linear)` then EXECUTES the
-      garbage as a full-speed command. The same noise explains today's repeated
-      link drops + ESP32 RX-watchdog `esp_restart()` self-resets (5× today, each
-      self-recovered unattended — no power cycle; the old "needs physical power
-      cycle" gotcha is partially obsolete on this build). Chained: full-duty lunge
-      → worst PWM noise → corruption burst → link drop → watchdog reset.
-      **Planned fix (firmware, ~10 lines, deferred by the user):** (1) in `cmd_cb`
-      reject any Twist that is non-finite or |linear.x|/|angular.z| beyond a sane
-      envelope (e.g. > 2.0 m/s / > 2.0 rad/s — beyond every legit publisher incl.
-      the 0.4 web clamp) BEFORE the maxlin/maxang clamp, keep the previous target,
-      and count+println rejects on the USB debug serial (UART0, visible via
-      `pio device monitor`) so the noise rate becomes observable; (2) in the PID
-      tick, re-seed the wheel PID state when |measured vel| > 1.5×g_maxlin
-      (physically impossible → catches the direction-flip lock too); (3) ALSO zero
-      `wpd_l/wpd_r` in the 2026-09-21 direction-flip reset branches (the 2-window
-      velocity history is left stale there — ~40 ms of wrong-sign velocity after
-      every flip; at KP 5 + imax=1/ki it can wind to full duty in ~100 ms and lock
-      via the commanded-direction tick signing until the wheel physically stops —
-      the "instant 0.38 m/s" fwd→rev repro). VERIFY after flash: 5× fwd→rev
-      transitions at 0.1 m/s + a ≥5 min drive soak with no lunge, and rejects
-      visible on the debug serial when noise hits. **SAFETY STATE 2026-09-21 (pm
-      session): maxlin back to 0.15 m/s (the lunge is a LINEAR full-duty event —
-      this clamp is its guard) but maxang restored to 0.8 rad/s (the user's
-      "turning is slow" was mostly the stale 0.3 NVS clamp + the 0.5 canned-turn
-      default; spins/transitions in 8 outback legs fired no lunge with 0.8 live).
-      Re-set via `pid_tune.py params --set 3=0.15,4=0.8`; the smoothness-pass-II
-      flash (zeroes the flip-stale velocity RING) is the real fix — re-verify the
-      5× fwd→rev transition check after flashing, then restore maxlin 0.4.** KFF
-      recomputes on param change so the PID still regulates correctly at the lower
-      clamp. Related hardware follow-up (not started): the noise SOURCE itself —
-      fan/LDS/drive PWM vs the ttyS1 routing (same family as the earlier
-      esp32-hardware-fried-ground-fix ground-bounce failure); options: routing/
-      shielding/decoupling, or a slower baud — current link is 115200.
-- [ ] **Verify the 2026-09-21 wheel-PID smoothness pass on hardware** (flashed +
-      deployed 2026-09-21 — five structural fixes, NO gain changes; see the
-      "2026-09-21 smoothness pass" block in AGENTS.md). **2026-09-21 first-pass
-      results (web-gateway harness, dev PC):**
+- [x] **NEW 2026-09-21: intermittent full-duty lunges on corrupted `/cmd_vel` — firmware
+      reject-gate + flip-state guard.** **2026-09-22: FIX BUILT + FLASHED + DEPLOYED +
+      DRIVE-VERIFIED — CLOSED.** `cmd_cb` now (1) REJECTS any Twist that is non-finite
+      or |linear.x|/|angular.z| > 2.0 (`CMD_REJECT_LIN/ANG` defines) BEFORE the
+      ±maxlin/maxang clamp — keeps the previous targets, does NOT pet the cmd watchdog,
+      counts + rate-limited-prints the reject on the USB debug serial (`[nano] cmd_vel
+      REJECT … (N total)`, ≤1 line/s = the observable noise rate); (2) the PID tick
+      re-seeds a wheel's PID state + ring when |measured vel| > max(1.5×live maxlin,
+      `WHEEL_VEL_PHYS_MAX` 0.55 m/s — floored above the ~0.464 m/s physical ceiling).
+      The flip-state part was already covered by the smoothness-pass-II ring zero.
+      **ACCEPTANCE RUN 2026-09-22 17:5x (on battery): 10+ fwd→rev transitions @0.1 m/s
+      (outback --reps 5 ×2) + a ~7 min soak across 0.05-0.15 m/s (crawl ×6, full
+      ladder, outback 0.15 ×5, reverse rung) — ZERO lunge events** (no mean anywhere
+      near the 0.37-0.45 m/s clamp band; max mean 0.147 @ 0.15 commanded), instant
+      breakaways (0.00 s) on every transition, two benign 0.4 s deadman blips (the
+      known delivery-stall family, self-recovered). maxlin RESTORED to 0.4 and stays.
+      Open follow-ups (not part of this item): the noise SOURCE (fan/LDS/drive PWM vs
+      the ttyS1 routing — routing/shielding/decoupling or a slower baud) and the
+      2026-09-22 board power-cycles (see below). **2026-09-22
+      session note: the BOARD itself power-cycled twice (14:36 — user switching ESP
+      power; 16:32 — while idle, right after a sudo command, cause unknown). If the
+      16:32 one was NOT a deliberate user power cycle, board-level power
+      instability jumps to the top of the hardware-suspect list (same family as
+      the esp32-hardware-fried-ground-fix).**
+- [x] **Verify the 2026-09-21 wheel-PID smoothness pass on hardware** — **CLOSED
+      2026-09-22.** NVS preflight: gains [5, 60, 0] + separation 0.102 + maxlin 0.4 /
+      maxang 1.0 / slew 1.5 / dither 0 / vhyst 0.15 survived the reject-gate flash
+      AND two more ESP reboots (verified live via `pid_tune.py state` three times).
+      The two blocked sub-items ran 2026-09-22 17:5x on battery: **(2) fwd→rev ×10+
+      — PASS** (regulates 0.085-0.099 of 0.100 within one frame, no frozen gap, no
+      overshoot, breakaway 0.00 s every transition); **(3) crawl 0.05 ×6 — RUN**,
+      aggregate p2p **0.014-0.030, means 82-96%** — rougher than the 0.007 pm-III
+      baseline session: the first drive session ON BATTERY POWER (USB logic supply
+      before) and a different carpet patch; run-to-run flip is the documented
+      variance. Not a safety item (no lunge, no stall cluster — one STALL(LR) flag
+      on 6 runs); if crawl roughness matters later, A/B the power config first
+      (USB-logic + battery-drive vs all-battery) before touching gains. **(5) boot
+      baseline seed: exercised across three ESP power-ups today (flash reboot,
+      bounce watchdog reset, battery switch) — no first-drive jerk on any.**
+      The 2026-09-21 first-pass results (web-gateway harness, dev PC):
       - (1) parked-at-zero bleed: **PASS** — fwd 2.5 s @0.10 → stop → 3 s watch:
         zero ticks after coast-down, /odom delta (0.0, 0.0); no rollback/nudge.
       - (4) `/reset_ticks` while parked: **PASS** — no lurch, ticks re-seed to
@@ -207,6 +199,34 @@ in this checkout.
         nano-slam + nano-nav automatically, logged to health.log). Also:
         arming the lidar rebuild window when /map goes stale while a fresh
         slam runs.**
+        **2026-09-22: the clock-step watcher is BUILT, EXTENDED + LIVE-VERIFIED
+        END-TO-END.** `sys_monitor`'s `clock_step` detector (epoch-minus-monotonic
+        between ticks) restarts BOTH `nano-slam` AND `nano-nav` on a detected step
+        (`CLOCK_STEP_RESTART_UNITS` in health_log.py; rate-limited by
+        `CLOCK_STEP_RESTART_MIN` 300 s), unit-tested, deployed. Verified live on
+        the board 2026-09-22 16:54 (with `systemd-timesyncd` STOPPED so a manual
+        `date -s +5` step persists — with NTP RUNNING the daemon reverts a manual
+        step within seconds and the 1 Hz detector correctly never sees it):
+        detection within 1 s of the step (`drift ...758.80 -> ...763.81`), the
+        exact two-unit sudoers rule accepted `sudo -n systemctl restart nano-slam
+        nano-nav`, slam restarted in seconds, nav's ~90 s stop completed, both
+        units active — no watchdog kill. TWO FIXES LANDED DURING VERIFY:
+        (1) the restart is now a DETACHED `Popen(start_new_session=True)` — the
+        old blocking `subprocess.run(timeout=45)` expired live at 16:22 (nav's
+        stop alone takes ~90 s) AND blocked the executor against the 90 s
+        watchdog pet; (2) the sudoers rule for the exact two-unit command is
+        INSTALLED on the board (deploy/sudoers/nano-power). GOTCHAS FOUND ALONG
+        THE WAY: the health.log contains NUL bytes from the board's abrupt
+        power losses — **greps against it need `-a` or "binary file matches"
+        HIDES real matches** (this false-negative cost an hour of debugging a
+        watcher that was actually firing); `systemctl stop systemd-timesyncd`
+        does NOT survive a reboot (re-run after any power cycle); a target
+        bounce can hit nano-nav's 3 min start timeout (Result: timeout, the
+        container KILLED) — retrying `sudo -n systemctl start
+        nano-robot.target` once recovers it. Live lab-procedure note: the
+        faithful step test is stop-timesyncd → `date -s` → watch → start
+        timesyncd again (the daemon then re-corrects the offset; the watcher
+        logs any follow-up step as rate-limited).
       - RE-VALIDATE now that the firmware kick is flashed (2026-09-20): restart
         nano-slam (fresh map — no map_file_name is configured, so a restart IS a
         clear), drive a clean lap, confirm walls line up with the room, a second
@@ -299,6 +319,14 @@ in this checkout.
       vs zenoh-pico's re-attach path; compare a router-restart vs ESP32-reboot
       declare table. The old "ESP32 wedged after stack restart" gotcha and this are
       likely the same root cause.
+      - **2026-09-22: the HEAL is verified end-to-end (motion-free form)** — full
+        `sudo -n systemctl restart nano-robot.target` → all units active, `esp32 UP
+        1s after start`, and SBC→ESP RX proven on BOTH sides of the bounce via the
+        motion-free /motor_params dither poke (id 6 readback flipped 0→0.02→0).
+        Gains [5,60,0] survived the bounce's ping-watchdog ESP reboot too. The
+        cmd_vel-SPECIFIC revival timing (does a router-only restart deafen it; how
+        fast the bounce revives delivery) still needs the drive-session test below —
+        motion is the only observable for cmd_vel delivery.
       - **2026-09-21 FIX FLASHED (deployed same day, robot live)**: the firmware
         **periodically UNDECLAREs + REDECLAREs every
         subscription** (`SUB_REDECLARE_MS 45000`, `SUBS` table + `subsRedeclare()` in
@@ -427,6 +455,40 @@ in this checkout.
         unexplained episode (~12:57): spin legs read sustained ~10× tick advance with
         correct 5/60/0 gains, no heartbeat reset, no recurrence in 12 recorded legs —
         re-probe with a passive frame recorder alongside the outback if it repeats.
+      - **2026-09-22: COMBINED-LOAD REPRO CLEAN + the executor-slip ROOT CAUSE
+        EVIDENCE CAPTURED.** Recreated the trap (5 s threshold, 30 min self-exit) and
+        ran stress (90 s all-core) + live GPU-vision + 2 TTS lines while timing
+        POST /drive {0,0} @2 Hz from the dev PC: **240 POSTs, median 29 ms, p95
+        59 ms, max 290 ms, ZERO over 600 ms** — the HTTP path is clean under the
+        full combined load (matches the 2026-09-21 stress+TTS-only clean; the
+        dedicated keepalive thread + scan-poll fix hold). BUT the trap fired 7×
+        during the run: **the app_hub MAIN thread (the SingleThreadedExecutor spin —
+        web_server + oled_display + mood_node share it, hub.py) was caught in
+        D-state with `wchan=mv64xxx_i2c_wait_for_completion`** (the Allwinner I2C
+        driver's completion wait — the OLED bus, /dev/i2c-0 @400 kHz), several
+        episodes ≥5 s. That is the executor-side slip mechanism the 2026-09-20
+        wchan dumps were hunting: **an OLED I2C write blocks uninterruptibly on the
+        shared executor thread and freezes every callback (telemetry tick, subs,
+        params) for the duration** — below the 90 s watchdog, so no restart, just
+        slipped callbacks (the 1-9 s POST-era symptom class; today's POSTs don't
+        see it because /drive left the executor). ~~FIX CANDIDATES (not started)~~
+        **FIXED + LIVE-VERIFIED 2026-09-22 17:4x: oled_display's panel I2C now runs
+        on a dedicated worker thread** — a bounded (4) drop-oldest render queue
+        (`DisplayNode._submit_draw`/`_draw_loop`); the executor-side timers and
+        subscriptions submit closures, the worker executes ALL `canvas()` I2C
+        (`_dashboard_render`/`_face_render`/`_draw_word_render`/`_mask_tick` + the
+        /oled_system screens); `shutdown_sequence` sets `_draw_stop`, drains the
+        queue, and renders the end-screen INLINE (the executor is already stopped
+        and the daemon worker may die with the process). A wedged bus now costs a
+        stale panel, NOT the shared executor. Unit-tested
+        (`src/oled_display/test/test_draw_queue.py`: in-order, drop-oldest-keeps-
+        newest, never-blocks, worker-survives-exceptions, stop-flag skip — 5 tests;
+        194 total green) and re-verified under the exact repro load (90 s all-core
+        stress + GPU vision + TTS + /drive timing): **ZERO i2c wchan in any trap
+        dump — the main/executor thread no longer blocks on the OLED bus** (pre-fix:
+        7 episodes of ≥5 s D-state in `mv64xxx_i2c_wait_for_completion`); POSTs
+        median 40 / max 92 ms. Dumps: /tmp/stall_17*.txt on the board (trap expires
+        ~17:4x + 30 min; re-run `nohup /tmp/stall_trap.sh` for more).
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze

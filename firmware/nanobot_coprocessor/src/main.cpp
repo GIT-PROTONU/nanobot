@@ -217,6 +217,21 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // accel without lagging the loop (slewing the PID OUTPUT would add loop lag + integral
 // windup). ~the old open-loop 3.0 duty/s feel at the 0.464 m/s full scale.
 #define WHEEL_TGT_SLEW 1.5f
+// Corrupt-command reject envelope (2026-09-21 lunge): UART line noise (fan/LDS/drive PWM
+// switching near the ttyS1 link) can corrupt a /cmd_vel frame in a still-decodable way —
+// the serial transport has no payload checksum, so a garbage Twist deserializes fine and
+// the ±maxlin/maxang clamp would EXECUTE it as a full-speed command (the lunge "from
+// standstill with NO source"). Everything beyond every legit publisher (web clamp
+// drive_max_lin/ang, Nav2 RPP, canned moves, skills) is noise, not a command.
+#define CMD_REJECT_LIN 2.0f   // m/s — reject |linear.x| above this before the maxlin clamp
+#define CMD_REJECT_ANG 2.0f   // rad/s — reject |angular.z| above this before the maxang clamp
+// Impossible-velocity PID re-seed ceiling: a measured wheel speed no drivetrain can produce
+// (full duty cruises ~0.37 m/s loaded, 0.464 no-load) means the feedback or the tick
+// baseline is fiction — re-seed the PID state instead of letting kp*err slam full duty and
+// the commanded-direction tick signing hold it there (the 2026-09-21 lunge shape). The
+// threshold is 1.5x the LIVE maxlin, floored at the physical ceiling so a lowered maxlin
+// can never push the threshold down into the real (achievable) band.
+#define WHEEL_VEL_PHYS_MAX 0.55f  // m/s — above every achievable wheel speed on this drivetrain
 static const float TICKS_PER_METER = TICKS_PER_REV / (2.0f*3.14159265f*WHEEL_RADIUS);
 
 #if !WHEEL_PID_ENABLED
@@ -648,8 +663,25 @@ static void cmd_cb(z_loaned_sample_t* sm, void*){
   double v, w;
   memcpy(&v, b+4,  8);                       // linear.x  (body offset 0)
   memcpy(&w, b+44, 8);                       // angular.z (body offset 40)
-  float fv = clampf((float)v, -g_maxlin,  g_maxlin);
-  float fw = clampf((float)w, -g_maxang, g_maxang);
+  // Reject-gate (CMD_REJECT_* above): a corrupted-but-decodable frame must be dropped
+  // BEFORE the ±maxlin/maxang clamp (which would execute the garbage as a full-speed
+  // command) and must NOT pet the cmd watchdog either (no g_last_cmd_ms update — garbage
+  // is not a live command, the 500 ms dead-man still applies). Previous targets are kept,
+  // so a reject mid-drive just continues the last good command. Rate-limited print, full
+  // count: the reject rate on the debug serial IS the observable noise rate.
+  float fv_raw = (float)v, fw_raw = (float)w;
+  if (!isfinite(fv_raw) || !isfinite(fw_raw)
+      || fabsf(fv_raw) > CMD_REJECT_LIN || fabsf(fw_raw) > CMD_REJECT_ANG){
+    static uint32_t rej_count = 0; static uint32_t rej_ms = 0;
+    rej_count++;
+    uint32_t nms = millis();
+    if (nms - rej_ms > 1000){ rej_ms = nms;
+      Serial.printf("[nano] cmd_vel REJECT v=%.3f w=%.3f (%lu total)\n",
+                    (double)fv_raw, (double)fw_raw, (unsigned long)rej_count); }
+    return;
+  }
+  float fv = clampf(fv_raw, -g_maxlin,  g_maxlin);
+  float fw = clampf(fw_raw, -g_maxang, g_maxang);
   float vl = fv - fw*g_wsep*0.5f, vr = fv + fw*g_wsep*0.5f;
 #if WHEEL_PID_ENABLED
   g_left_tgt = vl; g_right_tgt = vr;            // the control loop's PID turns these into duty
@@ -1322,6 +1354,17 @@ void loop(){   // Core 1: real-time control
     };
     g_left_vel  = velAvg(vring_l, nl);
     g_right_vel = velAvg(vring_r, nr);
+    // Impossible-velocity re-seed (WHEEL_VEL_PHYS_MAX above): a corrupted command path or
+    // a lost tick baseline can fabricate a speed no drivetrain can produce — kp*err on
+    // that fiction slams full duty and the commanded-direction tick signing can hold it
+    // there until the wheel physically stops (the 2026-09-21 lunge shape). Re-seed the
+    // PID state + ring (same reset as a direction flip) so the loop restarts from
+    // feedforward and the fictional feedback never reaches the duty output.
+    float vlim = 1.5f*g_maxlin; if (vlim < WHEEL_VEL_PHYS_MAX) vlim = WHEEL_VEL_PHYS_MAX;
+    if (fabsf(g_left_vel) > vlim){  wpid_l.integ = 0; wpid_l.prev = 0;
+                                    memset(vring_l, 0, sizeof(vring_l)); nl_h = 2; }
+    if (fabsf(g_right_vel) > vlim){ wpid_r.integ = 0; wpid_r.prev = 0;
+                                    memset(vring_r, 0, sizeof(vring_r)); nr_h = 2; }
     // Commanded-direction flip reset: single-channel ticks are signed by the COMMANDED
     // direction, so the instant a reverse command lands the still-forward-rolling wheel
     // reads as ALREADY moving the other way (fabricated vel) — kp*err then drives the OLD

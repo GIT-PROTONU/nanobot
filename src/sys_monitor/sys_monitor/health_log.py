@@ -38,11 +38,15 @@ FEED_GRACE = 20.0          # s of boot grace before "never seen" counts as DOWN
 
 BLOB_PATH = "/dev/shm/nano_scan.bin"
 
-# Clock-step watcher (see clock_step above): how big a step counts, and how long
-# the automatic nano-slam restart backs off (a flapping NTP must not loop-restart
-# SLAM — each restart IS a map clear).
+# Clock-step watcher (see clock_step above): how big a step counts, how long
+# the automatic restart backs off (a flapping NTP must not loop-restart — each
+# slam restart IS a map clear), and WHICH units bounce. slam reseeds the pose
+# graph + TF stamps; nav joins it because the 2026-09-21 pm step left NAV
+# evaluating a garbage pose ("collision ahead" ×2) even once the wall clock was
+# fixed. Exact-unit sudoers rule required for the pair (deploy/sudoers/nano-power).
 CLOCK_STEP_THRESH = 2.0
 CLOCK_STEP_RESTART_MIN = 300.0
+CLOCK_STEP_RESTART_UNITS = ("nano-slam", "nano-nav")
 
 
 def clock_step(prev_drift, drift, thresh=2.0):

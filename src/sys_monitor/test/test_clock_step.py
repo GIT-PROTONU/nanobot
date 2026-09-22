@@ -11,8 +11,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest  # noqa: E402
 
 from sys_monitor.health_log import (  # noqa: E402
-    clock_step, CLOCK_STEP_THRESH,
+    clock_step, CLOCK_STEP_THRESH, CLOCK_STEP_RESTART_UNITS,
 )
+
+
+def test_restart_units_cover_slam_and_nav():
+    # A detected step must bounce BOTH units: slam (pose graph + TF stamps reseed)
+    # AND nav (its costmap/TF caches — the 2026-09-21 pm step left RPP evaluating a
+    # garbage pose even after the wall clock was fixed). The sudoers rule is an
+    # exact-command match, so this tuple IS the permitted argv — keep it exact.
+    assert "nano-slam" in CLOCK_STEP_RESTART_UNITS
+    assert "nano-nav" in CLOCK_STEP_RESTART_UNITS
 
 
 def test_first_tick_never_flags():

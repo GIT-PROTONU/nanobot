@@ -10,3 +10,7 @@
 ibster ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot
 ibster ALL=(root) NOPASSWD: /usr/bin/systemctl start nano-robot.target, /usr/bin/systemctl stop nano-robot.target, /usr/bin/systemctl restart nano-robot.target
 ibster ALL=(root) NOPASSWD: /usr/bin/systemctl restart nano-slam
+# Clock-step watcher (sys_monitor): a detected mid-session wall-clock step restarts
+# slam AND nav together (fresh TF stamps + costmaps) — an exact two-unit command
+# needs its own exact-match rule (the single-unit rule above does NOT cover it).
+ibster ALL=(root) NOPASSWD: /usr/bin/systemctl restart nano-slam nano-nav
