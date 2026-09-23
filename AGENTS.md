@@ -1323,17 +1323,43 @@ reliable"). Rebuilt as THREE coordinated pieces:
   `test_nav_log.py` (log lines); smoke covers the endpoint contract.
 - **SECOND live finding (2026-09-23, after the deploy restart): a nano-nav restart
   with the lidar parked can HANG the Nav2 lifecycle activation** — the global
-  costmap's `on_activate` waits (forever, "Timed out waiting for transform …
-  Invalid frame ID 'map'") for slam's map frame, which only appears once scans
-  flow; with scans flowing the whole sequence completes in seconds ("Managed
-  nodes are active"). An inactive bt_navigator silently ignores every `/goal_pose`
-  (no status transition ever arrives) — the web chip then shows the gateway's
-  optimistic "planning" and the watchdog's fresh-/map branch names it. Heal:
-  wake the lidar (Spin slider / `POST /publish /lds_target_rpm 300`) so slam
-  publishes the map frame, or `sudo -n systemctl restart nano-slam nano-nav`
-  (the allowed sudoers pair). Note: a `systemctl restart nano-nav` can itself
-  wedge in "stopping" for minutes (component_container shutdown under zenoh) —
-  the bounce went through only after the stop timeout; give it time.
+  costmap's `on_activate` waits for slam's map frame, which only appears once scans
+  flow. **MECHANISM PINNED 2026-09-23 pm (4th hit): the hang is a zenoh query-expiry
+  reply drop, and it is DETERMINISTIC, not "intermittent".** The lifecycle manager's
+  `change_state` service call to planner_server is delivered immediately; the
+  planner's `on_activate` then blocks inside the costmap's transform wait (35-80 s on
+  a parked lidar). The zenoh query for that call **expires while the reply is still
+  pending**; when scans finally resume and the planner completes the transition, its
+  reply arrives after expiry — zenoh logs `Received ReplyData for unknown Query: 26`
+  and DROPS it (same query id, same second as the planner's reply, on two consecutive
+  bounces) → the manager waits forever for a response that no longer exists;
+  `bond_timeout: 4.0` never fires because the manager never learns the state changed.
+  **Once the costmap has blocked past the query timeout, resuming scans does NOT
+  un-wedge the manager** (19:52 + 20:01 evidence: /map fresh for 30+ s, planner
+  activated, manager still hung right after its bond). Result: controller_server/
+  behavior_server/**bt_navigator never activate** — bt_navigator silently ignores
+  every `/goal_pose` (no status transition ever arrives), the web chip shows the
+  gateway's optimistic "planning", and the Nav log's fresh-/map watchdog branch names
+  it ("the goal is not being processed"). **Heal that works (used 2026-09-23 20:05):
+  POST /param web_control/lds_idle_enable=false FIRST (persists to lds.json, so the
+  boot park can't fire), then `sudo -n systemctl restart nano-robot.target`, verify
+  "Managed nodes are active" in `journalctl -u nano-nav` (the whole sequence completes
+  in ~2 s when the map frame exists from the start), then re-enable
+  lds_idle_enable=true.** Two traps that make lesser heals fail: (1) **the app unit's
+  boot park defeats any pre-arm** — the fresh telemetry's idle controller parks the
+  lidar ~2 s after ITS unit start (19:59:39, app up 19:59:37) while the loader
+  attaches + the manager begins activating ~20 s later, so a bare
+  `POST /lds_target_rpm 300` before the bounce is overwritten before it matters;
+  (2) `sudo -n systemctl restart nano-slam nano-nav` **cannot fully restore nav on
+  its own** — restarting the container kills the loaded components and the loader is
+  a `RemainAfterExit` oneshot with NO sudoers rule, so the container comes back
+  EMPTY; only the target bounce re-runs the loader in dependency order. (A
+  `systemctl restart nano-nav` can also wedge in "stopping" for minutes —
+  component_container shutdown under zenoh; the stop timeout SIGKILL is expected.)
+  The clean structural fix (open, docs/TODO.md): **gate the loader (`unit_exec.sh
+  nav-loader`) on `/lds_hz ≥ 2.0` before running `load_only`** — the loader owns
+  nav-activation timing, so activation could never start into a dead map frame; the
+  reply would never expire and the wedge disappears.
 - **Nav log (the visibility half, also the verbose-SLAM-log request):**
   `telemetry.py` keeps a bounded ring (`_navlog`, 400 entries,
   `test_nav_log.py`) of nav-chain events — goal publishes (with source:
@@ -1522,11 +1548,16 @@ RPP cap, skill motion) tied to the `w·0.2 rad/scan` smear budget, and note the 
   `stack.sh restart`. No creds needed in the environment — key auth only.
   Before the restart it also **pre-arms the lidar setpoint** (POST /lds_target_rpm 300
   through the board's gateway, non-fatal when down): the parked-turret activation wedge
-  (a stack bounce with a parked lidar stalls the nav2 lifecycle manager on a dropped
-  zenoh bond query — hit 3× on 2026-09-23, bt_navigator left inactive so every goal was
-  silently ignored; heal = wake lidar + `sudo -n systemctl restart nano-slam nano-nav`,
-  and the nano-nav stop itself can wedge for minutes — wait it out). The firmware holds
-  the setpoint through the bounce; the idle controller re-parks afterwards.
+  (a stack bounce with a parked lidar stalls the nav2 lifecycle manager — hit 4× on
+  2026-09-23, bt_navigator left inactive so every goal was silently ignored; mechanism
+  + heal in the "Click-to-goal planning deadlock" block above). CAVEAT (2026-09-23 pm,
+  4th hit): the pre-arm alone is DEFEATED by the boot-park race — the fresh app unit
+  parks the lidar ~2 s after ITS start, while the loader attaches and the manager
+  begins activating ~20 s later, so the setpoint is overwritten before it matters.
+  The reliable choreography for a bounce on a quiet robot is
+  `POST /param web_control/lds_idle_enable=false` (persists to lds.json) → bounce →
+  re-enable. The firmware holds the setpoint through the bounce; the idle controller
+  re-parks afterwards.
   It also pushes the dev-made soul/bank (`memory/personality.json` + `phrases.json`, plus
   hand-edited `presence_chart.yaml`/`beats.json` if present)
   into the board's `~/.local/state/nanobot/` — **OFF by default**

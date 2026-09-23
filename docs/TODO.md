@@ -112,6 +112,33 @@ in this checkout.
       documented stopping-wedge) → "Managed nodes are active". The choreography is now
       AUTOMATED in deploy.sh (pre-restart lidar setpoint POST, non-fatal when the
       gateway is down) so a deploy can no longer skip it.**
+      **HIT A FOURTH TIME 2026-09-23 evening — and the dropped-query mechanism is now
+      CONFIRMED DETERMINISTIC, not intermittent: the manager's `change_state` service
+      call to planner_server is a zenoh QUERY with a ~10 s timeout; when the planner's
+      `on_activate` blocks inside the costmap waiting for the `map` frame LONGER than
+      that (35-80 s, lidar parked), the planner eventually processes the transition and
+      replies — but the query has expired, so zenoh logs `Received ReplyData for unknown
+      Query: 26` and DROPS the reply → the manager waits forever for a response that no
+      longer exists (same query id 26, same second as the planner reply, on two
+      consecutive bounces 19:52:41 + 20:01:22). bond_timeout never fires because the
+      manager never learns the state changed. bt_navigator stays inactive → goals
+      silently ignored → chip stuck on "planning" while /map is fresh (Nav log's
+      planning-stuck watchdog named it). ALSO: the boot-park race DEFEATS the deploy.sh
+      pre-arm — the fresh app unit parks the lidar ~2 s after ITS start (19:59:39, app
+      up 19:59:37) while the loader attaches + the manager begins activating ~20 s
+      later, so the pre-armed setpoint is overwritten BEFORE activation begins. The
+      bounce therefore needs the park PREVENTED, not pre-armed: healed this time by
+      POST /param web_control/lds_idle_enable=false FIRST (persists to lds.json, so the
+      boot park can't fire) → target bounce → activation completed in ~2 s ("Managed
+      nodes are active" 20:05:41) → re-enable lds_idle_enable=true. OPEN (real fix
+      candidates): (a) gate the loader (`unit_exec.sh nav-loader`) on /lds_hz ≥ 2.0
+      BEFORE running load_only — the loader owns nav-activation timing, so activation
+      can never start into a dead map frame; (b) or have the loader POST
+      /lds_target_rpm 300 itself and lds_hold through the load; (c) or teach
+      telemetry's boot not to park until the nav activation settles (a
+      nano-nav-active check in the idle controller's first minute). Until one lands,
+      ANY stack bounce on a quiet robot risks a ~2.5 min bounce followed by a dead
+      bt_navigator.**
 - [x] **2026-09-21 (code DONE + FLASHED + A/B'd 2026-09-22): wheel-PID adaptive-filter
       N hysteresis.** Residual drive roughness ("better than this morning but still
       not smooth"). IMPLEMENTED (main.cpp `hystN()` + id 7, telemetry.py gate
