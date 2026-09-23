@@ -100,7 +100,11 @@ controller_server:
     min_x_velocity_threshold: 0.0
     min_y_velocity_threshold: 0.0
     min_theta_velocity_threshold: 0.0
-    failure_tolerance: 0.3
+    # was 0.3 — under board load slam's map->odom cadence stretches (message-filter
+    # queue-full storms, 2026-09-23) and the RPP pose transform can fail in streaks
+    # longer than 0.3 s → "Controller patience exceeded" → every goal aborted after
+    # a few seconds of driving. 1.5 s rides out a slow map->odom stretch.
+    failure_tolerance: 1.5
     progress_checker_plugin: progress_checker
     goal_checker_plugins: ["goal_checker"]
     progress_checker:
@@ -153,7 +157,14 @@ controller_server:
       min_approach_linear_velocity: 0.05
       approach_velocity_scaling_dist: 0.6
       max_allowed_time_to_collision_up_to_carrot: 1.0
-      transform_tolerance: 0.1
+      # was 0.1 — transform_tolerance is the tf2 WAIT for a transform stamped at
+      # the pose's time (nav2_util::transformPoseInTargetFrame). slam_toolbox
+      # publishes map->odom once per processed scan (~5 Hz = ~190 ms gaps; longer
+      # under load), so a 0.1 s wait failed ~half of all lookups ("Lookup would
+      # require extrapolation into the future ... from [odom] to [map]") and
+      # failure_tolerance then killed every goal mid-drive (2026-09-23). 0.5 s
+      # covers the ~190 ms cadence with margin.
+      transform_tolerance: 0.5
 
 # ---- velocity_smoother (nav speed + accel caps, live-tunable) ----------------
 # Sits BETWEEN controller_server and /cmd_vel: the controller publishes
@@ -213,7 +224,7 @@ bt_navigator:
     odom_topic: /odom
     bt_loop_duration: 100
     default_server_timeout: 20
-    transform_tolerance: 0.1
+    transform_tolerance: 0.5
     # Minimal plugin set for the minimal recovery tree (config/nav2/recovery_bt.xml):
     # ComputePathToPose, FollowPath, ClearEntireCostmap, BackUp, Spin,
     # RecoveryNode, PipelineSequence — PLUS rate_controller / goal_updated /
@@ -252,7 +263,7 @@ behavior_server:
     cycle_frequency: 10.0
     global_frame: map
     robot_base_frame: base_link
-    transform_tolerance: 0.1
+    transform_tolerance: 0.5
 
 # ---- local costmap (rolling window around the robot) --------------------------
 local_costmap:
@@ -273,7 +284,7 @@ local_costmap:
       publish_frequency: 1.0
       # behavior_server reads the raw costmap + footprint from here
       always_send_full_costmap: true
-      transform_tolerance: 0.1
+      transform_tolerance: 0.3
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
@@ -301,7 +312,7 @@ global_costmap:
       # switches to incremental costmap_updates after the first grid, and the
       # web map's /global_costmap poll (which reads the full grid) would freeze
       always_send_full_costmap: true
-      transform_tolerance: 0.1
+      transform_tolerance: 0.3
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true

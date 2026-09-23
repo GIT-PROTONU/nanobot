@@ -15,6 +15,64 @@ in this checkout.
 
 ## Open — needs the physical robot
 
+- [ ] **2026-09-23: gpu_vision self-throttle when oversubscribed.** The vision loop
+      can fall behind its configured fps under load (documented gpu_duty finding:
+      60-190% of the frame budget) — today it ran at **gpu_duty 4.1** (4× the frame
+      period, a dark scene, still running flat-out), pegging ~a full core inside
+      app_hub on the 4-core board while everything else ran: all 4 cores ~96%,
+      load 6.7-8, kernel time 45% sy from the GL/V4L2 churn. That starvation is
+      what stretched slam's map→odom cadence mid-goal (see the 2026-09-23 TF
+      tolerance fix in AGENTS.md). Fix idea: in `gpu_vision._loop`, when
+      gpu_duty > ~1.0, degrade to a reduced pass set (core shaders only: diff +
+      blob) or raise the frame period until duty < 1.0, and expose the degraded
+      state in `f.vision`. Until then the camera stays DISABLED
+      (`POST /vision/camera_enable false`, persisted to vision.json — re-enable
+      from the Camera tab after this ships, or manually per session).
+- [ ] **2026-09-23: app_hub rclpy executor burns ~70% of a core on framework
+      overhead.** Measured via SIGUSR1 stackdump + `top -H`: the main/executor
+      thread (TIME+ 16:57 of 20 min uptime) spends its samples INSIDE rclpy
+      machinery — `executors._wait_for_ready_callbacks` (incl. `node.services`,
+      a property that builds a list per iteration), `callback_groups.can_execute`
+      — not in any of our callbacks. That is the framework's per-spin wait-set/
+      entity iteration cost across app_hub's ~60 entities (3 nodes × subs +
+      services + clients + timers), amplified by every wake (~60-80/s aggregate).
+      It has been constant since boot, NOT introduced by today's deploy. Candidate
+      directions: audit for subscriptions/timers that can be lazy-dropped like the
+      browser-only sub set, reduce entity count, or investigate the rclpy wait-set
+      rebuild path in this Humble build. Note the executor MUST stay responsive —
+      the systemd watchdog pets from it (app_hub is Type=notify).
+- [ ] **2026-09-23: guard web_control's HTTP handlers until the telemetry hub
+      exists.** During boot, a browser page that connects before `TelemetryHub`
+      is constructed makes every request thread throw
+      `AttributeError: 'WebServerNode' object has no attribute 'telemetry'`
+      (seen as a storm in the 17:49:46-47 boot journal — the page hammers
+      /telemetry + /nav/log etc. during startup). socketserver catches these per
+      thread (no crash, just noise + wasted work), but the handlers should
+      degrade cleanly instead: either construct the telemetry hub before the
+      HTTP server starts accepting, or guard the handlers (return 503 "starting
+      up" until `telemetry` exists).
+- [x] **2026-09-23: goals aborted mid-drive ("keeps failing after driving a bit")
+      — controller TF-tolerance race. FIXED + DEPLOYED + VERIFIED same day.**
+      Every goal died ~4-11 s in with `transformPose: Lookup would require
+      extrapolation into the future … from [odom] to [map]` → `Controller
+      patience exceeded` → BT recovery → abort. Mechanism (verified against the
+      installed Humble `nav2_util::transformPoseInTargetFrame` — the tolerance is
+      a tf2 **WAIT** for a transform stamped at the pose's time, not a slack):
+      slam_toolbox publishes map→odom once per processed scan (~5 Hz = ~190 ms
+      gaps, longer under load), so RPP's 0.1 s wait lost the race ~half the time,
+      and `failure_tolerance: 0.3` aborted on any failure streak. Fix: RPP
+      `transform_tolerance` 0.1→0.5, `failure_tolerance` 0.3→1.5, bt_navigator +
+      behavior_server `0.5`, both costmaps `0.3` (all in nav2_params.yaml, with
+      in-file comments). Contributing saturation (vision pipeline at gpu_duty 4.1
+      + app_hub executor burn — see the two open items above) fixed in part by
+      disabling the camera for the session. Verified live: the 18:29:58 goal
+      drove 10.7 s with ZERO extrapolation/patience errors in `journalctl -u
+      nano-nav`. Note: a goal into a REAL obstacle now correctly fails with
+      "RegulatedPurePursuitController detected collision ahead" from the first
+      cycle (inscribed cells on the path; recovery motions are zeroed so there is
+      no backup) — that refusal is legitimate, not this bug. Also restored the
+      ESP32 PID NVS drift found during the session (KP 1.4/KI 27.1 → 5/60/0).
+
 - [ ] **2026-09-23: zeroed recovery motions — verify a failed goal does NO backup/spin.**
       User decision: the per-goal no-recovery-BT web toggle was reverted (git 0db497f +
       00a1308 → reverts 2ab34ec + 66fc328) and `recovery_bt.xml`'s BackUp/Spin were
