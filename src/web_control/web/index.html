@@ -192,6 +192,8 @@
               <span>map age</span><b id="mapAge">–</b>
             </div>
             <div class="chiprow">
+              <label class="switch"><input type="checkbox" id="navRec" checked><span class="track"></span>
+                Recovery motions</label>
               <button id="mapWipe" class="btn">✕ Clear map</button>
             </div>
             <p class="hint">The SLAM grid + Nav2 state behind the hero <b>Map</b> view.
@@ -199,7 +201,10 @@
               it goes stale when either is down. <b>Clear map</b> wipes the grid and starts
               building fresh — it restarts <b>nano-slam</b> (slam_toolbox 2.6.10 async mode has
               no clear service, so a restart IS the map clear) and cancels any active
-              navigation; the page waits for the fresh grid to arrive.</p>
+              navigation; the page waits for the fresh grid to arrive. <b>Recovery motions</b>
+              is the same switch as the Map view's <b>Recovery</b>: on = a failed goal
+              retries once after clear-costmaps → back up → spin (the robot moves);
+              off = failed goals abort with no motion. Persisted; applies to the next goal.</p>
           </div>
           <div class="card">
             <h2>Nav log</h2>
@@ -2066,6 +2071,7 @@ const HINTS = {
   navInfl: "Keep-away zone: the costmaps' inflation radius in metres — the orange zone Nav2 keeps between the robot and walls (and the dashed bubble around the robot on the Map view). Applied live to BOTH costmaps (no restart) and persisted. 0 = no inflation zone. Raise it for a shy robot near furniture; drop it to squeeze through narrow gaps. Nav2 warns when it's smaller than the robot's inscribed radius.",
   navDiam: "Robot size: the diameter of the robot's footprint circle in metres — what the costmaps inflate around and what the Map view draws as the translucent red circle. Applied live to BOTH costmaps as robot_radius = ⌀/2 and persisted. Should match the real chassis (0.32 m ≈ the physical robot); inflating it gives safety margin at the cost of passable gaps.",
   mapRec: "Recovery motions for FAILED goals: ON = Nav2 clears the costmaps, backs up 0.15 m and spins 90° once, then retries (the robot physically moves). OFF = a failed goal aborts immediately with NO robot motion — use when the backup wedges against furniture/thresholds. Applies to the NEXT goal (goals carry the no-recovery BT directly); persisted across reboots.",
+  navRec: "Same switch as the Map view's Recovery (they stay in sync): recovery motions for FAILED goals. ON = clear costmaps, back up 0.15 m, spin 90° once, then retry (the robot physically moves). OFF = a failed goal aborts with NO robot motion. Applies to the NEXT goal; persisted across reboots.",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
   sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
@@ -3283,14 +3289,19 @@ fetch("/nav/config").then(r=>r.ok?r.json():null).then(c=>{
   $("navAngAcc").value=c.nav_ang_accel; $("navAngAccV").textContent=Number(c.nav_ang_accel).toFixed(2);
   $("navInfl").value=c.nav_inflation_m; $("navInflV").textContent=Number(c.nav_inflation_m).toFixed(2);
   $("navDiam").value=c.nav_robot_diam_m; $("navDiamV").textContent=Number(c.nav_robot_diam_m).toFixed(2);
-  if(typeof c.nav_recovery==="boolean") $("mapRec").checked=c.nav_recovery;   // the Map view's Recovery switch
+  if(typeof c.nav_recovery==="boolean") setRec(c.nav_recovery);   // both Recovery switches
   navLinWarn();
 }).catch(()=>{});
-// Recovery-motion toggle (Map view): a failed goal aborts with no backup+spin
-// when off (the goal carries the no-recovery BT). Rides /nav/config PATCH-style
-// like the sliders; persisted server-side (nav.json).
-$("mapRec").onchange=()=>fetch("/nav/config",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({nav_recovery:$("mapRec").checked})}).catch(()=>{});
+// Recovery-motion toggle: a failed goal aborts with no backup+spin when off
+// (the goal carries the no-recovery BT). Rides /nav/config PATCH-style like the
+// sliders; persisted server-side (nav.json). TWO controls stay in sync — the
+// hero Map view's switch (mapRec) and the Drive tab's Map (Nav2) card switch
+// (navRec); each change mirrors the other.
+const setRec=v=>{ $("mapRec").checked=v; $("navRec").checked=v; };
+const postRecovery=v=>fetch("/nav/config",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({nav_recovery:v})}).catch(()=>{});
+$("mapRec").onchange=()=>{ setRec($("mapRec").checked); postRecovery($("mapRec").checked); };
+$("navRec").onchange=()=>{ setRec($("navRec").checked); postRecovery($("navRec").checked); };
 
 // keyboard
 const keys={};
