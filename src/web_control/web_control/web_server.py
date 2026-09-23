@@ -35,6 +35,7 @@ import queue
 import subprocess
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 
 import rclpy
@@ -166,9 +167,13 @@ LDS_PERSIST_KEYS = ("lds_idle_enable", "lds_idle_secs", "lds_manual_secs",
 # The requested speed/accel caps for Nav2 goals, pushed to the velocity_smoother
 # node (composed in nav2_container; config/nav2/nav2_params.yaml) via its
 # DYNAMICALLY-reconfigurable max_velocity/min_velocity/max_accel/max_decel —
-# live, NO nano-nav restart. Persisted to nav.json (the move.json/tts.json
-# "persisted UI wins" pattern); the boot re-apply retries until the smoother's
-# set_parameters service appears (nano-nav activates it after app_hub is up).
+# live, NO nano-nav restart. The same endpoint also carries the costmap
+# GEOMETRY knobs (nav_inflation_m keep-away zone + nav_robot_diam_m robot
+# circle), pushed to both costmap components' dynamically-reconfigurable
+# inflation_layer.inflation_radius / robot_radius. Persisted to nav.json (the
+# move.json/tts.json "persisted UI wins" pattern); the boot re-apply retries
+# until each target reports active (nano-nav activates them after app_hub is
+# up).
 # y is 0 everywhere (differential drive). Limits mirror the drivetrain:
 # <= 0.35 m/s saturation cliff (loaded full-duty ~0.37), <= 1.0 rad/s the
 # w*0.2 rad/scan SLAM smear budget (same ceiling as drive_max_ang).
@@ -178,7 +183,32 @@ NAV_LIN_ACC_RANGE = (0.05, 2.0)   # m/s^2 clamp range for nav_lin_accel
 NAV_ANG_ACC_RANGE = (0.10, 4.0)   # rad/s^2 clamp range for nav_ang_accel
 NAV_SMOOTHER_NODE = "velocity_smoother"   # the param target (a C++ lifecycle node)
 NAV_PARAM_KEYS = ("nav_lin_speed", "nav_ang_speed", "nav_lin_accel",
-                  "nav_ang_accel")   # the four web sliders, in card order
+                  "nav_ang_accel", "nav_inflation_m",
+                  "nav_robot_diam_m")   # the six web sliders, in card order
+
+# ---- Keep-away zone + robot circle (GET/POST /nav/config; costmap geometry) --
+# Pushed to BOTH Nav2 costmap components as DYNAMICALLY-reconfigurable params —
+# live, no nano-nav restart (verified against Humble sources): the inflation
+# layer's dynamicParametersCallback accepts "<layer>.inflation_radius" and
+# re-computes its caches + reinflates the costmap; Costmap2DROS's callback
+# accepts "robot_radius" and rebuilds the footprint. Defaults mirror
+# config/nav2/nav2_params.yaml (0.25 / 0.16 radius = 0.32 diameter). The web
+# UI works in DIAMETRE (the drawn robot circle's size); the costmap wants the
+# RADIUS, so the push halves it. Same lifecycle race as the smoother: the
+# costmap's own dynamic callback attaches at on_activate, so pushes land on
+# the activation transition events + the bounded boot re-apply.
+NAV_INFL_RANGE = (0.0, 0.6)    # m clamp range for nav_inflation_m (keep-away zone)
+NAV_DIAM_RANGE = (0.1, 1.0)    # m clamp range for nav_robot_diam_m (robot circle ⌀)
+NAV_COSTMAP_NODES = ("local_costmap/local_costmap", "global_costmap/global_costmap")
+NAV_INFLATION_LAYER = "inflation_layer"   # the plugin name in nav2_params.yaml
+
+
+def _clamp_nav_geom(infl, diam):
+    """Clamp the keep-away/robot-size values to the web-slider ranges (pure —
+    unit-tested). Plain float clamps — tts.clamp rounds to int."""
+    lo, hi = NAV_INFL_RANGE
+    lo_d, hi_d = NAV_DIAM_RANGE
+    return (min(hi, max(lo, float(infl))), min(hi_d, max(lo_d, float(diam))))
 
 
 def _clamp_nav_cfg(lin, ang, lin_acc, ang_acc):
@@ -659,21 +689,32 @@ class WebServerNode(Node):
             target=self._man_loop, name="canned-moves", daemon=True)
         self._man_thread.start()
 
-        # ---- Nav2 navigation pace (GET/POST /nav/config; velocity_smoother) ------
+        # ---- Nav2 navigation pace + zone geometry (GET/POST /nav/config) -----------
         # Requested speed/accel caps for Nav2 goals. web_server holds the
         # requested values as its own params (the sliders' source of truth) and
         # pushes them to the velocity_smoother component (nano-nav) as 3-element
         # [x, 0, theta] arrays via a SetParameters client — the smoother's params
         # are dynamically reconfigurable, so this is LIVE (no nano-nav restart).
-        # Changes persist to nav_settings_path (the move.json/tts.json pattern).
+        # nav_inflation_m/nav_robot_diam_m ride the same endpoint and are pushed
+        # to BOTH costmap components' robot_radius / inflation_layer.inflation_radius
+        # (also dynamically reconfigurable — see _costmap_push). Changes persist
+        # to nav_settings_path (the move.json/tts.json pattern).
         self.declare_parameter("nav_lin_speed", 0.18)   # m/s speed cap for Nav2 goals
         self.declare_parameter("nav_ang_speed", 0.8)    # rad/s turn cap
         self.declare_parameter("nav_lin_accel", 0.5)    # m/s^2 linear accel limit
         self.declare_parameter("nav_ang_accel", 1.6)    # rad/s^2 angular accel limit
+        self.declare_parameter("nav_inflation_m", 0.25)  # m keep-away zone (costmap inflation_radius)
+        self.declare_parameter("nav_robot_diam_m", 0.32)  # m robot circle ⌀ (2× costmap robot_radius)
         self.declare_parameter("nav_settings_path", "")  # "" = ~/.local/state/nanobot/nav.json
-        self._nav_cfg_lock = threading.Lock()           # guards the nav_* params + client
+        self._nav_cfg_lock = threading.Lock()           # guards the nav_* params + clients
         self._nav_client = self.create_client(
             SetParameters, f"/{NAV_SMOOTHER_NODE}/set_parameters")
+        # The two costmap components: same SetParameters shape, their own
+        # lifecycle races — hence their own transition-event re-applies below.
+        self._cm_clients = {
+            n: self.create_client(SetParameters, f"/{n}/set_parameters")
+            for n in NAV_COSTMAP_NODES}
+        self._cm_last_push = {n: 0.0 for n in NAV_COSTMAP_NODES}  # per-target rate limit
         self._nav_last_push = 0.0                       # monotonic, rate-limits re-pushes
         self._apply_saved_nav_cfg()
         # Re-push on every activation of the smoother: the SetParameters SERVICE
@@ -687,6 +728,16 @@ class WebServerNode(Node):
         self.create_subscription(
             TransitionEvent, f"/{NAV_SMOOTHER_NODE}/transition_event",
             self._on_nav_transition, 10)
+        # Same race for the costmap geometry: Costmap2DROS's dynamic-params
+        # callback (robot_radius) attaches at on_activate, so re-apply the saved
+        # keep-away/robot-size after EVERY costmap activation (boot AND any
+        # nano-nav restart). Per-target rate limit — the smoother, local and
+        # global costmaps activate at staggered moments during one nano-nav
+        # startup, and a shared limiter would swallow the later pushes.
+        for n in NAV_COSTMAP_NODES:
+            self.create_subscription(
+                TransitionEvent, f"/{n}/transition_event",
+                (lambda msg, node=n: self._on_cm_transition(msg, node)), 10)
         self._nav_reapply_thread = threading.Thread(
             target=self._reapply_nav_cfg_when_up, name="nav-config-reapply", daemon=True)
         self._nav_reapply_thread.start()
@@ -1176,6 +1227,19 @@ class WebServerNode(Node):
         p.value = pv
         return p
 
+    def _scalar_param_msg(self, name, value):
+        """One SetParameters.Request entry holding a single double (the costmap
+        geometry params — robot_radius, inflation_layer.inflation_radius — are
+        scalars, unlike the smoother's [x,0,theta] arrays). Same RAW
+        rcl_interfaces/msg/Parameter wire message; unit-tested."""
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_DOUBLE
+        pv.double_value = float(value)
+        p = ParamMsg()
+        p.name = name
+        p.value = pv
+        return p
+
     def _nav_push(self, cfg):
         """Push cfg to the velocity_smoother (fire-and-forget, like /publish|/param).
         Returns an error string or None. max_decel mirrors max_accel negated so
@@ -1198,6 +1262,28 @@ class WebServerNode(Node):
             client.call_async(req)
         return None
 
+    def _costmap_push(self, cfg, node):
+        """Push cfg's geometry to ONE costmap component (fire-and-forget, like
+        /publish|/param). robot_radius is the DIAMETRE halved (the web UI works
+        in ⌀, the costmap wants the radius); the inflation layer's param is
+        namespaced "<plugin>.inflation_radius" (the plugin name from the yaml's
+        plugins list — dynamicParametersCallback matches exactly that name).
+        Returns an error string or None."""
+        with self._nav_cfg_lock:
+            client = self._cm_clients.get(node)
+            if client is None or not client.service_is_ready():
+                return f"{node} not reachable (is nano-nav up?)"
+            req = SetParameters.Request()
+            req.parameters = [
+                self._scalar_param_msg("robot_radius",
+                                       cfg["nav_robot_diam_m"] / 2.0),
+                self._scalar_param_msg(
+                    f"{NAV_INFLATION_LAYER}.inflation_radius",
+                    cfg["nav_inflation_m"]),
+            ]
+            client.call_async(req)
+        return None
+
     def _set_nav_cfg(self, lin, ang, lin_acc, ang_acc):
         """Clamp + store the requested values on this node's own params (the
         sliders' source of truth) — does NOT touch the smoother."""
@@ -1209,6 +1295,15 @@ class WebServerNode(Node):
             Parameter("nav_ang_accel", value=ang_acc)])
         return lin, ang, lin_acc, ang_acc
 
+    def _set_nav_geom(self, infl, diam):
+        """Clamp + store the keep-away/robot-size values on this node's own
+        params (the sliders' source of truth) — does NOT touch the costmaps."""
+        infl, diam = _clamp_nav_geom(infl, diam)
+        self.set_parameters([
+            Parameter("nav_inflation_m", value=infl),
+            Parameter("nav_robot_diam_m", value=diam)])
+        return infl, diam
+
     def update_nav_config(self, data):
         """PATCH-style /nav/config POST: missing keys keep current values."""
         data = data or {}
@@ -1219,17 +1314,23 @@ class WebServerNode(Node):
                 data.get("nav_ang_speed", cur["nav_ang_speed"]),
                 data.get("nav_lin_accel", cur["nav_lin_accel"]),
                 data.get("nav_ang_accel", cur["nav_ang_accel"]))
+            infl, diam = self._set_nav_geom(
+                data.get("nav_inflation_m", cur["nav_inflation_m"]),
+                data.get("nav_robot_diam_m", cur["nav_robot_diam_m"]))
         except (TypeError, ValueError):
-            return {"error": "speeds/accels must be numbers"}
+            return {"error": "speeds/accels/geometry must be numbers"}
         lin, ang, lin_acc, ang_acc = cfg
-        err = self._nav_push(self.nav_config())
+        errs = [self._nav_push(self.nav_config())]
+        errs += [self._costmap_push(self.nav_config(), n) for n in NAV_COSTMAP_NODES]
+        err = "; ".join(e for e in errs if e)
         if not write_json(self._nav_settings_file(), self.nav_config()):
             self.get_logger().warning("nav: could not persist nav config")
         if err:
-            self.get_logger().warning(f"nav: could not push to smoother: {err}")
+            self.get_logger().warning(f"nav: could not push to nav2: {err}")
         self.get_logger().info(
             f"POST /nav/config lin {lin:.2f} m/s turn {ang:.2f} rad/s "
-            f"accel {lin_acc:.2f} m/s^2 / {ang_acc:.2f} rad/s^2 (source: web UI)")
+            f"accel {lin_acc:.2f} m/s^2 / {ang_acc:.2f} rad/s^2 "
+            f"keep-away {infl:.2f} m robot ⌀ {diam:.2f} m (source: web UI)")
         out = {"status": "ok", **self.nav_config()}
         if err:
             out["error"] = err
@@ -1237,8 +1338,8 @@ class WebServerNode(Node):
 
     def _apply_saved_nav_cfg(self):
         """Boot re-apply part 1: load nav.json into THIS node's params (the GET's
-        source of truth) immediately. The smoother push happens later, in
-        _reapply_nav_cfg_when_up, because nano-nav activates the smoother after
+        source of truth) immediately. The smoother + costmap pushes happen later,
+        in _reapply_nav_cfg_when_up, because nano-nav activates them after
         app_hub is already up."""
         try:
             saved = read_json(self._nav_settings_file()) or {}
@@ -1247,6 +1348,9 @@ class WebServerNode(Node):
                 saved.get("nav_ang_speed", self.get_parameter("nav_ang_speed").value),
                 saved.get("nav_lin_accel", self.get_parameter("nav_lin_accel").value),
                 saved.get("nav_ang_accel", self.get_parameter("nav_ang_accel").value))
+            self._set_nav_geom(
+                saved.get("nav_inflation_m", self.get_parameter("nav_inflation_m").value),
+                saved.get("nav_robot_diam_m", self.get_parameter("nav_robot_diam_m").value))
         except (TypeError, ValueError) as e:
             self.get_logger().warning(f"nav: ignoring bad persisted config: {e!r}")
 
@@ -1270,20 +1374,37 @@ class WebServerNode(Node):
                 f"nav: re-applied pace on smoother activation "
                 f"(lin {cfg['nav_lin_speed']:.2f} m/s ang {cfg['nav_ang_speed']:.2f} rad/s)")
 
-    def _reapply_nav_cfg_when_up(self):
-        """Boot re-apply part 2: wait (bounded) for the smoother's ACTIVATE —
-        the SetParameters service exists from node construction but the params
-        are only declared at configure and the dynamic callback attaches at
-        activate, so pushing before that is silently lost — then push the saved
-        values once. Dedicated daemon thread; a missing smoother (nav stack
-        down) just gives up (the transition_event subscription covers the late
-        activation case too)."""
-        if not self._nav_client.wait_for_service(timeout_sec=60.0):
-            self.get_logger().warning(
-                "nav: velocity_smoother set_parameters never appeared — nav "
-                "config left at the nav2_params.yaml defaults")
+    def _on_cm_transition(self, msg, node):
+        """Re-apply the saved keep-away/robot-size when ONE costmap (re)activates
+        (same lifecycle race as the smoother: Costmap2DROS's robot_radius
+        dynamic callback attaches at on_activate). Own per-target rate limit —
+        smoother/local/global activate at staggered moments of one nano-nav
+        startup. Deactivate/cleanup transitions are ignored."""
+        if msg.goal_state.label != "active":
             return
-        state = self.create_client(GetState, f"/{NAV_SMOOTHER_NODE}/get_state")
+        with self._nav_cfg_lock:
+            if time.monotonic() - self._cm_last_push[node] < 5.0:
+                return
+            self._cm_last_push[node] = time.monotonic()
+        self._cm_push_saved(node, "activation re-push")
+
+    def _cm_push_saved(self, node, why):
+        """Push the saved keep-away/robot-size to ONE costmap, rate-limit guard
+        shared with the boot re-apply (whichever lands first wins)."""
+        cfg = self.nav_config()
+        err = self._costmap_push(cfg, node)
+        if err:
+            self.get_logger().warning(f"nav: {why} failed for {node}: {err}")
+        else:
+            self.get_logger().info(
+                f"nav: {why}: {node} keep-away {cfg['nav_inflation_m']:.2f} m "
+                f"robot ⌀ {cfg['nav_robot_diam_m']:.2f} m")
+
+    def _wait_nav_active(self, node_name):
+        """Bounded (90 s) GetState poll until a Nav2 lifecycle node reports
+        active — False when it never does (nav stack down or stuck). Shared by
+        the smoother + costmap boot re-applies."""
+        state = self.create_client(GetState, f"/{node_name}/get_state")
         end = time.monotonic() + 90.0
         while time.monotonic() < end:
             if not state.service_is_ready():
@@ -1298,26 +1419,63 @@ class WebServerNode(Node):
                 continue
             res = fut.result()
             if res is not None and res.current_state.label == "active":
-                break
+                return True
             time.sleep(1.0)         # still configuring/activating — keep waiting
+        return False
+
+    def _reapply_nav_cfg_when_up(self):
+        """Boot re-apply part 2: wait (bounded) for each Nav2 target's ACTIVATE —
+        the SetParameters services exist from node construction but the params
+        are only declared at configure and the dynamic callbacks attach at
+        activate (the smoother's own, Costmap2DROS's robot_radius) — so pushing
+        before that is silently lost; then push the saved values once per
+        target. Dedicated daemon thread; a missing target (nav stack down) just
+        gives up (the transition_event subscriptions cover the late activation
+        case too)."""
+        if not self._nav_client.wait_for_service(timeout_sec=60.0):
+            self.get_logger().warning(
+                "nav: velocity_smoother set_parameters never appeared — nav "
+                "config left at the nav2_params.yaml defaults")
+        elif self._wait_nav_active(NAV_SMOOTHER_NODE):
+            with self._nav_cfg_lock:
+                if time.monotonic() - self._nav_last_push < 5.0:
+                    pass            # the transition-event re-push already ran
+                else:
+                    self._nav_last_push = time.monotonic()
+                    cfg = self.nav_config()
+                    err = self._nav_push(cfg)
+                    if err:
+                        self.get_logger().warning(f"nav: boot re-apply failed: {err}")
+                    else:
+                        self.get_logger().info(
+                            f"nav: pushed saved pace to {NAV_SMOOTHER_NODE} "
+                            f"(lin {cfg['nav_lin_speed']:.2f} m/s "
+                            f"ang {cfg['nav_ang_speed']:.2f} rad/s "
+                            f"accel {cfg['nav_lin_accel']:.2f}/"
+                            f"{cfg['nav_ang_accel']:.2f})")
         else:
             self.get_logger().warning(
                 "nav: velocity_smoother never reached active within the bounded "
                 "wait — nav config left at the nav2_params.yaml defaults")
-            return
-        with self._nav_cfg_lock:
-            if time.monotonic() - self._nav_last_push < 5.0:
-                return              # the transition-event re-push already ran
-            self._nav_last_push = time.monotonic()
-        cfg = self.nav_config()
-        err = self._nav_push(cfg)
-        if err:
-            self.get_logger().warning(f"nav: boot re-apply failed: {err}")
-        else:
-            self.get_logger().info(
-                f"nav: pushed saved pace to {NAV_SMOOTHER_NODE} "
-                f"(lin {cfg['nav_lin_speed']:.2f} m/s ang {cfg['nav_ang_speed']:.2f} rad/s "
-                f"accel {cfg['nav_lin_accel']:.2f}/{cfg['nav_ang_accel']:.2f})")
+        # The costmap geometry (robot_radius only lands post-activate; the
+        # inflation layer's callback is live from configure): same bounded wait,
+        # same per-target rate-limit guard, then push the saved values once.
+        for node in NAV_COSTMAP_NODES:
+            if not self._cm_clients[node].wait_for_service(timeout_sec=60.0):
+                self.get_logger().warning(
+                    f"nav: {node} set_parameters never appeared — keep-away/"
+                    f"robot-size left at the nav2_params.yaml defaults")
+                continue
+            if self._wait_nav_active(node):
+                with self._nav_cfg_lock:
+                    if time.monotonic() - self._cm_last_push[node] < 5.0:
+                        continue    # the transition-event re-push already ran
+                    self._cm_last_push[node] = time.monotonic()
+                self._cm_push_saved(node, "boot re-apply")
+            else:
+                self.get_logger().warning(
+                    f"nav: {node} never reached active within the bounded wait "
+                    f"— keep-away/robot-size left at the nav2_params.yaml defaults")
 
     # ---- persisted LDS spin-down settings (lds.json) ---------------------------
     # The Lidar card's Idle spin-down toggle + Spin-down-after slider arrive via
@@ -1843,7 +2001,8 @@ class WebServerNode(Node):
                 m.pose.position.y = float(loc["y"])
                 m.pose.orientation.w = 1.0
                 pub.publish(m)
-                self.telemetry.note_goal(m.pose.position.x, m.pose.position.y)
+                self.telemetry.note_goal(m.pose.position.x, m.pose.position.y,
+                                         source=f"skill go-to '{name}'")
                 self.get_logger().info(
                     f"goal_pose -> '{name}' ({loc['x']:.2f}, {loc['y']:.2f}) (skill)")
                 return True, "/goal_pose -> '%s' (%.2f, %.2f)" % (name, loc["x"], loc["y"])
@@ -2530,6 +2689,11 @@ class WebServerNode(Node):
         }
         self._cog_health_pub.publish(String(data=json.dumps(health)))
 
+    def get_navlog(self, since=0):
+        """GET /nav/log body — the Drive tab's SLAM/Nav event log (the gateway's
+        ring of goal/status/lidar/motion events; see telemetry._navlog_add)."""
+        return self.telemetry.get_navlog(since)
+
     def get_brain_health(self):
         """Aggregated brain health for the /brain/health HTTP endpoint."""
         now = time.monotonic()
@@ -2790,6 +2954,16 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if path == "/brain/health":
             return self._respond_json(
                 self._node.get_brain_health() if self._node else {"error": "no node"})
+        if path == "/nav/log":
+            # Incremental: ?since=<last id> returns only newer entries (the page
+            # polls at 1 Hz while the Drive tab is open and prepends newest-first).
+            try:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                since = int(q.get("since", ["0"])[0])
+            except (ValueError, IndexError):
+                since = 0
+            return self._respond_json(
+                self._node.get_navlog(since) if self._node else {"error": "no node"})
         return super().do_GET()
 
     def do_POST(self):

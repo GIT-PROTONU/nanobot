@@ -131,6 +131,15 @@ def main():
         if first:
             missing = [k for k in ("susp", "oled", "esp", "lds", "nav") if k not in first]
             check("frame has base keys", not missing, f"missing={missing}")
+            nav = first.get("nav") or {}
+            # f.nav is a typed contract with the page's Map drawing: the
+            # keep-away bubble + robot footprint circle radii (m) must be
+            # present and numeric (they follow the /nav/config zone sliders).
+            check("frame f.nav carries bubble + robot radii",
+                  isinstance(nav.get("inflation"), (int, float))
+                  and isinstance(nav.get("robot_radius"), (int, float))
+                  and nav["inflation"] >= 0 and nav["robot_radius"] > 0,
+                  f"nav={nav}")
 
         st, body = req("POST", "/publish", {"topic": "/oled_face", "value": "happy"})
         check("publish whitelisted topic", st == 200 and b'"ok"' in body, body[:80])
@@ -189,19 +198,21 @@ def main():
         st, body = req("POST", "/move/config", {"move_lin_speed": "fast"})
         check("move/config garbage refused", b"error" in body, body[:80])
 
-        # --- Nav2 navigation pace (GET/POST /nav/config; velocity_smoother caps) ----
-        # No nano-nav container on this dev host, so the smoother push fails
-        # gracefully (the reply carries "error") while the values still apply +
-        # persist. The GET/POST contract with the page must hold regardless.
+        # --- Nav2 navigation pace + zone geometry (GET/POST /nav/config) ------------
+        # No nano-nav container on this dev host, so the smoother + costmap
+        # pushes fail gracefully (the reply carries "error") while the values
+        # still apply + persist. The GET/POST contract with the page must hold
+        # regardless.
         st, body = req("GET", "/nav/config")
         try:
             nav = json.loads(body)
         except Exception:
             nav = {}
-        check("nav/config GET has the four caps",
+        check("nav/config GET has the six keys",
               st == 200 and all(k in nav for k in (
                   "nav_lin_speed", "nav_ang_speed", "nav_lin_accel",
-                  "nav_ang_accel")), body[:80])
+                  "nav_ang_accel", "nav_inflation_m", "nav_robot_diam_m")),
+              body[:80])
         st, body = req("POST", "/nav/config", {"nav_lin_speed": 0.22})
         try:
             echo_nav_lin = json.loads(body)["nav_lin_speed"]
@@ -217,6 +228,16 @@ def main():
         # NAV_ANG_RANGE top = 1.0 (the SLAM rotation-smear budget)
         check("nav/config turn clamped to 1.0", st == 200 and echo_nav_ang == 1.0,
               body[:80])
+        st, body = req("POST", "/nav/config", {"nav_inflation_m": 99.0,
+                                               "nav_robot_diam_m": 0.02})
+        try:
+            geo = json.loads(body)
+            echo_infl, echo_diam = geo["nav_inflation_m"], geo["nav_robot_diam_m"]
+        except Exception:
+            echo_infl = echo_diam = None
+        # NAV_INFL_RANGE top 0.6 / NAV_DIAM_RANGE bottom 0.1
+        check("nav/config zone geometry clamped",
+              st == 200 and echo_infl == 0.6 and echo_diam == 0.1, body[:80])
         st, body = req("POST", "/nav/config", {"nav_lin_speed": "fast"})
         check("nav/config garbage refused", b"error" in body, body[:80])
         NAV_JSON = os.path.join(os.path.expanduser("~"), ".local", "state",
@@ -228,7 +249,8 @@ def main():
         except Exception as e:
             check("nav config persisted to nav.json", False, repr(e))
         req("POST", "/nav/config",       # restore the default so the dev host is clean
-            {"nav_lin_speed": 0.18, "nav_lin_accel": 0.5, "nav_ang_accel": 1.6})
+            {"nav_lin_speed": 0.18, "nav_lin_accel": 0.5, "nav_ang_accel": 1.6,
+             "nav_inflation_m": 0.25, "nav_robot_diam_m": 0.32})
 
         # --- LDS spin-down persistence (POST /param -> ~/.local/state/nanobot/lds.json;
         # the Lidar card's spin-down settings must survive a restart) ----------------

@@ -119,8 +119,10 @@
             click publishes <b>/goal_pose</b> and Nav2 drives there (Motion off = browse-only, so
             an accidental tap can't move the robot). <span class="map-dot robot"></span>red = robot,
             <span class="map-dot goal"></span>yellow = goal, <span class="map-dot trail"></span>cyan =
-            trail, dashed circle = the costmap's inflation radius (how close Nav2 will pass to
-            walls). <b>Costmap</b> overlays Nav2's actual costmap as a translucent heat map
+            trail, orange dashed circle = the keep-away zone (the costmap's
+            inflation radius — how close Nav2 will pass to walls; tunable via the
+            <b>Keep-away</b> slider in the Drive tab's Navigation pace card, which
+            also draws the robot's footprint circle). <b>Costmap</b> overlays Nav2's actual costmap as a translucent heat map
             (yellow→red = rising cost, solid red = lethal) — <b>global</b> is the full
             24×24 m planning space, <b>local</b> is the 2×2 m rolling window of live obstacle
             sensing that follows the robot. <b>✕ Cancel goal</b> aborts the active navigation.</p>
@@ -195,6 +197,22 @@
               navigation; the page waits for the fresh grid to arrive.</p>
           </div>
           <div class="card">
+            <h2>Nav log</h2>
+            <div class="row" style="margin-top:2px">
+              <button id="navLogPause" class="btn small">⏸ Hold</button>
+              <span class="hint grow" id="navLogCount" style="text-align:right"></span>
+            </div>
+            <div id="navLog" title="Live SLAM/Nav event feed: goal publishes, status transitions, lidar wake/park, motion, planning-stuck warnings. Also in journalctl -u nano-app."
+              style="max-height:230px;overflow-y:auto;font-family:var(--mono);font-size:11px;line-height:1.5;background:rgba(0,0,0,.35);border-radius:6px;padding:6px 8px;margin-top:6px"></div>
+            <p class="hint">Live SLAM/navigation event feed from the gateway: goal publishes
+              and cancels, status transitions with durations (planning → navigating →
+              arrived/failed), lidar wake/park decisions, motion start/stop, and
+              <b>planning-stuck warnings</b> (a plan that can't start usually means slam's
+              map→odom TF is stale — parked lidar or dead nano-slam). Every line is mirrored
+              to <b>journalctl -u nano-app</b> (grep <kbd>navlog:</kbd>).
+              <b>⏸ Hold</b> freezes the view while you read.</p>
+          </div>
+          <div class="card">
             <h2>Navigation pace</h2>
             <div class="field"><label>Nav speed <span id="navLinV">0.18</span> m/s</label>
               <input id="navLin" type="range" min="0.05" max="0.35" step="0.01" value="0.18"></div>
@@ -205,12 +223,22 @@
               <input id="navAng" type="range" min="0.1" max="1.0" step="0.05" value="0.8"></div>
             <div class="field"><label>Turn accel <span id="navAngAccV">1.60</span> rad/s²</label>
               <input id="navAngAcc" type="range" min="0.1" max="4.0" step="0.1" value="1.6"></div>
+            <div class="field"><label>Keep-away zone <span id="navInflV">0.25</span> m</label>
+              <input id="navInfl" type="range" min="0" max="0.6" step="0.01" value="0.25"></div>
+            <div class="field"><label>Robot size ⌀ <span id="navDiamV">0.32</span> m</label>
+              <input id="navDiam" type="range" min="0.1" max="1.0" step="0.01" value="0.32"></div>
             <p class="hint">How fast Nav2 <b>drives</b> toward a goal (map click, Locations Go,
               skill go-tos). These caps live inside <b>velocity_smoother</b> (nav2_container) —
               Nav2's controller emits the velocity, the smoother clamps speed + acceleration
               and publishes the final <b>/cmd_vel</b>. Applied <b>live</b> (no restart) and
               persisted across reboots; also bounds the recovery BackUp/Spin. Joystick/canned
               moves bypass the smoother (the firmware's per-wheel slew limits those).</p>
+            <p class="hint">The two <b>zone</b> sliders set Nav2's costmap geometry, applied live
+              to both costmaps (no restart): <b>Keep-away</b> is the inflation radius — the
+              <span style="color:#e8873a">orange zone</span> Nav2 keeps between the robot and
+              walls (also the dashed bubble on the Map view); <b>Robot size</b> is the robot's
+              footprint circle ⌀ (drawn on the Map view). Raise Keep-away for a shy robot, drop
+              it to squeeze through narrow gaps; Robot size should match the real chassis.</p>
           </div>
           <div class="card">
             <h2>Locations</h2>
@@ -2030,6 +2058,8 @@ const HINTS = {
   navAcc: "Linear acceleration/deceleration limit for Nav2 driving (m/s²). Applied live inside velocity_smoother; decel is set to the same value so stops are symmetric. Low = gentle crawl ramps (nice on carpet, prevents lurches after rotate-to-heading); high = snappy. The firmware's per-wheel slew applies on top.",
   navAng: "Turn-rate cap while navigating (rad/s) — rotate-to-heading at the goal start, in-path turns, and the recovery Spin. Applied live inside velocity_smoother. Keep at/below 1.0: faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
   navAngAcc: "Angular acceleration limit while navigating (rad/s²). Applied live inside velocity_smoother; low = smooth spin-up after a rotate-to-heading start, high = snappier turns.",
+  navInfl: "Keep-away zone: the costmaps' inflation radius in metres — the orange zone Nav2 keeps between the robot and walls (and the dashed bubble around the robot on the Map view). Applied live to BOTH costmaps (no restart) and persisted. 0 = no inflation zone. Raise it for a shy robot near furniture; drop it to squeeze through narrow gaps. Nav2 warns when it's smaller than the robot's inscribed radius.",
+  navDiam: "Robot size: the diameter of the robot's footprint circle in metres — what the costmaps inflate around and what the Map view draws as the translucent red circle. Applied live to BOTH costmaps as robot_radius = ⌀/2 and persisted. Should match the real chassis (0.32 m ≈ the physical robot); inflating it gives safety margin at the cost of passable gaps.",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
   sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
@@ -3212,30 +3242,41 @@ fetch("/move/config").then(r=>r.ok?r.json():null).then(c=>{
   moveLinWarn();
 }).catch(()=>{});
 
-// ---- Nav2 navigation pace sliders (GET/POST /nav/config) ----
-// Speed/accel caps for Nav2 goals, applied live inside velocity_smoother (no
+// ---- Nav2 navigation pace + zone sliders (GET/POST /nav/config) ----
+// Speed/accel caps for Nav2 goals (velocity_smoother) + the costmap geometry
+// (keep-away zone = inflation radius, robot circle ⌀), all applied live (no
 // restart); persisted server-side (nav.json), so the sliders re-seed on load.
-// Same saturation-cliff warning as the canned-speed slider.
+// Same saturation-cliff warning as the canned-speed slider. The map drawing
+// follows the SSE frame (f.nav.inflation / f.nav.robot_radius), so the bubble
+// + footprint circle track the sliders within one 5 Hz tick.
 const navLinWarn=()=>{$("navLinWarn").hidden=Number($("navLin").value)<=0.35;};
 $("navLin").oninput=()=>{$("navLinV").textContent=Number($("navLin").value).toFixed(2);navLinWarn();};
 $("navAcc").oninput=()=>$("navAccV").textContent=Number($("navAcc").value).toFixed(2);
 $("navAng").oninput=()=>$("navAngV").textContent=Number($("navAng").value).toFixed(2);
 $("navAngAcc").oninput=()=>$("navAngAccV").textContent=Number($("navAngAcc").value).toFixed(2);
+$("navInfl").oninput=()=>$("navInflV").textContent=Number($("navInfl").value).toFixed(2);
+$("navDiam").oninput=()=>$("navDiamV").textContent=Number($("navDiam").value).toFixed(2);
 const postNavCfg=()=>fetch("/nav/config",{method:"POST",headers:{"Content-Type":"application/json"},
   body:JSON.stringify({nav_lin_speed:Number($("navLin").value),
                        nav_ang_speed:Number($("navAng").value),
                        nav_lin_accel:Number($("navAcc").value),
-                       nav_ang_accel:Number($("navAngAcc").value)})}).catch(()=>{});
+                       nav_ang_accel:Number($("navAngAcc").value),
+                       nav_inflation_m:Number($("navInfl").value),
+                       nav_robot_diam_m:Number($("navDiam").value)})}).catch(()=>{});
 $("navLin").onchange=postNavCfg;
 $("navAcc").onchange=postNavCfg;
 $("navAng").onchange=postNavCfg;
 $("navAngAcc").onchange=postNavCfg;
+$("navInfl").onchange=postNavCfg;
+$("navDiam").onchange=postNavCfg;
 fetch("/nav/config").then(r=>r.ok?r.json():null).then(c=>{
   if(!c) return;
   $("navLin").value=c.nav_lin_speed; $("navLinV").textContent=Number(c.nav_lin_speed).toFixed(2);
   $("navAng").value=c.nav_ang_speed; $("navAngV").textContent=Number(c.nav_ang_speed).toFixed(2);
   $("navAcc").value=c.nav_lin_accel; $("navAccV").textContent=Number(c.nav_lin_accel).toFixed(2);
   $("navAngAcc").value=c.nav_ang_accel; $("navAngAccV").textContent=Number(c.nav_ang_accel).toFixed(2);
+  $("navInfl").value=c.nav_inflation_m; $("navInflV").textContent=Number(c.nav_inflation_m).toFixed(2);
+  $("navDiam").value=c.nav_robot_diam_m; $("navDiamV").textContent=Number(c.nav_robot_diam_m).toFixed(2);
   navLinWarn();
 }).catch(()=>{});
 
@@ -3467,6 +3508,16 @@ connect();   // auto-connect on load
     const p=(navFrame&&navFrame.pose);
     if(p){
       const [rx,ry]=W2P(p[0],p[1]), R=3.5;             // pose is [x, y, yaw_rad]
+      // footprint circle: the robot's actual size in map metres (Nav2's
+      // robot_radius, live from f.nav.robot_radius) — the ⌀ the costmaps
+      // inflate around, tunable in the Navigation pace card.
+      const rr=(navFrame&&navFrame.robot_radius)||0.16;
+      if(rr>0){
+        const Rr=(rr/m.res)*z;
+        ctx.fillStyle="rgba(255,59,48,0.12)";
+        ctx.strokeStyle="rgba(255,59,48,0.55)"; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.arc(rx,ry,Rr,0,6.2832); ctx.fill(); ctx.stroke();
+      }
       ctx.fillStyle="#ff3b30";
       ctx.strokeStyle="rgba(10,10,14,0.6)"; ctx.lineWidth=1;   // thin dark halo on light map
       ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
@@ -3475,12 +3526,13 @@ connect();   // auto-connect on load
       ctx.beginPath(); ctx.moveTo(rx,ry);
       ctx.lineTo(rx+9*Math.cos(p[2]||0), ry-9*Math.sin(p[2]||0)); ctx.stroke();
       ctx.lineCap="butt";
-      // inflation bubble: Nav2's inflation_radius — the distance the costmap keeps
-      // from walls (a dashed circle around the robot, grey).
-      const infl=(navFrame&&navFrame.inflation)||0.25;
+      // keep-away bubble: Nav2's inflation_radius — the orange zone the costmap
+      // keeps from walls (a dashed circle around the robot, fed live from
+      // f.nav.inflation; tunable in the Navigation pace card).
+      const infl=(navFrame&&navFrame.inflation);
       if(infl>0){
         const Rb=(infl/m.res)*z;
-        ctx.strokeStyle="#63666b"; ctx.lineWidth=1.5; ctx.setLineDash([5,4]);
+        ctx.strokeStyle="#e8873a"; ctx.lineWidth=1.5; ctx.setLineDash([5,4]);
         ctx.beginPath(); ctx.arc(rx,ry,Rb,0,6.2832); ctx.stroke();
         ctx.setLineDash([]);
       }
@@ -3834,6 +3886,59 @@ connect();   // auto-connect on load
     }catch(e){ alert("Save failed (server unreachable)."); }
   };
   loadLocations();
+})();
+</script>
+
+<script>
+// ---- Nav log panel (Drive tab) ----------------------------------------------
+// Self-contained, pure HTTP: incremental 1 Hz poll of GET /nav/log?since=<id>
+// (the gateway's SLAM/Nav event ring — goal publishes, status transitions, lidar
+// wake/park decisions, motion start/stop, planning-stuck warnings). Newest rows
+// prepend at the top (no scroll management), DOM capped. Only polls while the
+// Drive tab is visible so a closed tab costs one skipped timer tick.
+(function(){
+  "use strict";
+  const $=id=>document.getElementById(id);
+  const box=$("navLog"), pauseBtn=$("navLogPause"), countEl=$("navLogCount");
+  if(!box) return;
+  let lastId=0, paused=false, total=0;
+  const MAX_ROWS=250;
+  const CLR={info:"#9ec1ff", warn:"#f5b83d", error:"#ff5c72"};
+  const hhmmss=t=>{ const d=new Date(t*1000);
+    return d.toTimeString().slice(0,8); };
+  function render(entries){
+    for(let i=entries.length-1;i>=0;i--){
+      const e=entries[i];
+      const row=document.createElement("div");
+      row.style.whiteSpace="pre-wrap";
+      row.style.color=CLR[e.lvl]||CLR.info;
+      row.textContent=`${hhmmss(e.t)} ${e.msg}`;
+      box.prepend(row);
+      total++;
+    }
+    while(box.childElementCount>MAX_ROWS) box.lastChild.remove();
+    if(countEl) countEl.textContent=paused?"(on hold)":""+total+" events";
+  }
+  async function poll(){
+    if(paused||document.hidden) return;
+    if(!document.getElementById("panel-drive").classList.contains("active")) return;
+    try{
+      const r=await fetch("/nav/log?since="+lastId);
+      if(!r.ok) return;
+      const j=await r.json();
+      if(!Array.isArray(j)||!j.length) return;
+      lastId=j[j.length-1].id;
+      render(j);
+    }catch(e){ /* gateway restarting — next tick */ }
+  }
+  pauseBtn.onclick=()=>{
+    paused=!paused;
+    pauseBtn.textContent=paused?"▶ Resume":"⏸ Hold";
+    pauseBtn.classList.toggle("active",paused);
+    render([]);
+  };
+  setInterval(poll,1000);
+  poll();
 })();
 </script>
 </body>

@@ -363,6 +363,16 @@ web_control:
     nav_lin_accel: 0.5        # m/s^2 linear accel limit (body-level; firmware
                               # WHEEL_TGT_SLEW is per-wheel on top)
     nav_ang_accel: 1.6        # rad/s^2 angular accel limit
+    # Costmap GEOMETRY (the same POST /nav/config carries them; also persisted
+    # to nav.json — persisted UI wins). The keep-away zone is the costmaps'
+    # inflation_layer.inflation_radius (the orange bubble around walls + the
+    # dashed bubble around the robot on the web map); robot size is the drawn
+    # robot circle ⌀ — pushed to the costmaps as robot_radius = ⌀/2. Both are
+    # DYNAMICALLY reconfigurable on the costmaps (live, no nano-nav restart).
+    # Defaults mirror config/nav2/nav2_params.yaml (inflation 0.25 / robot_radius
+    # 0.16 = 0.32 ⌀) — if you hand-edit the yaml, keep these in step.
+    nav_inflation_m: 0.25     # m keep-away zone around walls/obstacles
+    nav_robot_diam_m: 0.32    # m robot footprint circle ⌀ (costmap robot_radius 0.16)
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"

@@ -23,6 +23,7 @@ connected (and torn down after `SUB_LINGER` with none), and the frame builder ea
 when there are no clients. Subscription create/destroy happens on the executor thread
 (inside the tick timer) so it never races the spin loop.
 """
+import collections
 import json
 import math
 import threading
@@ -81,17 +82,34 @@ NAV_BUSY = ("planning", "navigating", "canceling")
 # genuinely active goal, cmd_vel refreshes the clock, so this never parks a moving
 # robot; a goal silently stuck >90 s with no motion loses only the ~2 s spin-up.
 LDS_NAV_STALE = 90.0
+# "planning" gets a MUCH longer trust window. Planning is exactly the state where
+# the planner needs fresh scans (slam's map→odom TF) BEFORE it can even compute a
+# path, and there is NO /cmd_vel during planning to refresh the motion clock —
+# so the 90 s window above would park the lidar out from under a slow-waking
+# planner (the 2026-09-23 live deadlock: click → "planning" → lidar parked → no
+# scans → Nav2's Time(0) map→base_link lookup keeps resolving to the frozen
+# map→odom stamp → "extrapolation into the past" → never finishes planning →
+# robot never moves). A genuinely dead nano-nav/slam now costs at most 5 min of
+# lidar spin instead of silently deadlocking every goal.
+LDS_PLANNING_STALE = 300.0
+# --- SLAM/Nav event log (the Drive tab's "Nav log" card; GET /nav/log) ------
+NAVLOG_MAX = 400          # ring size (oldest dropped)
+NAVLOG_WARN_PERIOD = 15.0  # min gap between repeated planning-stuck warnings
+PLANNING_WARN_SECS = 10.0  # planning older than this starts warning in the log
+MAP_AGE_FRESH = 10.0       # /map younger than this counts as a live slam feed
 MOTOR_ACCEL_MIN = 0.3    # clamp on the /motor_accel ramp rate (duty/s) -- matches the
 MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.cpp)
 TRIM_MAX = 0.30          # ESP32 firmware's TRIM_MAX -- |wheel_trim| rebalance range (main.cpp)
 GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- Nav2's global costmap is
                          # 24x24 m; a goal outside it would just fail to plan
-# Keep-away bubble drawn around the robot on the web map (metres) -- mirrors
-# local_costmap/global_costmap inflation_radius in config/nav2/nav2_params.yaml.
-# Deliberately hardcoded (NOT a startup get_parameters call): that service could
-# race the Nav2 lifecycle at boot, and the value is restart-only anyway. If you
-# tune inflation_radius in nav2_params.yaml, change this to match.
+# Fallback for the keep-away bubble drawn around the robot on the web map
+# (metres) when web_control's nav_inflation_m param can't be read (used to be
+# a hardcoded mirror of local_costmap/global_costmap inflation_radius in
+# config/nav2/nav2_params.yaml — now that value is LIVE-tunable from the
+# Navigation pace card via /nav/config, and the frame carries the web node's
+# current setting each tick).
 NAV_INFLATION_M = 0.25
+NAV_ROBOT_DIAM_M = 0.32   # fallback robot-circle ⌀ (2× nav2_params.yaml robot_radius 0.16)
 # action_msgs/GoalStatus code -> the web map's status chip word. The status
 # sub is the LAST entry of /navigate_to_pose/_action/status (one entry per goal
 # bt_navigator knows, appended chronologically).
@@ -154,6 +172,21 @@ def lds_idle_target(now, last_move_at, idle_secs, idle_enable, nav_busy,
             last_move_at is not None and now - last_move_at < idle_secs):
         return max(0.0, float(active_rpm))
     return 0.0
+
+
+def lds_nav_busy(status, status_age):
+    """Is a Nav2 goal in flight, trusted PER-STATUS? The action status topic is
+    event-driven (arrivals only on transitions), so a busy status is trusted only
+    within its arrival window: `navigating`/`canceling` for LDS_NAV_STALE (a live
+    goal keeps /cmd_vel flowing, which refreshes the motion clock anyway; the age
+    bound stops a dead nano-nav from freezing "navigating" forever), but
+    "planning" for the much longer LDS_PLANNING_STALE — planning emits no
+    follow-up status and no /cmd_vel, yet the planner NEEDS fresh scans (the
+    map→odom TF) before it can compute a path. Parking the lidar during planning
+    is the "keeps planning, never moves" deadlock. Pure + unit-tested."""
+    if status not in NAV_BUSY:
+        return False
+    return status_age < (LDS_PLANNING_STALE if status == "planning" else LDS_NAV_STALE)
 
 
 class TelemetryHub:
@@ -234,6 +267,21 @@ class TelemetryHub:
         self._goal_status = "idle"
         self._goal_status_at = STALE   # monotonic ts of the last status arrival — the
                                        # busy-state trust window (LDS_NAV_STALE)
+        self._goal_status_since = None  # monotonic ts the CURRENT status value began
+                                        # (transition durations for the Nav log)
+        self._goal_published_at = None  # monotonic ts of the last goal publish
+        self._moving = False           # last /cmd_vel above the motion eps — the
+                                       # Nav log's motion start/stop transitions
+        self._navlog_warn_at = 0.0     # monotonic ts of the last planning-stuck warning
+        # --- SLAM/Nav event log (Drive tab "Nav log" card; GET /nav/log) -------
+        # A bounded ring of nav-chain events: goal publishes/cancels, action-status
+        # transitions with durations, the lidar idle controller's wake/park
+        # decisions, motion start/stop, planning-stuck warnings. Served via
+        # GET /nav/log?since=<id> (NOT the SSE frame — the frame is a typed
+        # contract, and a log is pull-friendly). Every entry is also mirrored to
+        # the app log (journald) so a diagnosis never needs the browser.
+        self._navlog_seq = 0
+        self._navlog = collections.deque(maxlen=NAVLOG_MAX)
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._latched_qos = latched
@@ -655,15 +703,27 @@ class TelemetryHub:
                 "bumper": bumper,
             }
         # Nav2 map view: pose (TF map->base_link), goal mirror + action status +
-        # the inflation bubble radius. All tiny; the heavy map grid itself is
-        # served by the /map HTTP route, never this frame.
+        # the inflation bubble + robot-circle radii. All tiny; the heavy map grid
+        # itself is served by the /map HTTP route, never this frame. The two radii
+        # read web_control's own params (the /nav/config sliders' source of truth —
+        # the same values the costmap pushes carry) each tick, with the module
+        # fallbacks if the params are somehow missing.
+        try:
+            infl = float(self._node.get_parameter("nav_inflation_m").value)
+        except Exception:
+            infl = NAV_INFLATION_M
+        try:
+            diam = float(self._node.get_parameter("nav_robot_diam_m").value)
+        except Exception:
+            diam = NAV_ROBOT_DIAM_M
         pose = self._tf_pose()
         map_age = (now - self._map_arrival) if self._map_arrival != STALE else None
         f["nav"] = {
             "pose": [round(v, 3) for v in pose] if pose else None,
             "goal": self._goal,
             "status": self._goal_status,
-            "inflation": NAV_INFLATION_M,
+            "inflation": round(infl, 3),
+            "robot_radius": round(diam / 2.0, 3),
             # Feeds-health strip (Map card): seconds since slam_toolbox last
             # published /map (None = never arrived) + whether the static
             # base_link->laser TF exists (None = nano-tf down). Both cheap:
@@ -876,6 +936,12 @@ class TelemetryHub:
             eps = 0.03
         if abs(lin) > eps or abs(ang) > eps:
             self._last_move_at = time.monotonic()
+            if not self._moving:
+                self._moving = True
+                self._navlog_add(f"moving (v={lin:+.2f} w={ang:+.2f})")
+        elif self._moving:
+            self._moving = False
+            self._navlog_add("stopped (cmd_vel quiet)")
 
     def _mk_oled(self, key):
         def cb(msg):
@@ -943,21 +1009,70 @@ class TelemetryHub:
             "t": time.time(), "kind": "costmap",
         }, data))
 
+    def _navlog_add(self, text, level="info"):
+        """One line in the Drive tab's Nav log (GET /nav/log), mirrored to the
+        app log (journald) so "why didn't it move" is diagnosable without the
+        browser too. `text` must be a plain JSON-safe string (these ride HTTP)."""
+        self._navlog_seq += 1
+        self._navlog.append({"id": self._navlog_seq, "t": time.time(),
+                             "lvl": level, "msg": str(text)})
+        log = self._node.get_logger()
+        msg = f"navlog: {text}"
+        if level == "error":
+            log.error(msg)
+        elif level == "warn":
+            log.warning(msg)
+        else:
+            log.info(msg)
+
+    def get_navlog(self, since=0):
+        """GET /nav/log body: entries newer than `since` (sequential ids), oldest
+        first — the page polls incrementally and prepends newest-first."""
+        since = max(0, int(since or 0))
+        return [dict(e) for e in self._navlog if e["id"] > since]
+
     def _on_goal_status(self, msg):
         """Track bt_navigator's action status (the web chip + the LDS idle
         controller's busy signal). status_list gains an entry per goal state
         transition; the LAST entry is the current goal. On a terminal state the
         goal mirror is dropped too, so the browser's goal ring doesn't resurrect
-        from every subsequent frame."""
-        self._goal_status_at = time.monotonic()   # arrival time (LDS_NAV_STALE window)
-        if msg.status_list:
-            code = msg.status_list[-1].status
-            if isinstance(code, bytes):      # rmw_zenoh int8 paranoia (see _on_diag)
-                code = code[0]
-            code = int(code)
-            self._goal_status = NAV_STATUS.get(code, "idle")
-            if code in (4, 5, 6):            # SUCCEEDED / CANCELED / ABORTED
-                self._goal = None
+        from every subsequent frame. Every transition also lands in the Nav log
+        with its duration."""
+        now = time.monotonic()
+        self._goal_status_at = now   # arrival time (busy-state trust windows)
+        if not msg.status_list:
+            return
+        code = msg.status_list[-1].status
+        if isinstance(code, bytes):      # rmw_zenoh int8 paranoia (see _on_diag)
+            code = code[0]
+        code = int(code)
+        new = NAV_STATUS.get(code, "idle")
+        prev = self._goal_status
+        if new != prev:
+            since = self._goal_status_since
+            dur = f" (was {prev} for {now - since:.1f}s)" if since is not None else ""
+            if new == "failed":
+                self._navlog_add(f"nav → FAILED{dur} — bt recovery exhausted", "warn")
+            elif new == "planning":
+                self._navlog_add(f"nav → planning{dur} — planner accepted the goal")
+            elif new == "navigating":
+                self._navlog_add(f"nav → navigating{dur} — plan ready, driving")
+            elif new == "arrived":
+                self._navlog_add(f"nav → arrived{dur}")
+            elif code == 5:
+                self._navlog_add(f"nav → canceled{dur}")
+            else:
+                self._navlog_add(f"nav → {new}{dur}")
+            self._goal_status_since = now
+        if code in (4, 5, 6):            # SUCCEEDED / CANCELED / ABORTED
+            pub_at = self._goal_published_at
+            if pub_at is not None:
+                verdict = {4: "reached", 5: "canceled", 6: "FAILED"}[code]
+                self._navlog_add(f"goal {verdict} in {now - pub_at:.1f}s",
+                                 "info" if code in (4, 5) else "warn")
+                self._goal_published_at = None
+            self._goal = None
+        self._goal_status = new
 
     def _tf_laser_age(self):
         """base_link→laser static TF existence check for the Map card's feeds
@@ -1007,9 +1122,12 @@ class TelemetryHub:
     def clear_goal(self):
         """Drop the goal mirror + chip state (POST /nav/cancel). Nav2's own status
         topic will corroborate with CANCELED/UNKNOWN on the next tick."""
+        if self._goal is not None or self._goal_status not in ("idle",):
+            self._navlog_add("goal cancelled (POST /nav/cancel) — lidar may idle-park now")
         self._goal = None
         self._goal_status = "idle"
         self._goal_status_at = time.monotonic()
+        self._goal_published_at = None
 
     def clear_map(self):
         """Drop the cached /map grid + goal mirror (POST /map/clear). The /map
@@ -1021,6 +1139,9 @@ class TelemetryHub:
         self._map_arrival = STALE
         self._goal = None
         self._goal_status = "idle"
+        self._goal_published_at = None
+        self._navlog_add("map cleared — nano-slam restart, goal dropped, "
+                         "lidar rebuild window armed")
 
     def note_map_clear(self):
         """POST /map/clear companion: a wiped map can only REBUILD if scans flow,
@@ -1056,13 +1177,17 @@ class TelemetryHub:
         within a tick. Runs on an always-on 1 Hz timer — the spin-down must work
         with the page closed. Manual owners (browser slider / skill action latch,
         IMU interference test hold) are never fought; the controller resumes after
-        their window."""
+        their window. Every wake/park lands in the Nav log with its reason, and a
+        plan that sits unresolved (usually a stale map→odom TF — the parked-lidar
+        deadlock) warns there too."""
         now = time.monotonic()
-        # A busy nav status is trusted only within its arrival window (LDS_NAV_STALE):
-        # nano-nav dying mid-goal would otherwise freeze "navigating" and keep the
-        # lidar awake on a parked robot forever. A live goal is held up by /cmd_vel.
-        nav_busy = (self._goal_status in NAV_BUSY
-                    and (now - self._goal_status_at) < LDS_NAV_STALE)
+        # A busy nav status is trusted only within its arrival window, PER STATUS
+        # (lds_nav_busy): navigating/canceling for LDS_NAV_STALE (a live goal keeps
+        # /cmd_vel flowing), planning for the much longer LDS_PLANNING_STALE — the
+        # planner needs scans BEFORE it can compute a path and there is no cmd_vel
+        # during planning to refresh the motion clock. Nano-nav dying mid-goal is
+        # still bounded (dead "navigating" ages out at 90 s; dead "planning" at 300).
+        nav_busy = lds_nav_busy(self._goal_status, now - self._goal_status_at)
         last_move = self._last_move_at
         # A map clear (POST /map/clear) explicitly asks for a FRESH map, which can
         # only build if scans flow — a parked lidar would leave slam stuck at no-map
@@ -1071,18 +1196,69 @@ class TelemetryHub:
         # normal quiet-park after ~lds_idle_secs (or real motion keeps it up).
         if now < self._lds_rebuild_until:
             last_move = now
-        rpm = lds_idle_target(
-            now, last_move,
-            float(self._lds_param("lds_idle_secs", LDS_IDLE_SECS_DEFAULT)),
-            bool(self._lds_param("lds_idle_enable", True)),
-            nav_busy,
-            now < self._lds_manual_until, self._lds_user_rpm)
+        idle_enable = bool(self._lds_param("lds_idle_enable", True))
+        idle_secs = float(self._lds_param("lds_idle_secs", LDS_IDLE_SECS_DEFAULT))
+        rpm = lds_idle_target(now, last_move, idle_secs, idle_enable, nav_busy,
+                              now < self._lds_manual_until, self._lds_user_rpm)
+        # Planning watchdog (Nav log): a plan unresolved past PLANNING_WARN_SECS
+        # almost always means slam's map→odom TF is stale — Nav2's Time(0)
+        # map→base_link lookups resolve to the frozen map→odom stamp and fail with
+        # "extrapolation into the past" forever until scans flow again. Warn
+        # (rate-limited) while it lasts instead of failing silently.
+        stuck = None
+        if (self._goal_status == "planning" and self._goal_status_since is not None
+                and now - self._goal_status_since > PLANNING_WARN_SECS):
+            stuck = now - self._goal_status_since
+            if now - self._navlog_warn_at > NAVLOG_WARN_PERIOD:
+                self._navlog_warn_at = now
+                map_age = ((now - self._map_arrival)
+                           if self._map_arrival != STALE else None)
+                if map_age is not None and map_age < MAP_AGE_FRESH:
+                    # /map IS arriving (scans flow, slam lives) but the goal still
+                    # hasn't reached EXECUTING — usually bt_navigator/lifecycle is
+                    # not accepting goals (nano-nav still activating after a
+                    # restart: "Managed nodes are active" never logged) or the
+                    # goal was dropped mid-restart. Re-click once the nav
+                    # container is up.
+                    self._navlog_add(
+                        f"planning stuck {int(stuck)}s but /map is fresh "
+                        f"({map_age:.0f}s) — the goal is not being processed; "
+                        "nano-nav may still be activating or was restarted "
+                        "(check journalctl -u nano-nav, then re-send the goal)",
+                        "warn")
+                else:
+                    self._navlog_add(
+                        f"planning stuck {int(stuck)}s — /map age "
+                        f"{'never arrived' if map_age is None else f'{map_age:.0f}s'}, "
+                        f"lidar {self._lds_sent} rpm: slam needs fresh scans for the "
+                        "map→odom TF (wake the lidar / check nano-slam)", "warn")
         if rpm is None or self._lds_hold:
             return
-        if rpm != self._lds_sent or (now - self._lds_sent_at) > LDS_REASSERT_SECS:
+        changed = rpm != self._lds_sent
+        if changed or (now - self._lds_sent_at) > LDS_REASSERT_SECS:
             self._pubs["/lds_target_rpm"][0].publish(Float32(data=rpm))
             self._lds_sent = rpm
             self._lds_sent_at = now
+            if changed:
+                self._navlog_add(
+                    f"lidar spin {'wake →' if rpm > 0 else 'park →'} {rpm:.0f} rpm "
+                    f"({self._lds_reason(nav_busy, idle_enable, idle_secs, last_move, now)})")
+
+    def _lds_reason(self, nav_busy, idle_enable, idle_secs, last_move, now):
+        """The Nav log's why for a wake/park transition (best-effort, never fatal)."""
+        if nav_busy:
+            return "nav " + self._goal_status
+        if now < self._lds_rebuild_until:
+            return "map rebuild window"
+        if not idle_enable:
+            return "idle spin-down disabled"
+        if last_move is not None and now - last_move < idle_secs:
+            return f"motion {now - last_move:.0f}s ago"
+        if self._goal_status == "planning":
+            return "planning trust window expired"
+        if last_move is None:
+            return "no motion since boot"
+        return f"idle >{idle_secs:.0f}s"
 
     def note_lds_manual(self, rpm, set_target=False):
         """Record a /lds_target_rpm published OUTSIDE the controller (browser slider
@@ -1178,12 +1354,19 @@ class TelemetryHub:
             self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
         return {"status": "ok", "topic": topic}
 
-    def note_goal(self, x, y):
+    def note_goal(self, x, y, source=""):
         """Record a goal published outside POST /publish (skill actions) so the
-        web map's goal ring + status chip stay in sync with those too."""
+        web map's goal ring + status chip stay in sync with those too. `source`
+        names the publisher in the Nav log ("skill go-to 'kitchen'")."""
         self._goal = [round(float(x), 3), round(float(y), 3)]
         self._goal_status = "planning"
-        self._goal_status_at = time.monotonic()
+        now = time.monotonic()
+        self._goal_status_at = now
+        self._goal_status_since = now
+        self._goal_published_at = now
+        via = f" via {source}" if source else ""
+        self._navlog_add(f"goal ({self._goal[0]:.2f}, {self._goal[1]:.2f}){via} — "
+                         "planning; lidar must spin for the planner's map→odom TF")
 
     @staticmethod
     def _mk_goal(v):

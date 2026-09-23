@@ -28,7 +28,8 @@ from geometry_msgs.msg import Twist
 
 from web_control.telemetry import (
     LDS_DEFAULT_RPM, LDS_IDLE_SECS_DEFAULT, LDS_MANUAL_SECS_DEFAULT,
-    TelemetryHub, lds_idle_target,
+    LDS_NAV_STALE, LDS_PLANNING_STALE,
+    TelemetryHub, lds_idle_target, lds_nav_busy,
 )
 
 
@@ -138,6 +139,39 @@ def test_pure_zero_active_target_stays_parked_when_active():
     assert lds_idle_target(1000.0, 990.0, 60.0, True, False, False, 0.0) == 0.0
 
 
+# ---- lds_nav_busy: the per-status trust windows (2026-09-23 deadlock fix) -----
+
+def test_nav_busy_fresh_navigating():
+    assert lds_nav_busy("navigating", 10.0) is True
+
+
+def test_nav_busy_navigating_ages_out_at_90s():
+    # nano-nav died mid-goal: the frozen "navigating" must not hold the lidar forever
+    assert lds_nav_busy("navigating", LDS_NAV_STALE - 1.0) is True
+    assert lds_nav_busy("navigating", LDS_NAV_STALE + 1.0) is False
+
+
+def test_nav_busy_planning_gets_the_long_window():
+    # THE 2026-09-23 DEADLOCK: planning needs fresh scans (map→odom TF) BEFORE the
+    # planner can compute a path, and there is no /cmd_vel during planning — a 90 s
+    # window parked the lidar out from under a slow planner, which then never got
+    # a fresh map→odom and retried "extrapolation into the past" forever.
+    assert lds_nav_busy("planning", LDS_NAV_STALE + 10.0) is True     # past the 90 s
+    assert lds_nav_busy("planning", LDS_PLANNING_STALE - 1.0) is True
+    assert lds_nav_busy("planning", LDS_PLANNING_STALE + 1.0) is False
+
+
+def test_nav_busy_canceling_uses_the_short_window():
+    assert lds_nav_busy("canceling", LDS_NAV_STALE - 1.0) is True
+    assert lds_nav_busy("canceling", LDS_NAV_STALE + 1.0) is False
+
+
+def test_nav_busy_non_busy_status_is_false():
+    assert lds_nav_busy("idle", 0.0) is False
+    assert lds_nav_busy("arrived", 0.0) is False
+    assert lds_nav_busy("failed", 0.0) is False
+
+
 # ---- the always-on subscriptions ----------------------------------------------
 
 def test_controller_subs_are_always_on():
@@ -215,6 +249,29 @@ def test_stale_nav_busy_does_not_hold_the_lidar():
     hub = _hub({"lds_idle_secs": 60.0})
     hub._goal_status = "navigating"
     hub._goal_status_at = time.monotonic() - 120.0    # beyond LDS_NAV_STALE
+    hub._lds_ctrl_tick()
+    pubs = hub._node.pubs["lds_target_rpm"].published
+    assert len(pubs) == 1 and pubs[0].data == 0.0
+
+
+def test_stale_planning_beyond_90s_still_holds_the_lidar():
+    # The deadlock fix: a goal clicked while the lidar was parked → planning for
+    # 120 s (lidar wake + slam's first map update can take that long) must STILL
+    # spin the lidar, or the planner never gets a fresh map→odom TF.
+    hub = _hub({"lds_idle_secs": 60.0})
+    hub._goal_status = "planning"
+    hub._goal_status_at = time.monotonic() - 120.0    # beyond LDS_NAV_STALE
+    hub._lds_ctrl_tick()
+    pubs = hub._node.pubs["lds_target_rpm"].published
+    assert len(pubs) == 1 and pubs[0].data == 300.0
+
+
+def test_stale_planning_beyond_300s_parks():
+    # But a plan stuck for the full planning window is genuinely dead nav/slam —
+    # park (bounded cost) instead of spinning forever.
+    hub = _hub({"lds_idle_secs": 60.0})
+    hub._goal_status = "planning"
+    hub._goal_status_at = time.monotonic() - (300.0 + 5.0)
     hub._lds_ctrl_tick()
     pubs = hub._node.pubs["lds_target_rpm"].published
     assert len(pubs) == 1 and pubs[0].data == 0.0

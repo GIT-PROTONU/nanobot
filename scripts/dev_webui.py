@@ -222,10 +222,13 @@ class DevState:
         # Canned-move speed sliders (GET/POST /move/config) — a dev-session dict (no
         # persistence; there are no motors here, the page just needs a live round-trip).
         self.move_cfg = {"move_lin_speed": 0.12, "move_ang_speed": 0.5}
-        # Nav2 speed/accel sliders (GET/POST /nav/config) — same dev-session dict
-        # treatment (the real velocity_smoother lives on the robot's nano-nav).
+        # Nav2 speed/accel + zone sliders (GET/POST /nav/config) — same dev-session dict
+        # treatment (the real velocity_smoother + costmaps live on the robot's
+        # nano-nav). Defaults mirror web_server's; the zone keys drive the map's
+        # keep-away bubble + robot circle in the dev session too.
         self.nav_cfg = {"nav_lin_speed": 0.18, "nav_ang_speed": 0.8,
-                        "nav_lin_accel": 0.5, "nav_ang_accel": 1.6}
+                        "nav_lin_accel": 0.5, "nav_ang_accel": 1.6,
+                        "nav_inflation_m": 0.25, "nav_robot_diam_m": 0.32}
         # Synthetic-sensor source: random (jittering, default) or manual (frozen, user-set). Loaded
         # from the persisted dev-state so a chosen manual reading survives restarts. See _sensor_values.
         self._sensors_lock = threading.Lock()
@@ -1078,11 +1081,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     pass
             return self._json({"status": "ok", "dev": True, **self.state.move_cfg})
         if p == "/nav/config":
-            # Nav2 pace sliders: accept + remember for this dev session (no
-            # velocity_smoother here; the page just needs the round-trip).
+            # Nav2 pace + zone sliders: accept + remember for this dev session
+            # (no velocity_smoother/costmaps here; the page just needs the
+            # round-trip).
             d = self._body()
             for k in ("nav_lin_speed", "nav_ang_speed", "nav_lin_accel",
-                      "nav_ang_accel"):
+                      "nav_ang_accel", "nav_inflation_m", "nav_robot_diam_m"):
                 try:
                     self.state.nav_cfg[k] = float(d[k])
                 except (KeyError, TypeError, ValueError):

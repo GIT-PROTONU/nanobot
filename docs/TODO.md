@@ -757,8 +757,6 @@ in this checkout.
   rmw_zenoh round-trip (`DiagnosticStatus.level` arrives as `bytes`; normalize at
   ingest in `telemetry._on_diag`).
 - ESP32 diff-drive limits stay synced to `robot.yaml`.
-- `NAV_INFLATION_M` in `telemetry.py` must mirror `inflation_radius` in
-  `config/nav2/nav2_params.yaml` (it is NOT read live).
 
 ## Resolved / retired (kept for the trail)
 
