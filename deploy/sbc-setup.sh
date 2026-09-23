@@ -148,6 +148,16 @@ systemctl enable nano-robot.target nano-router.service nano-app.service \
                  nano-sensors.service nano-nav.service nano-tf.service nano-slam.service \
                  nano-nav-loader.service nano-stall-trap.service
 
+echo "== 6b/6  disk-lean timer: daily rattler/pip cache cleanup =="
+# The pixi/rattler download cache regrows on every pixi resolve and once hit
+# 3.7 G (91% of the rootfs). A daily user-level cleanup (zero sudo, live env
+# untouched) keeps the rootfs lean. Deliberately NOT part of nano-robot.target
+# and enabled against timers.target, so it runs whether or not the stack is up.
+for unit in nano-disk-cleanup.service nano-disk-cleanup.timer; do
+  install -m 0644 "$HERE/systemd/$unit" "/etc/systemd/system/$unit"
+done
+systemctl enable --now nano-disk-cleanup.timer
+
 echo
 echo "Done. The stack auto-starts on boot; a crashed unit restarts itself (Restart=on-failure)."
 echo "Build first (pixi install/build), then:"

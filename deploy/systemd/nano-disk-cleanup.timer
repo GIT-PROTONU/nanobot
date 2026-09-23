@@ -1,0 +1,12 @@
+[Unit]
+Description=Nano disk-lean cleanup (daily)
+[Timer]
+# Daily in the small hours. Persistent=true: a board off at trigger time runs
+# the cleanup on the next boot (the "lean no matter what happens" guarantee).
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+AccuracySec=1h
+RandomizedDelaySec=30min
+Unit=nano-disk-cleanup.service
+[Install]
+WantedBy=timers.target

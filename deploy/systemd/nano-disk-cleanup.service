@@ -1,0 +1,14 @@
+[Unit]
+Description=Nano disk-lean cleanup (rattler/pip caches -> keep the 7G rootfs lean)
+# The pixi/rattler download cache regrows on every pixi resolve and once hit
+# 3.7 G (91% of the rootfs). This clears the regenerable user-owned caches —
+# zero sudo, the live ROS env is untouched. Scheduled by nano-disk-cleanup.timer;
+# deliberately NOT part of nano-robot.target (runs whether or not the stack is up).
+# See scripts/disk_cleanup.sh for the full rationale.
+[Service]
+Type=oneshot
+User=ibster
+ExecStart=/home/ibster/Nano/scripts/disk_cleanup.sh
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=50M

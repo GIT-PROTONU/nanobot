@@ -97,6 +97,21 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   stack.sh's start/stop/restart go through scoped NOPASSWD sudoers rules it installs
   (deploy/sudoers).
 
+- **Disk-lean timer (2026-09-23):** the pixi/rattler download cache
+  (`~/.cache/rattler/cache`) regrows on every `pixi install`/resolve and once hit
+  **3.7 G = 91% of the 7 GB rootfs** (755 stale package dirs from past resolves —
+  the live env at `~/Nano/.pixi/envs/default` keeps its own copies, so clearing it
+  is regenerable-by-definition; a manual run freed 605 MB → 82%). A daily
+  **`nano-disk-cleanup.timer`** (`deploy/systemd/`, new sbc-setup step **6b**)
+  runs **`scripts/disk_cleanup.sh`** at ~03:20 + `Persistent=true` (catches up after
+  downtime), `Nice=15`/`IOSchedulingClass=idle`/`MemoryMax=50M`. Zero sudo, entirely
+  user-owned regenerable caches (rattler pkgs/repodata/mapping/uv + pip) — safe
+  mid-drive, the running stack never touches those dirs. Deliberately NOT part of
+  `nano-robot.target` (runs whether or not the stack is up; enabled against
+  `timers.target`). Logs freed-MB to `journalctl -u nano-disk-cleanup`. NOT touched:
+  the live env, `build/`, `install/`, `brain/`, `~/.local/state/nanobot` (the soul),
+  `/var`/`/usr`. Already installed + armed on the live board (2026-09-23).
+
 - Dev PC offline testing: `scripts/dev_webui.py` serves the real web UI + cognition (no ROS).
 
 ## Tests
