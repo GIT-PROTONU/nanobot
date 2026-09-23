@@ -363,8 +363,9 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   app_hub's main also preserves the OLED SIGTERM end-screen (restart/shutdown glyph).
   It also registers an in-process **SIGUSR1 faulthandler** (`_install_stackdump`,
   2026-09-21): `kill -USR1 <pid>` dumps EVERY thread's stack to stderr → journald,
-  no ptrace/root needed — the executor-stall diagnosis (`/tmp/stall_trap.sh` signals
-  it; read `journalctl -u nano-app`). Verified live 2026-09-21. **The OLED's panel
+  no ptrace/root needed — the executor-stall diagnosis (the persistent
+  `nano-stall-trap.service` → `scripts/stall_trap.sh` signals it on a ≥5 s D-state;
+  read `journalctl -u nano-app`). Verified live 2026-09-21. **The OLED's panel
   I2C runs on a dedicated worker thread** (`oled_display` bounded drop-oldest render
   queue, 2026-09-22): the executor side only submits, so a wedged I2C bus (the
   `mv64xxx` ≥5 s D-state that froze every executor callback under load, found live
@@ -382,10 +383,15 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   see below), `/motor_pid` (Float32MultiArray `[kp,ki,kd]` — LIVE wheel-PID gains, see
   the closed-loop note below; **the web Coprocessor card's PID sliders drive it**, so
    tuning needs no reflash). **All subscriptions live in ONE table** (`SUBS` in
-   main.cpp) and are **periodically undeclared + re-declared** (45 s, `SUB_REDECLARE_MS`)
-   — the only known healing path for a router restart that wipes zenohd's remote-sub
-   table while the session keeps flowing (the 2026-09-20 `/cmd_vel`-deaf bug; built
-   2026-09-21, flashed + deployed same day — see the gotcha below). **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
+   main.cpp), declared once at boot. The 45 s periodic undeclare+re-declare
+   (`SUB_REDECLARE_MS`) built for the 2026-09-20 `/cmd_vel`-deaf bug is **DISABLED
+   (`0` — compiled out; `subsRedeclare()` kept for manual reuse)**: it failed its
+   2026-09-21 pm verify (the burst re-declared every 45 s over a half-dead session
+   without reviving delivery) and load-correlated ESP drops kept landing ON redeclare
+   moments. The reliable heal is a `nano-robot.target` bounce (the ESP's ping-watchdog
+   reboots it → fresh session both ends); `/esp32_reset` (@1 Hz, `esp_reset_reason()`)
+   triages any drop remotely. Reproduction/diagnosis: `scripts/cmd_vel_deaf_test.py`
+   — see the gotcha below. **The fan is parked (0 duty) whenever the SBC link isn't alive** — boot race,
   a dropped link, or the SBC genuinely powered off — same `linkAlive()`-gated treatment as
   the LDS spin-motor park below; there's no SBC heat to move if the SBC isn't running, and
   it resumes the instant `sys_monitor` reconnects (2026-07-15 fix — it used to hold its last
@@ -535,9 +541,10 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   anymore — the dead-man still cuts on command loss; DRV8871 `nFAULT` wiring remains
   the proper hardware fix), and manual-driving feel on this robot also depends on the
   web gateway's intermittent 1-9 s POST stalls (dead-man cuts mid-drive → stop →
-  lurch on recovery) — a /proc-based stall trap runs on the board, and since 2026-09-21
-  an in-process SIGUSR1 faulthandler dumps every app_hub thread's stack (see
-  docs/TODO.md);
+  lurch on recovery) — the /proc-based stall trap is now a PERSISTENT unit
+  (`nano-stall-trap.service` → `scripts/stall_trap.sh`, 5 s D-state → /proc snapshot
+  + SIGUSR1), and since 2026-09-21 an in-process SIGUSR1 faulthandler dumps every
+  app_hub thread's stack (see docs/TODO.md);
   the keepalive half of that problem is fixed (see the HTTP teleop note below).
   **2026-09-21 smoothness pass II (FLASHED + VERIFIED 2026-09-21 pm)** — two more
   structural changes in the PID block, plus a tuning-harness `outback` mode:

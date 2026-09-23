@@ -1,0 +1,23 @@
+[Unit]
+Description=Nano app_hub executor-stall trap (D-state watch -> /proc snapshot + SIGUSR1 stackdump)
+# Diagnostic tooling for the app_hub POST-stall family (docs/TODO.md): when any
+# app_hub thread wedges in uninterruptible D-state, snapshot every thread's
+# wchan and signal USR1 (app_hub's faulthandler dumps all stacks to journald).
+# Caught the OLED I2C mv64xxx D-state on the shared executor (fixed 2026-09-22).
+After=nano-app.service
+PartOf=nano-robot.target
+
+[Service]
+Type=simple
+User=ibster
+# The trap self-exits every 30 min and Restart=always rolls a fresh window —
+# a persistent version of the hand-run /tmp/stall_trap.sh that never survived
+# a reboot. Idle cost ~1 Hz of /proc reads.
+ExecStart=/home/ibster/Nano/scripts/stall_trap.sh
+Restart=always
+RestartSec=2
+Nice=15
+MemoryMax=50M
+
+[Install]
+WantedBy=nano-robot.target

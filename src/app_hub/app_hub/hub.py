@@ -81,8 +81,9 @@ def _disable_default_qos_event_callbacks():
 def _install_stackdump():
     """`kill -USR1 <pid>` dumps every thread's stack to stderr (-> journald) WITHOUT
     ptrace/root — the in-process half of the 2026-09-20 POST-stall diagnosis (the
-    board's /tmp/stall_trap.sh snapshots thread states via /proc on a stall; for the
-    actual stack frames it now just signals USR1 and reads journalctl -u nano-app).
+    persistent nano-stall-trap.service -> scripts/stall_trap.sh snapshots thread
+    states via /proc on a stall; for the actual stack frames it just signals USR1
+    and reads journalctl -u nano-app).
     Never fires on its own — SIGUSR1 is otherwise unused by this process."""
     try:
         import faulthandler

@@ -321,6 +321,48 @@ in this checkout.
       vs zenoh-pico's re-attach path; compare a router-restart vs ESP32-reboot
       declare table. The old "ESP32 wedged after stack restart" gotcha and this are
       likely the same root cause.
+      - **2026-09-23: the CONTROLLED TEST TOOLING IS BUILT — needs a robot run.**
+        `scripts/cmd_vel_deaf_test.py` (stdlib-only, pure HTTP to the gateway —
+        no ros2 CLI, so the fastrtps/RMW_IMPLEMENTATION gotcha can't bite):
+        per iteration it (1) `--restart-router` restarts ONLY nano-router.service
+        (the repro trigger — a full target bounce is also the HEAL, so it can't
+        reproduce; needs the NEW scoped sudoers rule
+        `/usr/bin/systemctl restart nano-router.service`, added to
+        `deploy/sudoers/nano-power` — reinstall it on the board: `install -m 0440
+        deploy/sudoers/nano-power /etc/sudoers.d/nano-power` or re-run
+        sbc-setup.sh), waits for :7447 + a fresh ESP heartbeat; (2) runs the
+        motion-free /motor_params dither-poke RX probe (readback flip +
+        restore — parked dither is never applied, moves nothing); (3) runs THE
+        test — a 0.05 m/s /drive pulse at ~3 Hz (the serial budget) scored by
+        the /wheel_ticks delta: flat = DEAF; (4) if deaf, heals with the
+        verified target bounce and re-probes. Exit codes 0/1/2/3 =
+        alive / deaf-then-healed / deaf-still / env error; `--repeat N`
+        restarts the router N times to characterize the intermittency;
+        `--selftest` pins the verdict logic offline. NEXT: run it on the robot
+        (wheels free, ~1 m clear) — the result decides the real fix (the
+        pause-pings auto-heal and the bidirectional-echo heartbeat remain the
+        held-in-reserve candidates).
+      - **2026-09-23: FIRST CONTROLLED RUN — 0/5 reproduction (bug may be gone,
+        possibly as a side effect of the 2026-09-22 client-mode migration).**
+        On the live robot via the script: 3× router-only restarts + 2× FULL
+        target bounces (the production deploy trigger) — **/cmd_vel DELIVERED
+        5/5** (tick deltas L+70..+100 / R+63..+94 ≈ the expected ~8 cm pulse),
+        the motion-free /motor_params RX probe flipped + restored 5/5, zero
+        deaf windows. Re-attach after a router restart takes a NORMAL ~40-60 s
+        (RX watchdog 8 s → ESP self-reboot → up to the 40 s connect deadline —
+        do not mistake this latency for the bug); a full target bounce takes
+        2-4+ min (nav's stop/start), and the script's 240 s sudo timeout
+        handled a >4 min bounce correctly. Gains/params survived 5 ESP reboots
+        un-drifted (wheel_pid [5,60,0], all wheel_params ids verified-clean —
+        no 5th NVS-drift occurrence). HYPOTHESIS worth testing on the next few
+        deploys: the 2026-09-20 deaf observations PREDATE the 2026-09-22
+        client-mode migration (`unit_exec.sh` — SBC nodes were zenoh PEERs
+        then, now CLIENTs of the router like the ESP32); the client path may
+        have incidentally fixed the declare race. NEXT: run
+        `python3 ~/Nano/scripts/cmd_vel_deaf_test.py --restart-target` after a
+        few more real deploys; several clean runs in the wild → close this
+        item as fixed-by-side-effect (the pause-pings / heartbeat fixes stay
+        retired unless it recurs).
       - **2026-09-22: the HEAL is verified end-to-end (motion-free form)** — full
         `sudo -n systemctl restart nano-robot.target` → all units active, `esp32 UP
         1s after start`, and SBC→ESP RX proven on BOTH sides of the bounce via the
@@ -409,8 +451,15 @@ in this checkout.
         occurrence): check `f.esp.wheel_pid` == [5,60,0] FIRST in every session.**
 - [ ] **Diagnose the web gateway's intermittent 1-9 s POST stalls** (they chop the
       10 Hz /drive stream → dead-man cut mid-drive → stop → lurch on recovery —
-      manual-driving feel depends on this as much as the firmware): 2026-09-20
-      evidence — two `POST /drive` clients timed out on connect while TTS was
+      manual-driving feel depends on this as much as the firmware).
+      **2026-09-23 STATUS: the ROOT CAUSE (OLED I2C D-state on the shared
+      executor) is FIXED + live-verified, and the combined-load repro is CLEAN
+      — the open residual is ONLY the unexplained ~12:57 tick-advance episode
+      (re-probe now backed by `scripts/frame_record.py`, see the 2026-09-22
+      bullet below) and confirming it stays clean across future sessions
+      (the persistent `scripts/stall_trap.sh` keeps collecting evidence
+      automatically).** Original 2026-09-20 evidence — two `POST /drive`
+      clients timed out on connect while TTS was
       speaking (espeak-ng running), and one processed 2.2 s late; board load
       reached 3.95/4 cores. A /proc-based stall trap (`/tmp/stall_trap.sh` on the
       board, 15 min windows, snapshots every app_hub thread's wchan/state on a >600 ms stall → `/tmp/stall_*.txt`) was deployed 2026-09-20 ~11:22 — review
@@ -458,16 +507,30 @@ in this checkout.
         commanded) on 2 of 4 legs pre-scan-fix and on ~2 of 4 legs in the run right
         after the 2026-09-22 deploy (the deploy's own post-restart settling made 4/4,
         clearing on re-run), so the /scan.bin poll fix reduced but did not eliminate
-        them. NOTE the /proc stall trap (`/tmp/stall_trap.sh`) does NOT survive a
-        reboot — it was gone when checked this day (re-run with nohup per the note
-        above before the next repro attempt). Same session, the tuning instrument
+        them. **2026-09-23: the stall trap is now PERSISTENT — checked in as
+        `scripts/stall_trap.sh` + `deploy/systemd/nano-stall-trap.service`
+        (Restart=always under `nano-robot.target`, installed by sbc-setup.sh):
+        the 30-min self-exit re-rolls a fresh window and the unit survives
+        reboots, superseding the hand-run `/tmp/stall_trap.sh` (5 s D-state
+        threshold, snapshots every app_hub thread's state/wchan →
+        `/tmp/stall_*.txt`, signals USR1 for the faulthandler dump — same
+        behavior, now self-recovering).** Same session, the tuning instrument
         itself was fixed: see the AGENTS.md ESP32-PID gotcha — after a stall the
         backlogged SSE frames burst in and parse-time dt collapses, inflating
         pid_tune speeds ~6-10× (phantom HUNT / spin-overspeed verdicts); the frame
         now carries a build stamp `"t"` and pid_tune scores against it. One
         unexplained episode (~12:57): spin legs read sustained ~10× tick advance with
         correct 5/60/0 gains, no heartbeat reset, no recurrence in 12 recorded legs —
-        re-probe with a passive frame recorder alongside the outback if it repeats.
+        **2026-09-23: the re-probe tool exists now — `scripts/frame_record.py`,
+        a PASSIVE telemetry-frame recorder (stdlib-only, GET /telemetry only):
+        run it alongside the outback (`pixi run` env or plain python3), then
+        `--report <file>` scores per-wheel speed from the frames' BUILD stamps
+        (BURST_MIN_DT-floored like pid_tune), lists speed spikes >0.5 m/s per
+        wheel, and reports the parse-gap/burst signature — a phantom spike
+        present in the RECORDING means the frames really carried the bad ticks
+        (plant/ESP side); absent recording + inflated pid_tune numbers means
+        reader-side batching (delivery side). `--selftest` pins the math
+        offline.**
       - **2026-09-22: COMBINED-LOAD REPRO CLEAN + the executor-slip ROOT CAUSE
         EVIDENCE CAPTURED.** Recreated the trap (5 s threshold, 30 min self-exit) and
         ran stress (90 s all-core) + live GPU-vision + 2 TTS lines while timing
