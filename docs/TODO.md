@@ -325,8 +325,11 @@ in this checkout.
       (The original five-check list for this item now lives merged with today's
       results in the "Verify the 2026-09-21 wheel-PID smoothness pass" item near
       the top of this section.)
-- [ ] **OPEN BUG: /cmd_vel delivery to the ESP32 dies after a router/stack restart —
-      Twist-specific, other topics keep flowing.** After `deploy.sh`/`stack.sh`
+- [x] **OPEN BUG (CLOSED 2026-09-23 as fixed-by-side-effect): /cmd_vel delivery to
+      the ESP32 dies after a router/stack restart — Twist-specific, other topics
+      keep flowing.** Has NOT reproduced since the 2026-09-22 client-mode migration:
+      4 full target bounces + 3 router-only restarts, ZERO deaf windows (see the
+      last sub-bullet). Historical record: after `deploy.sh`/`stack.sh`
       restarts the zenoh router, the coprocessor's session re-attaches (heartbeat,
       /wheel_ticks, /lds_* all flow) and SOME subscriptions still deliver
       (/motor_pid write → /wheel_pid readback flips instantly), but /cmd_vel
@@ -437,6 +440,21 @@ in this checkout.
         (expected physics). NOTE: at this deadband the slowest nonzero command ≈0.28
         m/s physical (the [0.70..1] remap) — there is no true slow crawl; the
         closed-loop PID above replaces the remap and re-opens the slow range.
+      - **2026-09-23 (second controlled run, later the same day): 2/2 DELIVERED
+        after two more FULL target bounces (`cmd_vel_deaf_test.py --restart-target
+        --repeat 2`)** — drive-pulse tick deltas L+103/R+103 and L+105/R+103 (the
+        expected ~8 cm pulses), the motion-free /motor_params RX probe flipped +
+        restored on both bounces, ~2 min re-attach per bounce (normal), gains/
+        params un-drifted across both ESP watchdog reboots (`pid_tune.py state`
+        preflight clean: [5,60,0], all wheel_params ids verified-clean). Cumulative
+        since the 2026-09-22 client-mode migration: **4 full target bounces + 3
+        router-only restarts, ZERO deaf windows. CLOSED — the client-mode migration
+        is the only correlate (SBC nodes are zenoh CLIENTs of the router now, like
+        the ESP32, so every declaration routes through the router and the peer-declare
+        race can no longer strand /cmd_vel).** If a deaf window ever recurs: re-run
+        `scripts/cmd_vel_deaf_test.py` first (it discriminates in ~10 min, one
+        pulse + motion-free probe); the pause-pings auto-heal and the
+        bidirectional-echo heartbeat stay retired unless it recurs.
 - [x] **Post-flash ESP32 verification** (firmware FLASHED 2026-09-20 on the dev PC —
       `/wheel_stray_ticks` + `/reset_ticks` (built 2026-07-15), the 2026-09-17
       `TRIM_AUTOCAL 1` re-enable, and the 2026-09-19 low-duty breakaway kick;
@@ -468,9 +486,14 @@ in this checkout.
         0.102, maxlin 0.4, maxang 1.0, slew 1.5, dither 0, vhyst 0.15, stray [0,0].
         Robot parked → NVS persists rate-limited. **STANDING RULE (4th drift
         occurrence): check `f.esp.wheel_pid` == [5,60,0] FIRST in every session.**
-- [ ] **Diagnose the web gateway's intermittent 1-9 s POST stalls** (they chop the
-      10 Hz /drive stream → dead-man cut mid-drive → stop → lurch on recovery —
-      manual-driving feel depends on this as much as the firmware).
+- [x] **Diagnose the web gateway's intermittent 1-9 s POST stalls** (they chopped the
+      10 Hz /drive stream → dead-man cut mid-drive → stop → lurch on recovery) —
+      **CLOSED 2026-09-23.** Root cause = the OLED I2C D-state blocking the shared
+      executor (fixed + live-verified 2026-09-22, see below); HTTP path clean under
+      combined load; the persistent `scripts/stall_trap.sh` keeps collecting evidence
+      automatically. The LAST residual — the unexplained ~12:57 tick-advance episode —
+      was re-probed 2026-09-23 under `frame_record.py` and is **PLANT-SIDE, not the
+      gateway** (L-encoder phantom ticks while commanded → its own open item below).
       **2026-09-23 STATUS: the ROOT CAUSE (OLED I2C D-state on the shared
       executor) is FIXED + live-verified, and the combined-load repro is CLEAN
       — the open residual is ONLY the unexplained ~12:57 tick-advance episode
@@ -584,6 +607,49 @@ in this checkout.
         7 episodes of ≥5 s D-state in `mv64xxx_i2c_wait_for_completion`); POSTs
         median 40 / max 92 ms. Dumps: /tmp/stall_17*.txt on the board (trap expires
         ~17:4x + 30 min; re-run `nohup /tmp/stall_trap.sh` for more).
+      - **2026-09-23: the last residual is RESOLVED — the ~12:57 tick-advance
+        episode REPRODUCED under the recorder and is PLANT-SIDE (L-encoder phantom
+        ticks), NOT the gateway.** Ran `scripts/frame_record.py` (board-side,
+        loopback SSE, `--secs 300`) alongside `pid_tune.py outback --v 0.12
+        --secs 5 --spin 0.8 --reps 4`: pid_tune showed sustained inflated means
+        (fwd legs 0.228-0.238 m/s vs 0.12 commanded; spin legs 0.187-0.190 vs
+        0.041, p2p 0.016-0.026 = sustained, NOT the post-stall burst artifact —
+        build-stamp scoring was already in place), and the BOARD-side recording
+        carries the same numbers, so the frames really carried the bad ticks (the
+        decision rule this tool was built for). Shape: **one-sided L-channel races
+        while commanded** — 135/1499 intervals one-sided (fast side 0.21-0.51 m/s
+        ≈ the full-duty ceiling, the other wheel ~0 or tracking normally), 80
+        spin-phase intervals >3× commanded; clean example: L raced -411 ticks/s
+        (-0.34 m/s = 8.4× its ±0.041 spin command) for 3+ s while R tracked its
+        own command at 60-80% (normal spin band) and heartbeat stayed monotonic
+        (no ESP reset — the counters themselves raced). **Idle periods are
+        perfectly clean** (1087 still intervals, mean 0.000, max 0.013) → the
+        noise is gated by motor DRIVE, not ambient. PID-stability argument rules
+        out real motion: a wheel genuinely at 0.34 m/s under a 0.041 target would
+        be braked by kp within one tick — a SUSTAINED race can only be
+        counter-side ticks, not rotation. Exonerated: the web gateway/telemetry
+        frame, the WiFi path (board-local recording shows it), the pid_tune
+        instrument (build-stamp scoring already deployed 2026-09-22), the
+        deaf-test family (different topic). The stray-tick diagnostic only counts
+        post-settle ticks, so commanded-period noise is its blind spot → spun
+        out into its own open item below.
+- [ ] **NEW 2026-09-23: L-encoder phantom ticks while the motor is DRIVEN (PWM/ground
+      noise coupling into the L encoder ISR, GPIO 19) — inflates `/wheel_ticks`,
+      `/odom` and every tick-scored tuning verdict.** Found while closing the
+      POST-stall item (full evidence trail in its 2026-09-23 bullet). Same family
+      as the documented stray-tick noise — and plausibly the lunge item's open
+      "noise SOURCE" lead (fan/LDS/drive PWM coupling) — but active DURING
+      commanded motion, where the stray counter is blind (idle is clean). Candidates,
+      in order: (1) firmware ISR dead-time debounce (~200-500 µs — a real tick is
+      ≥1.8 ms apart even at the no-load ceiling, so no false rejects at real rates);
+      (2) firmware excess-rate guard while commanded — extend the stray-tick
+      diagnostic to count ISR ticks arriving faster than ~2.5× the commanded wheel
+      rate as strays instead of motion (surfaces the rate in the web card);
+      (3) hardware: twist/shield the encoder leads away from the motor leads or a
+      small RC on the encoder input (the esp32-hardware-fried-ground-fix family).
+      NOTE: any pid_tune legs collected during a burst are garbage (today's HUNT
+      verdicts on fwd/spin legs) — after the fix, re-run the outback with
+      `frame_record.py` alongside to re-baseline the bands.
 - [ ] **Hardware-verify the 2026-07-13 GPU-vision batch** (code-complete +
       unit/smoke/GL-tested on the dev PC only): named colour targets
       (`vision_targets.json` persist/select/delete), novelty score, camera-freeze

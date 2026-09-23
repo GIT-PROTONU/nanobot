@@ -457,7 +457,11 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   it (red if nonzero) with a **🔁 Reset ticks** button (`/reset_ticks` Bool) that zeros
   both `/wheel_ticks` and `/wheel_stray_ticks` on the ESP32; `wheel_odometry` also watches
   `/reset_ticks` and re-seeds its prev-tick baseline (`_have_ticks=False`) so `/odom`
-  doesn't see a fake huge jump when the raw counters reset.
+  doesn't see a fake huge jump when the raw counters reset. **2026-09-23: the counter has
+  a BLIND SPOT — phantom ticks also occur DURING commanded motion** (measured live: the
+  L channel raced up to 8.4× its command in sustained bursts gated by motor DRIVE, idle
+  perfectly clean — PWM/ground coupling into the encoder ISR; see docs/TODO.md for the
+  `frame_record.py` evidence and the debounce/excess-rate-guard candidates).
 - **Straight-line trim (open-loop rebalance)**: the mismatched gearmotors are rebalanced
   by a single trim factor in `applyMotors` (`l*=(1-t)`, `r*=(1+t)`; **negative = robot was
   pulling left** — boost left / cut right — because the robot currently veers LEFT).
@@ -513,7 +517,12 @@ Navigation/SLAM are stock C++ (not packages here): **Nav2 Humble servers** in on
   scores against it (parse-dt floored at `BURST_MIN_DT` 0.15 s for stampless
   gateways). Corollary: a run's verdicts are only trustworthy when its frame gaps
   stayed small — a deadman/stall in the same run can also mean the numbers are burst
-  garbage; re-run before concluding anything about gains.** (Same session's real
+  garbage; re-run before concluding anything about gains. **SECOND phantom mechanism
+  (2026-09-23): encoder-noise bursts DURING commanded motion inflate legs for real**
+  (the L channel raced to 8.4× its command, sustained — idle clean, see the stray-tick
+  bullet + docs/TODO.md), so a bad leg is either instrument burst OR plant noise:
+  run `frame_record.py` alongside any decisive tuning session and check the recording
+  before trusting HUNT/SAG verdicts.** (Same session's real
   findings: the live NVS had drifted to KP 0.7/KI 19.4/KFF 5.95 — the user's
   feedforward-only experiments, third drift occurrence — and restoring 5/60/0 +
   slew 1.5 + vhyst 0.15 + KFF auto re-verified clean: crawl p2p 0.005-0.029, mid
