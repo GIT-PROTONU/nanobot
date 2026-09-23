@@ -15,6 +15,17 @@ in this checkout.
 
 ## Open — needs the physical robot
 
+- [ ] **2026-09-23: zeroed recovery motions — verify a failed goal does NO backup/spin.**
+      User decision: the per-goal no-recovery-BT web toggle was reverted (git 0db497f +
+      00a1308 → reverts 2ab34ec + 66fc328) and `recovery_bt.xml`'s BackUp/Spin were
+      set to `backup_dist="0"` / `spin_dist="0"` instead — the recovery branch still
+      clears both costmaps and retries Navigate ONCE, but the robot never physically
+      backs up or spins (Humble's DriveOnHeading/Spin succeed the first tick at zero).
+      Deployed 2026-09-23. Verify by hand: click a goal that cannot complete (into a
+      known obstacle) → the goal must FAIL with no robot motion; `journalctl -u
+      nano-nav | grep -a "behavior_server"` shows BackUp/Spin accepting+finishing
+      instantly. To restore real recovery motion: put values back in recovery_bt.xml
+      + `deploy.sh robot_bringup` (tree loads at bt_navigator activation only).
 - [x] **2026-09-23: Nav2 velocity_smoother — nav speed/accel live-tunable. DEPLOYED +
       LIVE-VERIFIED on the board (closed same day).** Drive tab's "Navigation pace"
       card (4 sliders → GET/POST /nav/config, persisted to nav.json) live-tunes the

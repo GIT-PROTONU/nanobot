@@ -5,12 +5,20 @@
 
   Semantics (verified against Humble recovery_node.cpp): run Navigate; on
   FAILURE run the Recovery sequence ONCE (clear local + global costmaps, back
-  up 0.15 m, spin 90 deg), then retry Navigate; on a second failure abort.
+  up, spin), then retry Navigate; on a second failure abort.
 
   The ClearEntireCostmap service_name values MUST match the costmap node
   namespaces ("local_costmap/clear_entirely_local_costmap" /
   "global_costmap/clear_entirely_global_costmap"). BackUp/Spin actions are
   served by behavior_server's spin/backup plugins (nav2_params.yaml).
+
+  User decision 2026-09-23: the recovery MOTIONS are zeroed (backup_dist 0,
+  spin_dist 0) — a failed goal still clears the costmaps and retries ONCE,
+  but the robot never physically backs up or spins (both behaviors complete
+  immediately at zero distance/yaw; a web Recovery toggle that swapped BTs
+  per goal was tried and reverted the same day). Restore motion by giving
+  backup_dist/spin_dist real values here + restarting nano-nav (the tree
+  loads at activation only).
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
@@ -22,8 +30,8 @@
       <Sequence name="Recovery">
         <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
         <ClearEntireCostmap name="ClearGlobal" service_name="global_costmap/clear_entirely_global_costmap"/>
-        <BackUp backup_dist="0.15" backup_speed="0.1"/>
-        <Spin spin_dist="1.57"/>
+        <BackUp backup_dist="0" backup_speed="0.1"/>
+        <Spin spin_dist="0"/>
       </Sequence>
     </RecoveryNode>
   </BehaviorTree>
