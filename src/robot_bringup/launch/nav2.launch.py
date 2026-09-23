@@ -32,7 +32,11 @@ Lifecycle split (verified against nav2 1.1.x):
     physical drive direction.
   * default_nav_to_pose_bt_xml is the Humble param key (the older
     default_bt_xml_filename is silently ignored) and gets the ABSOLUTE path of
-    config/nav2/recovery_bt.xml.
+    config/nav2/recovery_bt.xml. The no-recovery variant
+    (config/nav2/no_recovery_bt.xml) is NOT injected here: web_control sends
+    it per goal via the NavigateToPose action's behavior_tree field when the
+    web Recovery switch is off (Humble reads default_nav_to_pose_bt_xml once
+    at configure, so the goal field is the only live lever).
   * velocity_smoother (2026-09-23) caps Nav2's speed + linear/angular
     accel/decel between the controller and /cmd_vel — the LINEAR accel limit
     RPP Humble lacks. Its params are dynamically reconfigurable, so

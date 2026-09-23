@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<!--
+  The NO-recovery variant of recovery_bt.xml: the identical plan+follow
+  pipeline but WITHOUT the RecoveryNode wrapper — a failed ComputePathToPose
+  or FollowPath aborts the goal immediately, with no clear-costmaps /
+  back-up / spin motion at all.
+
+  Selected PER GOAL by web_control (the Map view's "Recovery" switch): when
+  recovery motions are OFF, goals go out as NavigateToPose ACTION goals with
+  behavior_tree pointing at this file — Humble's bt_navigator loads the
+  goal's behavior_tree field on every new goal, while the
+  default_nav_to_pose_bt_xml param is read ONCE at configure (a runtime
+  SetParameters push would be silently ignored; verified against the Humble
+  sources). Every BT node used here is already in bt_navigator's
+  plugin_lib_names (nav2_params.yaml). Deploy note: this file is installed by
+  robot_bringup's setup.py glob — a colcon rebuild ships it.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="Navigate">
+      <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+      <FollowPath path="{path}" controller_id="FollowPath"/>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

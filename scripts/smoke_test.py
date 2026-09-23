@@ -208,10 +208,11 @@ def main():
             nav = json.loads(body)
         except Exception:
             nav = {}
-        check("nav/config GET has the six keys",
+        check("nav/config GET has the six keys + nav_recovery",
               st == 200 and all(k in nav for k in (
                   "nav_lin_speed", "nav_ang_speed", "nav_lin_accel",
-                  "nav_ang_accel", "nav_inflation_m", "nav_robot_diam_m")),
+                  "nav_ang_accel", "nav_inflation_m", "nav_robot_diam_m",
+                  "nav_recovery")),
               body[:80])
         st, body = req("POST", "/nav/config", {"nav_lin_speed": 0.22})
         try:
@@ -220,6 +221,16 @@ def main():
             echo_nav_lin = None
         check("nav/config POST applied+clamped", st == 200 and echo_nav_lin == 0.22,
               body[:80])
+        st, body = req("POST", "/nav/config", {"nav_recovery": False})
+        try:
+            echo_rec = json.loads(body)["nav_recovery"]
+        except Exception:
+            echo_rec = None
+        # the recovery-motion toggle echoes as a strict boolean
+        check("nav/config recovery toggle echoes", st == 200 and echo_rec is False,
+              body[:80])
+        st, body = req("POST", "/nav/config", {"nav_recovery": "off"})
+        check("nav/config non-boolean recovery refused", b"error" in body, body[:80])
         st, body = req("POST", "/nav/config", {"nav_ang_speed": 99.0})
         try:
             echo_nav_ang = json.loads(body)["nav_ang_speed"]
@@ -250,7 +261,8 @@ def main():
             check("nav config persisted to nav.json", False, repr(e))
         req("POST", "/nav/config",       # restore the default so the dev host is clean
             {"nav_lin_speed": 0.18, "nav_lin_accel": 0.5, "nav_ang_accel": 1.6,
-             "nav_inflation_m": 0.25, "nav_robot_diam_m": 0.32})
+             "nav_inflation_m": 0.25, "nav_robot_diam_m": 0.32,
+             "nav_recovery": True})
 
         # --- LDS spin-down persistence (POST /param -> ~/.local/state/nanobot/lds.json;
         # the Lidar card's spin-down settings must survive a restart) ----------------
