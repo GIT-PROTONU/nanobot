@@ -15,6 +15,23 @@ in this checkout.
 
 ## Open — needs the physical robot
 
+- [ ] **2026-09-23: Nav2 velocity_smoother — nav speed/accel live-tunable (code DONE +
+      dev-verified; BOARD DEPLOY + drive verification pending).** Drive tab's
+      "Navigation pace" card (4 sliders → GET/POST /nav/config, persisted to
+      nav.json) live-tunes the composed `nav2_velocity_smoother`
+      (controller → /cmd_vel_nav → smoother → /cmd_vel; teleop stays direct).
+      Dev-verified: params reach the node through the production launch path
+      (max_velocity [0.35,0,1.0], smoothing_frequency 5.0 — the serial-budget
+      value), live SetParameters reconfig accepted the exact wire shape
+      /nav/config pushes, 201 tests + smoke green. ON THE BOARD still to do:
+      `deploy.sh robot_bringup web_control` (first boot pulls the ~195 KiB
+      package), then (1) `ros2 param get /velocity_smoother max_velocity` on the
+      board matches nav.json, (2) drag Nav speed mid-goal → cap changes live,
+      (3) drive a goal and confirm speed+accel caps hold and recovery
+      BackUp/Spin still move the robot (they now pass through the smoother —
+      if nav froze entirely after this change, first suspect the smoother's
+      lifecycle activation), (4) `journalctl -u nano-app` shows the boot
+      re-apply "pushed saved pace" line after a stack bounce.
 - [x] **2026-09-21 (code DONE + FLASHED + A/B'd 2026-09-22): wheel-PID adaptive-filter
       N hysteresis.** Residual drive roughness ("better than this morning but still
       not smooth"). IMPLEMENTED (main.cpp `hystN()` + id 7, telemetry.py gate

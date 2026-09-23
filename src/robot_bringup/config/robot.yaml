@@ -347,6 +347,22 @@ web_control:
     move_lin_speed: 0.12      # m/s cruise for canned drives
     move_ang_speed: 1.0       # rad/s cap for canned turns (2026-09-21 pm: was 0.8 —
                               # the user found turns slow; see drive_max_ang note)
+    # Nav2 navigation pace — live sliders on the Drive card ("Nav speed" /
+    # "Nav accel" / "Turn rate" / "Turn accel", GET/POST /nav/config). These are
+    # the REQUESTED values; web_server pushes them to the velocity_smoother node
+    # (config/nav2/nav2_params.yaml) via its dynamically-reconfigurable
+    # max_velocity / max_accel / max_decel arrays — live, no nano-nav restart.
+    # A slider change persists to ~/.local/state/nanobot/nav.json and WINS over
+    # these defaults on boot (the move.json/tts.json pattern; the boot re-apply
+    # retries until the smoother's set_parameters service appears, since
+    # nano-nav activates it after app_hub is already up).
+    # Limits: speed <= 0.35 m/s (saturation cliff), turn <= 1.0 rad/s (the
+    # w*0.2 rad/scan SLAM smear budget, same as drive_max_ang).
+    nav_lin_speed: 0.18       # m/s cruise cap for Nav2 goals (matches RPP desired_linear_vel)
+    nav_ang_speed: 0.8        # rad/s turn cap (rotate_to_heading + path turns)
+    nav_lin_accel: 0.5        # m/s^2 linear accel limit (body-level; firmware
+                              # WHEEL_TGT_SLEW is per-wheel on top)
+    nav_ang_accel: 1.6        # rad/s^2 angular accel limit
     # Served on GET /health/log for the web "Health events" card (sys_monitor writes
     # it; keep in sync with sys_monitor.health_log_path above).
     health_log_path: "~/.local/state/nanobot/health.log"

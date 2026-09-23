@@ -15,7 +15,7 @@
 #  * nav = the ONE heavy process: an rclcpp_components/component_container_isolated
 #    hosting the Nav2 servers + their lifecycle manager (see
 #    robot_bringup/launch/nav2.launch.py). The nano-nav-loader unit (After=/
-#    Requisite=nano-nav) attaches the five components to that container via
+#    Requisite=nano-nav) attaches the six components to that container via
 #    `nav2.launch.py load_only:=true` — the launch's LoadComposableNodes retries
 #    the container's load-node service every 1 s until it appears. Fallback if
 #    the loader path ever misbehaves: `ros2 launch robot_bringup nav2.launch.py`
@@ -133,9 +133,10 @@ PY
     ;;
   nav)      # ONE heavy C++ process: the rclcpp component container (isolated
             # executor, upstream nav2's Humble choice) hosting planner_server +
-            # controller_server + bt_navigator + behavior_server + their
-            # lifecycle manager (see nav2.launch.py). Components are attached
-            # by the nano-nav-loader unit (load_only:=true). The container
+            # controller_server + velocity_smoother + bt_navigator +
+            # behavior_server + their lifecycle manager (see nav2.launch.py).
+            # Components are attached by the nano-nav-loader unit
+            # (load_only:=true). The container
             # itself gets the FULL params file: launch_ros inlines only the
             # sections matching each component's own name into the load
             # request, so the DOUBLE-NESTED costmap sections

@@ -222,6 +222,10 @@ class DevState:
         # Canned-move speed sliders (GET/POST /move/config) — a dev-session dict (no
         # persistence; there are no motors here, the page just needs a live round-trip).
         self.move_cfg = {"move_lin_speed": 0.12, "move_ang_speed": 0.5}
+        # Nav2 speed/accel sliders (GET/POST /nav/config) — same dev-session dict
+        # treatment (the real velocity_smoother lives on the robot's nano-nav).
+        self.nav_cfg = {"nav_lin_speed": 0.18, "nav_ang_speed": 0.8,
+                        "nav_lin_accel": 0.5, "nav_ang_accel": 1.6}
         # Synthetic-sensor source: random (jittering, default) or manual (frozen, user-set). Loaded
         # from the persisted dev-state so a chosen manual reading survives restarts. See _sensor_values.
         self._sensors_lock = threading.Lock()
@@ -1029,6 +1033,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(self.state.get_tts_settings())
         if p == "/move/config":
             return self._json(self.state.move_cfg)
+        if p == "/nav/config":
+            return self._json(self.state.nav_cfg)
         if p == "/oled/state":
             return self._json(self.state.oled_state())
         if p == "/dev/sensors":
@@ -1071,6 +1077,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 except (KeyError, TypeError, ValueError):
                     pass
             return self._json({"status": "ok", "dev": True, **self.state.move_cfg})
+        if p == "/nav/config":
+            # Nav2 pace sliders: accept + remember for this dev session (no
+            # velocity_smoother here; the page just needs the round-trip).
+            d = self._body()
+            for k in ("nav_lin_speed", "nav_ang_speed", "nav_lin_accel",
+                      "nav_ang_accel"):
+                try:
+                    self.state.nav_cfg[k] = float(d[k])
+                except (KeyError, TypeError, ValueError):
+                    pass
+            return self._json({"status": "ok", "dev": True, **self.state.nav_cfg})
         if p == "/llm/say":
             if not s.llm.available():
                 return self._text(503, "llm unavailable")

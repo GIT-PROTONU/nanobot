@@ -189,6 +189,47 @@ def main():
         st, body = req("POST", "/move/config", {"move_lin_speed": "fast"})
         check("move/config garbage refused", b"error" in body, body[:80])
 
+        # --- Nav2 navigation pace (GET/POST /nav/config; velocity_smoother caps) ----
+        # No nano-nav container on this dev host, so the smoother push fails
+        # gracefully (the reply carries "error") while the values still apply +
+        # persist. The GET/POST contract with the page must hold regardless.
+        st, body = req("GET", "/nav/config")
+        try:
+            nav = json.loads(body)
+        except Exception:
+            nav = {}
+        check("nav/config GET has the four caps",
+              st == 200 and all(k in nav for k in (
+                  "nav_lin_speed", "nav_ang_speed", "nav_lin_accel",
+                  "nav_ang_accel")), body[:80])
+        st, body = req("POST", "/nav/config", {"nav_lin_speed": 0.22})
+        try:
+            echo_nav_lin = json.loads(body)["nav_lin_speed"]
+        except Exception:
+            echo_nav_lin = None
+        check("nav/config POST applied+clamped", st == 200 and echo_nav_lin == 0.22,
+              body[:80])
+        st, body = req("POST", "/nav/config", {"nav_ang_speed": 99.0})
+        try:
+            echo_nav_ang = json.loads(body)["nav_ang_speed"]
+        except Exception:
+            echo_nav_ang = None
+        # NAV_ANG_RANGE top = 1.0 (the SLAM rotation-smear budget)
+        check("nav/config turn clamped to 1.0", st == 200 and echo_nav_ang == 1.0,
+              body[:80])
+        st, body = req("POST", "/nav/config", {"nav_lin_speed": "fast"})
+        check("nav/config garbage refused", b"error" in body, body[:80])
+        NAV_JSON = os.path.join(os.path.expanduser("~"), ".local", "state",
+                                "nanobot", "nav.json")
+        try:
+            with open(NAV_JSON, encoding="utf-8") as fh:
+                check("nav config persisted to nav.json",
+                      json.load(fh).get("nav_lin_speed") == 0.22)
+        except Exception as e:
+            check("nav config persisted to nav.json", False, repr(e))
+        req("POST", "/nav/config",       # restore the default so the dev host is clean
+            {"nav_lin_speed": 0.18, "nav_lin_accel": 0.5, "nav_ang_accel": 1.6})
+
         # --- LDS spin-down persistence (POST /param -> ~/.local/state/nanobot/lds.json;
         # the Lidar card's spin-down settings must survive a restart) ----------------
         LDS_JSON = os.path.join(os.path.expanduser("~"), ".local", "state",

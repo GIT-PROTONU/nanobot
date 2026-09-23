@@ -42,6 +42,8 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter as ParamMsg, ParameterValue, ParameterType
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, PoseStamped
@@ -157,6 +159,36 @@ MOVE_ANG_RANGE = (0.10, 1.00)  # rad/s clamp range for move_ang_speed (2026-09-2
 # callback catches both paths (any setter, same file).
 LDS_PERSIST_KEYS = ("lds_idle_enable", "lds_idle_secs", "lds_manual_secs",
                     "lds_active_rpm")
+
+# ---- Nav2 navigation pace (GET/POST /nav/config; persisted to nav_settings_path) --
+# The requested speed/accel caps for Nav2 goals, pushed to the velocity_smoother
+# node (composed in nav2_container; config/nav2/nav2_params.yaml) via its
+# DYNAMICALLY-reconfigurable max_velocity/min_velocity/max_accel/max_decel —
+# live, NO nano-nav restart. Persisted to nav.json (the move.json/tts.json
+# "persisted UI wins" pattern); the boot re-apply retries until the smoother's
+# set_parameters service appears (nano-nav activates it after app_hub is up).
+# y is 0 everywhere (differential drive). Limits mirror the drivetrain:
+# <= 0.35 m/s saturation cliff (loaded full-duty ~0.37), <= 1.0 rad/s the
+# w*0.2 rad/scan SLAM smear budget (same ceiling as drive_max_ang).
+NAV_LIN_RANGE = (0.05, 0.35)   # m/s clamp range for nav_lin_speed
+NAV_ANG_RANGE = (0.10, 1.00)   # rad/s clamp range for nav_ang_speed
+NAV_LIN_ACC_RANGE = (0.05, 2.0)   # m/s^2 clamp range for nav_lin_accel
+NAV_ANG_ACC_RANGE = (0.10, 4.0)   # rad/s^2 clamp range for nav_ang_accel
+NAV_SMOOTHER_NODE = "velocity_smoother"   # the param target (a C++ lifecycle node)
+NAV_PARAM_KEYS = ("nav_lin_speed", "nav_ang_speed", "nav_lin_accel",
+                  "nav_ang_accel")   # the four web sliders, in card order
+
+
+def _clamp_nav_cfg(lin, ang, lin_acc, ang_acc):
+    """Clamp the Nav2 pace values to the web-slider ranges (pure — unit-tested).
+    Plain float clamps — tts.clamp rounds to int (it's for the % settings)."""
+    lo, hi = NAV_LIN_RANGE
+    lo_a, hi_a = NAV_ANG_RANGE
+    lo_la, hi_la = NAV_LIN_ACC_RANGE
+    lo_aa, hi_aa = NAV_ANG_ACC_RANGE
+    return (min(hi, max(lo, float(lin))), min(hi_a, max(lo_a, float(ang))),
+            min(hi_la, max(lo_la, float(lin_acc))),
+            min(hi_aa, max(lo_aa, float(ang_acc))))
 
 
 def _clamp_move_cfg(lin, ang):
@@ -625,6 +657,26 @@ class WebServerNode(Node):
             target=self._man_loop, name="canned-moves", daemon=True)
         self._man_thread.start()
 
+        # ---- Nav2 navigation pace (GET/POST /nav/config; velocity_smoother) ------
+        # Requested speed/accel caps for Nav2 goals. web_server holds the
+        # requested values as its own params (the sliders' source of truth) and
+        # pushes them to the velocity_smoother component (nano-nav) as 3-element
+        # [x, 0, theta] arrays via a SetParameters client — the smoother's params
+        # are dynamically reconfigurable, so this is LIVE (no nano-nav restart).
+        # Changes persist to nav_settings_path (the move.json/tts.json pattern).
+        self.declare_parameter("nav_lin_speed", 0.18)   # m/s speed cap for Nav2 goals
+        self.declare_parameter("nav_ang_speed", 0.8)    # rad/s turn cap
+        self.declare_parameter("nav_lin_accel", 0.5)    # m/s^2 linear accel limit
+        self.declare_parameter("nav_ang_accel", 1.6)    # rad/s^2 angular accel limit
+        self.declare_parameter("nav_settings_path", "")  # "" = ~/.local/state/nanobot/nav.json
+        self._nav_cfg_lock = threading.Lock()           # guards the nav_* params + client
+        self._nav_client = self.create_client(
+            SetParameters, f"/{NAV_SMOOTHER_NODE}/set_parameters")
+        self._apply_saved_nav_cfg()
+        self._nav_reapply_thread = threading.Thread(
+            target=self._reapply_nav_cfg_when_up, name="nav-config-reapply", daemon=True)
+        self._nav_reapply_thread.start()
+
         # ---- Stress test mode (POST /stress/start|stop, GET /stress/status) -----------
         # Deliberately loads every CPU core to validate the hardening tier (systemd
         # watchdogs, MemoryMax, the fan curve) under real load — see stress.py for why
@@ -1082,6 +1134,127 @@ class WebServerNode(Node):
         self.get_logger().info(
             f"POST /move/config lin {lin:.2f} m/s turn {ang:.2f} rad/s (source: web UI)")
         return {"status": "ok", **self.move_config()}
+
+    # ---- Nav2 navigation pace (GET/POST /nav/config) --------------------------
+    # Requested speed/accel caps for Nav2 goals, pushed to the velocity_smoother
+    # (nano-nav) as [x, 0, theta] arrays. web_control's own nav_* params are the
+    # source of truth for GET (the last requested/applied values); the smoother
+    # push is fire-and-forget like every other control write.
+
+    def _nav_settings_file(self):
+        p = self.get_parameter("nav_settings_path").value
+        return p or os.path.expanduser("~/.local/state/nanobot/nav.json")
+
+    def nav_config(self):
+        return {k: float(self.get_parameter(k).value) for k in NAV_PARAM_KEYS}
+
+    def _nav_param_msg(self, name, value):
+        """One SetParameters.Request entry for the smoother: a 3-element
+        [x, 0, theta] double array (y=0 — differential drive). Built as the RAW
+        rcl_interfaces/msg/Parameter wire message (the same shape telemetry.py's
+        set_param_json sends) — NOT rclpy's Parameter wrapper. Pure builder +
+        _clamp_nav_cfg are unit-tested in test_nav_config.py."""
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_DOUBLE_ARRAY
+        pv.double_array_value = [float(v) for v in value]
+        p = ParamMsg()
+        p.name = name
+        p.value = pv
+        return p
+
+    def _nav_push(self, cfg):
+        """Push cfg to the velocity_smoother (fire-and-forget, like /publish|/param).
+        Returns an error string or None. max_decel mirrors max_accel negated so
+        deceleration is bounded too (the smoother validates signs at configure)."""
+        with self._nav_cfg_lock:
+            client = self._nav_client
+            if not client.service_is_ready():
+                return f"{NAV_SMOOTHER_NODE} not reachable (is nano-nav up?)"
+            req = SetParameters.Request()
+            req.parameters = [
+                self._nav_param_msg("max_velocity", [cfg["nav_lin_speed"], 0.0,
+                                                     cfg["nav_ang_speed"]]),
+                self._nav_param_msg("min_velocity", [-cfg["nav_lin_speed"], 0.0,
+                                                     -cfg["nav_ang_speed"]]),
+                self._nav_param_msg("max_accel", [cfg["nav_lin_accel"], 0.0,
+                                                  cfg["nav_ang_accel"]]),
+                self._nav_param_msg("max_decel", [-cfg["nav_lin_accel"], 0.0,
+                                                  -cfg["nav_ang_accel"]]),
+            ]
+            client.call_async(req)
+        return None
+
+    def _set_nav_cfg(self, lin, ang, lin_acc, ang_acc):
+        """Clamp + store the requested values on this node's own params (the
+        sliders' source of truth) — does NOT touch the smoother."""
+        lin, ang, lin_acc, ang_acc = _clamp_nav_cfg(lin, ang, lin_acc, ang_acc)
+        self.set_parameters([
+            Parameter("nav_lin_speed", value=lin),
+            Parameter("nav_ang_speed", value=ang),
+            Parameter("nav_lin_accel", value=lin_acc),
+            Parameter("nav_ang_accel", value=ang_acc)])
+        return lin, ang, lin_acc, ang_acc
+
+    def update_nav_config(self, data):
+        """PATCH-style /nav/config POST: missing keys keep current values."""
+        data = data or {}
+        cur = self.nav_config()
+        try:
+            cfg = self._set_nav_cfg(
+                data.get("nav_lin_speed", cur["nav_lin_speed"]),
+                data.get("nav_ang_speed", cur["nav_ang_speed"]),
+                data.get("nav_lin_accel", cur["nav_lin_accel"]),
+                data.get("nav_ang_accel", cur["nav_ang_accel"]))
+        except (TypeError, ValueError):
+            return {"error": "speeds/accels must be numbers"}
+        lin, ang, lin_acc, ang_acc = cfg
+        err = self._nav_push(self.nav_config())
+        if not write_json(self._nav_settings_file(), self.nav_config()):
+            self.get_logger().warning("nav: could not persist nav config")
+        if err:
+            self.get_logger().warning(f"nav: could not push to smoother: {err}")
+        self.get_logger().info(
+            f"POST /nav/config lin {lin:.2f} m/s turn {ang:.2f} rad/s "
+            f"accel {lin_acc:.2f} m/s^2 / {ang_acc:.2f} rad/s^2 (source: web UI)")
+        out = {"status": "ok", **self.nav_config()}
+        if err:
+            out["error"] = err
+        return out
+
+    def _apply_saved_nav_cfg(self):
+        """Boot re-apply part 1: load nav.json into THIS node's params (the GET's
+        source of truth) immediately. The smoother push happens later, in
+        _reapply_nav_cfg_when_up, because nano-nav activates the smoother after
+        app_hub is already up."""
+        try:
+            saved = read_json(self._nav_settings_file()) or {}
+            self._set_nav_cfg(
+                saved.get("nav_lin_speed", self.get_parameter("nav_lin_speed").value),
+                saved.get("nav_ang_speed", self.get_parameter("nav_ang_speed").value),
+                saved.get("nav_lin_accel", self.get_parameter("nav_lin_accel").value),
+                saved.get("nav_ang_accel", self.get_parameter("nav_ang_accel").value))
+        except (TypeError, ValueError) as e:
+            self.get_logger().warning(f"nav: ignoring bad persisted config: {e!r}")
+
+    def _reapply_nav_cfg_when_up(self):
+        """Boot re-apply part 2: wait (bounded) for the smoother's set_parameters
+        service, then push the saved/declared values once. A dedicated daemon
+        thread — service_is_ready() blocks on the executor graph, which is fine
+        off-thread, and a missing smoother (nav stack down) just gives up."""
+        if not self._nav_client.wait_for_service(timeout_sec=60.0):
+            self.get_logger().warning(
+                "nav: velocity_smoother set_parameters never appeared — nav "
+                "config left at the nav2_params.yaml defaults")
+            return
+        cfg = self.nav_config()
+        err = self._nav_push(cfg)
+        if err:
+            self.get_logger().warning(f"nav: boot re-apply failed: {err}")
+        else:
+            self.get_logger().info(
+                f"nav: pushed saved pace to {NAV_SMOOTHER_NODE} "
+                f"(lin {cfg['nav_lin_speed']:.2f} m/s ang {cfg['nav_ang_speed']:.2f} rad/s "
+                f"accel {cfg['nav_lin_accel']:.2f}/{cfg['nav_ang_accel']:.2f})")
 
     # ---- persisted LDS spin-down settings (lds.json) ---------------------------
     # The Lidar card's Idle spin-down toggle + Spin-down-after slider arrive via
@@ -2453,6 +2626,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     GET_JSON = {
         "/tts/config": lambda n: n.get_settings(),      # page restores controls on load
         "/move/config": lambda n: n.move_config(),      # canned-move speed sliders seed
+        "/nav/config": lambda n: n.nav_config(),        # Nav2 speed/accel sliders seed
         "/llm/config": lambda n: n.get_llm_settings(),
         "/personality": lambda n: n.get_personality(),
         "/llm/log": lambda n: n.get_cog_log(),
@@ -2471,6 +2645,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/drive": lambda n, d: n.drive(d),              # hot path: ~10 Hz while driving
         "/move": lambda n, d: n.move(d),                # canned dist/deg maneuvers
         "/move/config": lambda n, d: n.update_move_config(d),   # canned speed sliders
+        "/nav/config": lambda n, d: n.update_nav_config(d),     # Nav2 speed/accel sliders
         "/publish": lambda n, d: n.telemetry.publish_json(d),   # whitelisted topic pokes
         "/param": lambda n, d: n.telemetry.set_param_json(d),   # whitelisted live-tune params
         "/stress/start": lambda n, d: n.stress_start(d),

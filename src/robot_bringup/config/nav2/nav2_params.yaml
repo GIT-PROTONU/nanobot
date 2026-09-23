@@ -1,12 +1,13 @@
 # =============================================================================
 # Nav2 + slam_toolbox parameters (Humble) — replaces the custom slam_nav stack.
-# ONE process hosts planner_server · controller_server · bt_navigator ·
-# behavior_server · lifecycle_manager · slam_toolbox (see launch/nav2.launch.py):
+# ONE process hosts planner_server · controller_server · velocity_smoother ·
+# bt_navigator · behavior_server · lifecycle_manager (see launch/nav2.launch.py):
 # launch_ros hands this whole file to every ComposableNode and each node picks
 # the section matching its own name. Deliberately ABSENT everywhere: AMCL,
-# velocity_smoother, collision_monitor, map_server, waypoint_follower,
-# smoother_server, voxel/3D/range/keepout costmap layers — lean RAM/CPU on the
-# 1 GB NanoPi NEO Plus2 (H5).
+# collision_monitor, map_server, waypoint_follower, smoother_server,
+# voxel/3D/range/keepout costmap layers — lean RAM/CPU on the
+# 1 GB NanoPi NEO Plus2 (H5). (velocity_smoother JOINED 2026-09-23: nav speed +
+# linear/angular accel caps, live-tunable via web_control's POST /nav/config.)
 #
 # Key hardware facts baked in (see docs/nav2-migration.md):
 #   * LDS02RR lidar: 0.12–6.0 m, ~1° beams, frame "laser" (static base_link→laser
@@ -154,6 +155,41 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
       transform_tolerance: 0.1
 
+# ---- velocity_smoother (nav speed + accel caps, live-tunable) ----------------
+# Sits BETWEEN controller_server and /cmd_vel: the controller publishes
+# /cmd_vel_nav (remapped in nav2.launch.py), the smoother caps it and
+# publishes the final /cmd_vel. Gives the LINEAR accel/decel limit RPP Humble
+# lacks (it only has max_angular_accel) — the firmware's per-wheel
+# WHEEL_TGT_SLEW is wheel-level, this is body-level. All max_/min_/deadband
+# params are 3-element [x, y, theta] arrays (y=0: differential drive).
+# LIVE-TUNABLE (web POST /nav/config -> /velocity_smoother/set_parameters):
+# dynamicParametersCallback is registered in on_activate, so no nano-nav
+# restart is needed — unlike the RPP plugin params (cached at configure).
+# SERIAL BUDGET: the smoother republishes at smoothing_frequency on /cmd_vel
+# which crosses the 115200-baud ESP32 link that decays under sustained
+# high-rate flow (measured 2026-09-20, why controller_frequency is 4.0) —
+# so 5.0 Hz, NOT the 20 Hz default.
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 5.0
+    feedback: OPEN_LOOP          # integrate own published commands; no odom sub
+    scale_velocities: false
+    # Drivetrain limits: <=0.35 m/s (the saturation cliff, loaded full-duty
+    # ~0.37 m/s), <=1.0 rad/s (the w*0.2 rad/scan SLAM smear budget).
+    max_velocity: [0.35, 0.0, 1.0]
+    min_velocity: [-0.35, 0.0, -1.0]
+    # Body-level accel/decel: gentle 0.5 m/s^2 linear. max_decel mirrors
+    # max_accel NEGATED — the same symmetric shape web_control's /nav/config
+    # pushes (it derives min_velocity = -max_velocity and max_decel = -max_accel
+    # from its four scalars; the smoother's configure() throws on positive
+    # decel, so keep the signs).
+    max_accel: [0.5, 0.0, 1.6]
+    max_decel: [-0.5, 0.0, -1.6]
+    deadband_velocity: [0.01, 0.0, 0.01]   # kill sub-creep commands
+    velocity_timeout: 0.5        # controller went quiet -> publish zeros (active
+                                 # brake) for this long, then stop republishing;
+                                 # under the ESP32 500 ms cmd watchdog
+
 # ---- planner_server (NavFn, A*) ----------------------------------------------
 planner_server:
   ros__parameters:
@@ -275,9 +311,11 @@ global_costmap:
         cost_scaling_factor: 3.0
       plugins: ["static_layer", "inflation_layer"]
 
-# ---- lifecycle manager: FOUR Nav2 servers ONLY --------------------------------
+# ---- lifecycle manager: FIVE Nav2 servers ONLY --------------------------------
 # - bt_navigator must be LAST: CONFIGURE/ACTIVATE iterate node_names FORWARD and
 #   the navigator needs planner/controller up first.
+# - velocity_smoother sits after controller_server (its input) — order among
+#   the first four is not load-bearing, but keep it before the navigator.
 # - slam_toolbox is not listed at all: it is a plain node in 2.6.10 with no
 #   lifecycle services to drive (see the slam_toolbox section above).
 nav2_lifecycle_manager:
@@ -285,4 +323,5 @@ nav2_lifecycle_manager:
     autostart: true
     bond_timeout: 4.0
     attempt_respawn_reconnection: true
-    node_names: ['planner_server', 'controller_server', 'behavior_server', 'bt_navigator']
+    node_names: ['planner_server', 'controller_server', 'velocity_smoother',
+                 'behavior_server', 'bt_navigator']

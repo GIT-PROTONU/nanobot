@@ -33,6 +33,10 @@ Lifecycle split (verified against nav2 1.1.x):
   * default_nav_to_pose_bt_xml is the Humble param key (the older
     default_bt_xml_filename is silently ignored) and gets the ABSOLUTE path of
     config/nav2/recovery_bt.xml.
+  * velocity_smoother (2026-09-23) caps Nav2's speed + linear/angular
+    accel/decel between the controller and /cmd_vel — the LINEAR accel limit
+    RPP Humble lacks. Its params are dynamically reconfigurable, so
+    web_control's POST /nav/config tunes them live (no restart).
 
 Systemd pairing: the board runs the container directly (nano-nav.service via
 scripts/unit_exec.sh nav), attaches the components with a nano-nav-loader
@@ -57,16 +61,29 @@ PARAMS = os.path.join(
 RECOVERY_BT = os.path.join(
     get_package_share_directory("robot_bringup"), "config", "nav2", "recovery_bt.xml")
 
-# The five composed nodes (slam_toolbox is NOT one — see module docstring). Each
+# The six composed nodes (slam_toolbox is NOT one — see module docstring). Each
 # gets the FULL params file; launch_ros selects the section matching the node's
 # NAME. Managers load LAST (after every node they manage) — see docstring.
+# Remap chain (2026-09-23): controller publishes /cmd_vel_nav, velocity_smoother
+# caps speed+accel and publishes the final /cmd_vel (web teleop keepalive
+# publishes /cmd_vel directly — teleop bypasses the smoother; the firmware's
+# per-wheel slew handles its accel). Topic names inside the smoother are
+# hardcoded (subscribes cmd_vel, publishes cmd_vel_smoothed) so routing is
+# remaps-only.
 COMPONENTS = [
     ComposableNode(
         package="nav2_planner", plugin="nav2_planner::PlannerServer",
         name="planner_server", parameters=[PARAMS]),
     ComposableNode(
         package="nav2_controller", plugin="nav2_controller::ControllerServer",
-        name="controller_server", parameters=[PARAMS]),
+        name="controller_server", parameters=[PARAMS],
+        remappings=[("cmd_vel", "/cmd_vel_nav")]),
+    ComposableNode(
+        package="nav2_velocity_smoother",
+        plugin="nav2_velocity_smoother::VelocitySmoother",
+        name="velocity_smoother", parameters=[PARAMS],
+        remappings=[("cmd_vel", "/cmd_vel_nav"),
+                    ("cmd_vel_smoothed", "/cmd_vel")]),
     ComposableNode(
         package="nav2_behaviors", plugin="behavior_server::BehaviorServer",
         name="behavior_server", parameters=[PARAMS]),
@@ -81,11 +98,13 @@ COMPONENTS = [
         name="lifecycle_manager",
         parameters=[{
             "autostart": True,
-            # FOUR servers, bt_navigator LAST so the forward-order activation
-            # finds its dependencies up. slam_toolbox is not listed: it is a
+            # FIVE servers, bt_navigator LAST so the forward-order activation
+            # finds its dependencies up (velocity_smoother after its input,
+            # controller_server). slam_toolbox is not listed: it is a
             # plain node in 2.6.10 with no lifecycle at all (docstring).
             "node_names": ["planner_server", "controller_server",
-                           "behavior_server", "bt_navigator"]}]),
+                           "velocity_smoother", "behavior_server",
+                           "bt_navigator"]}]),
 ]
 
 
@@ -109,7 +128,7 @@ def generate_launch_description():
         parameters=[PARAMS],
         condition=UnlessCondition(load_only))
 
-    # Attach the five components; retries the container's load_node service
+    # Attach the six components; retries the container's load_node service
     # every 1 s (launch_ros Humble), so a separately-started container is fine.
     # Fully-qualified target (upstream style) so the client resolves regardless
     # of any namespace the including launch applies.

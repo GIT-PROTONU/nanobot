@@ -127,6 +127,13 @@ PARAM_WHITELIST = {
                     # LDS idle spin-down controller (telemetry.py's _lds_ctrl_tick)
                     "lds_idle_enable", "lds_idle_secs", "lds_manual_secs",
                 },
+    # velocity_smoother (nav2_container): the nav speed/accel caps. The SCALAR
+    # params here are settable via POST /param; the 3-element array params
+    # (max_velocity/min_velocity/max_accel/max_decel) need the dedicated
+    # GET/POST /nav/config endpoint in web_server (set_param_json sends
+    # scalars only). Both routes hit the same dynamically-reconfigurable
+    # params — no nano-nav restart needed for either.
+    "velocity_smoother": {"smoothing_frequency", "velocity_timeout"},
 }
 
 

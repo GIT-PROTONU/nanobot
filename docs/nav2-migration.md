@@ -93,8 +93,11 @@ replaces the fusion role), `nano-map` (map_bridge reads the deleted blob).
 | **local_costmap** | `rolling_window: true`, `width: 2.0`, `height: 2.0`, `resolution: 0.05`, `update_frequency: 2.0`, `publish_frequency: 1.0`, `always_send_full_costmap: true` (footprint for behavior_server), `plugins: [static_layer, inflation_layer]` (`inflation_radius: 0.25`, `cost_scaling_factor: 3.0`), `global_frame: odom`, `robot_radius: 0.16` |
 | **global_costmap** | `width: 24.0`, `height: 24.0`, `resolution: 0.05`, `update_frequency: 1.0`, `plugins: [static_layer, inflation_layer]` (same radii), `global_frame: map`, `robot_radius: 0.16` |
 
-Explicitly ABSENT everywhere: AMCL, velocity_smoother, collision_monitor, map_server,
+Explicitly ABSENT everywhere: AMCL, collision_monitor, map_server,
 waypoint_follower, smoother_server, voxel/3D/range/keepout costmap layers.
+(velocity_smoother LEFT this absent list 2026-09-23: it is now composed into the
+container — nav speed + linear/angular accel/decel caps, live-tunable via
+web_control's POST /nav/config; see AGENTS.md "Nav2 speed & acceleration".)
 
 ## Deliverable 2 — `src/robot_bringup/config/nav2/recovery_bt.xml`
 

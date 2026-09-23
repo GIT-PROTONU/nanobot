@@ -195,6 +195,24 @@
               navigation; the page waits for the fresh grid to arrive.</p>
           </div>
           <div class="card">
+            <h2>Navigation pace</h2>
+            <div class="field"><label>Nav speed <span id="navLinV">0.18</span> m/s</label>
+              <input id="navLin" type="range" min="0.05" max="0.35" step="0.01" value="0.18"></div>
+            <p id="navLinWarn" hidden style="color:var(--amber);font-size:11.5px;line-height:1.55;margin:2px 0 0">⚠ >0.35 m/s is the saturation cliff — the motors top out at ≈0.37 m/s loaded, so the PID has no duty headroom left and the drive stutters/lurches. Smooth ≤0.15 m/s.</p>
+            <div class="field"><label>Nav accel <span id="navAccV">0.50</span> m/s²</label>
+              <input id="navAcc" type="range" min="0.05" max="2.0" step="0.05" value="0.5"></div>
+            <div class="field"><label>Turn rate <span id="navAngV">0.80</span> rad/s</label>
+              <input id="navAng" type="range" min="0.1" max="1.0" step="0.05" value="0.8"></div>
+            <div class="field"><label>Turn accel <span id="navAngAccV">1.60</span> rad/s²</label>
+              <input id="navAngAcc" type="range" min="0.1" max="4.0" step="0.1" value="1.6"></div>
+            <p class="hint">How fast Nav2 <b>drives</b> toward a goal (map click, Locations Go,
+              skill go-tos). These caps live inside <b>velocity_smoother</b> (nav2_container) —
+              Nav2's controller emits the velocity, the smoother clamps speed + acceleration
+              and publishes the final <b>/cmd_vel</b>. Applied <b>live</b> (no restart) and
+              persisted across reboots; also bounds the recovery BackUp/Spin. Joystick/canned
+              moves bypass the smoother (the firmware's per-wheel slew limits those).</p>
+          </div>
+          <div class="card">
             <h2>Locations</h2>
             <div class="row">
               <input id="locName" type="text" placeholder="spot name (e.g. kitchen)" maxlength="32" style="flex:1;min-width:120px">
@@ -2007,6 +2025,11 @@ const HINTS = {
   moveStatus: "Live progress of the canned move (phase, target, % done) and its result after it finishes. The maneuver aborts if /odom is lost or the browser disconnects for >5 s.",
   moveLin: "Cruise speed for the canned Drive maneuvers (m/s). Live-tunes the server and persists across reboots. The approach still ramps down into the target, so very short moves peak below this. Above ~0.35 m/s the motors saturate (loaded full-duty ≈0.37 m/s): the PID has no duty headroom and the drive stutters — the page warns past 0.35.",
   moveAng: "Turn-rate cap for the canned Turn maneuvers (rad/s). Live-tunes the server and persists across reboots. Keep at/below 1.0 -- faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
+  // Navigation pace (Nav2 / velocity_smoother)
+  navLin: "Top speed Nav2 drives at toward a goal (m/s) — map clicks, Locations Go, skill go-tos. Applied live inside velocity_smoother (no restart) and persisted across reboots. Also bounds the recovery BackUp. Above ~0.35 m/s the motors saturate (loaded full-duty ≈0.37 m/s) — the page warns past 0.35. RPP still ramps down into the goal, so short hops peak below this.",
+  navAcc: "Linear acceleration/deceleration limit for Nav2 driving (m/s²). Applied live inside velocity_smoother; decel is set to the same value so stops are symmetric. Low = gentle crawl ramps (nice on carpet, prevents lurches after rotate-to-heading); high = snappy. The firmware's per-wheel slew applies on top.",
+  navAng: "Turn-rate cap while navigating (rad/s) — rotate-to-heading at the goal start, in-path turns, and the recovery Spin. Applied live inside velocity_smoother. Keep at/below 1.0: faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
+  navAngAcc: "Angular acceleration limit while navigating (rad/s²). Applied live inside velocity_smoother; low = smooth spin-up after a rotate-to-heading start, high = snappier turns.",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
   sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
@@ -3187,6 +3210,33 @@ fetch("/move/config").then(r=>r.ok?r.json():null).then(c=>{
   $("moveLin").value=c.move_lin_speed; $("moveLinV").textContent=Number(c.move_lin_speed).toFixed(2);
   $("moveAng").value=c.move_ang_speed; $("moveAngV").textContent=Number(c.move_ang_speed).toFixed(2);
   moveLinWarn();
+}).catch(()=>{});
+
+// ---- Nav2 navigation pace sliders (GET/POST /nav/config) ----
+// Speed/accel caps for Nav2 goals, applied live inside velocity_smoother (no
+// restart); persisted server-side (nav.json), so the sliders re-seed on load.
+// Same saturation-cliff warning as the canned-speed slider.
+const navLinWarn=()=>{$("navLinWarn").hidden=Number($("navLin").value)<=0.35;};
+$("navLin").oninput=()=>{$("navLinV").textContent=Number($("navLin").value).toFixed(2);navLinWarn();};
+$("navAcc").oninput=()=>$("navAccV").textContent=Number($("navAcc").value).toFixed(2);
+$("navAng").oninput=()=>$("navAngV").textContent=Number($("navAng").value).toFixed(2);
+$("navAngAcc").oninput=()=>$("navAngAccV").textContent=Number($("navAngAcc").value).toFixed(2);
+const postNavCfg=()=>fetch("/nav/config",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({nav_lin_speed:Number($("navLin").value),
+                       nav_ang_speed:Number($("navAng").value),
+                       nav_lin_accel:Number($("navAcc").value),
+                       nav_ang_accel:Number($("navAngAcc").value)})}).catch(()=>{});
+$("navLin").onchange=postNavCfg;
+$("navAcc").onchange=postNavCfg;
+$("navAng").onchange=postNavCfg;
+$("navAngAcc").onchange=postNavCfg;
+fetch("/nav/config").then(r=>r.ok?r.json():null).then(c=>{
+  if(!c) return;
+  $("navLin").value=c.nav_lin_speed; $("navLinV").textContent=Number(c.nav_lin_speed).toFixed(2);
+  $("navAng").value=c.nav_ang_speed; $("navAngV").textContent=Number(c.nav_ang_speed).toFixed(2);
+  $("navAcc").value=c.nav_lin_accel; $("navAccV").textContent=Number(c.nav_lin_accel).toFixed(2);
+  $("navAngAcc").value=c.nav_ang_accel; $("navAngAccV").textContent=Number(c.nav_ang_accel).toFixed(2);
+  navLinWarn();
 }).catch(()=>{});
 
 // keyboard
