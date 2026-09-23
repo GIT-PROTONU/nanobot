@@ -15,22 +15,6 @@ in this checkout.
 
 ## Open — needs the physical robot
 
-- [ ] **2026-09-23: Recovery-motion toggle (web button) — DEPLOYED + gateway-verified;
-      the physical-motion verify is still open.** Code-complete + unit/smoke-verified on
-      the dev PC (test_nav_config.py pins the no-fallback contract; smoke covers the
-      GET/POST/nav.json echo). **Deployed 2026-09-23 (`deploy.sh robot_bringup
-      web_control`)** — board evidence: build log installed
-      `config/nav2/no_recovery_bt.xml`, all 8 units active, `nano-nav` journal
-      "Managed nodes are active" (bt_navigator serving the action), ESP32 re-attached
-      1 s after start, `GET /nav/config` carries `nav_recovery`, the toggle round-trip
-      echoes as a strict bool and persists/restores in nav.json. STILL TO VERIFY BY
-      HAND on the robot: (1) toggle Recovery OFF, click a goal that cannot complete
-      (into/behind a known obstacle) → the goal must FAIL with NO backup/spin motion
-      (old behavior: BackUp 0.15 + Spin 90 then abort); (2) toggle ON → backup+spin
-      returns; (3) a restart keeps the switch state (verified via nav.json above);
-      (4) `journalctl -u nano-app` shows "no-recovery goal accepted by bt_navigator"
-      on off-state goals. Mid-navigation toggle just delays the next goal (Humble
-      rejects cross-BT preemption — expected, documented in AGENTS.md).
 - [x] **2026-09-23: Nav2 velocity_smoother — nav speed/accel live-tunable. DEPLOYED +
       LIVE-VERIFIED on the board (closed same day).** Drive tab's "Navigation pace"
       card (4 sliders → GET/POST /nav/config, persisted to nav.json) live-tunes the

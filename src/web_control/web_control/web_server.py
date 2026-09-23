@@ -46,14 +46,12 @@ from rcl_interfaces.msg import SetParametersResult
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter as ParamMsg, ParameterValue, ParameterType
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from rclpy.action import ActionClient
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, PoseStamped
 from action_msgs.srv import CancelGoal
 from action_msgs.msg import GoalInfo
 from lifecycle_msgs.msg import TransitionEvent
 from lifecycle_msgs.srv import GetState
-from nav2_msgs.action import NavigateToPose
 
 from . import procstats
 from .procstats import STAT_PATH, MEMINFO_PATH, THERMAL_PATH
@@ -203,16 +201,6 @@ NAV_INFL_RANGE = (0.0, 0.6)    # m clamp range for nav_inflation_m (keep-away zo
 NAV_DIAM_RANGE = (0.1, 1.0)    # m clamp range for nav_robot_diam_m (robot circle ⌀)
 NAV_COSTMAP_NODES = ("local_costmap/local_costmap", "global_costmap/global_costmap")
 NAV_INFLATION_LAYER = "inflation_layer"   # the plugin name in nav2_params.yaml
-
-# ---- Recovery motions toggle (Map view switch; GET/POST /nav/config) ---------
-# When OFF, goals go out as NavigateToPose ACTION goals whose behavior_tree
-# field points at robot_bringup's no_recovery_bt.xml (plan+follow, NO
-# RecoveryNode — a failed plan/follow aborts with no clear-costmaps/back-up/
-# spin motion). The per-goal behavior_tree field is the only LIVE lever:
-# Humble's bt_navigator loads it on every new goal, but reads the
-# default_nav_to_pose_bt_xml param ONCE at configure (verified against the
-# Humble sources), so a runtime SetParameters push would be silently ignored.
-NAV_NO_RECOVERY_BT = "no_recovery_bt.xml"
 
 
 def _clamp_nav_geom(infl, diam):
@@ -717,17 +705,7 @@ class WebServerNode(Node):
         self.declare_parameter("nav_ang_accel", 1.6)    # rad/s^2 angular accel limit
         self.declare_parameter("nav_inflation_m", 0.25)  # m keep-away zone (costmap inflation_radius)
         self.declare_parameter("nav_robot_diam_m", 0.32)  # m robot circle ⌀ (2× costmap robot_radius)
-        # Recovery motions (Map view switch): the failed-goal retry branch of the
-        # recovery BT (clear costmaps -> back up -> spin). OFF = goals carry the
-        # no-recovery BT XML (see _publish_nav_goal). Persisted in nav.json.
-        self.declare_parameter("nav_recovery_enable", True)
         self.declare_parameter("nav_settings_path", "")  # "" = ~/.local/state/nanobot/nav.json
-        # The recovery-motion-off goal channel (ActionClient, created HERE —
-        # before _apply_saved_nav_cfg restores a persisted recovery=off, so the
-        # HTTP server that binds a few lines below can never hit an unbound
-        # client; see _publish_nav_goal).
-        self._nav_action_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
-        self._no_recovery_xml_path = None   # lazily resolved (see _no_recovery_xml)
         self._nav_cfg_lock = threading.Lock()           # guards the nav_* params + clients
         self._nav_client = self.create_client(
             SetParameters, f"/{NAV_SMOOTHER_NODE}/set_parameters")
@@ -938,12 +916,6 @@ class WebServerNode(Node):
         # the first connected client, dropped after the last — so it costs ~nothing idle.
         self._system_pub = self.create_publisher(String, "oled_system", 5)
         self.telemetry = TelemetryHub(self, rate=float(g("telemetry_rate").value))
-        # Goal-publish hook (the recovery-motion toggle): telemetry's POST
-        # /publish consults it before the plain /goal_pose topic publish; when
-        # recovery motions are off, _publish_nav_goal sends the goal as a
-        # no-recovery-BT action goal instead. Stays None in the offline tests
-        # (the plain topic path keeps running).
-        self.telemetry._goal_hook = self._publish_nav_goal
         self.get_logger().info(
             f"llm: {'enabled' if self._cog.available() else 'idle (no key / disabled)'}"
             f" model={self._cog.llm.model}")
@@ -1239,9 +1211,7 @@ class WebServerNode(Node):
         return p or os.path.expanduser("~/.local/state/nanobot/nav.json")
 
     def nav_config(self):
-        out = {k: float(self.get_parameter(k).value) for k in NAV_PARAM_KEYS}
-        out["nav_recovery"] = self.nav_recovery_enabled()
-        return out
+        return {k: float(self.get_parameter(k).value) for k in NAV_PARAM_KEYS}
 
     def _nav_param_msg(self, name, value):
         """One SetParameters.Request entry for the smoother: a 3-element
@@ -1314,79 +1284,6 @@ class WebServerNode(Node):
             client.call_async(req)
         return None
 
-    # ---- Recovery motions toggle (Map view switch) -----------------------------
-    # The failed-goal retry branch of the recovery BT (clear costmaps -> back up
-    # 0.15 m -> spin 90°) can move the robot when the user doesn't want it to.
-    # OFF = goals are submitted as NavigateToPose ACTION goals carrying the
-    # no-recovery BT XML: Humble's bt_navigator loads the goal's
-    # behavior_tree field on EVERY new goal (verified against the Humble
-    # sources), while default_nav_to_pose_bt_xml is read ONCE at configure —
-    # so the goal field is the only restart-free lever; a runtime param push
-    # would be silently ignored. No push to Nav2 is needed at all: the decision
-    # is purely goal-side in this node (and applies to the NEXT goal).
-
-    def nav_recovery_enabled(self):
-        return bool(self.get_parameter("nav_recovery_enable").value)
-
-    def _no_recovery_xml(self):
-        """Absolute path of no_recovery_bt.xml in the CURRENT install space
-        (robot_bringup's share dir — the same resolution nav2.launch.py uses
-        for the default BT). Resolved lazily + cached; None when robot_bringup
-        isn't in the ament index or the file is missing (deploy not rebuilt)."""
-        p = self._no_recovery_xml_path
-        if p is None:
-            try:
-                p = os.path.join(get_package_share_directory("robot_bringup"),
-                                 "config", "nav2", NAV_NO_RECOVERY_BT)
-            except Exception:
-                return None
-            self._no_recovery_xml_path = p
-        return p if os.path.isfile(p) else None
-
-    def _send_nav_goal_action(self, msg):
-        """Send ONE NavigateToPose action goal whose behavior_tree field points
-        at no_recovery_bt.xml (the recovery-motions-off path). Fire-and-forget
-        like /param; the accept/reject outcome is logged from the response
-        future (resolved by the app_hub executor). Returns an error string or
-        None. A failed send is REPORTED — never silently downgraded to a
-        recovery-BT goal publish."""
-        xml = self._no_recovery_xml()
-        if xml is None:
-            return (f"{NAV_NO_RECOVERY_BT} not found (robot_bringup not "
-                    "rebuilt/installed?)")
-        if not self._nav_action_client.service_is_ready():
-            return "bt_navigator not reachable (is nano-nav up?)"
-        goal = NavigateToPose.Goal()
-        goal.pose = msg
-        goal.behavior_tree = xml
-        fut = self._nav_action_client.send_goal_async(goal)
-        fut.add_done_callback(self._on_nav_goal_response)
-        return None
-
-    def _on_nav_goal_response(self, fut):
-        """The action goal's accept/reject outcome (executor thread — never
-        raise). Rejected = bt_navigator refused (usually mid-restart)."""
-        try:
-            gh = fut.result()
-            if gh is not None and gh.accepted:
-                self.get_logger().info("no-recovery goal accepted by bt_navigator")
-            else:
-                self.get_logger().warning(
-                    "no-recovery goal rejected by bt_navigator (nano-nav restarting?)")
-        except Exception as e:
-            self.get_logger().warning(f"no-recovery goal send failed: {e!r}")
-
-    def _publish_nav_goal(self, msg):
-        """The ONE goal-publish decision (map clicks arrive through telemetry's
-        goal hook, skill go-tos call this directly). Recovery motions ON ->
-        (False, None): the caller's usual /goal_pose topic publish runs.
-        OFF -> (True, err|None): the goal went out as a no-recovery-BT action
-        goal. Returns (handled, error); a failed send must NOT fall back to
-        the recovery-BT topic publish."""
-        if self.nav_recovery_enabled():
-            return False, None
-        return True, self._send_nav_goal_action(msg)
-
     def _set_nav_cfg(self, lin, ang, lin_acc, ang_acc):
         """Clamp + store the requested values on this node's own params (the
         sliders' source of truth) — does NOT touch the smoother."""
@@ -1411,11 +1308,6 @@ class WebServerNode(Node):
         """PATCH-style /nav/config POST: missing keys keep current values."""
         data = data or {}
         cur = self.nav_config()
-        if "nav_recovery" in data:
-            rv = data["nav_recovery"]
-            if not isinstance(rv, bool):
-                return {"error": "nav_recovery must be a boolean"}
-            self.set_parameters([Parameter("nav_recovery_enable", value=rv)])
         try:
             cfg = self._set_nav_cfg(
                 data.get("nav_lin_speed", cur["nav_lin_speed"]),
@@ -1435,17 +1327,10 @@ class WebServerNode(Node):
             self.get_logger().warning("nav: could not persist nav config")
         if err:
             self.get_logger().warning(f"nav: could not push to nav2: {err}")
-        if "nav_recovery" in data and data["nav_recovery"] != cur["nav_recovery"]:
-            rv = data["nav_recovery"]
-            self.get_logger().info(
-                f"nav: recovery motions turned {'ON' if rv else 'OFF'} — the NEXT "
-                f"goal uses the {'recovery' if rv else 'no-recovery'} BT (source: web UI)")
         self.get_logger().info(
             f"POST /nav/config lin {lin:.2f} m/s turn {ang:.2f} rad/s "
             f"accel {lin_acc:.2f} m/s^2 / {ang_acc:.2f} rad/s^2 "
-            f"keep-away {infl:.2f} m robot ⌀ {diam:.2f} m "
-            f"recovery {'on' if self.nav_recovery_enabled() else 'off'} "
-            f"(source: web UI)")
+            f"keep-away {infl:.2f} m robot ⌀ {diam:.2f} m (source: web UI)")
         out = {"status": "ok", **self.nav_config()}
         if err:
             out["error"] = err
@@ -1466,9 +1351,6 @@ class WebServerNode(Node):
             self._set_nav_geom(
                 saved.get("nav_inflation_m", self.get_parameter("nav_inflation_m").value),
                 saved.get("nav_robot_diam_m", self.get_parameter("nav_robot_diam_m").value))
-            rv = saved.get("nav_recovery")
-            if isinstance(rv, bool):    # strict: junk in the file never flips recovery
-                self.set_parameters([Parameter("nav_recovery_enable", value=rv)])
         except (TypeError, ValueError) as e:
             self.get_logger().warning(f"nav: ignoring bad persisted config: {e!r}")
 
@@ -2118,14 +2000,7 @@ class WebServerNode(Node):
                 m.pose.position.x = float(loc["x"])
                 m.pose.position.y = float(loc["y"])
                 m.pose.orientation.w = 1.0
-                # The recovery-motion toggle decides the channel (same decision
-                # telemetry's goal hook makes for map clicks): ON = the usual
-                # /goal_pose topic; OFF = the no-recovery-BT action goal.
-                handled, err = self._publish_nav_goal(m)
-                if err:
-                    return False, err
-                if not handled:
-                    pub.publish(m)
+                pub.publish(m)
                 self.telemetry.note_goal(m.pose.position.x, m.pose.position.y,
                                          source=f"skill go-to '{name}'")
                 self.get_logger().info(
@@ -2908,10 +2783,6 @@ class WebServerNode(Node):
                 self._gpu_vision.stop()
             except Exception:
                 pass
-        try:
-            self._nav_action_client.destroy()    # release the action waitable
-        except Exception:
-            pass
         try:
             self._httpd.shutdown()
         except Exception:

@@ -270,12 +270,6 @@ class TelemetryHub:
         self._goal_status_since = None  # monotonic ts the CURRENT status value began
                                         # (transition durations for the Nav log)
         self._goal_published_at = None  # monotonic ts of the last goal publish
-        # web_server's goal-publish hook (the recovery-motion toggle): when set,
-        # publish_json consults it BEFORE the plain /goal_pose topic publish —
-        # a disabled recovery sends the goal as a NavigateToPose action goal
-        # carrying the no-recovery BT XML instead (see web_server._publish_nav_goal).
-        # Stays None in the offline tests / dev harness: the topic path keeps running.
-        self._goal_hook = None
         self._moving = False           # last /cmd_vel above the motion eps — the
                                        # Nav log's motion start/stop transitions
         self._navlog_warn_at = 0.0     # monotonic ts of the last planning-stuck warning
@@ -1341,29 +1335,11 @@ class TelemetryHub:
             return {"error": f"bad value: {exc}"}
         if msg is None:
             return {"error": "bad value"}
-        err = None
-        handled = False
-        if topic == "/goal_pose" and self._goal_hook is not None:
-            # The recovery-motion toggle (web_server._publish_nav_goal): when
-            # recovery motions are off it submits the goal ITSELF as a
-            # no-recovery-BT action goal and returns (True, err). A failed
-            # send is reported — never downgraded to a recovery-BT publish.
-            handled, err = self._goal_hook(msg)
-        if not handled:
-            pub.publish(msg)
+        pub.publish(msg)
         if topic == "/goal_pose":
-            if err is not None:
-                # no goal went out — leave the mirror alone (a "planning" chip
-                # with no goal in flight would mislead the planning-stuck
-                # watchdog); the failure is reported to the caller + the log
-                self._node.get_logger().warning(
-                    f"goal not sent (recovery motions off): {err}")
-                return {"error": err}
-            # Goal mirror for the web map (f["nav"].goal) — set for BOTH paths
-            # (the action-goal path corroborates via the action status topic
-            # the same way). Nav2 will corroborate via the action status topic
-            # within a tick or two; set "planning" here so the chip reacts to
-            # the click immediately.
+            # Goal mirror for the web map (f["nav"].goal). Nav2 will corroborate
+            # via the action status topic within a tick or two; set "planning"
+            # here so the chip reacts to the click immediately.
             self.note_goal(msg.pose.position.x, msg.pose.position.y)
         if topic == "/lds_target_rpm":
             # The browser's Spin slider: remember it as the spin-when-active target

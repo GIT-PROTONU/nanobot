@@ -25,11 +25,6 @@ dynamicParametersCallbacks accept live. Pinned here:
     * _costmap_push composition: robot_radius = ⌀/2 (the web UI works in
       diameter, the costmap wants the radius) + the namespaced inflation param,
       on BOTH costmap nodes, graceful when unreachable
-    * the recovery-motion toggle (_publish_nav_goal): recovery ON = the usual
-      /goal_pose topic path (False, None — the caller publishes), OFF = a
-      NavigateToPose action goal carrying the no-recovery BT XML; a failed
-      send (missing XML / nano-nav down) is reported as (True, error) and must
-      NEVER fall back to a recovery-BT topic publish
 
     pixi run test
 """
@@ -43,10 +38,8 @@ from web_control.web_server import (_clamp_nav_cfg, _clamp_nav_geom,
                                     NAV_LIN_ACC_RANGE, NAV_ANG_ACC_RANGE,
                                     NAV_INFL_RANGE, NAV_DIAM_RANGE,
                                     NAV_SMOOTHER_NODE, NAV_COSTMAP_NODES,
-                                    NAV_INFLATION_LAYER, NAV_PARAM_KEYS,
-                                    NAV_NO_RECOVERY_BT)
+                                    NAV_INFLATION_LAYER, NAV_PARAM_KEYS)
 from rcl_interfaces.msg import ParameterType
-from geometry_msgs.msg import PoseStamped
 
 
 # ---- clamps -----------------------------------------------------------------------
@@ -287,119 +280,3 @@ def test_cm_transition_repushes_on_activate_only():
     ws.WebServerNode._on_cm_transition(node, _event("active"), n2)
     assert len(node._cm_clients[n1].requests) == 1
     assert len(node._cm_clients[n2].requests) == 1
-
-
-# ---- recovery-motion toggle (the no-recovery action goal) --------------------------
-class _FakeActionClient:
-    def __init__(self, ready=True):
-        self.sent = []
-        self.ready = ready
-
-    def service_is_ready(self):
-        return self.ready
-
-    def send_goal_async(self, goal):
-        self.sent.append(goal)
-        return types.SimpleNamespace(add_done_callback=lambda cb: None)
-
-
-class _FakeGoalNode:
-    """Just enough of WebServerNode for the goal-publish decision methods."""
-
-    def __init__(self, recovery=False, ready=True, xml=None):
-        self._recovery = recovery
-        self._nav_action_client = _FakeActionClient(ready)
-        self._no_recovery_xml_path = xml   # the lazy cache (None = resolve on demand)
-
-    def get_parameter(self, name):
-        return types.SimpleNamespace(value={"nav_recovery_enable": self._recovery}[name])
-
-    def get_logger(self):
-        return types.SimpleNamespace(info=lambda *a, **k: None,
-                                     warning=lambda *a, **k: None)
-
-
-def _bind(node, *names):
-    for n in names:
-        setattr(node, n, getattr(ws.WebServerNode, n).__get__(node))
-    return node
-
-
-def _goal_pose(x=1.0, y=2.0):
-    m = PoseStamped()
-    m.header.frame_id = "map"
-    m.pose.position.x = x
-    m.pose.position.y = y
-    m.pose.orientation.w = 1.0
-    return m
-
-
-def test_publish_goal_recovery_on_uses_topic_path():
-    # recovery ON -> (False, None): the caller's usual /goal_pose topic publish
-    # runs; nothing is sent to the action client
-    node = _bind(_FakeGoalNode(recovery=True, xml="/tmp/nope.xml"),
-                 "nav_recovery_enabled", "_publish_nav_goal",
-                 "_send_nav_goal_action", "_no_recovery_xml")
-    handled, err = node._publish_nav_goal(_goal_pose())
-    assert handled is False and err is None
-    assert node._nav_action_client.sent == []
-
-
-def test_publish_goal_recovery_off_sends_action_goal_with_bt(tmp_path):
-    xml = tmp_path / NAV_NO_RECOVERY_BT
-    xml.write_text("<root/>")
-    node = _bind(_FakeGoalNode(recovery=False, xml=str(xml)),
-                 "nav_recovery_enabled", "_publish_nav_goal",
-                 "_send_nav_goal_action", "_no_recovery_xml",
-                 "_on_nav_goal_response")
-    handled, err = node._publish_nav_goal(_goal_pose(1.5, -2.5))
-    # handled=True (the caller must NOT also topic-publish the same goal)
-    assert handled is True and err is None
-    (g,) = node._nav_action_client.sent
-    # the pose rides the action goal and behavior_tree points at the
-    # no-recovery XML (Humble loads the goal's BT per goal)
-    assert abs(g.pose.pose.position.x - 1.5) < 1e-9
-    assert abs(g.pose.pose.position.y - -2.5) < 1e-9
-    assert g.behavior_tree == str(xml)
-
-
-def test_publish_goal_recovery_off_missing_xml_never_falls_back():
-    # a missing XML is REPORTED, and handled=True: the caller must not
-    # silently downgrade to a recovery-BT topic publish
-    node = _bind(_FakeGoalNode(recovery=False, xml="/nonexistent/dir/x.xml"),
-                 "nav_recovery_enabled", "_publish_nav_goal",
-                 "_send_nav_goal_action", "_no_recovery_xml")
-    handled, err = node._publish_nav_goal(_goal_pose())
-    assert handled is True
-    assert err and NAV_NO_RECOVERY_BT in err
-    assert node._nav_action_client.sent == []
-
-
-def test_send_goal_not_reachable_is_graceful(tmp_path):
-    # a REAL xml file (so the missing-XML check passes) but the action service
-    # absent: reported, nothing sent, no fallback
-    xml = tmp_path / NAV_NO_RECOVERY_BT
-    xml.write_text("<root/>")
-    node = _bind(_FakeGoalNode(recovery=False, ready=False, xml=str(xml)),
-                 "nav_recovery_enabled", "_publish_nav_goal",
-                 "_send_nav_goal_action", "_no_recovery_xml",
-                 "_on_nav_goal_response")
-    handled, err = node._publish_nav_goal(_goal_pose())
-    assert handled is True
-    assert err and "bt_navigator" in err
-    assert node._nav_action_client.sent == []
-
-
-def test_no_recovery_xml_none_when_unresolved():
-    # no cached path + a package-less ament index -> None (the share-dir
-    # resolution failure path; get_package_share_directory raises)
-    node = _bind(_FakeGoalNode(recovery=False), "nav_recovery_enabled",
-                 "_no_recovery_xml")
-    node._no_recovery_xml_path = None
-    real = ws.get_package_share_directory
-    ws.get_package_share_directory = lambda name: (_ for _ in ()).throw(
-        RuntimeError("not in the ament index"))
-    try:
-        assert node._no_recovery_xml() is None
-    finally:
-        ws.get_package_share_directory = real

@@ -93,8 +93,6 @@
           <div class="chiprow">
             <label class="switch"><input type="checkbox" id="mapMotion"><span class="track"></span>
               Motion</label>
-            <label class="switch"><input type="checkbox" id="mapRec" checked><span class="track"></span>
-              Recovery</label>
             <span id="mapNavStatus" class="navchip" data-s="idle">idle</span>
             <button id="mapCancel" class="btn" style="display:none">✕ Cancel goal</button>
           </div>
@@ -127,10 +125,7 @@
             also draws the robot's footprint circle). <b>Costmap</b> overlays Nav2's actual costmap as a translucent heat map
             (yellow→red = rising cost, solid red = lethal) — <b>global</b> is the full
             24×24 m planning space, <b>local</b> is the 2×2 m rolling window of live obstacle
-            sensing that follows the robot. <b>✕ Cancel goal</b> aborts the active navigation.
-            <b>Recovery</b> on = a failed goal retries once after the recovery motions (clear
-            costmaps → back up → spin — the robot physically moves); off = failed goals abort
-            with <i>no</i> robot motion. Persisted; applies to the next goal.</p>
+            sensing that follows the robot. <b>✕ Cancel goal</b> aborts the active navigation.</p>
         </div>
       </div>
     </section>
@@ -2065,7 +2060,6 @@ const HINTS = {
   navAngAcc: "Angular acceleration limit while navigating (rad/s²). Applied live inside velocity_smoother; low = smooth spin-up after a rotate-to-heading start, high = snappier turns.",
   navInfl: "Keep-away zone: the costmaps' inflation radius in metres — the orange zone Nav2 keeps between the robot and walls (and the dashed bubble around the robot on the Map view). Applied live to BOTH costmaps (no restart) and persisted. 0 = no inflation zone. Raise it for a shy robot near furniture; drop it to squeeze through narrow gaps. Nav2 warns when it's smaller than the robot's inscribed radius.",
   navDiam: "Robot size: the diameter of the robot's footprint circle in metres — what the costmaps inflate around and what the Map view draws as the translucent red circle. Applied live to BOTH costmaps as robot_radius = ⌀/2 and persisted. Should match the real chassis (0.32 m ≈ the physical robot); inflating it gives safety margin at the cost of passable gaps.",
-  mapRec: "Recovery motions for FAILED goals: ON = Nav2 clears the costmaps, backs up 0.15 m and spins 90° once, then retries (the robot physically moves). OFF = a failed goal aborts immediately with NO robot motion — use when the backup wedges against furniture/thresholds. Applies to the NEXT goal (goals carry the no-recovery BT directly); persisted across reboots.",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
   sysLoad: "1-minute load average (/proc/loadavg) -- roughly how many processes are waiting for CPU.",
@@ -3283,14 +3277,8 @@ fetch("/nav/config").then(r=>r.ok?r.json():null).then(c=>{
   $("navAngAcc").value=c.nav_ang_accel; $("navAngAccV").textContent=Number(c.nav_ang_accel).toFixed(2);
   $("navInfl").value=c.nav_inflation_m; $("navInflV").textContent=Number(c.nav_inflation_m).toFixed(2);
   $("navDiam").value=c.nav_robot_diam_m; $("navDiamV").textContent=Number(c.nav_robot_diam_m).toFixed(2);
-  if(typeof c.nav_recovery==="boolean") $("mapRec").checked=c.nav_recovery;   // the Map view's Recovery switch
   navLinWarn();
 }).catch(()=>{});
-// Recovery-motion toggle (Map view): a failed goal aborts with no backup+spin
-// when off (the goal carries the no-recovery BT). Rides /nav/config PATCH-style
-// like the sliders; persisted server-side (nav.json).
-$("mapRec").onchange=()=>fetch("/nav/config",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({nav_recovery:$("mapRec").checked})}).catch(()=>{});
 
 // keyboard
 const keys={};
