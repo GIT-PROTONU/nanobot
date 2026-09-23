@@ -19,6 +19,7 @@ dynamicParametersCallback accepts them live (no nano-nav restart). Pinned here:
     pixi run test
 """
 import threading
+import time
 import types
 
 import web_control.web_server as ws
@@ -120,3 +121,45 @@ def test_nav_push_not_reachable_is_graceful():
 def test_nav_param_keys_are_the_four_sliders():
     assert NAV_PARAM_KEYS == ("nav_lin_speed", "nav_ang_speed",
                               "nav_lin_accel", "nav_ang_accel")
+
+
+# ---- activation re-push (the 2026-09-23 board race) --------------------------------
+def _fake_node_with_push(ready=True):
+    node = _fake_node(ready)
+    node._nav_last_push = 0.0
+    node.nav_config = lambda: {"nav_lin_speed": 0.18, "nav_ang_speed": 0.8,
+                               "nav_lin_accel": 0.5, "nav_ang_accel": 1.6}
+    node._nav_push = ws.WebServerNode._nav_push.__get__(node)
+    node.get_logger = lambda: types.SimpleNamespace(
+        warning=lambda *a, **k: None, info=lambda *a, **k: None)
+    return node
+
+
+def _event(label):
+    return types.SimpleNamespace(goal_state=types.SimpleNamespace(label=label))
+
+
+def test_nav_transition_repushes_on_activate_only():
+    node = _fake_node_with_push()
+    # cleanup/deconfigure transitions are ignored
+    ws.WebServerNode._on_nav_transition(node, _event("finalized"))
+    assert node._nav_client.requests == []
+    # the active transition re-applies the saved pace
+    ws.WebServerNode._on_nav_transition(node, _event("active"))
+    (req,) = node._nav_client.requests
+    assert list(req.parameters[0].value.double_array_value) == [0.18, 0.0, 0.8]
+    # rate-limited: an immediate second activation does not double-push
+    ws.WebServerNode._on_nav_transition(node, _event("active"))
+    assert len(node._nav_client.requests) == 1
+
+
+def test_nav_transition_rate_limit_expires(monkeypatch):
+    node = _fake_node_with_push()
+    fake = types.SimpleNamespace(t=time.monotonic())
+    monkeypatch.setattr(ws.time, "monotonic", lambda: fake.t)
+    ws.WebServerNode._on_nav_transition(node, _event("active"))
+    assert len(node._nav_client.requests) == 1
+    # 6 s later the rate limit has expired -> a new activation pushes again
+    fake.t += 6.0
+    ws.WebServerNode._on_nav_transition(node, _event("active"))
+    assert len(node._nav_client.requests) == 2

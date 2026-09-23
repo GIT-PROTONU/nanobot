@@ -49,6 +49,8 @@ from std_msgs.msg import Bool, Int8, Int32, Float32, String
 from geometry_msgs.msg import Twist, PoseStamped
 from action_msgs.srv import CancelGoal
 from action_msgs.msg import GoalInfo
+from lifecycle_msgs.msg import TransitionEvent
+from lifecycle_msgs.srv import GetState
 
 from . import procstats
 from .procstats import STAT_PATH, MEMINFO_PATH, THERMAL_PATH
@@ -672,7 +674,19 @@ class WebServerNode(Node):
         self._nav_cfg_lock = threading.Lock()           # guards the nav_* params + client
         self._nav_client = self.create_client(
             SetParameters, f"/{NAV_SMOOTHER_NODE}/set_parameters")
+        self._nav_last_push = 0.0                       # monotonic, rate-limits re-pushes
         self._apply_saved_nav_cfg()
+        # Re-push on every activation of the smoother: the SetParameters SERVICE
+        # exists from node CONSTRUCTION, but on_configure only DECLARES the params
+        # and on_activate attaches the dynamic-params callback that updates the
+        # smoother's cached members — a push between construction and activation
+        # is silently lost (dev board, 2026-09-23: the boot push landed 3 s before
+        # on_activate and the cap stayed at the yaml default). Subscribing to the
+        # lifecycle TransitionEvent re-applies the saved pace after EVERY
+        # activation — boot AND any nano-nav restart.
+        self.create_subscription(
+            TransitionEvent, f"/{NAV_SMOOTHER_NODE}/transition_event",
+            self._on_nav_transition, 10)
         self._nav_reapply_thread = threading.Thread(
             target=self._reapply_nav_cfg_when_up, name="nav-config-reapply", daemon=True)
         self._nav_reapply_thread.start()
@@ -1236,16 +1250,65 @@ class WebServerNode(Node):
         except (TypeError, ValueError) as e:
             self.get_logger().warning(f"nav: ignoring bad persisted config: {e!r}")
 
+    def _on_nav_transition(self, msg):
+        """Re-apply the saved nav pace when the smoother (re)activates. The
+        transition event fires AFTER on_activate returned, so the dynamic-params
+        callback is attached and the push lands in the smoother's live members.
+        Rate-limited; deactivate/cleanup transitions are ignored."""
+        if msg.goal_state.label != "active":
+            return
+        with self._nav_cfg_lock:
+            if time.monotonic() - self._nav_last_push < 5.0:
+                return
+            self._nav_last_push = time.monotonic()
+        cfg = self.nav_config()
+        err = self._nav_push(cfg)
+        if err:
+            self.get_logger().warning(f"nav: activation re-push failed: {err}")
+        else:
+            self.get_logger().info(
+                f"nav: re-applied pace on smoother activation "
+                f"(lin {cfg['nav_lin_speed']:.2f} m/s ang {cfg['nav_ang_speed']:.2f} rad/s)")
+
     def _reapply_nav_cfg_when_up(self):
-        """Boot re-apply part 2: wait (bounded) for the smoother's set_parameters
-        service, then push the saved/declared values once. A dedicated daemon
-        thread — service_is_ready() blocks on the executor graph, which is fine
-        off-thread, and a missing smoother (nav stack down) just gives up."""
+        """Boot re-apply part 2: wait (bounded) for the smoother's ACTIVATE —
+        the SetParameters service exists from node construction but the params
+        are only declared at configure and the dynamic callback attaches at
+        activate, so pushing before that is silently lost — then push the saved
+        values once. Dedicated daemon thread; a missing smoother (nav stack
+        down) just gives up (the transition_event subscription covers the late
+        activation case too)."""
         if not self._nav_client.wait_for_service(timeout_sec=60.0):
             self.get_logger().warning(
                 "nav: velocity_smoother set_parameters never appeared — nav "
                 "config left at the nav2_params.yaml defaults")
             return
+        state = self.create_client(GetState, f"/{NAV_SMOOTHER_NODE}/get_state")
+        end = time.monotonic() + 90.0
+        while time.monotonic() < end:
+            if not state.service_is_ready():
+                time.sleep(1.0)
+                continue
+            fut = state.call_async(GetState.Request())
+            try:
+                while fut.result() is None and time.monotonic() < end:
+                    time.sleep(0.5)
+            except Exception:
+                time.sleep(1.0)
+                continue
+            res = fut.result()
+            if res is not None and res.current_state.label == "active":
+                break
+            time.sleep(1.0)         # still configuring/activating — keep waiting
+        else:
+            self.get_logger().warning(
+                "nav: velocity_smoother never reached active within the bounded "
+                "wait — nav config left at the nav2_params.yaml defaults")
+            return
+        with self._nav_cfg_lock:
+            if time.monotonic() - self._nav_last_push < 5.0:
+                return              # the transition-event re-push already ran
+            self._nav_last_push = time.monotonic()
         cfg = self.nav_config()
         err = self._nav_push(cfg)
         if err:
