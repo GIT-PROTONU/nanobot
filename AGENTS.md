@@ -67,7 +67,11 @@ IMU (WitMotion, USB-serial/CH340), **Logitech C270** webcam + mic (USB).
   is gone.)
   What each unit execs lives in ONE place: **`scripts/unit_exec.sh`** (pixi env
   activation via `pixi shell-hook`, then `exec` of the installed executable — no
-  resident wrapper, no `ros2 run` RAM overhead). **Every unit also runs a bounded
+  resident wrapper, no `ros2 run` RAM overhead). **Every ROS unit also runs as a
+  zenoh CLIENT of the router** (`ZENOH_SESSION_CONFIG_URI=$NANO/.run/zenoh_client.json5`,
+  2026-09-22 — cross-host discovery was one-sided-blind in peer mode; the router
+  branch is excluded; `NANO_ZENOH_PEER=1` reverts. The client session config MUST
+  disable zenoh shared memory — see the gotcha below). **Every unit also runs a bounded
   NTP clock-step wait at the top of `unit_exec.sh`** (up to 20 s, then starts anyway):
   the board has no battery RTC, so a power-on boots with a days-stale fake-hwclock and
   NTP steps the clock mid-run while the stack is already up — under a live SLAM session
@@ -175,14 +179,20 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
 - **`/map` is a real ROS topic now**: slam_toolbox publishes it transient-local, so a
   remote RViz simply subscribes over the zenoh graph (the old `/dev/shm` map blob +
   `nano-map` bridge unit are gone with slam_nav).
-- **Cross-host zenoh discovery**: `ROS_DOMAIN_ID`/`RMW_IMPLEMENTATION` already match by
-  construction (both machines activate the same `pixi.toml`). Same-LAN zenoh multicast
-  scouting usually finds the robot's `zenohd-serial` router with no extra config; if not
-  (blocked multicast / different subnet), `rviz_remote.sh --connect <ip>` writes a small
-   session config pointing at `tcp/<ip>:7447` and sets `ZENOH_SESSION_CONFIG_URI` — if
-   `ros2 topic list` on the dev PC doesn't show the robot's topics, check the installed
-   `rmw_zenoh_cpp` version's docs for the current session-config env var/schema.
-   Cross-host discovery is not yet tested end-to-end (tracked in `docs/TODO.md`).
+- **Cross-host zenoh discovery (TESTED end-to-end 2026-09-22)**: `ROS_DOMAIN_ID`/
+  `RMW_IMPLEMENTATION` already match by construction (both machines activate the same
+  `pixi.toml`). Same-LAN zenoh multicast scouting usually finds the robot's
+  `zenohd-serial` router with no extra config; if not (blocked multicast / different
+  subnet), `rviz_remote.sh --connect <ip>` writes a small session config pointing at
+  `tcp/<ip>:7447` and sets `ZENOH_SESSION_CONFIG_URI`. The old one-sided blindness
+  (dev-PC saw only the ESP32's topics, not the robot's ROS nodes) was a **peer-mode
+  propagation failure** — fixed 2026-09-22 by running every robot-side unit as a zenoh
+  CLIENT of the router (`unit_exec.sh`, see above): a dev-PC session pointed at the
+  router now sees /scan /odom /tf /map /wheel_* /goal_pose /cmd_vel + costmaps and
+  receives real data (`ros2 topic echo --once /diagnostics` verified). Two related
+  gotchas when hunting the graph: the ros2 CLI's persistent daemon caches a stale
+  graph (`ros2 daemon stop` first), and a bare ssh `ros2` runs under fastrtps (wrong
+  RMW sees nothing) — export `RMW_IMPLEMENTATION=rmw_zenoh_cpp` first.
 
 ## Architecture
 
@@ -1278,8 +1288,13 @@ reliable"). Rebuilt as THREE coordinated pieces:
   "Canned turn" sliders, `GET/POST /move/config`): a change is clamped to
   `MOVE_LIN_RANGE`/`MOVE_ANG_RANGE`, applied via `set_parameters`, and persisted to
   `~/.local/state/nanobot/move.json`, which is re-applied over the robot.yaml
-  defaults at boot (the llm.json/tts.json "persisted UI wins" pattern). The pure
-  step math is
+  defaults at boot (the llm.json/tts.json "persisted UI wins" pattern). **The page
+  warns past the saturation cliff (2026-09-22)**: an amber `#moveLinWarn` note under
+  the Canned speed slider when the value exceeds 0.35 m/s (the measured saturation
+  cliff — loaded full-duty ≈0.37 m/s, so above ~0.35 the loop has zero authority and
+  the drive stutters; smooth band ≤0.15 m/s). The cliff is hardware, not a bug — the
+  note re-seeds from `GET /move/config` and the hover hint on `moveLin` says the same.
+  The pure step math is
   `_maneuver_step` (unit-tested in `test_maneuver.py`: projection/backward sign,
   phase re-snapshot, P clamp + low-kp floor, wrap, full-loop on a fake node, +
   `_clamp_move_cfg`); the
@@ -1494,6 +1509,14 @@ Tuning (occupancy.py): `SUPPORT_RADIUS_M` (0.15 = DT kernel width), `EXACT_B` (2
 - **`brain_timeout` must stay well above `reflect_period`** (invariant: timeouts shorter than the reflection gap cause the chart to revert accumulated drift).
 - **Heavy data paths bypass the ROS graph and the SSE frame:** `/scan.bin` (+ the other `nano_*` blobs) live in `/dev/shm` and are served over HTTP; `/map` is served by the `GET /map` HTTP route (telemetry holds a transient-local sub to slam_toolbox). (rosbridge was removed 2026-07-06 — there is no bridge at all.)
 - **`rmw_zenoh` ordering:** a node started before `rmw_zenohd` runs islanded (won't appear in the graph).
+- **Zenoh CLIENT sessions MUST disable shared memory** (2026-09-22, hit live): a
+  client-mode session config without `transport: { shared_memory: { enabled: false } }`
+  crash-loops at rmw_init on the board with `Failed to create POSIX SHM provider
+  (OS error 12)` — app/slam/nav restart-looped ~55× each; only the first session of
+  a boot (nano-sensors) survived. `.run/zenoh_client.json5` (written by `unit_exec.sh`)
+  carries the disable flag; keep it if you regenerate the config. Cost of the fix: an
+  extra copy on big loopback messages (/map, /scan) — negligible at their rates; the
+  ESP32 serial link never used SHM anyway.
 - **Python edits are live:** `--symlink-install` means edit `src/<pkg>/<pkg>/foo.py`, restart node = picked up. New modules import fine via egg-link.
 - **nanobot-brain is pip-installed**: edit `src/nanobot_brain/` in the nanobot-brain repo, restart node = picked up (editable install).
 - **Deleting a file under `src/web_control/web/` breaks the next colcon build** with `error: can't copy '...': doesn't exist` — colcon caches the setup.py `glob("web/*")` result in `build/web_control`. `rm -rf build/web_control install/web_control` once (the board needs the same after rsyncing such a deletion) and rebuild. Hit 2026-09-16 when the 8 dead split `.js` files were deleted.

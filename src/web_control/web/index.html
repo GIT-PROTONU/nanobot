@@ -166,6 +166,7 @@
               <input id="moveLin" type="range" min="0.05" max="0.4" step="0.01" value="0.12"></div>
             <div class="field"><label>Canned turn <span id="moveAngV">1.00</span> rad/s</label>
               <input id="moveAng" type="range" min="0.1" max="1.0" step="0.05" value="1.0"></div>
+            <p id="moveLinWarn" hidden style="color:var(--amber);font-size:11.5px;line-height:1.55;margin:2px 0 0">⚠ >0.35 m/s is the saturation cliff — the motors top out at ≈0.37 m/s loaded, so the PID has no duty headroom left and the drive stutters/lurches. Smooth ≤0.15 m/s; 0.3 is the practical max.</p>
             <p class="hint">Drag the joystick to drive (speed scales with how far you push),
               or use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrow keys on a keyboard.
               Release or <kbd>Space</kbd> stops.               Publishes <b>/cmd_vel</b>. <b>Drive</b> / <b>Reverse</b> /
@@ -2004,7 +2005,7 @@ const HINTS = {
   moveTurn: "Starts the canned rotation (Turn N degrees). A running canned move is replaced by a new one.",
   moveStop: "Cancels the running canned move and stops (same as touching the joystick or pressing STOP).",
   moveStatus: "Live progress of the canned move (phase, target, % done) and its result after it finishes. The maneuver aborts if /odom is lost or the browser disconnects for >5 s.",
-  moveLin: "Cruise speed for the canned Drive maneuvers (m/s). Live-tunes the server and persists across reboots. The approach still ramps down into the target, so very short moves peak below this.",
+  moveLin: "Cruise speed for the canned Drive maneuvers (m/s). Live-tunes the server and persists across reboots. The approach still ramps down into the target, so very short moves peak below this. Above ~0.35 m/s the motors saturate (loaded full-duty ≈0.37 m/s): the PID has no duty headroom and the drive stutters — the page warns past 0.35.",
   moveAng: "Turn-rate cap for the canned Turn maneuvers (rad/s). Live-tunes the server and persists across reboots. Keep at/below 1.0 -- faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
   // System health
   sysCpu: "Aggregate CPU busy % across all cores (from /proc/stat deltas). Tap to expand per-core.",
@@ -3171,7 +3172,10 @@ $("moveDeg").addEventListener("keydown",e=>{ if(e.key==="Enter") $("moveTurn").c
 // ---- canned-move speed sliders (GET/POST /move/config) ----
 // Live-tune the server's move_lin_speed/move_ang_speed; values persist server-side
 // (survive reboots), so the sliders re-seed from GET /move/config on page load.
-$("moveLin").oninput=()=>$("moveLinV").textContent=Number($("moveLin").value).toFixed(2);
+// Soft warning above the full-duty cliff (loaded top speed ≈0.37 m/s; at 0.4 the loop
+// has zero authority — reverse p2p 0.277 vs 0.028-0.085 at 0.3, 2026-09-21 session):
+const moveLinWarn=()=>{$("moveLinWarn").hidden=Number($("moveLin").value)<=0.35;};
+$("moveLin").oninput=()=>{$("moveLinV").textContent=Number($("moveLin").value).toFixed(2);moveLinWarn();};
 $("moveAng").oninput=()=>$("moveAngV").textContent=Number($("moveAng").value).toFixed(2);
 const postMoveCfg=()=>fetch("/move/config",{method:"POST",headers:{"Content-Type":"application/json"},
   body:JSON.stringify({move_lin_speed:Number($("moveLin").value),
@@ -3182,6 +3186,7 @@ fetch("/move/config").then(r=>r.ok?r.json():null).then(c=>{
   if(!c) return;
   $("moveLin").value=c.move_lin_speed; $("moveLinV").textContent=Number(c.move_lin_speed).toFixed(2);
   $("moveAng").value=c.move_ang_speed; $("moveAngV").textContent=Number(c.move_ang_speed).toFixed(2);
+  moveLinWarn();
 }).catch(()=>{});
 
 // keyboard

@@ -79,6 +79,32 @@ ESP32_UART="${ESP32_UART:-/dev/ttyS1}"
 ESP32_BAUD="${ESP32_BAUD:-115200}"
 ZENOHD_SERIAL="${ZENOHD_SERIAL:-$NANO/bin/zenohd-serial}"
 
+# Cross-host discovery fix (2026-09-22): the ROS units ran as zenoh PEERs (loopback
+# gossip). Peer declarations do NOT propagate through the router to later joiners, so
+# a dev-PC session pointed at tcp/<board>:7447 saw ONLY the ESP32's topics (it is a
+# zenoh CLIENT) — /scan /odom /tf /map stayed invisible (one-sided blindness,
+# 2026-09-21 test). Client sessions demonstrably propagate (the ESP32's do), so run
+# every ROS unit as a CLIENT of the router — the same declaration path as the ESP32.
+# GOTCHA (found + fixed live 2026-09-22): with plain client configs every rmw_zenoh
+# node except the FIRST after boot dies at rmw_init with "Failed to create POSIX SHM
+# provider (OS error 12)" (nano-app/slam/nav crash-looped 50+ times; sensors — first
+# session — survived). Disabling zenoh's shared-memory transport in the session config
+# fixes init entirely; the cost is an extra copy on big loopback messages (/map, /scan)
+# — negligible at their rates, and the ESP32 serial link never used SHM anyway.
+# The router branch (raw zenohd with its own -c config) must NOT get this env.
+# NANO_ZENOH_PEER=1 reverts to the old peer behaviour.
+if [ "${1:-}" != "router" ] && [ -z "${NANO_ZENOH_PEER:-}" ]; then
+  ZCFG="$LOGDIR/zenoh_client.json5"
+  cat > "$ZCFG" <<'EOF'
+{
+  mode: "client",
+  connect: { endpoints: ["tcp/localhost:7447"] },
+  transport: { shared_memory: { enabled: false } },
+}
+EOF
+  export ZENOH_SESSION_CONFIG_URI="$ZCFG"
+fi
+
 case "${1:-}" in
   router)
     # The router MUST run with rmw_zenoh's own ROUTER config (not zenohd defaults):

@@ -19,10 +19,12 @@
 # NOTE: ZENOH_SESSION_CONFIG_URI is rmw_zenoh_cpp's documented env var for the SESSION
 # (client) side config, as opposed to ZENOH_ROUTER_CONFIG_URI for the router (rmw_zenohd)
 # -- distinct from stack.sh's router config, which is instead passed as a `-c` CLI arg to
-# the custom zenohd-serial binary. Written without a way to test the exact discovery
-# behaviour end-to-end from here; if `ros2 topic list` doesn't show the robot's topics
-# after this, check the installed rmw_zenoh_cpp version's docs for the current env var
-# name/session-config schema.
+# the custom zenohd-serial binary. TESTED end-to-end 2026-09-22 (robot's units run as
+# zenoh CLIENTS of the router -- see AGENTS.md "Remote RViz"): with --connect the dev PC
+# sees the robot's whole graph (/scan /odom /tf /map /wheel_* /cmd_vel costmaps...) and
+# receives real data. If `ros2 topic list` still doesn't show them: `ros2 daemon stop`
+# first (the CLI daemon caches a stale graph) and export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+# (a bare ssh ros2 runs under fastrtps and sees nothing).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

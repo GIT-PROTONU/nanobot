@@ -28,25 +28,23 @@ in this checkout.
       already in place via the 50 Hz `slewTo`; #2 KI-lowering — contradicts
       the live sweep; #4 flip-reset deadband — costs sub-crawl reverses)
       held in reserve with their tradeoffs. Do not apply those blindly.
-- [ ] **NEW 2026-09-21: LDS idle spin-down + jam guard — built + unit/smoke-tested,
-      needs the robot.** The spin-down controller (`web_control/telemetry.py`
-      `_lds_ctrl_tick`, owns `/lds_target_rpm` again after a week of nobody) and
-      the firmware jam guard (`main.cpp` `ldsControl` — 6 s of "target set but
-      can't spin" ⇒ latched motor park, `/lds_jam`) are code-complete; see the
-      "LDS idle spin-down + jam guard (2026-09-21)" block in AGENTS.md. VERIFY on
-      the robot: (1) deploy + `pio run -t upload`, then let it sit ≥90 s — `f.lds`
-      state goes parked, spin 0 rpm, Lidar-card **last move** timer keeps counting,
-      `/scan.bin` goes stale, Map feeds LDS dot amber (not red); (2) drive by
-      hand (or send a goal) — lidar wakes to ~300 rpm within ~1 s of the first
-      `/cmd_vel`, last-move resets; (3) block the rotor gently with a finger/
-      string at Spin 300 → within ~6 s `f.lds.jam` true, state **JAM**, motor CUT
-      (duty 0) — confirm no grind, and that setting Spin 0 clears the latch (a
-      motion resumption retries at most once); (4) the IMU interference test
-      still runs its lds phase cleanly (the controller is held for the whole
-      run); (5) ESP32 power-cycle while parked → NVS-restored target 0 → no boot
-      spin (first flash ever writes `ldstgt` on the first setpoint change).
-      NVS note: `pio run -t upload` does NOT erase NVS — the new `ldstgt` key
-      just appears on first save.
+- [x] **NEW 2026-09-21: LDS idle spin-down + jam guard — built + unit/smoke-tested.**
+      **VERIFIED ON THE ROBOT 2026-09-23 — CLOSED.** All five checks: (1) parked —
+      idle >60 s → `f.lds.state` "park", tgt 0, lidar stopped (also every session
+      start since deploy); (2) wake-on-motion — a 0.05 m/s /drive pulse set
+      `f.lds.tgt` 300 within **1.4 s** of the first /cmd_vel, state left "park",
+      turret ramped to 298-304 rpm at duty 0.72 (no false jam on a healthy
+      spin-up), and it parked again after 60 s quiet (last-move timer ✓);
+      (3) JAM — the user pinched the spinning turret **3 times**: each time rpm
+      collapsed and the guard latched within ~6 s, duty 0, no grind; the latch
+      cleared only on target ≤ 0 (the idle controller's park did it naturally);
+      (4) the IMU interference test's lds-hold phase verified live 2026-09-21
+      (RLock fix + full 5-phase run — cite, no re-run needed); (5) boot-spin —
+      ESP32 power-cycled twice while parked (user's board reset 2026-09-23 +
+      the ping-watchdog reboot after the target bounce): turret stayed still
+      both times (user-observed + journal rpm 0 throughout). Also verified the
+      manual path live: POST /lds_target_rpm 300 → state "manual", 296.7 rpm
+      clean ramp; Spin 0 stops it.
       **PERSISTENT (2026-09-21, dev-verified): the Lidar card's spin-down settings
       survive a restart/reboot** — `web_server._persist_lds_params`
       (`add_on_set_parameters_callback`) snapshots the whole cluster
@@ -119,7 +117,7 @@ in this checkout.
         [6.8, 10.0, 0] (abandoned-session NVS writes — see the AGENTS.md gotcha)
         and maxlin/maxang at the lunge-guard 0.15/0.3; restored [5, 60, 0] +
         0.15/0.8 via pid_tune.py (verify survived the NEXT flash/reboot).**
-- [ ] **Flash + verify the 2026-09-21 smoothness pass II** (**FLASHED 2026-09-21 pm**
+- [x] **Flash + verify the 2026-09-21 smoothness pass II** (**FLASHED 2026-09-21 pm**
       — adaptive velocity filter + stiction-aware I-term + DITHER; gains NVS
       survived the flash: 5/60/0 + params incl. dith id 6 = 0.05. The post-flash
       "robot drove nowhere" event was the ESP32 half-attached-session wedge (NOT
@@ -153,6 +151,10 @@ in this checkout.
       and "still stuttering"; set to 0.15 via POST /move/config — 0.15
       measures p2p 0.024-0.056 / mean 91-98% vs 0.4's p2p 0.277. The user can
       still drag it up; the cliff is hardware.)
+      **2026-09-22: the soft warning is BUILT + DEPLOYED — CLOSED.** `#moveLinWarn`
+      under the Canned speed/turn sliders (amber note past 0.35 m/s, loaded
+      top speed ≈0.37), wired into oninput + the GET /move/config re-seed;
+      hover hint for `moveLin` extended. 194 tests green pre-deploy.
       **2026-09-21 pm: NAV made choppier by the same physics — Nav2's RPP
       cruised at desired_linear_vel 0.25 (the rough band) and its in-place
       rotate-to-heading (0.5 rad/s, translating nothing) tripped the progress
@@ -374,7 +376,7 @@ in this checkout.
         (expected physics). NOTE: at this deadband the slowest nonzero command ≈0.28
         m/s physical (the [0.70..1] remap) — there is no true slow crawl; the
         closed-loop PID above replaces the remap and re-opens the slow range.
-- [ ] **Post-flash ESP32 verification** (firmware FLASHED 2026-09-20 on the dev PC —
+- [x] **Post-flash ESP32 verification** (firmware FLASHED 2026-09-20 on the dev PC —
       `/wheel_stray_ticks` + `/reset_ticks` (built 2026-07-15), the 2026-09-17
       `TRIM_AUTOCAL 1` re-enable, and the 2026-09-19 low-duty breakaway kick;
       `upload_speed = 115200` added to platformio.ini since the default 460800
@@ -393,7 +395,18 @@ in this checkout.
         quantization), L/R equal through the whole ramp; a second fwd→rev run
         showed L/R -0.097..-0.110 vs -0.089..-0.102 (≤±5%). Stray ticks [0,0],
         trim 0.0. Remaining sub-items (crawl/spin re-validation) ride on the
-        smoothness-pass item above.
+        smoothness-pass item above — **those closed there (2026-09-21 pm III/IV:
+        crawl/spin bands verified; THREAD CLOSED).**
+      - **CLOSED 2026-09-23: post-power-cycle NVS readback verified** (board reset
+        + ESP32 power cycle that morning). Found the **4th NVS-drift occurrence**:
+        `wheel_pid` read [1.8, 11.6, 0.0] — restored [5, 60, 0] via POST
+        /publish /motor_pid (readback flipped live = the motion-free RX probe too);
+        **KFF anomaly resolved** — wheel_params id 8 read 1.15 (a stale manual
+        override vs the 2026-09-22 verified-clean AUTO) → set [8, 0] = auto-derive.
+        Everything else matched verified-clean: tpr 253, radius 0.0335, separation
+        0.102, maxlin 0.4, maxang 1.0, slew 1.5, dither 0, vhyst 0.15, stray [0,0].
+        Robot parked → NVS persists rate-limited. **STANDING RULE (4th drift
+        occurrence): check `f.esp.wheel_pid` == [5,60,0] FIRST in every session.**
 - [ ] **Diagnose the web gateway's intermittent 1-9 s POST stalls** (they chop the
       10 Hz /drive stream → dead-man cut mid-drive → stop → lurch on recovery —
       manual-driving feel depends on this as much as the firmware): 2026-09-20
@@ -516,7 +529,7 @@ in this checkout.
         this mode; the mag-sweep calibration eyeball only applies if 9-axis is
         ever re-enabled. The test could flag "mag frozen (6-axis)" instead of a
         misleading 0.0 (small code tweak, low priority).
-- [ ] **Test cross-host zenoh discovery end-to-end** — `rviz_remote.sh --connect
+- [x] **Test cross-host zenoh discovery end-to-end** — `rviz_remote.sh --connect
       <ip>` (the `ZENOH_SESSION_CONFIG_URI` path) was written without a way to test
       it from the dev PC.
       - **2026-09-21 first live test (robot online, dev PC)**: the config schema is
@@ -547,6 +560,23 @@ in this checkout.
         sees NOTHING on the zenoh island — "Unknown topic" is the wrong-RMW
         symptom, not proof of absence; export `RMW_IMPLEMENTATION=rmw_zenoh_cpp`
         first (hit live 2026-09-21 while hunting the /cmd_vel publisher list).
+      - **FIXED + VERIFIED END-TO-END 2026-09-22 — CLOSED.** The candidate fix was
+        applied: **every ROS unit now runs as a zenoh CLIENT of the router**
+        (`scripts/unit_exec.sh`: all branches export
+        `ZENOH_SESSION_CONFIG_URI=$NANO/.run/zenoh_client.json5`; the router branch
+        excluded; `NANO_ZENOH_PEER=1` reverts to peer mode). **GOTCHA found + fixed
+        live: plain client configs crash-looped app/slam/nav at rmw_init** —
+        `Failed to create POSIX SHM provider (OS error 12)` (~55 restarts each; only
+        `nano-sensors`, the FIRST session after boot, survived). Fix: the session
+        config disables zenoh shared memory (`transport: { shared_memory:
+        { enabled: false } }`); cost is an extra copy on big loopback messages
+        (/map, /scan) — negligible at their rates; the ESP32 serial link never used
+        SHM anyway. Verified from the dev PC (`ZENOH_SESSION_CONFIG_URI` peer →
+        `tcp/<robot>:7447`): `ros2 topic list` shows ALL the robot's topics
+        (/scan /odom /tf /map /wheel_* /goal_pose /cmd_vel costmaps…) and
+        `ros2 topic echo --once /diagnostics` received real data — the 2026-09-21
+        one-sided blindness is gone. AGENTS.md updated (Remote RViz + the SHM
+        gotcha); rviz_remote.sh's stale comment refreshed.
 
 ## Open — dev-PC / scripts
 
