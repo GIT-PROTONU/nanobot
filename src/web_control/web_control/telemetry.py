@@ -1546,6 +1546,14 @@ class TelemetryHub:
         req = SetParameters.Request()
         req.parameters = [Parameter(name=name, value=pv)]
         client.call_async(req)
+        if node == "web_control" and name == "lds_idle_enable":
+            # Toggling Idle spin-down (off or on) is the user taking the topic BACK
+            # from a manual owner (a slider drag latches `lds_manual_secs` — 300 s
+            # by default). Without this the controller keeps handing off for the
+            # whole manual window after re-enabling: the Lidar card stays "manual"
+            # and spin-down never resumes. Same clearing the slider path does via
+            # _lds_sent bookkeeping.
+            self._lds_manual_until = 0.0
         # Diagnosability: who/what changed a param (esp. enable_motion) must be in the
         # app log — nav_node's _on_params only logs the transition it receives, so this
         # records the browser-facing side too.
