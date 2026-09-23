@@ -92,6 +92,16 @@ LDS_NAV_STALE = 90.0
 # robot never moves). A genuinely dead nano-nav/slam now costs at most 5 min of
 # lidar spin instead of silently deadlocking every goal.
 LDS_PLANNING_STALE = 300.0
+# Goal-click pre-wake (2026-09-23): a goal clicked while the idle controller has the
+# lidar parked used to FAIL — the goal went out first, Nav2 started planning against
+# slam's frozen map→odom TF, and bt recovery aborted the FIRST goal before the ~2 s
+# spin-up finished (a re-click then worked because the lidar was already up). The goal
+# publish now fires the spin setpoint immediately and holds (bounded) until /lds_hz
+# shows the lidar actually delivering frames, so planning starts against a live TF.
+LDS_READY_MIN_HZ = 2.0    # /lds_hz valid-frame rate that counts as "scans flowing"
+LDS_READY_AGE = 1.5       # /lds_* readouts must be fresher than this (s) to be trusted
+LDS_WAKE_WAIT = 10.0      # max seconds a goal is held while the parked lidar spins up
+LDS_WAKE_POLL = 0.25      # readiness poll period while holding
 # --- SLAM/Nav event log (the Drive tab's "Nav log" card; GET /nav/log) ------
 NAVLOG_MAX = 400          # ring size (oldest dropped)
 NAVLOG_WARN_PERIOD = 15.0  # min gap between repeated planning-stuck warnings
@@ -1169,6 +1179,57 @@ class TelemetryHub:
         except (TypeError, ValueError):
             return LDS_MANUAL_SECS_DEFAULT
 
+    def _lds_ready(self):
+        """Is the lidar actually delivering valid frames right now? Trusts the ESP32's
+        /lds_hz (valid-frame rate, 0 = not receiving) only while the /lds_* readouts
+        are fresh — a dead ESP32 link leaves the last hz lingering on the dict, and
+        the age check is what reads that as NOT ready."""
+        if self._lds_at is None or (time.monotonic() - self._lds_at) > LDS_READY_AGE:
+            return False
+        return float(self._lds.get("hz") or 0.0) >= LDS_READY_MIN_HZ
+
+    def wake_lidar(self, reason="goal", wait=True):
+        """Make sure the lidar is spinning + delivering frames BEFORE a Nav2 goal goes
+        out. Fires the spin-when-active setpoint immediately if /lds_hz says no valid
+        frames are flowing (the 1 Hz idle controller alone is too slow — the planner
+        starts failing before its next tick), then optionally holds the CALLER (an
+        HTTP/skill worker thread — never the executor) until frames actually arrive,
+        bounded by LDS_WAKE_WAIT; on timeout the goal proceeds anyway (no worse than
+        the old behaviour) with a Nav-log warning. Returns the seconds held (0.0 when
+        the lidar was already ready). A remembered spin target of 0 (slider parked) is
+        overridden for the goal — navigation is impossible without scans — falling
+        back to LDS_DEFAULT_RPM; the IMU interference test's lds_hold is never fought."""
+        now = time.monotonic()
+        if self._lds_ready():
+            return 0.0
+        held = 0.0
+        rpm = min(LDS_RPM_MAX, max(0.0, float(self._lds_user_rpm or 0.0)
+                                   or LDS_DEFAULT_RPM))
+        if not self._lds_hold:
+            self._pubs["/lds_target_rpm"][0].publish(Float32(data=rpm))
+            self._lds_sent = rpm
+            self._lds_sent_at = now
+            # Treat this as recent motion so _lds_ctrl_tick holds the wake (and
+            # re-asserts it) until the goal's own nav_busy takes over.
+            self._lds_rebuild_until = max(self._lds_rebuild_until, now + max(
+                5.0, float(self._lds_param("lds_idle_secs", LDS_IDLE_SECS_DEFAULT))))
+        self._navlog_add(f"lidar not delivering frames — spinning up to {rpm:.0f} rpm "
+                         f"before {reason}")
+        if wait:
+            deadline = now + LDS_WAKE_WAIT
+            while not self._lds_ready() and time.monotonic() < deadline:
+                time.sleep(LDS_WAKE_POLL)
+            held = min(time.monotonic() - now, LDS_WAKE_WAIT)
+            if self._lds_ready():
+                self._navlog_add(f"lidar ready after {held:.1f}s — {reason} "
+                                 "going out now")
+            else:
+                self._navlog_add(
+                    f"lidar STILL not delivering frames after {LDS_WAKE_WAIT:.0f}s — "
+                    f"{reason} sent anyway; expect planning to fail (ESP32 link / "
+                    "nano-sensors down?)", "warn")
+        return held
+
     def _lds_ctrl_tick(self):
         """Own /lds_target_rpm when nobody else does: spin at the user's target while
         the robot is active (recent commanded motion or a Nav2 goal in flight), park
@@ -1335,6 +1396,11 @@ class TelemetryHub:
             return {"error": f"bad value: {exc}"}
         if msg is None:
             return {"error": "bad value"}
+        held = 0.0
+        if topic == "/goal_pose":
+            # Pre-wake: never let Nav2 plan against slam's frozen map→odom TF — hold
+            # the goal (bounded) until the parked lidar is actually delivering frames.
+            held = self.wake_lidar(reason="the goal")
         pub.publish(msg)
         if topic == "/goal_pose":
             # Goal mirror for the web map (f["nav"].goal). Nav2 will corroborate
@@ -1346,13 +1412,20 @@ class TelemetryHub:
             # AND latch the manual window so the idle controller doesn't fight the
             # user for lds_manual_secs.
             self._lds_user_rpm = self.note_lds_manual(msg.data, set_target=True)
+            # Bookkeep the setpoint here too, so wake_lidar sees a slider-parked 0
+            # as parked (and a slider spin-up as already commanded).
+            self._lds_sent = float(msg.data)
+            self._lds_sent_at = time.monotonic()
         # Diagnosability: log map-click goals + LDS rpm etc. so "who told the robot to
         # go there / spin" is in the app log. Throttle the chatty spin-down? No — these
         # are discrete user actions, not a hot loop; every one is a meaningful event.
         if topic in ("/goal_pose", "/reset_ticks", "/laser_pwm", "/motor_pid",
                      "/lds_target_rpm"):
             self._node.get_logger().info(f"POST /publish {topic} value={data.get('value')!r}")
-        return {"status": "ok", "topic": topic}
+        out = {"status": "ok", "topic": topic}
+        if held:
+            out["lidar_wait"] = round(held, 1)
+        return out
 
     def note_goal(self, x, y, source=""):
         """Record a goal published outside POST /publish (skill actions) so the

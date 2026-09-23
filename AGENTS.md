@@ -1295,6 +1295,32 @@ reliable"). Rebuilt as THREE coordinated pieces:
   flow and the plan can actually compute (dead nav/slam now costs ≤5 min of lidar
   spin, not a deadlock). Recovery for a stuck plan once scans flow: the planner's
   own retries succeed as soon as map→odom is fresh — no re-click needed.
+- **SECOND failure mode — the first goal of a wake FAILS (found live 2026-09-23,
+  after the deadlock fix above): click a goal on a PARKED lidar → the first
+  navigation aborts, a re-click works.** The deadlock fix only kept the lidar up
+  DURING planning; the goal itself still went out first, so Nav2 started planning
+  against the frozen map→odom TF, the planner failed, bt recovery (clear costmaps
+  → retry) exhausted, and the goal aborted — all within the ~2 s the spin-up
+  needed. **Fix: goal-click lidar PRE-WAKE (`telemetry.wake_lidar` +
+  `_lds_ready`)** — a `/goal_pose` publish (map click, Locations Go, skill go-to)
+  now fires the spin setpoint IMMEDIATELY (the 1 Hz idle controller's next tick is
+  too slow) and HOLDS the goal publish (bounded, `LDS_WAKE_WAIT` 10 s) until the
+  ESP32's `/lds_hz` valid-frame rate ≥ `LDS_READY_MIN_HZ` (2.0) with fresh
+  `/lds_*` readouts (`LDS_READY_AGE` 1.5 s — a lingering hz from a dead ESP32
+  link reads as NOT ready), then publishes the goal against a live TF. On timeout
+  the goal goes out anyway (+ Nav-log warning) — a dead ESP/sensors behaves no
+  worse than before. Details: the hold runs on the HTTP/skill WORKER thread (never
+  the executor); a remembered spin target of 0 (slider parked) is overridden for
+  the goal (falls back to `LDS_DEFAULT_RPM` — navigation is impossible without
+  scans) while the IMU test's `lds_hold` is never fought; the wake arms the
+  rebuild window so `_lds_ctrl_tick` holds + re-asserts it until the goal's own
+  nav_busy takes over; the Spin-slider path bookkeeps `_lds_sent` so a
+  slider-parked 0 is recognized as parked. The `/publish /goal_pose` response
+  carries a `lidar_wait` field, and the Nav log records wake → ready (held Xs) →
+  goal-out (or the timeout warning). Skill goals pre-wake the same way in
+  `web_server._publish_skill_action` before publishing. Unit-tested in
+  `test_nav_telemetry.py` (wake/hold/timeout/hold-fight/`_lds_sent` bookkeeping) +
+  `test_nav_log.py` (log lines); smoke covers the endpoint contract.
 - **SECOND live finding (2026-09-23, after the deploy restart): a nano-nav restart
   with the lidar parked can HANG the Nav2 lifecycle activation** — the global
   costmap's `on_activate` waits (forever, "Timed out waiting for transform …

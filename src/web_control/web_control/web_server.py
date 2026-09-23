@@ -2000,6 +2000,9 @@ class WebServerNode(Node):
                 m.pose.position.x = float(loc["x"])
                 m.pose.position.y = float(loc["y"])
                 m.pose.orientation.w = 1.0
+                # Pre-wake the lidar (bounded hold) — same as a map click: a goal
+                # against slam's frozen map→odom TF fails its first planning attempt.
+                self.telemetry.wake_lidar(reason=f"skill goal '{name}'")
                 pub.publish(m)
                 self.telemetry.note_goal(m.pose.position.x, m.pose.position.y,
                                          source=f"skill go-to '{name}'")

@@ -23,6 +23,7 @@ import time
 from geometry_msgs.msg import Twist
 from action_msgs.msg import GoalStatus, GoalStatusArray
 
+from web_control import telemetry as telemetry_mod
 from web_control.telemetry import NAVLOG_MAX, TelemetryHub
 
 
@@ -162,11 +163,16 @@ def test_note_goal_skill_source_is_named():
     assert "skill go-to 'kitchen'" in _msgs(hub)[0]
 
 
-def test_publish_json_goal_logs_through_note_goal():
+def test_publish_json_goal_logs_through_note_goal(monkeypatch):
     hub = _hub()
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_WAIT", 0.05)   # parked lidar: bounded wake
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_WAIT", 0.05)   # parked lidar: bounded wake
     r = hub.publish_json({"topic": "/goal_pose", "value": {"x": 2.0, "y": 3.0}})
-    assert r["status"] == "ok"
-    assert len(_msgs(hub)) == 1 and "goal" in _msgs(hub)[0]
+    assert r["status"] == "ok" and r["lidar_wait"] > 0.0
+    msgs = _msgs(hub)
+    # the pre-wake logs its spin-up + timeout, then note_goal's goal entry follows
+    assert any("spinning up" in m for m in msgs)
+    assert msgs[-1].startswith("goal (2.00, 3.00)") and "planning" in msgs[-1]
 
 
 def test_clear_goal_logs_only_when_a_goal_existed():

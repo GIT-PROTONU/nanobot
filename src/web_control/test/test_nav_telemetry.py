@@ -389,3 +389,97 @@ def test_status_uses_last_entry_of_the_list():
     arr.status_list = [_status_arr(1).status_list[0], _status_arr(2).status_list[0]]
     h._on_goal_status(arr)
     assert h._goal_status == "navigating"
+
+
+# --- goal-click lidar pre-wake (2026-09-23) --------------------------------
+# A goal clicked while the idle controller has the lidar parked must NOT reach
+# Nav2 planning against slam's frozen map→odom TF: wake_lidar fires the spin
+# setpoint immediately and holds the publisher (bounded) until /lds_hz shows
+# valid frames; on timeout the goal still goes out (old behaviour) + a warning.
+
+import time
+
+from web_control import telemetry as telemetry_mod
+from web_control.telemetry import LDS_DEFAULT_RPM
+
+
+def _lds_arrival(h, hz=5.0):
+    h._lds = {"rpm": 300.0, "hz": hz, "duty": 0.3}
+    h._lds_at = time.monotonic()
+
+
+def test_wake_lidar_noop_when_frames_flow():
+    h = _hub()
+    _lds_arrival(h)
+    assert h.wake_lidar(reason="the goal") == 0.0
+    assert h._pubs["/lds_target_rpm"][0].published == []
+
+
+def test_wake_lidar_parked_publishes_setpoint_and_times_out(monkeypatch):
+    h = _hub()
+    h._lds_sent = 0.0                       # idle controller parked it
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_WAIT", 0.4)
+    held = h.wake_lidar(reason="the goal")  # no /lds_hz ever arrives (dead ESP32)
+    assert held == pytest.approx(0.4, abs=0.2)
+    pub = h._pubs["/lds_target_rpm"][0]
+    assert pub.published and pub.published[-1].data == pytest.approx(LDS_DEFAULT_RPM)
+    assert h._lds_sent == pytest.approx(LDS_DEFAULT_RPM)
+    assert h._lds_rebuild_until > time.monotonic()   # controller must hold the wake
+
+
+def test_wake_lidar_remembered_zero_rpm_falls_back_to_default(monkeypatch):
+    # A slider parked at 0 must not keep the goal parked too — navigation needs scans.
+    h = _hub()
+    h._lds_user_rpm = 0.0
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_WAIT", 0.1)
+    h.wake_lidar(wait=False)
+    pub = h._pubs["/lds_target_rpm"][0]
+    assert pub.published[-1].data == pytest.approx(LDS_DEFAULT_RPM)
+
+
+def test_wake_lidar_holds_until_frames_arrive(monkeypatch):
+    h = _hub()
+    calls = []
+    monkeypatch.setattr(h, "_lds_ready", lambda: (calls.append(1), len(calls) >= 2)[1])
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_POLL", 0.01)
+    held = h.wake_lidar(reason="the goal")
+    assert 0.0 < held < 1.0
+
+
+def test_wake_lidar_never_fights_lds_hold(monkeypatch):
+    # The IMU interference test owns the spin motor — no setpoint from here.
+    h = _hub()
+    h._lds_hold = 1
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_WAIT", 0.1)
+    h.wake_lidar(wait=False)
+    assert h._pubs["/lds_target_rpm"][0].published == []
+
+
+def test_publish_json_goal_wakes_lidar_and_reports_hold(monkeypatch):
+    h = _hub()
+    h._lds_sent = 0.0                       # parked
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_WAIT", 0.2)
+    out = h.publish_json({"topic": "goal_pose", "value": {"x": 1.0, "y": 2.0}})
+    assert out["status"] == "ok" and out["lidar_wait"] > 0.0
+    goal_pub = h._pubs["/goal_pose"][0]
+    assert len(goal_pub.published) == 1     # goal went out even on timeout
+    assert h._goal == [1.0, 2.0]            # mirror set after the publish
+
+
+def test_publish_json_goal_no_hold_when_ready(monkeypatch):
+    h = _hub()
+    _lds_arrival(h)
+    out = h.publish_json({"topic": "/goal_pose", "value": {"x": 0.5, "y": -0.5}})
+    assert out["status"] == "ok" and "lidar_wait" not in out
+    assert h._pubs["/lds_target_rpm"][0].published == []
+
+
+def test_publish_json_slider_updates_lds_sent(monkeypatch):
+    # wake_lidar's parked-check reads _lds_sent — the slider path must bookkeep it
+    # or a slider-parked 0 looks "already spinning" to the pre-wake.
+    h = _hub()
+    h.publish_json({"topic": "/lds_target_rpm", "value": 0})
+    assert h._lds_sent == 0.0
+    h.publish_json({"topic": "/lds_target_rpm", "value": 250})
+    assert h._lds_sent == 250.0
+    assert h._lds_user_rpm == 250.0
