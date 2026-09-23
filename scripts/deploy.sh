@@ -51,6 +51,15 @@ for f in llm.json personality.json phrases.json workshop.json trait_history.json
   [ "$pushed" = 0 ] && echo "   (nothing in memory/ to push — run personality_creator.py first)"
 fi
 
+echo ">> wake the lidar setpoint (the parked-turret activation wedge: a stack bounce
+    with a parked lidar slows/crashes the nav2 lifecycle activation — the manager
+    can wedge permanently on a dropped zenoh bond query, seen 3× on 2026-09-23.
+    The firmware holds the setpoint through the bounce; the idle controller
+    re-parks afterwards. Non-fatal if the gateway is down.)"
+ssh "$HOST" "curl -s -m 5 -X POST -H 'Content-Type: application/json' \
+  -d '{\"topic\":\"/lds_target_rpm\",\"value\":300}' http://127.0.0.1:8080/publish \
+  >/dev/null 2>&1 || true"
+
 echo ">> build + restart on board"
 # Build via scripts/build.sh — the RoboStack env needs the explicit -DPython_* CMake
 # hints it contains (rosidl_generator_py fails to configure without them); a bare

@@ -1490,6 +1490,13 @@ RPP cap, skill motion) tied to the `w·0.2 rad/scan` smear budget, and note the 
   passwordless `ssh nano` key alias (`~/.ssh/config`, `Host nano`; override the target with
   `NANO_HOST`), colcon-builds on the board (optionally `--packages-select`), then
   `stack.sh restart`. No creds needed in the environment — key auth only.
+  Before the restart it also **pre-arms the lidar setpoint** (POST /lds_target_rpm 300
+  through the board's gateway, non-fatal when down): the parked-turret activation wedge
+  (a stack bounce with a parked lidar stalls the nav2 lifecycle manager on a dropped
+  zenoh bond query — hit 3× on 2026-09-23, bt_navigator left inactive so every goal was
+  silently ignored; heal = wake lidar + `sudo -n systemctl restart nano-slam nano-nav`,
+  and the nano-nav stop itself can wedge for minutes — wait it out). The firmware holds
+  the setpoint through the bounce; the idle controller re-parks afterwards.
   It also pushes the dev-made soul/bank (`memory/personality.json` + `phrases.json`, plus
   hand-edited `presence_chart.yaml`/`beats.json` if present)
   into the board's `~/.local/state/nanobot/` — **OFF by default**

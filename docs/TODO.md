@@ -50,6 +50,15 @@ in this checkout.
       choreography is: POST /publish /lds_target_rpm 300 (the firmware holds the
       setpoint through the bounce) → immediately restart nano-robot.target → the
       cascade completes in ~50 s. Leave the idle controller to re-park afterwards.
+      **HIT A THIRD TIME same day (web_control deploy): the second bounce ran WITHOUT
+      the pre-wake → planner bond wedged at 17:19:47 ("Creating bond (planner_server)"
+      then silence; bt_navigator stayed inactive → every goal silently ignored, web
+      chip stuck on "planning" while /map was fresh — the Nav log's planning-stuck
+      watchdog named it). Healed via the choreography (wake lidar → `sudo -n systemctl
+      restart nano-slam nano-nav`; the nano-nav stop itself wedged ~2.5 min, the
+      documented stopping-wedge) → "Managed nodes are active". The choreography is now
+      AUTOMATED in deploy.sh (pre-restart lidar setpoint POST, non-fatal when the
+      gateway is down) so a deploy can no longer skip it.**
 - [x] **2026-09-21 (code DONE + FLASHED + A/B'd 2026-09-22): wheel-PID adaptive-filter
       N hysteresis.** Residual drive roughness ("better than this morning but still
       not smooth"). IMPLEMENTED (main.cpp `hystN()` + id 7, telemetry.py gate
