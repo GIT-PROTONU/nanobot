@@ -162,7 +162,94 @@ PY
       fi
       sleep 0.5
     done
-    exec "$CONDA_PREFIX/bin/ros2" launch robot_bringup nav2.launch.py load_only:=true
+    # LIDAR GATE (added 2026-09-24 — the structural fix for the deterministic
+    # "planning stuck" wedge, hit 4x on 2026-09-23): activating Nav2 into a dead
+    # map frame hangs the lifecycle manager FOREVER. The global costmap's
+    # on_activate blocks waiting for slam's map->odom TF (it only exists while
+    # scans flow), the zenoh change_state query EXPIRES while its reply is still
+    # pending, and the dropped reply ("Received ReplyData for unknown Query: N")
+    # leaves the manager waiting on a response that no longer exists —
+    # bt_navigator never activates, every /goal_pose is silently ignored, and
+    # resuming scans does NOT un-wedge it. The loader owns activation timing, so
+    # hold it until the map frame CAN exist:
+    #   * lidar actually spinning — the vitals blob's lds.hz (valid frames/s,
+    #     the same signal telemetry's goal pre-wake gates on: hz >= 2, age
+    #     <= 1.5 s — a stale hz from a dead ESP32 link must NOT count);
+    #   * nano-slam + nano-tf active (no mapper / no base_link->laser TF = no
+    #     map frame either, no matter how fast the lidar spins).
+    # A parked lidar (the idle controller's boot park lands ~lds_idle_secs after
+    # the app unit — it DEFEATED the deploy pre-arm) is woken first: POST
+    # /lds_target_rpm through the LOCAL gateway so telemetry.note_lds_manual
+    # holds the setpoint for lds_manual_secs (300 s) and the idle controller
+    # cannot fight it. Bounded: after LDS_GATE_SECS proceed anyway (the pre-gate
+    # behaviour) so a dead lidar/jam delays boot by the timeout instead of
+    # hanging the target start job. 30 s + the 30 s container poll + launch stay
+    # safely under the unit's default 90 s TimeoutStartSec (the board's loader
+    # unit has no explicit TimeoutStartSec; sudoers has no daemon-reload rule).
+    LDS_GATE_SECS="${LDS_GATE_SECS:-30}"
+    LDS_GATE_HZ="${LDS_GATE_HZ:-2.0}"
+    gate_ready() {
+      systemctl is-active --quiet nano-slam.service nano-tf.service || return 1
+      python -c 'import json,sys
+try:
+    v = json.load(open("/dev/shm/nano_vitals.json")).get("lds") or {}
+except Exception:
+    sys.exit(1)
+hz = float(v.get("hz") or 0.0); age = v.get("age")
+sys.exit(0 if (hz >= float(sys.argv[1]) and age is not None and float(age) <= 1.5) else 1)' "$LDS_GATE_HZ" 2>/dev/null
+    }
+    # The user's persisted spin-when-active target (lds.json lds_active_rpm) so
+    # the wake does not silently move their setting; the gateway POST rides
+    # publish_json -> note_lds_manual, the proper outside-publisher path.
+    gate_rpm="$(python -c 'import json,os
+try:
+    print(float(json.load(open(os.path.expanduser("~/.local/state/nanobot/lds.json"))).get("lds_active_rpm") or 300.0))
+except Exception:
+    print(300.0)' 2>/dev/null)"
+    gate_rpm="${gate_rpm:-300.0}"
+    gate_web="${NANO_WEB_PORT:-8080}"
+    gate_t0=$SECONDS; gate_next_wake=0; gate_waited=""
+    while [ "$((SECONDS - gate_t0))" -lt "$LDS_GATE_SECS" ]; do
+      if gate_ready; then gate_waited=$((SECONDS - gate_t0)); break; fi
+      if [ "$SECONDS" -ge "$gate_next_wake" ]; then
+        # Jam-safe wake: the ESP32's jam guard LATCHES a park when a target is
+        # set but the tach stays dead 6 s, and only target <= 0 clears it —
+        # while a freshly watchdog-rebooted ESP may not accept the first
+        # target puts at all (live 2026-09-24: a bare 300 after the boot park
+        # left the motor latched; an explicit 0 -> 300 cycle spun it up). So
+        # every cycle first POSTs 0 (clears any latch, no-op otherwise), then
+        # the setpoint.
+        curl -s -m 3 -X POST "http://127.0.0.1:${gate_web}/publish" \
+          -d '{"topic":"/lds_target_rpm","value":0}' >/dev/null 2>&1 || true
+        sleep 1
+        curl -s -m 3 -X POST "http://127.0.0.1:${gate_web}/publish" \
+          -d "{\"topic\":\"/lds_target_rpm\",\"value\":${gate_rpm}}" >/dev/null 2>&1 || true
+        gate_next_wake=$((SECONDS + 10))
+      fi
+      sleep 1
+    done
+    if [ -n "$gate_waited" ]; then
+      echo "nav-loader: lidar spinning after ${gate_waited}s (gate) — map frame can exist, loading nav components"
+    else
+      echo "nav-loader: WARNING lidar not spinning after ${LDS_GATE_SECS}s (vitals lds.hz < ${LDS_GATE_HZ}, or slam/tf down) — loading anyway; activation may wedge (the 2026-09-23 planning-stuck failure)" >&2
+    fi
+    # The launch itself is bounded: LoadComposableNodes completing does NOT
+    # always mean the launch process exits — its zenoh session teardown can
+    # hang (same shutdown-under-zenoh family as the container's stop wedge;
+    # live 2026-09-24: all 6 components loaded + "Managed nodes are active",
+    # launch lingered 3+ min at ~25% CPU until killed, holding the target's
+    # start job). A healthy load exits in 2-8 s; a linger is SIGTERM'd
+    # (+KILL 10 s later) and forced to success — by then the load has either
+    # demonstrably completed or loudly failed in the journal above. (Type=
+    # oneshot has NO default start timeout — verified live — so without this
+    # the linger is unbounded.)
+    timeout -k 10 60 "$CONDA_PREFIX/bin/ros2" launch robot_bringup nav2.launch.py load_only:=true
+    rc=$?
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+      echo "nav-loader: launch lingered past 60s (zenoh teardown hang) — components already loaded; forcing success so the target start job completes" >&2
+      exit 0
+    fi
+    exit "$rc"
     ;;
   slam)     # slam_toolbox 2.6.10 (the only robostack build): PLAIN rclcpp::Node,
             # self-configuring executable. Provides /map + the map->odom TF that
