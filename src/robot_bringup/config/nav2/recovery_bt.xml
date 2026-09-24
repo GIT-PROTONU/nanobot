@@ -24,7 +24,16 @@
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="1" name="NavigateRecovery">
       <PipelineSequence name="Navigate">
-        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        <!-- RateController (2026-09-24): REPLAN at 1 Hz while driving. Without it
+             ComputePathToPose runs ONCE and the robot follows a STALE plan — when
+             the obstacle layer marks a new/moved object mid-drive, the plan keeps
+             crossing it → RPP "collision ahead" → goal failed (hit live twice
+             2026-09-24). PipelineSequence halts FollowPath for the planning
+             instant each tick (stock Nav2 default-tree pattern; the
+             rate_controller_bt_node plugin is already in plugin_lib_names). -->
+        <RateController hz="1.0">
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        </RateController>
         <FollowPath path="{path}" controller_id="FollowPath"/>
       </PipelineSequence>
       <Sequence name="Recovery">

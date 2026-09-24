@@ -5,9 +5,14 @@
 # launch_ros hands this whole file to every ComposableNode and each node picks
 # the section matching its own name. Deliberately ABSENT everywhere: AMCL,
 # collision_monitor, map_server, waypoint_follower, smoother_server,
-# voxel/3D/range/keepout costmap layers — lean RAM/CPU on the
-# 1 GB NanoPi NEO Plus2 (H5). (velocity_smoother JOINED 2026-09-23: nav speed +
-# linear/angular accel caps, live-tunable via web_control's POST /nav/config.)
+# voxel/3D/keepout costmap layers — lean RAM/CPU on the 1 GB NanoPi NEO Plus2
+# (H5). EXCEPTION (2026-09-24): an ObstacleLayer NOW feeds BOTH costmaps from
+# /scan — live hits become obstacles immediately instead of waiting for slam's
+# ~5 s /map repaint; the fix for "robot crowds an obstacle then stops"
+# (docs/TODO.md, the 2026-09-24 collision-ahead confirmation). Raytrace ranges
+# are capped at 3-3.5 m to bound the raytracing cost on the big global grid.
+# (velocity_smoother JOINED 2026-09-23: nav speed + linear/angular accel caps,
+# live-tunable via web_control's POST /nav/config.)
 #
 # Key hardware facts baked in (see docs/nav2-migration.md):
 #   * LDS02RR lidar: 0.12–6.0 m, ~1° beams, frame "laser" (static base_link→laser
@@ -149,7 +154,12 @@ controller_server:
       use_velocity_scaled_lookahead_dist: true
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      inflation_cost_scaling_factor: 3.0
+      # was 3.0 — with the persisted keep-away at 0.20 m and scaling 3.0 the cost at
+      # 0.17 m from an obstacle was tiny, so NavFn planned right along the inscribed
+      # boundary and RPP's collision-ahead check tripped on every pose error
+      # ("crowds an object then stops", 2026-09-24 ×2). 2.0 = flatter decay: cells
+      # near the ring stay expensive, so plans keep real margin.
+      inflation_cost_scaling_factor: 2.0
       regulated_linear_scaling_min_radius: 0.9
       regulated_linear_scaling_min_speed: 0.25
       use_rotate_to_heading: true
@@ -285,14 +295,34 @@ local_costmap:
       # behavior_server reads the raw costmap + footprint from here
       always_send_full_costmap: true
       transform_tolerance: 0.3
-      static_layer:
-        plugin: nav2_costmap_2d::StaticLayer
-        map_subscribe_transient_local: true
+      # NO static_layer here (2026-09-24): the local costmap is an ODOM-frame
+      # rolling window and StaticLayer stamps the incoming MAP-frame grid at
+      # numeric world coords — walls get offset by slam's map->odom error
+      # (measured 0.01-0.08 m aligned, but it has hit 0.3+ m after carries),
+      # painting PHANTOM walls that trip RPP's collision check. The obstacle
+      # layer (below) covers live truth; planning margin is the global
+      # costmap's job. Also cost_scaling_factor 3.0 -> 1.7 (flatter decay =
+      # real margin around the inscribed ring; see RPP note above).
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          sensor_frame: laser
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          obstacle_min_range: 0.12
+          obstacle_max_range: 2.5
+          raytrace_min_range: 0.0
+          raytrace_max_range: 3.0
+          inf_is_valid: false
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         inflation_radius: 0.25
-        cost_scaling_factor: 3.0
-      plugins: ["static_layer", "inflation_layer"]
+        cost_scaling_factor: 1.7
+      plugins: ["obstacle_layer", "inflation_layer"]
 
 # ---- global costmap (static map + inflation) ----------------------------------
 global_costmap:
@@ -316,11 +346,34 @@ global_costmap:
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
+      # LIVE obstacles (2026-09-24): same scan source as the local costmap.
+      # obstacle_max_range 3.0 + raytrace 3.5 CAP the raytracing cost on this
+      # 24x24 m grid (@1 Hz update) — beyond ~3 m the static layer (slam's
+      # painted walls) still carries the obstacle, so live marking is a
+      # local-horizon job.
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          sensor_frame: laser
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          obstacle_min_range: 0.12
+          obstacle_max_range: 3.0
+          raytrace_min_range: 0.0
+          raytrace_max_range: 3.5
+          inf_is_valid: false
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         inflation_radius: 0.25
-        cost_scaling_factor: 3.0
-      plugins: ["static_layer", "inflation_layer"]
+        # was 3.0 — steep decay let NavFn plan paths hugging the inscribed ring
+        # (2026-09-24 "crowds an obstacle then stops"); 1.7 keeps cost high
+        # across the whole inflation radius so plans prefer real margin.
+        cost_scaling_factor: 1.7
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
 
 # ---- lifecycle manager: FIVE Nav2 servers ONLY --------------------------------
 # - bt_navigator must be LAST: CONFIGURE/ACTIVATE iterate node_names FORWARD and

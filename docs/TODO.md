@@ -15,6 +15,215 @@ in this checkout.
 
 ## Open — needs the physical robot
 
+- [ ] **NEW 2026-09-24: robot crowds obstacles then stops mid-goal — raising the
+      keep-away zone did NOT fix it.** User report: navigating around an object,
+      the robot comes too close and stops. The web **Keep-away zone** slider
+      (`nav_inflation_m` → both costmaps' `inflation_layer.inflation_radius`, live)
+      was raised and the behavior PERSISTS, so inflation geometry is not the whole
+      story. Working diagnosis (config/nav2/nav2_params.yaml): (1) **neither
+      costmap has an ObstacleLayer** — a new/moved object only enters the costmaps
+      when slam_toolbox repaints `/map` (`map_update_interval: 5.0`) and the static
+      layer re-ingests it, so the robot is often already inside the margin when the
+      costmap flips to inscribed → RPP's collision-ahead check
+      (`max_allowed_time_to_collision_up_to_carrot: 1.0`) kills /cmd_vel → abrupt
+      stop (recovery motions are zeroed, so it re-plans the same hugging path);
+      (2) `cost_scaling_factor: 3.0` on both inflation layers (+ RPP's
+      `inflation_cost_scaling_factor: 3.0`) = fast cost falloff, so the planner hugs
+      even at a larger radius; (3) the persisted `nav.json` value may never have
+      landed on the costmaps — verify live
+      (`ros2 param get /local_costmap/local_costmap inflation_layer.inflation_radius`,
+      with the RMW_IMPLEMENTATION + `ros2 daemon stop` gotchas). Diagnose first:
+      `journalctl -u nano-nav` at the stop moment for "detected collision ahead" +
+      the Drive tab's Nav log terminal line. Likely fixes: the ObstacleLayer
+      candidate in the 2026-09-23 batch item below (live /scan obstacles, not just
+      SLAM-painted walls — this finding is its strongest motivation yet) and/or
+      `cost_scaling_factor` 3.0 → 1.5-2.0 (restart-only, nano-nav); also confirm
+      Robot size ⌀ on the Navigation pace card matches the physical robot.
+      Verify: obstacle in the middle, goal behind it → keeps the margin, no abrupt
+      stop, goal completes.
+      **2026-09-24 PROGRESS: the ObstacleLayer half is LANDED** — an `obstacle_layer`
+      (live /scan marking+raytrace clearing, `sensor_frame laser`) was added to BOTH
+      costmaps in nav2_params.yaml, deployed via `deploy.sh robot_bringup
+      web_control` + stack bounce, and live-verified (both costmaps log
+      `Initialized plugin "obstacle_layer"`, `plugins` readback
+      `[static_layer, obstacle_layer, inflation_layer]`, /local_costmap route 200
+      with inflated-cost cells, nav container load unchanged). Web visibility rides
+      the existing Costmap toggle (composited master grid) — a new/moved object
+      shows as a yellow→red blob within ~1 s. REMAINING for this item: the
+      PHYSICAL behavior verify (obstacle in the middle, goal behind it → keeps
+      margin, no abrupt stop, goal completes) and, if it still hugs,
+      `cost_scaling_factor` 3.0 → 1.5-2.0.
+      **2026-09-24 07:09 SECOND HIT (10 min after the ObstacleLayer deploy) →
+      ROOT CAUSES PINNED + THREE-LEVER FIX DEPLOYED same day.** Same signature
+      (goal (−0.67,−0.18)→(0.43,−0.55), collision-ahead at 7 s → patience →
+      fail). Live evidence gathered: local↔global wall alignment
+      median 0.01/max 0.08 m (phantom mis-projection MILD — the collision was
+      real); `nav.json` was live at **inflation 0.20 m + robot ⌀ 0.30 m**
+      (BELOW the yaml defaults — with scaling 3.0 the cost at 0.17 m is tiny, so
+      NavFn planned right along the inscribed boundary); and
+      `recovery_bt.xml` had **no RateController — ComputePathToPose ran ONCE per
+      goal**, so the stale plan never rerouted when the obstacle layer
+      marked the object mid-drive. Fix (all deployed + board-verified):
+      (1) `RateController hz="1.0"` around ComputePathToPose (stock default-tree
+      replanning; plugin already in plugin_lib_names; PipelineSequence halts
+      FollowPath for the planning instant each second); (2) `cost_scaling_factor`
+      3.0 → 1.7 on BOTH costmaps + RPP `inflation_cost_scaling_factor` 3.0 → 2.0
+      (flatter decay = real margin around the ring); (3) local costmap's
+      `static_layer` DROPPED (odom-frame rolling window + map-frame static data
+      = phantom-wall class; obstacle layer covers live truth) → local plugins
+      now `[obstacle_layer, inflation_layer]`; (4) persisted UI corrected via
+      POST /nav/config: inflation 0.20 → **0.30**, robot ⌀ 0.30 → **0.32**
+      (true chassis ⌀; the file had drifted low). Verified live: params readback
+      (1.7/0.3/0.16), local+global plugin lists, "Managed nodes are active".
+      REMAINING: the physical verify (above) — obstacle in the middle, goal
+      behind it → reroutes with margin, completes.
+      **2026-09-24 06:47 LIVE CONFIRMATION (the exact failure, from
+      `journalctl -u nano-nav`):** goal (0.37,-0.65)→(1.30,0.14) at 06:47:50 —
+      ~9 s in: 3× "Unable to transform robot pose into global plan's frame" (the
+      map→odom cadence race, contributing to patience) → "collision ahead" ×6 →
+      "Controller patience exceeded" → follow_path abort → zeroed backup/spin →
+      retry → immediate collision-ahead ×7 → "Goal failed" in 12.5 s. Three
+      shorter goals before it (same area) SUCCEEDED — the failing one crosses
+      near the object. The plan can pass within the 0.16 m inscribed ring even at
+      a larger inflation radius because NavFn only avoids LETHAL cells; the
+      collision check then trips when slam's ~5 s /map repaint updates the local
+      costmap mid-drive. **SECONDARY FINDING (same event): after the failed goal
+      the lidar parked (idle) → slam republishes map→odom with the FROZEN
+      last-scan stamp (06:48:10.745854) → nano-nav requests base_link→map AT that
+      stamp ~1 Hz forever → a perpetual "Extrapolation Error … Requested time
+      1790232490.745854" storm (2550 lines in 50 min, ongoing while parked, units
+      otherwise healthy). Identify the holder (a costmap-update/pose path holding
+      the frozen-stamp pose and retrying) and bound it — it is log spam + wasted
+      cycles every time the lidar parks, and it will poison any future
+      log-reading session.**
+- [ ] **NEW 2026-09-23: drawable keep-away/no-go zones on the web map (Nav2 keepout
+      filter).** Today's only keep-away is the uniform inflation bubble
+      (`nav_inflation_m` around every wall); area-specific zones died with slam_nav's
+      no-go brush (`/dev/shm/nano_nogo.bin`, retired 2026-09-14) and were deliberately
+      not rebuilt. The Nav2-native mechanism is a **costmap filter**: publish a
+      keepout mask (OccupancyGrid or nav2_msgs `CostmapFilterInfo` + `FilterMask`)
+      and add `nav2_costmap_2d::KeepoutFilter` to the costmaps — the planner then
+      treats painted cells as lethal. Sketch: web-map rectangle/brush draw tool →
+      zones persisted (`~/.local/state/nanobot/keepout.json`, the move.json
+      "persisted UI wins" pattern) → `telemetry.py`/`web_server` publishes the mask
+      grid + info topic (latched/transient-local, re-published on edit) → add the
+      filter layer to the GLOBAL costmap in `nav2_params.yaml` (restart-only; decide
+      whether the local costmap needs it too) → draw the zones on the web map
+      overlay alongside the costmap toggle. Beware the params-file gotcha (the
+      filter section must reach the costmap via the process-wide
+      `--params-file`), the mask must live in the `map` frame at the map's
+      resolution, and edited masks need a costmap re-subscribe/clear like
+      `/map/clear`. Needs board verify end-to-end (draw → planner routes around →
+      survives reboot).
+- [ ] **NEW 2026-09-24: persistent robot pose on the web map while the lidar is
+      parked (LDS off).** Today `f.nav.pose` = a tf2 lookup `map→base_link` at
+      Time(0) (`telemetry._tf_pose`) — while the lidar is parked,
+      slam_toolbox processes no scans, so its `map→odom` stays stamped at the
+      LAST processed scan and the composed lookup fails with "extrapolation
+      into the past" → the web map's robot dot/trail just STOPS (and the page
+      shows a stale or missing pose). The wheels keep knowing where the robot
+      is (`odom→base_link` from wheel_odometry flows continuously) — only the
+      map→odom half freezes. Sketch: in `telemetry.py`, cache the last
+      successful `map→odom` lookup (its stamp is fine to reuse — slam
+      republishes it latched) and compose it with the LIVE `/odom` pose
+      (already subscribed as `_odom`) whenever the full-chain
+      `map→base_link` lookup fails, so the marker dead-reckons on the map
+      while parked; drop back to None if `/odom` itself is stale or no
+      `map→odom` has ever been seen (boot before slam). Accuracy caveat to
+      surface: while parked-and-pushed (or on carpet slip) the dead-reckoned
+      marker drifts vs reality until the lidar wakes and slam re-anchors —
+      mark the stale/dead-reckoned state visibly (e.g. an amber pose dot or
+      a `pose_src: "tf"|"extrap"` field in `f.nav`, additive — the page
+      falls back gracefully). Mind the planning-deadlock docs: this is
+      DISPLAY ONLY — it must not make anything consume the extrapolated
+      pose as if it were slam-verified (Locations Save fallback at
+      web_server.py:2595 is the main consumer to double-check).
+      Verify: park the lidar 60+ s, drive/turn by hand → marker keeps
+      moving on the map; wake the lidar → marker snaps back to slam-truth
+      with no jump > a few cm.
+- [ ] **NEW 2026-09-23: multi-waypoint navigation ("visit A then B then C").**
+      Today every goal is a single `/goal_pose` (map click, Locations Go, skill
+      go-to); the Locations card is a named-poses store, not a sequence.
+      bt_navigator ALREADY loads + validates the default NavigateThroughPoses tree
+      plugins at activation (nav2_params.yaml:228-233) and `waypoint_follower` was
+      deliberately left out of the build — so the zero-new-dependency path is
+      publishing `/navigate_through_poses` (PoseArray) from web_control/skills,
+      which the default tree consumes as-is. Design questions: UI (add-multiple
+      clicks on the map before Go, ordered list in the Locations card?),
+      progress/status surfacing per waypoint (the single-goal status chip +
+      Nav log need waypoint indices), skip/reorder, interaction with the
+      keepout-filter item above (a waypoint inside a       keepout zone must fail
+      visibly), and cancel semantics. Verify the through-poses tree actually
+      activates on the board's minimal plugin set before building UI.
+- [ ] **NEW 2026-09-24: live planned-path polyline on the web map (`/plan`).**
+      Humble's `planner_server` publishes the computed path on **`/plan`**
+      (`nav_msgs/Path`) each time it plans — the AGENTS.md line "Nav2 doesn't
+      expose a plan topic" is inaccurate for Humble. Verify on the board first
+      (CLI gotchas: `RMW_IMPLEMENTATION=rmw_zenoh_cpp` + `ros2 daemon stop`):
+      `ros2 topic list | grep plan` + `ros2 topic echo --once /plan`. If there,
+      plumbing mirrors `/map`: a lazy browser-only sub in `telemetry.py`,
+      one cached copy, a small downsampled `GET /plan` JSON route, drawn as a
+      polyline in the map IIFE (index.html) alongside the trail. Timing caveat:
+      the path appears the instant planning finishes — effectively as the
+      robot starts moving, not before you commit. A true pre-commit preview
+      (plan-only via the `/compute_path_to_pose` action, robot never moves,
+      then a "Drive it" button) is the bigger sibling — only build that if
+      the live polyline isn't enough. Whatever lands here interacts with the
+      keepout-zone + multi-waypoint items above (a preview through a keepout
+      zone, or per-waypoint paths, reuse the same plumbing) — decide the
+      shape once.
+- [ ] **NEW 2026-09-23: Nav2 cheap-useful features batch (five candidates from the
+      2026-09-23 review).** Ranked by value-per-effort; independent, pick any:
+1. **`ObstacleLayer` on both costmaps** (config-only, no new package) — live
+          `/scan` hits become obstacles in planning + control, not just
+          SLAM-painted walls. Fixes "chair moved in front of the robot → the
+          planner paths through it" (the live-obstacle half that keepout zones
+          cannot cover). **2026-09-24: strengthened by the live finding that the
+          robot crowds obstacles then stops even with a larger keep-away zone —
+          see the NEW 2026-09-24 item at the top of this section.** Add `nav2_costmap_2d::ObstacleLayer` + a `scan`
+          observation source (`sensor_frame laser`, expected update 1-2 Hz global /
+          2 Hz local); mind the params-file delivery gotcha (the section must
+          reach the costmap nodes via the process-wide `--params-file`) and the
+          int width/height gotcha. Restart-only (nano-nav). Verify board CPU headroom
+          (raytracing 24×24 m @ 1 Hz) + a moved-obstacle goal now reroutes.
+          **DONE 2026-09-24 — deployed + live-verified: both costmaps log
+          `Initialized plugin "obstacle_layer"`, `plugins` readback
+          `[static_layer, obstacle_layer, inflation_layer]`, /local_costmap route
+          200 with inflated-cost cells, nav container CPU unchanged (~33% of a
+          core at Nice 10; raytrace ranges capped 3.0/3.5 m to bound the 24×24 m
+          raytracing). Web visibility rides the existing Costmap toggle. The
+          moved-obstacle REROUTE check (robot physically navigating around a new
+          object) still rides the NEW 2026-09-24 item's physical verify.**
+      2. **slam_toolbox map persistence / localization mode** (config-only, no
+         new package) — `map_file_name` + `mode: localization` (slam_params)
+         means the robot keeps its map across restarts instead of "restart IS
+         the map clear"; slam_toolbox also has a serialize-map service to wire
+         to a web Save button (replaces the /map/clear restart for persistence
+         workflows). Decide the UX: Save (serialize) vs boot-in-localization vs
+         per-boot fresh (today). Careful: localization mode changes the
+         nano-slam restart semantics that several docs/heals rely on, and a
+         stale/loaded map needs the frame-anchor sanity that slam handles
+         internally. Needs board verify (save → reboot → localize, no re-map).
+      3. **`smoother_server` + SimpleSmoother** (small pkg `ros-humble-nav2-smoother`,
+         one BT node `nav2_smoother` in plugin_lib_names) — post-processes the
+         grid path to kill zigzags before RPP tracks it. Add to the container +
+         lifecycle list (before bt_navigator), wire the BT's FollowPath to use
+         smoothing (Humble: the planner→smoother chain via the default tree, or
+         keep the custom recovery tree and add the smoothing node). Verify CPU.
+      4. **`SmacPlanner2D` swap** (pkg `ros-humble-nav2-smac-planner`, one param
+         line: `GridBased.plugin: nav2_smac_planner/SmacPlanner2D` + its params) —
+         any-angle paths, less staircase-weaving, more robust on small maps.
+         Easy A/B against Navfn (same plugin slot, `use_astar` etc. differ —
+         Smac needs its own param block: tolerance, max_iterations, motion model).
+      5. **`drive_on_heading` behavior** — already in the behavior_server plugin
+         family (nav2_behaviors); free to add for scripted straight-line
+         approach maneuvers (the canned-move overlap is real — only add if a
+         use case outgrows `POST /move`).
+      Already-decided, do NOT re-litigate: rotation shim (rejected),
+      collision_monitor (deferred), denoise_layer (moot — #1 landed, so an
+      obstacle layer to denoise now exists but adds nothing for this grid),
+      waypoint_follower (the /navigate_through_poses TODO
+      above needs no new dep).
 - [ ] **2026-09-23: gpu_vision self-throttle when oversubscribed.** The vision loop
       can fall behind its configured fps under load (documented gpu_duty finding:
       60-190% of the frame budget) — today it ran at **gpu_duty 4.1** (4× the frame
@@ -130,15 +339,36 @@ in this checkout.
       bounce therefore needs the park PREVENTED, not pre-armed: healed this time by
       POST /param web_control/lds_idle_enable=false FIRST (persists to lds.json, so the
       boot park can't fire) → target bounce → activation completed in ~2 s ("Managed
-      nodes are active" 20:05:41) → re-enable lds_idle_enable=true. OPEN (real fix
-      candidates): (a) gate the loader (`unit_exec.sh nav-loader`) on /lds_hz ≥ 2.0
-      BEFORE running load_only — the loader owns nav-activation timing, so activation
-      can never start into a dead map frame; (b) or have the loader POST
-      /lds_target_rpm 300 itself and lds_hold through the load; (c) or teach
-      telemetry's boot not to park until the nav activation settles (a
-      nano-nav-active check in the idle controller's first minute). Until one lands,
-      ANY stack bounce on a quiet robot risks a ~2.5 min bounce followed by a dead
-      bt_navigator.**
+      nodes are active" 20:05:41) → re-enable lds_idle_enable=true. **FIXED
+      STRUCTURALLY 2026-09-24 (candidates (a)+(b) combined, live-verified in a real
+      bounce): the `unit_exec.sh nav-loader` LIDAR GATE.** The loader now (1) polls the
+      vitals blob's `lds.hz ≥ 2.0` fresh (`age ≤ 1.5 s` — the same signal as telemetry's
+      goal pre-wake; a stale hz from a dead ESP link must not count) AND `nano-slam` +
+      `nano-tf` active (no mapper / no base_link→laser TF = no map frame either), (2)
+      WAKES a parked lidar itself by POSTing `/lds_target_rpm` through the LOCAL gateway
+      every 10 s (rides `publish_json` → `note_lds_manual`, so the idle controller
+      can't fight it for `lds_manual_secs` — the boot park is defeated by construction
+      and the disable-idle-park choreography is no longer needed for bounces), (3) the
+      wake is JAM-SAFE: each cycle POSTs 0 FIRST (clears the firmware's jam latch —
+      a bare 300-after-park can trip the 6 s tach guard and latch the motor; verified
+      live 2026-09-24: a bare 300 left the motor latched, an explicit 0→300 spun it),
+      then the setpoint (the user's persisted `lds.json lds_active_rpm`, not a hardcoded
+      300), (4) all bounded: after `LDS_GATE_SECS` (30) it loads anyway with a loud
+      warning, so a dead lidar delays boot instead of hanging the target (30 s gate +
+      30 s container poll + launch stay under the unit's default timeouts; Type=oneshot
+      has NO default start timeout — verified live). **BONUS FIX same day (found in the
+      verification bounce): the loader's `ros2 launch` can HANG after a successful
+      load** — all 6 components loaded + "Managed nodes are active", yet the launch
+      process lingered 3+ min (zenoh session teardown hang; same shutdown-under-zenoh
+      family as the container's stop wedge), holding the target's start job at ~25% CPU
+      until killed. The launch is now run under `timeout -k 10 60` and a linger (124/137)
+      is FORCED to success (the load has demonstrably completed or loudly failed by
+      then); a genuine early launch failure still propagates. Verified live 2026-09-24:
+      gated bounce on a quiet robot → wake + jam-safe cycle at 15 s → components
+      loaded → "Managed nodes are active" in 3 s → zero unknown-Query drops. (Candidate
+      (c) is unnecessary now: the loader, not the idle controller, owns activation
+      timing. NOTE: the live loader unit was left in `failed` state by the manual kill
+      that cleared the first linger — cosmetic; the next target bounce reruns it.)**
 - [x] **2026-09-21 (code DONE + FLASHED + A/B'd 2026-09-22): wheel-PID adaptive-filter
       N hysteresis.** Residual drive roughness ("better than this morning but still
       not smooth"). IMPLEMENTED (main.cpp `hystN()` + id 7, telemetry.py gate
