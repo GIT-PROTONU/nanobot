@@ -33,6 +33,13 @@
              rate_controller_bt_node plugin is already in plugin_lib_names). -->
         <RateController hz="1.0">
           <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+          <!-- SmoothPath (2026-09-24): smoother_server post-processes the path
+               after EVERY replan (inside the rate controller, so it re-runs with
+               each fresh plan) — kills residual grid zigzag before FollowPath
+               tracks it. smoother_id must match smoother_server's
+               smoother_plugins list in nav2_params.yaml. -->
+          <SmoothPath path="{path}" smoother_id="simple_smoother"
+                      smoothing_duration="2.0"/>
         </RateController>
         <FollowPath path="{path}" controller_id="FollowPath"/>
       </PipelineSequence>

@@ -47,7 +47,10 @@ from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter as ParamMsg, ParameterValue, ParameterType
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool, Int8, Int32, Float32, String
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, PoseStamped, PoseArray
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateThroughPoses
+from slam_toolbox.srv import SerializePoseGraph
 from action_msgs.srv import CancelGoal
 from action_msgs.msg import GoalInfo
 from lifecycle_msgs.msg import TransitionEvent
@@ -59,7 +62,7 @@ from .jsonio import read_json, write_json
 from .mjpeg_camera import CameraStream
 from .gpu_vision import GpuVision
 from .mic_audio import AudioStream
-from .telemetry import TelemetryHub, GOAL_MAX_ABS_M
+from .telemetry import TelemetryHub, GOAL_MAX_ABS_M, NAV_WAYPOINT_MAX, KEEPOUT_MAX_ZONES
 from .tts import TtsEngine, VOICES, clamp
 from .stress import StressTest
 from .imu_interference import IMUInterferenceTest
@@ -403,6 +406,13 @@ class WebServerNode(Node):
         # Locations is a waypoint layer on top: save current pose as a name, then publish
         # the stored pose to /goal_pose (go to it).
         self.declare_parameter("locations_path", "")   # "" -> ~/.local/state/nanobot/locations.json
+        # Map persistence (POST /map/save): the file slam_toolbox's
+        # serialize_pose_graph service writes. Empty = save disabled (the route
+        # returns an error). To make slam LOAD it on boot, set slam_toolbox's
+        # map_file_name in nav2_params.yaml to the same path.
+        self.declare_parameter("map_save_file",
+                               "~/.local/state/nanobot/nano_map.posegraph")
+        self.declare_parameter("keepout_path", "")     # "" -> ~/.local/state/nanobot/keepout.json
         # Visual diary: a slow durable log of the scene scalars (luma/motion/edge/
         # novelty/warmth) folded into the reflection prompts -- sensory continuity for
         # the self-narrative, same mechanism as the trait trajectory.
@@ -536,6 +546,13 @@ class WebServerNode(Node):
             g("locations_path").value or "~/.local/state/nanobot/locations.json")
         self._locations = {}
         self._load_locations()
+        # Drawable keep-away zones (web Map card → the global costmap's
+        # KeepoutFilter): rectangles in map-frame metres, persisted to
+        # keepout.json, rasterized + latched by telemetry (see publish_keepout).
+        self._keepout_path = os.path.expanduser(
+            g("keepout_path").value or "~/.local/state/nanobot/keepout.json")
+        self._keepout_zones = []
+        self._load_keepout()
         self._oled_mask_on = False         # OLED tracking-mask mirror state
         self._oled_mask_pub = None
         self._vision_state_pub = None
@@ -931,6 +948,12 @@ class WebServerNode(Node):
         # (not a full ActionClient) — one small client, fire-and-forget like /param,
         # created here before spin so the HTTP thread never touches creation.
         self._cancel_client = self.create_client(CancelGoal, "navigate_to_pose/_action/cancel_goal")
+        # Multi-waypoint navigation (POST /nav/waypoints): bt_navigator's
+        # NavigateThroughPoses action. A full ActionClient (unlike the cancel
+        # service client above) — the goal carries the whole PoseArray; feedback
+        # (waypoint progress) is consumed by telemetry's always-on feedback sub.
+        self._nav_poses_client = ActionClient(self, NavigateThroughPoses,
+                                              "navigate_through_poses")
         # NOTE: /slam_pose died with slam_nav (slam_toolbox owns the map->odom TF
         # now but doesn't publish a pose topic the UI used). The web map gets its
         # pose from telemetry's TF lookup (map->base_link); Locations' "save
@@ -2593,9 +2616,13 @@ class WebServerNode(Node):
             yaw = float(d.get("yaw", 0.0)); from_point = True
         except (TypeError, ValueError):
             pose = self.telemetry._tf_pose()
-            if pose is None:
+            # _tf_pose may return an extrapolated (dead-reckoned) pose while the
+            # lidar is parked — display-only elsewhere, but a saved location's
+            # whole purpose is to be a REAL map pose, so reject the fallback here.
+            if pose is None or pose[3] != "tf":
                 return {"error": "no x/y given and no live map pose (is SLAM up?)"}
-            x, y, yaw = pose
+            x, y = pose[0], pose[1]
+            yaw = pose[2]
             from_point = False
         # Clamp like the goal publisher does, so a saved spot is always a navigable goal.
         x = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, x))
@@ -2624,6 +2651,68 @@ class WebServerNode(Node):
         return self.telemetry.publish_json({"topic": "goal_pose",
                                             "value": {"x": loc["x"], "y": loc["y"]}})
 
+    # --- drawable keep-away zones (web Map card → the global costmap) ---------
+    # Rectangles in map-frame metres, persisted to keepout.json, rasterized into
+    # the live /map geometry + latched on /keepout_mask by telemetry
+    # (publish_keepout). The global costmap's KeepoutFilter (nav2_params.yaml)
+    # reads the mask and the planner treats painted cells as lethal.
+    def _load_keepout(self):
+        data = read_json(self._keepout_path)
+        zones = data.get("zones") if isinstance(data, dict) else None
+        if isinstance(zones, list):
+            self._keepout_zones = [
+                z for z in zones
+                if isinstance(z, dict) and all(k in z for k in ("x1", "y1", "x2", "y2"))
+            ][:KEEPOUT_MAX_ZONES]
+        if getattr(self, "telemetry", None) is not None:   # boot re-apply: latch the mask
+            self.telemetry.set_keepout_zones(self._keepout_zones)
+
+    def _save_keepout(self):
+        if not write_json(self._keepout_path, {"zones": self._keepout_zones}):
+            self.get_logger().warning("keepout: save failed")
+
+    def get_keepout(self):
+        """GET /keepout: the persisted rectangles (map-frame metres)."""
+        return {"zones": self._keepout_zones}
+
+    def keepout_save(self, d):
+        """POST /keepout/save {x1,y1,x2,y2}: add one keepout rectangle
+        (metres, map frame — any corner order; normalized server-side)."""
+        try:
+            z = {k: float(d[k]) for k in ("x1", "y1", "x2", "y2")}
+        except (TypeError, ValueError, KeyError):
+            return {"error": "need x1,y1,x2,y2 (metres, map frame)"}
+        if len(self._keepout_zones) >= KEEPOUT_MAX_ZONES:
+            return {"error": f"too many keepout zones (max {KEEPOUT_MAX_ZONES})"}
+        self._keepout_zones.append(z)
+        self._save_keepout()
+        self.telemetry.set_keepout_zones(self._keepout_zones)
+        self.get_logger().info(f"POST /keepout/save rect {z!r} "
+                               f"({len(self._keepout_zones)} zones)")
+        return {"ok": True, "zones": self._keepout_zones}
+
+    def keepout_delete(self, d):
+        """POST /keepout/delete {index}: remove one zone by its list index."""
+        try:
+            i = int((d or {}).get("index"))
+        except (TypeError, ValueError):
+            return {"error": "need an integer index"}
+        if not (0 <= i < len(self._keepout_zones)):
+            return {"error": f"no zone at index {i}"}
+        removed = self._keepout_zones.pop(i)
+        self._save_keepout()
+        self.telemetry.set_keepout_zones(self._keepout_zones)
+        return {"ok": True, "removed": removed}
+
+    def keepout_clear(self):
+        """POST /keepout/clear: remove ALL zones (publishes an empty mask so a
+        previously latched lethal mask clears immediately)."""
+        self._keepout_zones = []
+        self._save_keepout()
+        self.telemetry.set_keepout_zones(self._keepout_zones)
+        self.get_logger().info("POST /keepout/clear (all zones removed)")
+        return {"ok": True}
+
     def cancel_goal(self):
         """POST /nav/cancel: cancel every active NavigateToPose goal (web map ✕).
         Empty GoalInfo = cancel-all per CancelGoal.srv. Fire-and-forget like /param;
@@ -2636,6 +2725,45 @@ class WebServerNode(Node):
         self.telemetry.clear_goal()
         self.get_logger().info("POST /nav/cancel (web map)")
         return {"ok": True}
+
+    def nav_waypoints(self, d):
+        """POST /nav/waypoints {points: [{x,y},...]}: multi-waypoint navigation —
+        publish the ordered stops as ONE NavigateThroughPoses action goal (the
+        default through-poses tree consumes PoseArray natively). Bounded by the
+        same ±12 m clamp as a single goal; ≥1 point. The lidar pre-wake +
+        mirror bookkeeping mirror the single-goal path."""
+        pts_in = (d or {}).get("points")
+        if not isinstance(pts_in, list) or not pts_in:
+            return {"error": "no points given"}
+        if len(pts_in) > NAV_WAYPOINT_MAX:
+            return {"error": f"too many waypoints (max {NAV_WAYPOINT_MAX})"}
+        poses = []
+        for p in pts_in:
+            try:
+                x = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, float(p["x"])))
+                y = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, float(p["y"])))
+            except (TypeError, ValueError, KeyError):
+                return {"error": "bad point (need {x, y} each)"}
+            poses.append((x, y))
+        if not self._nav_poses_client.wait_for_server(timeout_sec=2.0):
+            return {"error": "bt_navigator not reachable (is nano-nav up?)"}
+        # Pre-wake: never let Nav2 plan against slam's frozen map->odom TF.
+        self.telemetry.wake_lidar(reason="the waypoints")
+        goal = NavigateThroughPoses.Goal()
+        for x, y in poses:
+            ps = PoseStamped()
+            ps.header.frame_id = "map"
+            ps.header.stamp = self.get_clock().now().to_msg()
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            ps.pose.orientation.w = 1.0
+            goal.poses.append(ps)
+        self._nav_poses_client.send_goal_async(goal)
+        self.telemetry.note_waypoints(poses, source="web waypoints")
+        self.get_logger().info(
+            "POST /nav/waypoints %d stops: %s" % (
+                len(poses), " → ".join(f"({x:.2f},{y:.2f})" for x, y in poses)))
+        return {"ok": True, "n": len(poses)}
 
     def clear_map(self):
         """POST /map/clear: wipe the SLAM map = restart nano-slam (web Map card).
@@ -2655,6 +2783,28 @@ class WebServerNode(Node):
         self.cancel_goal()
         self.telemetry.clear_map()
         self.telemetry.note_map_clear()   # wake the parked lidar: no scans = no fresh map
+        # Map persistence (2026-09-24): if slam boots with map_file_name set, the
+        # restart would RE-LOAD the saved pose graph instead of clearing it — so a
+        # clear must first retire the file (renamed to .bak, kept for recovery).
+        map_file = os.path.expanduser(
+            self.get_parameter_or("map_save_file", rclpy.Parameter(
+                "map_save_file", rclpy.Parameter.Type.STRING, "")).value)
+        if map_file:
+            try:
+                # slam_toolbox's serialize writes <path>.posegraph + <path>.data
+                # (it appends .posegraph to the given filename); a map_file_name
+                # boot may reference either form. Retire every variant that exists.
+                for candidate in (map_file, map_file + ".posegraph"):
+                    for suffix in ("", ".data"):
+                        src = candidate + suffix
+                        if os.path.exists(src):
+                            os.replace(src, src + ".bak")
+                self.get_logger().info(
+                    f"POST /map/clear: retired the persisted map file {map_file}(.posegraph|.data)")
+            except OSError as exc:
+                self.get_logger().warning(
+                    f"POST /map/clear: could not retire the map file: {exc} — "
+                    "the restart may re-load the old map")
         self.get_logger().info("POST /map/clear (web Map card) -> restarting nano-slam")
         try:
             r = subprocess.run(
@@ -2671,6 +2821,29 @@ class WebServerNode(Node):
             return {"ok": False, "error": f"restart failed: {err} "
                     "(is the nano-slam sudoers rule installed? see deploy/sudoers/nano-power)"}
         return {"ok": True, "reply": "clearing map (nano-slam restarted)"}
+
+    def save_map(self):
+        """POST /map/save: persist the current SLAM map via slam_toolbox's
+        serialize_pose_graph service (2.6.10 ships it in async mode too). Writes
+        the map_save_file path (a .posegraph + a .data file pair). To LOAD it on
+        the next boot, set slam_toolbox's map_file_name in nav2_params.yaml to
+        the same path — mapping mode then CONTINUES the saved map instead of
+        starting fresh. The call is fire-and-forget async (the service reply
+        only confirms; a failure surfaces in the slam journal)."""
+        path = os.path.expanduser(self.get_parameter_or(
+            "map_save_file", rclpy.Parameter(
+                "map_save_file", rclpy.Parameter.Type.STRING, "")).value)
+        if not path:
+            return {"error": "map saving disabled (map_save_file is empty)"}
+        client = self.create_client(SerializePoseGraph, "serialize_pose_graph")
+        if not client.service_is_ready():
+            return {"error": "slam_toolbox not reachable (is nano-slam up?)"}
+        req = SerializePoseGraph.Request()
+        req.filename = path
+        client.call_async(req)
+        self.get_logger().info(f"POST /map/save -> serialize_pose_graph {path}")
+        return {"ok": True, "reply": f"saving map to {path}",
+                "file": path, "note": "slam_toolbox appends .posegraph + .data"}
 
     def _brain_health_tick(self):
         """Publish cognition-layer health as JSON on /brain/cognition_health (~1 Hz)."""
@@ -2869,6 +3042,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/imu/interference/status": lambda n: n.imu_interference_status(),
         "/vision/targets": lambda n: n.get_vision_targets(),
         "/locations": lambda n: n.get_locations(),
+        "/keepout": lambda n: n.get_keepout(),
         "/llm/vision_diary": lambda n: n.get_vision_diary(),
     }
     POST_JSON = {
@@ -2901,8 +3075,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         "/locations/save": lambda n, d: n.location_save(d),
         "/locations/delete": lambda n, d: n.location_delete(d),
         "/locations/go": lambda n, d: n.location_go(d),
+        "/keepout/save": lambda n, d: n.keepout_save(d),
+        "/keepout/delete": lambda n, d: n.keepout_delete(d),
+        "/keepout/clear": lambda n, d: n.keepout_clear(),
         "/nav/cancel": lambda n, d: n.cancel_goal(),
+        "/nav/waypoints": lambda n, d: n.nav_waypoints(d),
         "/map/clear": lambda n, d: n.clear_map(),
+        "/map/save": lambda n, d: n.save_map(),
     }
     # LLM generation endpoints: all gated on llm_available(), all blocking on the
     # OpenRouter call (handler thread), all replying {say,mood} or an error.
@@ -2954,6 +3133,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return self._serve_costmap("local")
         if path == "/global_costmap":
             return self._serve_costmap("global")
+        if path == "/plan":
+            return self._serve_plan()
         if path == "/brain/health":
             return self._respond_json(
                 self._node.get_brain_health() if self._node else {"error": "no node"})
@@ -3322,6 +3503,30 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(503, "no map yet - is nano-slam up?")
             return
         body = json.dumps(meta).encode() + b"\n" + cells
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def _serve_plan(self):
+        # Nav2 map view: planner_server's latest /plan (nav_msgs/Path), cached
+        # downsampled by telemetry (lazy sub, browser-only). One JSON header
+        # line {n, t}, '\n', then raw float32 [x0,y0,x1,y1,...] map-frame
+        # metres — the page draws the polyline. 503 until the planner has
+        # planned at least once (no plan while no goal / nav down).
+        meta, pts = self._node.telemetry.get_plan_payload()
+        if meta is None:
+            # ASCII-only message: send_error writes the error page as latin-1
+            # (see _serve_map).
+            self.send_error(503, "no plan yet - is nano-nav up?")
+            return
+        body = json.dumps(meta).encode() + b"\n" + array.array(
+            "f", pts).tobytes()
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Cache-Control", "no-store")

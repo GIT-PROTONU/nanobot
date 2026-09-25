@@ -36,13 +36,24 @@ from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rclpy.parameter import Parameter as RclpyParameter
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, Float32MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
+try:
+    from nav2_msgs.msg import CostmapFilterInfo
+except Exception:                                    # keep telemetry importable without nav2_msgs
+    CostmapFilterInfo = None
 from action_msgs.msg import GoalStatusArray
 from sensor_msgs.msg import MagneticField
 from diagnostic_msgs.msg import DiagnosticArray
 from tf2_ros import Buffer as TfBuffer, TransformListener
 
+try:
+    from nav2_msgs.action import NavigateThroughPoses
+    NavThroughPosesFeedback = NavigateThroughPoses.Feedback
+except Exception:                                    # board without nav2_msgs? never
+    NavThroughPosesFeedback = None
+
 SUB_LINGER = 15.0        # s to keep the browser-only subscriptions after the last client
+PLAN_MAX_POINTS = 200    # /plan downsample cap (GET /plan polyline stays bounded)
 # Optical virtual bumper (GPU vision Tier-B extension): commanded-to-move but the GPU's
 # frame-diff score stays under a floor for a confirm window -> likely a wheel stall/slip
 # (expected optical flow from ego-motion isn't happening). Informational only for now --
@@ -112,6 +123,10 @@ MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.c
 TRIM_MAX = 0.30          # ESP32 firmware's TRIM_MAX -- |wheel_trim| rebalance range (main.cpp)
 GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- Nav2's global costmap is
                          # 24x24 m; a goal outside it would just fail to plan
+NAV_WAYPOINT_MAX = 12    # cap on POST /nav/waypoints stops (a crawl-speed tour
+                         # of more would outlive any sane watchdog)
+KEEPOUT_MAX_ZONES = 16   # cap on persisted keepout rectangles (a mask rasterizes
+                         # in O(zones×cells); 16 painted rects is far past the map)
 # Fallback for the keep-away bubble drawn around the robot on the web map
 # (metres) when web_control's nav_inflation_m param can't be read (used to be
 # a hardcoded mirror of local_costmap/global_costmap inflation_radius in
@@ -215,6 +230,9 @@ class TelemetryHub:
 
         # --- latest-value stores written by the lazy subscriptions -------------
         self._odom = None             # (x, y, yaw_rad)
+        # Cached map->odom (x, y, yaw_rad) — see _tf_pose's "extrap" fallback
+        # (persistent web-map pose while the lidar is parked). DISPLAY-ONLY.
+        self._map_odom = None
         self._diag = ({}, STALE)      # ({key: value}, arrival monotonic)
         self._pipe_diag = None    # (feed dict, arrival, level, message) or None
         self._ticks = None            # (l, r)
@@ -265,6 +283,17 @@ class TelemetryHub:
         # + the grid yaw so the page shades/rotates accordingly.
         self._local_costmap_payload = None
         self._global_costmap_payload = None
+        # Latest planned path (planner_server publishes nav_msgs/Path on /plan
+        # each replan — 1 Hz with the RateController-wrapped ComputePathToPose).
+        # Served by GET /plan (NOT the SSE frame — a plan can be hundreds of
+        # poses); downsampled to PLAN_MAX_POINTS at arrival so the browser
+        # polyline is bounded regardless of path length.
+        self._plan_payload = None      # atomic ({n, t}, [x0, y0, x1, y1, ...])
+        self._plan_arrival = STALE
+        # Drawable keep-away zones (web Map card → the global costmap's
+        # KeepoutFilter): rectangles in map-frame metres, owned by web_server
+        # (persisted to keepout.json) and mirrored here for mask rasterization.
+        self._keepout_zones = []
         # map-frame pose via TF (map->odom from slam_toolbox + odom->base_link
         # from wheel_odometry). Listener is lazy — created with the other
         # browser-only subs, unregistered in _drop_subs.
@@ -280,6 +309,11 @@ class TelemetryHub:
         self._goal_status_since = None  # monotonic ts the CURRENT status value began
                                         # (transition durations for the Nav log)
         self._goal_published_at = None  # monotonic ts of the last goal publish
+        # Multi-waypoint progress (NavigateThroughPoses action feedback): the
+        # waypoint index the action is currently driving toward + the total.
+        # None on a single-goal NavigateToPose (and reset on terminal states).
+        self._wp_index = None
+        self._wp_total = None
         self._moving = False           # last /cmd_vel above the motion eps — the
                                        # Nav log's motion start/stop transitions
         self._navlog_warn_at = 0.0     # monotonic ts of the last planning-stuck warning
@@ -333,6 +367,17 @@ class TelemetryHub:
             # HH:MM + skill entries, persists them, and echoes the normalized result back on
             # the latched /schedule topic below — see behavior.brain.Schedule).
             "/schedule_edit": (pub(String, "schedule_edit", 5), self._mk_schedule),
+            # Drawable keep-away/no-go zones (web Map card): the keepout mask is
+            # an OccupancyGrid in the MAP frame at slam's resolution, rasterized
+            # from the persisted rectangles — the global costmap's KeepoutFilter
+            # (nav2_params.yaml) reads it and the planner treats painted cells
+            # as lethal. Both topics LATCHED (transient-local): the costmap
+            # filter subscribes whenever the costmap (re)starts and must get
+            # the current mask immediately, browser or no browser.
+            "/keepout_mask": (pub(OccupancyGrid, "keepout_mask", latched),
+                              self._mk_keepout_mask),
+            "/keepout_filter_info": (pub(CostmapFilterInfo, "keepout_filter_info", latched),
+                                     self._mk_keepout_info),
         }
         # --- POST /param: one SetParameters client per whitelisted node --------
         self._param_clients = {
@@ -371,6 +416,19 @@ class TelemetryHub:
             node.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, 5),
             node.create_subscription(GoalStatusArray, "navigate_to_pose/_action/status",
                                      self._on_goal_status, 5),
+            # NavigateThroughPoses status rides the SAME shape (GoalStatusArray)
+            # on the sibling action namespace — one more always-on sub so the
+            # waypoint chip + LDS busy window track a multi-waypoint goal with
+            # the page closed, exactly like a single goal.
+            node.create_subscription(GoalStatusArray,
+                                     "navigate_through_poses/_action/status",
+                                     self._on_goal_status, 5),
+            # Waypoint progress (f.nav.wp_index): the action's 1-2 Hz feedback
+            # carries number_of_poses_remaining — enough to light the current
+            # waypoint on the map. Always-on like the status sub above.
+            node.create_subscription(NavThroughPosesFeedback,
+                                     "navigate_through_poses/_action/feedback",
+                                     self._on_wp_feedback, 2),
         ]
 
     # ---- client lifecycle (called from HTTP handler threads) -------------------
@@ -729,7 +787,11 @@ class TelemetryHub:
         pose = self._tf_pose()
         map_age = (now - self._map_arrival) if self._map_arrival != STALE else None
         f["nav"] = {
-            "pose": [round(v, 3) for v in pose] if pose else None,
+            "pose": [round(v, 3) for v in pose[:3]] if pose else None,
+            # Pose source: "tf" = live map->base_link lookup; "extrap" =
+            # display-only dead-reckon while the lidar is parked (amber dot on
+            # the page). Additive key — older pages ignore it.
+            "pose_src": pose[3] if pose else None,
             "goal": self._goal,
             "status": self._goal_status,
             "inflation": round(infl, 3),
@@ -740,6 +802,13 @@ class TelemetryHub:
             # _map_arrival is already tracked, _tf_laser_age is one TF lookup.
             "map_age": round(map_age, 1) if map_age is not None else None,
             "tf_laser": self._tf_laser_age(),
+            # Waypoint progress (multi-waypoint goals, f.nav.wp_*): None on a
+            # single-goal NavigateToPose; index/total while NavigateThroughPoses
+            # runs. Additive keys — older pages ignore them.
+            "wp_index": self._wp_index,
+            "wp_total": self._wp_total,
+            "plan_age": round(now - self._plan_arrival, 1)
+                        if self._plan_arrival != STALE else None,
         }
         # latched brain readouts, passed through as the raw JSON strings the page parses
         for k, v in (("purpose", self._purpose), ("task", self._task),
@@ -809,6 +878,11 @@ class TelemetryHub:
               lambda m: self._on_costmap("_local_costmap_payload", "odom", m), 1))
         s(sub(OccupancyGrid, "global_costmap/costmap",
               lambda m: self._on_costmap("_global_costmap_payload", "map", m), 1))
+        # planner_server's computed path (published on /plan each replan — 1 Hz
+        # with the RateController-wrapped ComputePathToPose). VOLATILE depth 1,
+        # same reasoning as the costmaps; cached downsampled (see _on_plan),
+        # served by the GET /plan route as the map view's polyline.
+        s(sub(Path, "plan", self._on_plan, 1))
         # NOTE: bt_navigator's goal status sub moved to __init__ (always-on) — see the
         # cmd_vel note above.
         # map->base_link TF (map->odom: slam_toolbox @10 Hz; odom->base_link:
@@ -840,6 +914,22 @@ class TelemetryHub:
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
         yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
         self._odom = (p.x, p.y, yaw)
+
+    def _on_plan(self, msg):
+        """Cache planner_server's latest /plan (nav_msgs/Path), downsampled to
+        PLAN_MAX_POINTS poses. Empty paths are skipped so a planner hiccup
+        can't blank the polyline; the copy is one atomic assignment."""
+        pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        if len(pts) < 2:
+            return
+        if len(pts) > PLAN_MAX_POINTS:
+            step = (len(pts) - 1) / (PLAN_MAX_POINTS - 1)
+            pts = [pts[round(i * step)] for i in range(PLAN_MAX_POINTS)]
+        flat = []
+        for x, y in pts:
+            flat.extend((round(x, 4), round(y, 4)))
+        self._plan_payload = ({"n": len(pts), "t": time.time()}, flat)
+        self._plan_arrival = time.monotonic()
 
     def _on_diag(self, msg):
         st = next((s for s in msg.status if s.name == "system"), None)
@@ -979,6 +1069,10 @@ class TelemetryHub:
             "t": time.time(),
         }, data)
         self._map_arrival = time.monotonic()
+        # A rebuilt map may have new dims/origin — re-rasterize + re-latch the
+        # keepout mask so the KeepoutFilter's cells stay aligned with the new
+        # grid (no-op when no zones are set).
+        self.publish_keepout()
 
     def _on_costmap(self, attr, frame, msg):
         """Cache the latest Nav2 costmap for the /local_costmap + /global_costmap
@@ -1041,6 +1135,22 @@ class TelemetryHub:
         since = max(0, int(since or 0))
         return [dict(e) for e in self._navlog if e["id"] > since]
 
+    def _on_wp_feedback(self, msg):
+        """NavigateThroughPoses action feedback: number_of_poses_remaining →
+        f.nav.wp_index (0-based index of the waypoint being driven toward).
+        Guarded so a malformed/garbage feedback can never kill the hub."""
+        try:
+            total = self._wp_total
+            remaining = int(msg.number_of_poses_remaining)
+            if total is None:
+                return                      # feedback for some other client's goal
+            idx = max(0, total - 1 - remaining)
+            if idx != self._wp_index and idx < total:
+                self._wp_index = idx
+                self._navlog_add(f"waypoint {idx + 1}/{total} — heading to the next stop")
+        except Exception:
+            pass                            # rmw_zenoh oddity / foreign message — never fatal
+
     def _on_goal_status(self, msg):
         """Track bt_navigator's action status (the web chip + the LDS idle
         controller's busy signal). status_list gains an entry per goal state
@@ -1082,6 +1192,8 @@ class TelemetryHub:
                                  "info" if code in (4, 5) else "warn")
                 self._goal_published_at = None
             self._goal = None
+            self._wp_index = None            # waypoint progress is done either way
+            self._wp_total = None
         self._goal_status = new
 
     def _tf_laser_age(self):
@@ -1100,18 +1212,47 @@ class TelemetryHub:
             return None
 
     def _tf_pose(self):
-        """map-frame pose (x, y, yaw_rad) from TF, or None (slam_toolbox or
-        wheel_odometry not up yet / TF stale). lookup_transform with a zero time
-        = latest available transform."""
+        """Map-frame pose (x, y, yaw_rad) + a source tag, or None.
+
+        Source "tf": a live map->base_link lookup at Time(0) (= latest available
+        transform). On success the map->odom half is also cached.
+
+        Source "extrap": DISPLAY-ONLY dead-reckoned fallback (2026-09-24 TODO).
+        While the lidar is parked, slam_toolbox processes no scans, so its
+        map->odom stays stamped at the LAST processed scan; the composed
+        map->base_link lookup then fails ("extrapolation into the past") and the
+        web map's dot used to just stop. The wheels keep knowing where the robot
+        is (odom->base_link flows continuously), so we compose the CACHED
+        map->odom with the live /odom pose instead. Accuracy caveat: while
+        parked-and-pushed (or on carpet slip) the dead-reckoned marker drifts vs
+        reality until the lidar wakes and slam re-anchors — the page shows the
+        amber pose dot for it. Nothing may CONSUME the extrapolated pose as if
+        it were slam-verified (Locations Save uses its own lookup and never
+        sees this fallback)."""
         if self._tf_buf is None:
             return None
         try:
             t = self._tf_buf.lookup_transform("map", "base_link", Time())
             tr, q = t.transform.translation, t.transform.rotation
             yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
-            return (tr.x, tr.y, yaw)
-        except Exception:                    # lookup/connectivity/extrapolation — all "no pose"
-            return None
+            try:
+                mo = self._tf_buf.lookup_transform("map", "odom", Time())
+                self._map_odom = (
+                    mo.transform.translation.x, mo.transform.translation.y,
+                    math.atan2(2.0 * mo.transform.rotation.w * mo.transform.rotation.z,
+                               1.0 - 2.0 * mo.transform.rotation.z ** 2))
+            except Exception:
+                pass                        # keep the previous cache
+            return (tr.x, tr.y, yaw, "tf")
+        except Exception:
+            # map->base_link failed. Dead-reckon: cached map->odom ∘ live /odom.
+            mo, od = self._map_odom, self._odom
+            if mo is None or od is None:
+                return None
+            c, s = math.cos(mo[2]), math.sin(mo[2])
+            return (c * od[0] - s * od[1] + mo[0],
+                    s * od[0] + c * od[1] + mo[1],
+                    mo[2] + od[2], "extrap")
 
     def get_map_payload(self):
         """The /map HTTP route body: (meta_dict, int8_bytes), or (None, None)
@@ -1128,6 +1269,11 @@ class TelemetryHub:
     def get_global_costmap_payload(self):
         """GET /global_costmap body, same shape as get_local_costmap_payload."""
         return self._global_costmap_payload or (None, None)
+
+    def get_plan_payload(self):
+        """GET /plan body: ({n, t}, [x0, y0, x1, y1, ...]) — the latest planned
+        path, downsampled. (None, None) until planner_server has published."""
+        return self._plan_payload or (None, None)
 
     def clear_goal(self):
         """Drop the goal mirror + chip state (POST /nav/cancel). Nav2's own status
@@ -1441,6 +1587,17 @@ class TelemetryHub:
         self._navlog_add(f"goal ({self._goal[0]:.2f}, {self._goal[1]:.2f}){via} — "
                          "planning; lidar must spin for the planner's map→odom TF")
 
+    def note_waypoints(self, poses, source=""):
+        """Mirror a multi-waypoint goal (POST /nav/waypoints) for the web map:
+        the goal ring sits on the FIRST waypoint, the chip reads planning, and
+        f.nav gains wp_total (the action's feedback refines wp_index as it
+        drives). `poses` is the [(x, y), ...] list that was sent."""
+        self.note_goal(poses[0][0], poses[0][1], source=source)
+        self._wp_total = len(poses)
+        self._wp_index = 0
+        self._navlog_add(f"waypoints: {len(poses)} stops — "
+                         + " → ".join(f"({x:.2f},{y:.2f})" for x, y in poses))
+
     @staticmethod
     def _mk_goal(v):
         m = PoseStamped()
@@ -1449,6 +1606,68 @@ class TelemetryHub:
         m.pose.position.y = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, float(v["y"])))
         m.pose.orientation.w = 1.0
         return m
+
+    # ---- keepout zones (web-drawn no-go rectangles → the global costmap) -------
+    def set_keepout_zones(self, zones):
+        """Take the persisted keepout rectangles (map-frame metres,
+        [{x1,y1,x2,y2}, ...]) from web_server and (re)publish the mask. Called
+        on save/delete/clear AND on boot re-apply."""
+        self._keepout_zones = [
+            (float(z["x1"]), float(z["y1"]), float(z["x2"]), float(z["y2"]))
+            for z in (zones or [])
+            if all(k in z for k in ("x1", "y1", "x2", "y2"))
+        ]
+        self.publish_keepout()
+
+    def publish_keepout(self):
+        """Rasterize the keepout rectangles into the CURRENT /map grid geometry
+        and latch the mask + its filter-info topic. No map yet (boot) or no
+        zones → an empty mask is still published once so a deleted zone can
+        clear a previously latched one; nothing at all before the first /map."""
+        if CostmapFilterInfo is None:
+            return
+        meta = self._map_payload[0] if self._map_payload else None
+        if meta is None:
+            return                          # can't rasterize without grid geometry
+        w, h, res = int(meta["w"]), int(meta["h"]), float(meta["res"])
+        ox, oy = float(meta["ox"]), float(meta["oy"])
+        cells = bytearray(w * h)            # 0 = free everywhere
+        for x1, y1, x2, y2 in self._keepout_zones:
+            lo_x, hi_x = sorted((x1, x2))
+            lo_y, hi_y = sorted((y1, y2))
+            c0 = max(0, int((lo_x - ox) / res))
+            c1 = min(w - 1, int(math.ceil((hi_x - ox) / res)) - 1)
+            r0 = max(0, int((lo_y - oy) / res))
+            r1 = min(h - 1, int(math.ceil((hi_y - oy) / res)) - 1)
+            for r in range(r0, r1 + 1):
+                base = r * w
+                for c in range(c0, c1 + 1):
+                    cells[base + c] = 100   # occupied = keepout
+        mask = OccupancyGrid()
+        mask.header.frame_id = "map"
+        mask.header.stamp = self._node.get_clock().now().to_msg()
+        mask.info.width = w
+        mask.info.height = h
+        mask.info.resolution = res
+        mask.info.origin.position.x = ox
+        mask.info.origin.position.y = oy
+        mask.data = list(cells)
+        info = CostmapFilterInfo()
+        info.type = 0                       # KEEPOUT filter
+        info.filter_mask_topic = "keepout_mask"
+        self._pubs["/keepout_mask"][0].publish(mask)
+        self._pubs["/keepout_filter_info"][0].publish(info)
+
+    @staticmethod
+    def _mk_keepout_mask(v):
+        """POST /publish /keepout_mask is whitelisted but UNUSED by the page —
+        the mask is server-owned (rasterized from the persisted zones). Accept
+        nothing: a browser can't hand-craft grid cells."""
+        raise ValueError("keepout mask is server-owned (draw zones on the map)")
+
+    @staticmethod
+    def _mk_keepout_info(v):
+        raise ValueError("keepout filter info is server-owned")
 
     @staticmethod
     def _mk_lds_rpm(v):

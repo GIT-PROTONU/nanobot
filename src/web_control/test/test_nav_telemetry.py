@@ -80,6 +80,14 @@ class _FakeNode:
     def create_timer(self, period, cb):
         pass
 
+    def get_clock(self):
+        class _C:
+            def now(self):
+                from rclpy.time import Time
+                return Time()
+
+        return _C()
+
 
 def _hub():
     return TelemetryHub(_FakeNode())
@@ -483,3 +491,94 @@ def test_publish_json_slider_updates_lds_sent(monkeypatch):
     h.publish_json({"topic": "/lds_target_rpm", "value": 250})
     assert h._lds_sent == 250.0
     assert h._lds_user_rpm == 250.0
+
+
+# ---- persistent pose while the lidar parked (pose_src fallback) ------------------
+class _FakeTfBuf:
+    """Stands in for tf2_ros.Buffer: scriptable lookup outcomes per frame pair."""
+
+    def __init__(self, outcomes):
+        # {(frame_a, frame_b): TransformStamped | Exception}
+        self.outcomes = outcomes
+
+    def lookup_transform(self, target, source, time):
+        v = self.outcomes.get((target, source))
+        if isinstance(v, Exception):
+            raise v
+        if v is None:
+            raise LookupError("no transform")
+        return v
+
+
+def _xform(x=0.0, y=0.0, yaw=0.0):
+    t = TransformStamped()
+    t.transform.translation.x = x
+    t.transform.translation.y = y
+    t.transform.rotation.z = math.sin(yaw / 2.0)
+    t.transform.rotation.w = math.cos(yaw / 2.0)
+    return t
+
+
+def _odom(x, y, yaw):
+    from nav_msgs.msg import Odometry
+    m = Odometry()
+    m.pose.pose.position.x = x
+    m.pose.pose.position.y = y
+    m.pose.pose.orientation.z = math.sin(yaw / 2.0)
+    m.pose.pose.orientation.w = math.cos(yaw / 2.0)
+    return m
+
+
+def _hub_tf(outcomes):
+    h = _hub()
+    h._tf_buf = _FakeTfBuf(outcomes)
+    return h
+
+
+def test_tf_pose_hit_caches_map_odom():
+    """A live map->base_link lookup also caches the map->odom half — the raw
+    material the parked-lidar dead-reckon composes."""
+    h = _hub_tf({("map", "base_link"): _xform(1.0, 2.0, 0.5),
+                 ("map", "odom"): _xform(0.7, 1.4, 0.25)})
+    pose = h._tf_pose()
+    assert pose[:3] == pytest.approx((1.0, 2.0, 0.5))
+    assert pose[3] == "tf"
+    assert h._map_odom == pytest.approx((0.7, 1.4, 0.25))
+
+
+def test_tf_pose_extrapolates_from_cache_when_lookup_fails():
+    """map->base_link fails (frozen last-scan stamp) but the cached map->odom +
+    the live /odom pose compose a dead-reckoned map-frame pose, tagged 'extrap'."""
+    h = _hub_tf({("map", "base_link"): _xform(9.9, 9.9, 0.0),
+                 ("map", "odom"): _xform(0.7, 1.4, 0.25)})
+    h._tf_pose()                     # seed the cache while TF was still OK
+    h._tf_buf = _FakeTfBuf({})       # TF chain down entirely (slam parked)
+    h._on_odom(_odom(1.0, 0.0, math.pi / 2))
+    pose = h._tf_pose()
+    assert pose is not None and pose[3] == "extrap"
+    x, y, yaw = pose[:3]
+    # map = R(0.25) * (1, 0) + (0.7, 1.4); yaw = 0.25 + pi/2
+    assert x == pytest.approx(0.7 + math.cos(0.25), abs=1e-6)
+    assert y == pytest.approx(1.4 + math.sin(0.25), abs=1e-6)
+    assert yaw == pytest.approx(0.25 + math.pi / 2, abs=1e-6)
+
+
+def test_tf_pose_no_fallback_without_cache_or_odom():
+    """No cached map->odom (boot before slam's first publish) and no /odom →
+    None, never a fabricated pose."""
+    h = _hub_tf({})
+    assert h._tf_pose() is None
+    h2 = _hub_tf({("map", "base_link"): LookupError("x")})
+    h2._on_odom(_odom(1.0, 2.0, 0.0))
+    assert h2._tf_pose() is None     # odom but no map->odom cache
+
+
+def test_tf_pose_extrap_survives_stale_odom_drop():
+    """After SUB_LINGER drops the lazy subs (_odom None again) the fallback
+    degrades to None — never a pose computed from a half-rotten chain."""
+    h = _hub_tf({("map", "base_link"): LookupError("x"),
+                 ("map", "odom"): _xform(0.7, 1.4, 0.25)})
+    h._tf_pose()
+    h._tf_buf = _FakeTfBuf({})
+    h._odom = None
+    assert h._tf_pose() is None

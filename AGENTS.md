@@ -1524,6 +1524,65 @@ reliable"). Rebuilt as THREE coordinated pieces:
 - **Controller TF tolerances RAISED (2026-09-23) — every goal aborted mid-drive ("keeps failing after driving a bit").** Symptom: goals died ~4-11 s in with `controller_server: Exception in transformPose: Lookup would require extrapolation into the future … from frame [odom] to frame [map]` → `Controller patience exceeded` → follow_path abort → BT recovery (clear costmaps) → retry → same → "bt recovery exhausted" → Goal failed. Mechanism, verified against the installed Humble sources: `nav2_util::transformPoseInTargetFrame` uses `transform_tolerance` as a tf2 **WAIT timeout** for a transform stamped at the pose's time (the pose = latest odom→base_link ≈ now, so the lookup needs map→odom data stamped ≥ pose.stamp to appear within the wait). slam_toolbox publishes map→odom once per PROCESSED scan (~5 Hz = ~190 ms gaps) — so the 0.1 s RPP `transform_tolerance` wait lost the race ~half of all lookups, and `controller_server failure_tolerance: 0.3` aborted on any failure streak longer than 0.3 s. It "worked at 18:01 and died from 18:05" because under board saturation slam's scan-pairing queue overflowed ("Message Filter dropping message: frame 'laser' … queue is full" storms in the slam journal during EVERY failed goal) and the map→odom cadence stretched past the streak. The saturation itself: the GPU-vision pipeline ran at **gpu_duty 4.1** (4× frame budget, ~1 core pegged, 45% kernel time, load 8 on 4 cores — see the 2026-09-23 TODO items), so sensor_hub/slam starved mid-drive. **Fix (nav2_params.yaml, deployed 2026-09-23 via `deploy.sh robot_bringup` + stack restart): RPP `transform_tolerance` 0.1 → 0.5, `controller_server failure_tolerance` 0.3 → 1.5, bt_navigator + behavior_server `transform_tolerance` 0.5, both costmaps `0.3`.** Verified live: the 18:29:58 goal drove 10.7 s with ZERO extrapolation/patience errors. Diagnosis aids that made this log-only: the nav log's terminal states + `journalctl -u nano-nav` for the transform errors, `ros2 run tf2_ros tf2_monitor odom base_link` / `view_frames` for the TF cadence, and the app_hub SIGUSR1 stackdump (`kill -USR1`) for the CPU burn. TWO related notes: (1) "RegulatedPurePursuitController detected collision ahead" from the FIRST control cycle is a DIFFERENT, legitimate failure — inscribed cells on the path (check `/scan` nearest range before blaming nav; with recovery motions zeroed a blocked goal just fails); the published `/local_costmap/costmap` OccupancyGrid encodes costs back to occupancy semantics (LETHAL 254→100, INSCRIBED 253→99, -1 unknown) — don't misread a blob histogram of 0/99/100 as "no obstacles". (2) The ESP32 PID NVS drift gotcha hit again during the session (live gains were KP 1.4 / KI 27.1, readback in `f.esp.wheel_pid`) — restored to 5/60/0 via POST /publish /motor_pid; check the readback first in every tuning session.
 
 
+### Nav2 batch — Smac/smoother/keepout/waypoints/plan/pose/persistence (2026-09-24, CODE-COMPLETE; board verify pending)
+Seven features built + unit-tested on the dev PC in one pass (207 web_control tests
++ smoke green). ALL of the nav-config half is **restart-only** (one `nano-nav`
+bounce after `pixi install` + `deploy.sh robot_bringup web_control`); the
+web/telemetry half ships live. Per-feature detail lives in docs/TODO.md.
+
+- **Planner: NavFn → `SmacPlanner2D`** (`pixi.toml` + `nav2_params.yaml`): any-angle
+  paths (no staircase-weaving), whole-path collision checking (NavFn only avoided
+  LETHAL cells — the plan-hugs-the-inscribed-ring class), `smooth_path: true` +
+  `cost_penalty 2.0` to respect the inflation gradient. pkg
+  `ros-humble-nav2-smac-planner` (resolves linux-64; aarch64 verify rides deploy).
+- **`smoother_server`** (`ros-humble-nav2-smoother`): SimpleSmoother post-processes
+  the path — `<SmoothPath smoother_id="simple_smoother"/>` inside recovery_bt.xml's
+  RateController (re-runs with every 1 Hz replan). The BT plugin lib is
+  **`nav2_smooth_path_action_bt_node`** (verified against the installed .so — not
+  "smoother_action"). NOTE Smac ALSO smooths (`smooth_path`) — if the board shows
+  double-smoothing or CPU cost, drop the BT node; Smac's alone may suffice.
+- **Keepout zones (web-drawn no-go)**: rectangles (map-frame metres) persisted to
+  `~/.local/state/nanobot/keepout.json`; `GET /keepout` +
+  `POST /keepout/save|delete|clear`; telemetry rasterizes them into the CURRENT
+  /map geometry and latches `/keepout_mask` (OccupancyGrid) +
+  `/keepout_filter_info` (CostmapFilterInfo type 0), re-emitting on every /map
+  rebuild; the GLOBAL costmap's new `keepout_filter` layer (KeepoutFilter) treats
+  painted cells as lethal. Deliberately GLOBAL-only (a local-window keepout could
+  trap the robot) and rectangle-only. The mask publishers are whitelisted but
+  SERVER-OWNED (the `_mk_*` builders raise — browsers can't hand-craft cells).
+- **Multi-waypoint nav**: `POST /nav/waypoints {points:[{x,y},…]}` sends ONE
+  `NavigateThroughPoses` action goal (Humble's goal field is `poses:
+  PoseStamped[]`, NOT a PoseArray — verified against the installed msg), clamped
+  ±12 m, capped 12 stops, lidar pre-wake + `note_waypoints` mirror. The sibling
+  `/navigate_through_poses/_action/status` sub is ALWAYS-ON (feeds the chip + the
+  LDS busy window with the page closed); the action feedback
+  (`number_of_poses_remaining`) refines additive `f.nav.wp_index`/`wp_total`. UI:
+  Waypoints card beside Locations (Add-by-map-click toggle, numbered rings —
+  current glows, ↑/↓/✕ ordered list, Go/Clear; mapCancel clears).
+- **`/plan` polyline**: telemetry lazily subs `/plan` (VOLATILE d1), downsamples
+  to 200 poses, `GET /plan` serves `JSON{n,t}+\n+float32[x,y…]` (503 pre-first-
+  plan); additive `f.nav.plan_age`; the Map card's **Plan** toggle draws a cyan
+  dashed polyline (greyed when stale >8 s). Board check first:
+  `RMW_IMPLEMENTATION=rmw_zenoh_cpp; ros2 daemon stop; ros2 topic list | grep -w plan`.
+- **Persistent pose while the lidar parks**: `_tf_pose` returns `(x, y, yaw, src)`
+  and caches the map→odom half on every hit; on a lookup miss (slam's
+  frozen-stamp case) it composes cached map→odom ∘ live `/odom` (dead-reckon),
+  additive `f.nav.pose_src = "tf"|"extrap"|null`, and the page rings the dot
+  AMBER when dead-reckoned. DISPLAY-ONLY: Locations Save now REJECTS
+  `src!="tf"` (a saved spot must be a real map pose).
+- **slam map persistence (serialize-first)**: `POST /map/save` (💾 Save on the
+  Map card) calls slam_toolbox's `serialize_pose_graph` →
+  `~/.local/state/nanobot/nano_map.posegraph` (+.data). The commented
+  `map_file_name:` line in nav2_params.yaml's slam_toolbox section makes a boot
+  LOAD + CONTINUE the saved map (mode stays `mapping`; `mode: localization` is a
+  documented separate one-way flip — it would change the restart semantics the
+  heals rely on). POST /map/clear now RETIRES the saved file (every variant →
+  `.bak`) before the nano-slam restart, so the clear heal still works.
+
+**New frame keys (additive):** `f.nav.pose_src`, `f.nav.wp_index`, `f.nav.wp_total`,
+`f.nav.plan_age`. **New routes:** `GET /plan`, `GET /keepout`,
+`POST /keepout/save|delete|clear`, `POST /nav/waypoints`, `POST /map/save`.
+
 **SLAM rotation-smear tuning (2026-09-19, live-verified):** the first slam_toolbox map came out
 as incoherent dust (852 scattered wall cells; a live scan correlated with it at only 33% at ANY
 rigid offset — while the LDS itself repeated scans to 1-3 cm parked). Root causes were the drive

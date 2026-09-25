@@ -88,6 +88,9 @@ COMPONENTS = [
         package="nav2_behaviors", plugin="behavior_server::BehaviorServer",
         name="behavior_server", parameters=[PARAMS]),
     ComposableNode(
+        package="nav2_smoother", plugin="nav2_smoother::SmootherServer",
+        name="smoother_server", parameters=[PARAMS]),
+    ComposableNode(
         package="nav2_bt_navigator", plugin="nav2_bt_navigator::BtNavigator",
         name="bt_navigator", parameters=[
             # Humble key; the BT path must be ABSOLUTE (injected from the share dir).
@@ -98,13 +101,14 @@ COMPONENTS = [
         name="lifecycle_manager",
         parameters=[{
             "autostart": True,
-            # FIVE servers, bt_navigator LAST so the forward-order activation
-            # finds its dependencies up (velocity_smoother after its input,
-            # controller_server). slam_toolbox is not listed: it is a
-            # plain node in 2.6.10 with no lifecycle at all (docstring).
+            # SIX servers, bt_navigator LAST so the forward-order activation
+            # finds its dependencies up (smoother_server after planner_server,
+            # velocity_smoother after controller_server). slam_toolbox is not
+            # listed: it is a plain node in 2.6.10 with no lifecycle at all
+            # (docstring).
             "node_names": ["planner_server", "controller_server",
-                           "velocity_smoother", "behavior_server",
-                           "bt_navigator"]}]),
+                           "smoother_server", "velocity_smoother",
+                           "behavior_server", "bt_navigator"]}]),
 ]
 
 

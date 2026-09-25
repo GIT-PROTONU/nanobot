@@ -36,6 +36,16 @@ slam_toolbox:
   ros__parameters:
     # Mode: online async mapping (matcher runs per scan, graph grows in background)
     mode: mapping
+    # Map persistence (2026-09-24): web_control's POST /map/save serializes the
+    # current pose graph to ~/.local/state/nanobot/nano_map.posegraph. Set
+    # map_file_name to that path (uncomment) to make a nano-slam boot LOAD it —
+    # mapping mode then CONTINUES the saved map instead of starting fresh (and
+    # POST /map/clear retires the file + restarts, so the clear heal still works).
+    # Leave it COMMENTED for the current per-boot fresh map (restart IS the clear).
+    # map_file_name: /home/ibster/.local/state/nanobot/nano_map.posegraph
+    # Localization mode is a SEPARATE one-way operational flip (mode: localization
+    # + a saved map) — it changes the restart semantics several heals rely on;
+    # flip it manually only after a deliberate decision.
     # Frames: base_frame == Nav2's robot_base_frame so no TF timeout waits.
     odom_frame: odom
     map_frame: map
@@ -211,17 +221,53 @@ velocity_smoother:
                                  # brake) for this long, then stop republishing;
                                  # under the ESP32 500 ms cmd watchdog
 
-# ---- planner_server (NavFn, A*) ----------------------------------------------
+# ---- planner_server (SmacPlanner2D; was NavFn) --------------------------------
+# Smac2D replaces NavFn (2026-09-24): any-angle paths (no staircase-weaving for
+# RPP to sawtooth-correct), collision checking along the whole swept path (NavFn
+# only avoided LETHAL cells — the "plan hugs the inscribed ring" failure class),
+# and built-in path smoothing (smooth_path). smooth_path needs nav2_msgs'
+# SmoothPath action — shipped by nav2_smac_planner itself.
 planner_server:
   ros__parameters:
     expected_planner_frequency: 1.0
     planner_plugins: ["GridBased"]
     GridBased:
-      plugin: nav2_navfn_planner/NavfnPlanner
-      use_astar: true
-      allow_unknown: true
-      tolerance: 0.0
-      max_planning_time: 1.0
+      plugin: nav2_smac_planner/SmacPlanner2D
+      tolerance: 0.0                 # 0 = exact reach only (matches the old NavFn)
+      downsample_costmap: false      # 0.05 m grid is small enough
+      allow_unknown: true            # matches NavFn's setting
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      motion_model_for_search: "MOORE"   # 8-connected 2D search
+      angle_quantization_bins: 1     # 2D: no heading bins (MOORE model)
+      analytic_expansion_ratio: 3.5
+      minimum_turning_radius: 0.0    # 2D model: unused
+      change_penalty: 0.0
+      non_straight_penalty: 1.1      # slight preference for straight segments
+      cost_penalty: 2.0              # respect the inflation gradient (keep-away)
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: false
+      smooth_path: true              # built-in path smoothing (kills grid zigzag)
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+
+# ---- smoother_server (SimpleSmoother) ------------------------------------------
+# Post-processes the planned path (SmoothPath BT node in recovery_bt.xml, after
+# ComputePathToPose) to kill residual zigzag before RPP tracks it. Deliberately
+# minimal: one simple smoother; CPU-checked on the 4-core board.
+smoother_server:
+  ros__parameters:
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
 
 # ---- bt_navigator --------------------------------------------------------------
 # default_nav_to_pose_bt_xml is injected by launch/nav2.launch.py (Humble key;
@@ -252,6 +298,7 @@ bt_navigator:
       - nav2_rate_controller_bt_node
       - nav2_goal_updated_condition_bt_node
       - nav2_wait_action_bt_node
+      - nav2_smooth_path_action_bt_node
 
 # ---- behavior_server (recovery behaviors) ------------------------------------
 # Per-plugin C++ types are REQUIRED in Humble (the node crashes without them).
@@ -373,13 +420,24 @@ global_costmap:
         # (2026-09-24 "crowds an obstacle then stops"); 1.7 keeps cost high
         # across the whole inflation radius so plans prefer real margin.
         cost_scaling_factor: 1.7
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      # KeepoutFilter (2026-09-24): web-drawn no-go rectangles (keepout.json)
+      # rasterized + latched by web_control on /keepout_mask (map frame, slam's
+      # resolution). GLOBAL costmap only — a keepout in the local rolling
+      # window could trap the robot mid-drive; the planner routes around zones
+      # while control still reacts to live obstacles.
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: "keepout_filter_info"
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "keepout_filter"]
 
 # ---- lifecycle manager: FIVE Nav2 servers ONLY --------------------------------
 # - bt_navigator must be LAST: CONFIGURE/ACTIVATE iterate node_names FORWARD and
 #   the navigator needs planner/controller up first.
+# - smoother_server sits after planner_server (its input) — order among the
+#   first five is not load-bearing, but keep them all before the navigator.
 # - velocity_smoother sits after controller_server (its input) — order among
-#   the first four is not load-bearing, but keep it before the navigator.
+#   the first five is not load-bearing, but keep it before the navigator.
 # - slam_toolbox is not listed at all: it is a plain node in 2.6.10 with no
 #   lifecycle services to drive (see the slam_toolbox section above).
 nav2_lifecycle_manager:
@@ -387,5 +445,5 @@ nav2_lifecycle_manager:
     autostart: true
     bond_timeout: 4.0
     attempt_respawn_reconnection: true
-    node_names: ['planner_server', 'controller_server', 'velocity_smoother',
-                 'behavior_server', 'bt_navigator']
+    node_names: ['planner_server', 'controller_server', 'smoother_server',
+                 'velocity_smoother', 'behavior_server', 'bt_navigator']

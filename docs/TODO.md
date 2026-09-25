@@ -96,8 +96,8 @@ in this checkout.
       the frozen-stamp pose and retrying) and bound it — it is log spam + wasted
       cycles every time the lidar parks, and it will poison any future
       log-reading session.**
-- [ ] **NEW 2026-09-23: drawable keep-away/no-go zones on the web map (Nav2 keepout
-      filter).** Today's only keep-away is the uniform inflation bubble
+- [x] **NEW 2026-09-23: drawable keep-away/no-go zones on the web map (Nav2 keepout
+      filter). CODE-COMPLETE 2026-09-24 (dev-PC + smoke; board verify pending).** Today's only keep-away is the uniform inflation bubble
       (`nav_inflation_m` around every wall); area-specific zones died with slam_nav's
       no-go brush (`/dev/shm/nano_nogo.bin`, retired 2026-09-14) and were deliberately
       not rebuilt. The Nav2-native mechanism is a **costmap filter**: publish a
@@ -115,8 +115,24 @@ in this checkout.
       resolution, and edited masks need a costmap re-subscribe/clear like
       `/map/clear`. Needs board verify end-to-end (draw → planner routes around →
       survives reboot).
-- [ ] **NEW 2026-09-24: persistent robot pose on the web map while the lidar is
-      parked (LDS off).** Today `f.nav.pose` = a tf2 lookup `map→base_link` at
+      **2026-09-24 IMPLEMENTED (rectangle-only, GLOBAL costmap only — the local
+      rolling window could trap the robot mid-drive):** zones are rectangles in
+      map-frame metres, persisted to `~/.local/state/nanobot/keepout.json`;
+      `GET /keepout` + `POST /keepout/save|delete|clear` (web Keep-out card:
+      drag a box on the map with the Draw toggle, translucent-red overlay,
+      per-zone delete + Clear all). `telemetry.py` rasterizes the rects into the
+      CURRENT /map geometry and latches `/keepout_mask` (OccupancyGrid) +
+      `/keepout_filter_info` (CostmapFilterInfo, type 0) — both transient-local
+      so the costmap's KeepoutFilter gets the current mask on (re)start;
+      `_on_map` re-emits on a rebuilt grid so the cells stay aligned. The
+      `keepout_filter` layer is in the GLOBAL costmap's plugins (nav2_params.yaml,
+      restart-only — lands with the Smac/smoother bounce). Unit-tested
+      (`test_keepout_mask.py`): rasterize/alignment/clamp/re-emit/clear +
+      handler round-trip/cap. REMAINING: the board verify (draw → planner routes
+      around → survives a nano-slam restart).
+- [x] **NEW 2026-09-24: persistent robot pose on the web map while the lidar is
+      parked (LDS off). CODE-COMPLETE 2026-09-24; board verify pending.**
+      Today `f.nav.pose` = a tf2 lookup `map→base_link` at
       Time(0) (`telemetry._tf_pose`) — while the lidar is parked,
       slam_toolbox processes no scans, so its `map→odom` stays stamped at the
       LAST processed scan and the composed lookup fails with "extrapolation
@@ -141,7 +157,19 @@ in this checkout.
       Verify: park the lidar 60+ s, drive/turn by hand → marker keeps
       moving on the map; wake the lidar → marker snaps back to slam-truth
       with no jump > a few cm.
-- [ ] **NEW 2026-09-23: multi-waypoint navigation ("visit A then B then C").**
+      **2026-09-24 IMPLEMENTED:** `_tf_pose` now returns `(x, y, yaw, src)`;
+      on a successful map→base_link lookup it also caches the map→odom half
+      (`_map_odom`). On a lookup miss (the parked-lidar frozen-stamp case) it
+      composes the cached map→odom with the LIVE `/odom` pose (dead-reckon) and
+      tags it `"extrap"`; the frame gains additive `f.nav.pose_src` =
+      `"tf"|"extrap"|null` and the page draws an AMBER ring around the pose dot
+      when dead-reckoned. DISPLAY-ONLY guard: Locations Save now REJECTS the
+      extrapolated pose (needs `src=="tf"`). Unit-tested in
+      `test_nav_telemetry.py` (hit caches map→odom; miss composes correctly;
+      no-cache/no-odom → None; SUB_LINGER drop degrades to None). REMAINING:
+      the board verify (park 60+ s → dot keeps moving → snap-back on wake).
+- [x] **NEW 2026-09-23: multi-waypoint navigation ("visit A then B then C").
+      CODE-COMPLETE 2026-09-24; board verify pending.**
       Today every goal is a single `/goal_pose` (map click, Locations Go, skill
       go-to); the Locations card is a named-poses store, not a sequence.
       bt_navigator ALREADY loads + validates the default NavigateThroughPoses tree
@@ -153,9 +181,26 @@ in this checkout.
       progress/status surfacing per waypoint (the single-goal status chip +
       Nav log need waypoint indices), skip/reorder, interaction with the
       keepout-filter item above (a waypoint inside a       keepout zone must fail
-      visibly), and cancel semantics. Verify the through-poses tree actually
+      visibly), and       cancel semantics. Verify the through-poses tree actually
       activates on the board's minimal plugin set before building UI.
-- [ ] **NEW 2026-09-24: live planned-path polyline on the web map (`/plan`).**
+      **2026-09-24 IMPLEMENTED:** `POST /nav/waypoints {points:[{x,y},...]}` —
+      web_control sends the ordered stops as ONE `NavigateThroughPoses` action
+      goal (Humble's goal field is `poses: PoseStamped[]`, NOT a PoseArray —
+      verified against the installed msg), clamped ±12 m, capped
+      `NAV_WAYPOINT_MAX` 12, with the lidar pre-wake + `note_waypoints`
+      mirror (ring on the FIRST stop, nav-log line "waypoints: N stops → …").
+      bt_navigator's sibling `/navigate_through_poses/_action/status` sub is
+      ALWAYS-ON in telemetry (same GoalStatusArray shape) so the chip + the
+      LDS busy window track a tour with the page closed; the action's
+      feedback (`number_of_poses_remaining`) refines additive
+      `f.nav.wp_index`/`wp_total` (guarded, never fatal). UI: a "Waypoints"
+      card beside Locations — Add-by-map-click toggle, numbered rings on the
+      map (current one glows), ordered list with ↑/↓/✕, Go/Clear; mapCancel
+      clears the list. Unit-tested (`test_nav_waypoints.py`): validation/
+      clamps/cap/refuse-when-down + mirror/feedback/terminal-clear.
+      REMAINING: the board verify (3 clicks → Go → visits in order).
+- [x] **NEW 2026-09-24: live planned-path polyline on the web map (`/plan`).
+      CODE-COMPLETE 2026-09-24; board verify pending.**
       Humble's `planner_server` publishes the computed path on **`/plan`**
       (`nav_msgs/Path`) each time it plans — the AGENTS.md line "Nav2 doesn't
       expose a plan topic" is inaccurate for Humble. Verify on the board first
@@ -172,6 +217,17 @@ in this checkout.
       keepout-zone + multi-waypoint items above (a preview through a keepout
       zone, or per-waypoint paths, reuse the same plumbing) — decide the
       shape once.
+      **2026-09-24 IMPLEMENTED (live polyline only, no pre-commit preview):**
+      telemetry lazily subscribes `/plan` (nav_msgs/Path, VOLATILE depth 1,
+      same reasoning as the costmap subs), downsamples to `PLAN_MAX_POINTS`
+      200 poses (endpoints preserved), and caches one atomic copy; `GET /plan`
+      serves `JSON({n,t}) + \n + float32 [x0,y0,x1,y1,...]` (503 before the
+      first plan). Additive `f.nav.plan_age`; the page's Plan toggle (Map
+      card) polls at 1 Hz and draws a cyan DASHED polyline under the trail —
+      greyed when `plan_age > 8 s` (planner quiet / no goal). Unit-tested
+      (`test_plan_payload.py`). REMAINING: board verify `/plan` actually
+      flows (`RMW_IMPLEMENTATION=rmw_zenoh_cpp; ros2 daemon stop;
+      ros2 topic list | grep -w plan`) + the polyline renders on a goal.
 - [ ] **NEW 2026-09-23: Nav2 cheap-useful features batch (five candidates from the
       2026-09-23 review).** Ranked by value-per-effort; independent, pick any:
 1. **`ObstacleLayer` on both costmaps** (config-only, no new package) — live
@@ -204,17 +260,50 @@ in this checkout.
          nano-slam restart semantics that several docs/heals rely on, and a
          stale/loaded map needs the frame-anchor sanity that slam handles
          internally. Needs board verify (save → reboot → localize, no re-map).
+         **2026-09-24: PARTIALLY IMPLEMENTED (serialize-first, mode stays
+         mapping).** `POST /map/save` (web Map card's 💾 Save button) calls
+         slam_toolbox's `serialize_pose_graph` service → writes
+         `~/.local/state/nanobot/nano_map.posegraph` (+ .data; the path is the
+         `map_save_file` param). nav2_params.yaml's slam_toolbox section carries
+         the commented `map_file_name` line — uncomment to make a nano-slam boot
+         LOAD + CONTINUE the saved map (mapping mode, not localization). POST
+         /map/clear now RETIRES the saved file (renames every variant to .bak)
+         before the restart, so the clear heal still works even with
+         map_file_name set. `mode: localization` deliberately NOT defaulted
+         (documented in the yaml as a separate one-way operational flip).
+         Unit-tested (`test_map_save.py`). REMAINING: board verify (build →
+         Save → set map_file_name → bounce → map continues).
       3. **`smoother_server` + SimpleSmoother** (small pkg `ros-humble-nav2-smoother`,
          one BT node `nav2_smoother` in plugin_lib_names) — post-processes the
          grid path to kill zigzags before RPP tracks it. Add to the container +
          lifecycle list (before bt_navigator), wire the BT's FollowPath to use
          smoothing (Humble: the planner→smoother chain via the default tree, or
          keep the custom recovery tree and add the smoothing node). Verify CPU.
+         **2026-09-24: CONFIG STAGED (dev-PC; board verify pending)** —
+         `ros-humble-nav2-smoother` in pixi.toml (resolves on linux-64; aarch64
+         verify rides the deploy), `smoother_server` section in nav2_params.yaml
+         (`simple_smoother`, tolerance 1e-10, max_its 1000, do_refinement),
+         the component added to nav2.launch.py, `nav2_smooth_path_action_bt_node`
+         (the INSTALLED lib name, verified in the pixi env) added to
+         plugin_lib_names, `smoother_server` in the lifecycle node_names, and
+         `<SmoothPath smoother_id="simple_smoother" smoothing_duration="2.0"/>`
+         inside recovery_bt.xml's RateController (after ComputePathToPose —
+         re-runs with every 1 Hz replan). Note SmacPlanner2D ALSO has built-in
+         `smooth_path` — if the board shows double-smoothing artifacts or CPU
+         cost, drop the BT node (Smac's alone may suffice).
       4. **`SmacPlanner2D` swap** (pkg `ros-humble-nav2-smac-planner`, one param
          line: `GridBased.plugin: nav2_smac_planner/SmacPlanner2D` + its params) —
          any-angle paths, less staircase-weaving, more robust on small maps.
          Easy A/B against Navfn (same plugin slot, `use_astar` etc. differ —
          Smac needs its own param block: tolerance, max_iterations, motion model).
+         **2026-09-24: CONFIG STAGED (dev-PC; board verify pending)** —
+         `ros-humble-nav2-smac-planner` in pixi.toml (resolves on linux-64:
+         libnav2_smac_planner_2d.so + headers in the env), the full Smac2D param
+         block in nav2_params.yaml (MOORE model, tolerance 0, allow_unknown,
+         cost_penalty 2.0 to respect the inflation gradient, `smooth_path: true`
+         with its own smoother sub-block). Aarch64 resolve happens at the deploy
+         `pixi install`; verify `ros2 param get /planner_server …plugin` + a goal
+         plans + `/plan` populates after the bounce.
       5. **`drive_on_heading` behavior** — already in the behavior_server plugin
          family (nav2_behaviors); free to add for scripted straight-line
          approach maneuvers (the canned-move overlap is real — only add if a

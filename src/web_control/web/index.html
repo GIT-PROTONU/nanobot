@@ -105,6 +105,9 @@
               <label style="margin-left:6px"><input type="radio" name="costSrc" id="costGlobal" checked> global</label>
               <label style="margin-left:6px"><input type="radio" name="costSrc" id="costLocal"> local</label>
             </span>
+            <label class="switch"><input type="checkbox" id="mapPlan"><span class="track"></span>
+              Plan</label>
+            <span id="koDrawHint" style="display:none;color:var(--amber)">drag to draw</span>
           </div>
           <div class="chiprow" id="mapFeeds">
             <span class="fdot" id="feedEsp32"></span>ESP32
@@ -190,6 +193,7 @@
               <span>map age</span><b id="mapAge">–</b>
             </div>
             <div class="chiprow">
+              <button id="mapSave" class="btn">💾 Save map</button>
               <button id="mapWipe" class="btn">✕ Clear map</button>
             </div>
             <p class="hint">The SLAM grid + Nav2 state behind the hero <b>Map</b> view.
@@ -254,6 +258,32 @@
               name (needs a live pose — stand the robot where you want saved). <b>Go</b> publishes
               that pose to <b>/goal_pose</b> exactly like a map click. Saved to
               <b>~/.local/state/nanobot/locations.json</b>; skills can navigate to these names too.</p>
+          </div>
+          <div class="card">
+            <h2>Waypoints</h2>
+            <div class="chiprow">
+              <label class="switch"><input type="checkbox" id="mapWaypoint"><span class="track"></span>
+                Add by map click</label>
+              <button id="wpGo" class="btn" style="display:none">▶ Go</button>
+              <button id="wpClear" class="btn" style="display:none">✕ Clear</button>
+            </div>
+            <div id="wpList"></div>
+            <p class="hint">With <b>Add by map click</b> on, map taps drop numbered stops
+              instead of setting a single goal. <b>Go</b> sends the whole ordered list as one
+              NavigateThroughPoses goal — the robot visits them in order. Cancel clears.</p>
+          </div>
+          <div class="card">
+            <h2>Keep-out zones</h2>
+            <div class="chiprow">
+              <label class="switch"><input type="checkbox" id="mapKeepout"><span class="track"></span>
+                Draw (drag on map)</label>
+              <button id="koClear" class="btn" style="display:none">✕ Clear all</button>
+            </div>
+            <div id="koList"></div>
+            <p class="hint">Draw a box around an area the robot must never enter — the
+              <b>global costmap's keep-out filter</b> turns painted cells into walls, so the
+              planner routes around it (goals fully inside fail visibly). Shown as translucent
+              red. Saved to <b>~/.local/state/nanobot/keepout.json</b>.</p>
           </div>
           <div class="card">
             <h2>Odometry</h2>
@@ -3442,6 +3472,7 @@ connect();   // auto-connect on load
   let lastGrid=null;                   // last raw occupancy bytes, for immediate re-shade on toggle
   let sharpShade=true;                 // wall shading: posterize (crisp) vs linear (soft)
   let flash=null;                      // {x, y, t} click-feedback ring (world metres)
+  let waypoints=[];                    // collected stops (map-frame metres, ordered)
   let _goalClearT=undefined;           // pending "clear the goal ring" timer
   const trailCap=250;                  // breadcrumb ring buffer (world metres)
   // Nav2 costmap overlay state (toggle-gated; see pollCost below)
@@ -3494,7 +3525,39 @@ connect();   // auto-connect on load
       ctx.restore();
     }
     // breadcrumb trail (cyan polyline) — where the robot has been (fed by the
-    // SSE nav hook below)
+    // SSE nav hook below) — and the planned path above it:
+    // keep-out zones (translucent red + dashed outline): the drawn no-go
+    // rectangles, mirrored from the server's persisted zones. The live drag
+    // rectangle overlays while drawing.
+    if(koZones.length || koDrag){
+      const drawKo=z=>{
+        const [ax,ay]=W2P(Math.min(z.x1,z.x2),Math.min(z.y1,z.y2));
+        const [bx,by]=W2P(Math.max(z.x1,z.x2),Math.max(z.y1,z.y2));
+        ctx.fillStyle="rgba(255,59,48,0.16)";
+        ctx.strokeStyle="rgba(255,59,48,0.75)"; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
+        ctx.fillRect(ax,ay,bx-ax,by-ay); ctx.strokeRect(ax,ay,bx-ax,by-ay);
+        ctx.setLineDash([]);
+      };
+      koZones.forEach(drawKo);
+      if(koDrag) drawKo(koDrag);
+    }
+    // planned path (GET /plan): cyan dashed polyline under the trail — the
+    // route Nav2 is FOLLOWING right now (appears as the replan lands, not
+    // before you commit). Greyed when stale (plan_age > 8 s = planner quiet).
+    if(planPts && planMeta && planPts.length>=4){
+      const stalePlan=!(navFrame&&navFrame.plan_age!=null&&navFrame.plan_age<8);
+      ctx.setLineDash([5,4]);
+      ctx.strokeStyle=stalePlan?"rgba(34,211,238,0.35)":"#22d3ee";
+      ctx.lineWidth=1.5;
+      ctx.beginPath();
+      for(let i=0;i<planPts.length;i+=2){
+        const [x,y]=W2P(planPts[i],planPts[i+1]);
+        i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+      }
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    // breadcrumb trail (cyan polyline) — where the robot has been (fed by the
+    // SSE frame; pushed in mapOnNav below).
     if(navTrail.length>1){
       ctx.strokeStyle="#22d3ee"; ctx.lineWidth=1; ctx.globalAlpha=0.7; ctx.beginPath();
       navTrail.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
@@ -3505,6 +3568,20 @@ connect();   // auto-connect on load
       const [gx,gy]=W2P(mapGoal[0],mapGoal[1]);
       ctx.strokeStyle="#ffd60a"; ctx.lineWidth=1.5;
       ctx.beginPath(); ctx.arc(gx,gy,5,0,6.2832); ctx.stroke();
+    }
+    // waypoint stops (numbered yellow rings) — the collected multi-waypoint
+    // list while it's being built; the CURRENT one (f.nav.wp_index) glows.
+    if(waypoints.length){
+      const cur=(navFrame&&navFrame.wp_index!=null)?navFrame.wp_index:-1;
+      waypoints.forEach((wp,i)=>{
+        const [wx2,wy2]=W2P(wp[0],wp[1]);
+        ctx.strokeStyle="#ffd60a"; ctx.lineWidth=i===cur?3:1.5;
+        if(i===cur){ ctx.fillStyle="rgba(255,214,10,0.35)"; }
+        ctx.beginPath(); ctx.arc(wx2,wy2,i===cur?7:5,0,6.2832); ctx.stroke();
+        if(i===cur){ ctx.fill(); }
+        ctx.fillStyle="#ffd60a"; ctx.font="bold 9px sans-serif";
+        ctx.fillText(String(i+1), wx2+7, wy2-5);
+      });
     }
     // robot pose: a small, crisp dot + heading line, drawn at full display
     // resolution so it stays sharp (and constant-sized on screen) at any zoom.
@@ -3526,6 +3603,13 @@ connect();   // auto-connect on load
       ctx.strokeStyle="rgba(10,10,14,0.6)"; ctx.lineWidth=1;   // thin dark halo on light map
       ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.stroke();
       ctx.beginPath(); ctx.arc(rx,ry,R,0,6.2832); ctx.fill();
+      // Dead-reckoned pose (f.nav.pose_src "extrap"): the lidar is parked and
+      // slam's map->odom is frozen — the dot is wheel dead-reckoning, not a
+      // slam-verified fix. Amber ring; snaps back to plain red when TF returns.
+      if(navFrame&&navFrame.pose_src==="extrap"){
+        ctx.strokeStyle="#f5b83d"; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.arc(rx,ry,R+3,0,6.2832); ctx.stroke();
+      }
       ctx.strokeStyle="#ff3b30"; ctx.lineWidth=2; ctx.lineCap="round";
       ctx.beginPath(); ctx.moveTo(rx,ry);
       ctx.lineTo(rx+9*Math.cos(p[2]||0), ry-9*Math.sin(p[2]||0)); ctx.stroke();
@@ -3573,8 +3657,25 @@ connect();   // auto-connect on load
   // subsequent click still targets cv (click-to-goal), not the wrap container.
   let panDrag=false, panMoved=false, pdsx=0,pdsy=0,pdpx=0,pdpy=0, pinch=null;
   const pointers=new Map();
+  // Keep-out draw state (kept here because the drag math is the pan machinery's
+  // neighbour): when #mapKeepout is on, a one-pointer drag paints a rectangle
+  // instead of panning; on release it's saved (POST /keepout/save).
+  let koZones=[], koDrag=null;         // saved rects + the rect being dragged
+  function koWorld(clientX,clientY){
+    const rect=cv.getBoundingClientRect();
+    const z=zoom||fitZoom(), [x0,y0]=origin(z);
+    const gcx=(clientX-rect.left-x0)/z, gcy=(clientY-rect.top-y0)/z;
+    const m=lastMeta;
+    return [m.ox+gcx*m.res, m.oy+(m.h-1-gcy)*m.res];
+  }
   cv.addEventListener("pointerdown",e=>{
     pointers.set(e.pointerId,[e.clientX,e.clientY]);
+    if($("mapKeepout").checked && pointers.size===1 && lastMeta){
+      const [wx,wy]=koWorld(e.clientX,e.clientY);
+      koDrag={x1:wx,y1:wy,x2:wx,y2:wy};
+      cv.setPointerCapture(e.pointerId);
+      return;
+    }
     if(pointers.size===2){
       const [[ax,ay],[bx,by]]=[...pointers.values()];
       pinch={d:Math.hypot(bx-ax,by-ay), mx:(ax+bx)/2, my:(ay+by)/2};
@@ -3582,6 +3683,11 @@ connect();   // auto-connect on load
     cv.setPointerCapture(e.pointerId);
   });
   cv.addEventListener("pointermove",e=>{
+    if(koDrag){
+      const [wx,wy]=koWorld(e.clientX,e.clientY);
+      koDrag.x2=wx; koDrag.y2=wy; repaint();
+      return;
+    }
     if(pointers.has(e.pointerId)) pointers.set(e.pointerId,[e.clientX,e.clientY]);
     if(pointers.size===2 && pinch){
       const [[ax,ay],[bx,by]]=[...pointers.values()];
@@ -3596,6 +3702,13 @@ connect();   // auto-connect on load
   });
   const upPtr=e=>{
     pointers.delete(e.pointerId);
+    if(koDrag){
+      const d=koDrag; koDrag=null;
+      // Ignore degenerate clicks (a tap is not a box).
+      if(Math.hypot(d.x2-d.x1,d.y2-d.y1)>0.1) saveKeepout(d);
+      repaint();
+      return;
+    }
     if(pointers.size<2) pinch=null;
     if(pointers.size===0) panDrag=false;
   };
@@ -3671,6 +3784,35 @@ connect();   // auto-connect on load
     }catch(e){ /* transient: keep polling */ }
   }
 
+  // Planned-path polyline (GET /plan, planner_server's latest nav_msgs/Path,
+  // cached downsampled by telemetry). Cyan dashed line under the trail.
+  let planMeta=null, planPts=null, planTimer=null;
+  function dropPlan(){ planMeta=planPts=null; }
+  async function pollPlan(){
+    if(!$("mapOn").checked || !$("mapPlan").checked) return;
+    try{
+      const r=await fetch("/plan?t="+Date.now());
+      if(!r.ok){ dropPlan(); repaint(); return; }   // no plan yet / nav down
+      const buf=new Uint8Array(await r.arrayBuffer());
+      const nl=buf.indexOf(10); if(nl<0) return;
+      const m=JSON.parse(dec.decode(buf.subarray(0,nl)));
+      const f=new Float32Array(buf.buffer.slice(buf.byteOffset+nl+1,
+                                                 buf.byteOffset+buf.byteLength));
+      planMeta=m; planPts=f;
+      repaint();
+    }catch(e){ /* transient: keep polling */ }
+  }
+  const planStart=()=>{
+    if(planTimer) return;
+    pollPlan(); planTimer=setInterval(pollPlan,1000);
+  };
+  const planStop=()=>{ if(planTimer){ clearInterval(planTimer); planTimer=null; } dropPlan(); };
+  $("mapPlan").addEventListener("change",()=>{
+    if($("mapPlan").checked && $("mapOn").checked) planStart();
+    else planStop();
+    repaint();
+  });
+
   function shadeMap(){
     if(!img || !lastGrid || !lastMeta) return;
     const w=lastMeta.w, h=lastMeta.h, d=img.data;
@@ -3717,6 +3859,7 @@ connect();   // auto-connect on load
   cv.addEventListener("click",e=>{
     if(!lastMeta) return;
     if(panMoved){ panMoved=false; return; }   // a pan just ended, not a goal tap
+    if($("mapKeepout").checked) return;       // keep-out draw mode: clicks paint, not goals
     const rect=cv.getBoundingClientRect();
     const z=zoom||fitZoom(), [x0,y0]=origin(z);
     const gcx=(e.clientX-rect.left-x0)/z;      // grid px
@@ -3724,7 +3867,10 @@ connect();   // auto-connect on load
     const m=lastMeta;
     const wx=m.ox+gcx*m.res, wy=m.oy+(m.h-1-gcy)*m.res;
     flash={x:wx,y:wy,t:performance.now()};
-    if($("mapMotion").checked){
+    if($("mapWaypoint").checked){
+      // Waypoint mode: taps COLLECT stops (numbered rings); Go sends the list.
+      waypoints.push([wx,wy]); renderWaypoints(); mapGoal=null;
+    }else if($("mapMotion").checked){
       mapSetGoal(wx,wy);                       // publishes /goal_pose
     }else{
       mapGoal=[wx,wy];                         // browse-only: local marker, no publish
@@ -3738,6 +3884,7 @@ connect();   // auto-connect on load
   $("mapCancel").onclick=()=>{
     mapGoal=null;
     navTrail.length=0; lastTrailPt=null;
+    clearWaypoints();                       // cancelling a tour drops its stops
     fetch("/nav/cancel",{method:"POST"}).catch(()=>{});
     repaint();
   };
@@ -3760,6 +3907,18 @@ connect();   // auto-connect on load
     }catch(e){ alert("Map clear request failed: "+e); }
   };
   $("mapShade").addEventListener("change",e=>{ sharpShade=e.target.checked; shadeMap(); repaint(); });
+
+  // Save map (Drive tab Map card): POST /map/save serializes the current pose
+  // graph via slam_toolbox's serialize service (writes the map_save_file path).
+  // To load it on boot, set slam_toolbox's map_file_name in nav2_params.yaml.
+  $("mapSave").onclick=async()=>{
+    try{
+      const r=await fetch("/map/save",{method:"POST"});
+      const j=await r.json().catch(()=>({}));
+      if(j.error){ alert("Map save FAILED: "+j.error); return; }
+      alert("Saving map: "+(j.file||"")+"\n"+(j.note||""));
+    }catch(e){ alert("Map save request failed: "+e); }
+  };
 
   // Costmap overlay toggle + local/global source pick. The pick row only shows
   // while the toggle is on; switching sources drops the old grid so a stale
@@ -3790,9 +3949,11 @@ connect();   // auto-connect on load
       $("mapWait").style.display="flex"; cv.style.cursor="default"; // until a frame lands
       poll(); timer=setInterval(poll,1000);
       if($("mapCost").checked) costStart();
+      if($("mapPlan").checked) planStart();
     } else {
       clearInterval(timer); timer=null;
       costStop();
+      planStop();
     }
   });
 
@@ -3890,6 +4051,110 @@ connect();   // auto-connect on load
     }catch(e){ alert("Save failed (server unreachable)."); }
   };
   loadLocations();
+
+  // ---- Waypoints card (Drive tab) ---------------------------------------------
+  // Collected stops live in `waypoints` (the map IIFE state above); this panel
+  // renders the ordered list with up/down/delete, and Go posts the whole list
+  // as ONE NavigateThroughPoses goal (POST /nav/waypoints).
+  const wpList=$("wpList");
+  function renderWaypoints(){
+    const has=waypoints.length>0;
+    $("wpGo").style.display=has?"":"none";
+    $("wpClear").style.display=has?"":"none";
+    if(!has){ wpList.innerHTML='<p class="hint" style="margin:6px 0 0">No stops yet — toggle “Add by map click” and tap the map.</p>'; return; }
+    wpList.innerHTML="";
+    waypoints.forEach((wp,i)=>{
+      const row=document.createElement("div"); row.className="chiprow";
+      const label=document.createElement("span");
+      label.textContent=`${i+1}. (${wp[0].toFixed(2)}, ${wp[1].toFixed(2)})`;
+      label.style.flex="1";
+      row.appendChild(label);
+      const up=document.createElement("button"); up.className="btn"; up.textContent="↑";
+      up.title="Move earlier"; up.disabled=i===0;
+      up.onclick=()=>{ [waypoints[i-1],waypoints[i]]=[waypoints[i],waypoints[i-1]]; renderWaypoints(); repaint(); };
+      const dn=document.createElement("button"); dn.className="btn"; dn.textContent="↓";
+      dn.title="Move later"; dn.disabled=i===waypoints.length-1;
+      dn.onclick=()=>{ [waypoints[i+1],waypoints[i]]=[waypoints[i],waypoints[i+1]]; renderWaypoints(); repaint(); };
+      const del=document.createElement("button"); del.className="btn"; del.textContent="✕";
+      del.title="Remove this stop";
+      del.onclick=()=>{ waypoints.splice(i,1); renderWaypoints(); repaint(); };
+      row.appendChild(up); row.appendChild(dn); row.appendChild(del);
+      wpList.appendChild(row);
+    });
+  }
+  function clearWaypoints(){ waypoints=[]; renderWaypoints(); repaint(); }
+  $("wpClear").onclick=clearWaypoints;
+  $("wpGo").onclick=async()=>{
+    if(!waypoints.length) return;
+    try{
+      const r=await fetch("/nav/waypoints",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({points:waypoints.map(w=>({x:w[0],y:w[1]}))})});
+      const j=await r.json();
+      if(j.error){ alert("Waypoints failed: "+j.error); return; }
+      mapGoal=[waypoints[waypoints.length-1][0], waypoints[waypoints.length-1][1]];
+    }catch(e){ alert("Waypoints failed (server unreachable)."); }
+  };
+  renderWaypoints();
+
+  // ---- Keep-out zones card (Drive tab) ----------------------------------------
+  // Rectangles in map-frame metres, persisted server-side (keepout.json) and
+  // rasterized into the global costmap's KeepoutFilter. Draw = drag on the map
+  // while #mapKeepout is on (the pointer handlers above); list = this card.
+  const koList=$("koList");
+  async function loadKeepout(){
+    try{
+      const r=await fetch("/keepout");
+      if(!r.ok) return;
+      const j=await r.json();
+      koZones=(j.zones||[]).map(z=>({x1:z.x1,y1:z.y1,x2:z.x2,y2:z.y2}));
+      renderKeepout(); repaint();
+    }catch(e){ /* offline: keep what we have */ }
+  }
+  function renderKeepout(){
+    $("koClear").style.display=koZones.length?"":"none";
+    $("mapKeepout").parentElement.style.color="";
+    if(!koZones.length){
+      koList.innerHTML='<p class="hint" style="margin:6px 0 0">No zones yet.</p>';
+      return;
+    }
+    koList.innerHTML="";
+    koZones.forEach((z,i)=>{
+      const row=document.createElement("div"); row.className="chiprow";
+      const label=document.createElement("span");
+      label.textContent=`${i+1}. (${Math.min(z.x1,z.x2).toFixed(1)}, ${Math.min(z.y1,z.y2).toFixed(1)}) → `+
+        `(${Math.max(z.x1,z.x2).toFixed(1)}, ${Math.max(z.y1,z.y2).toFixed(1)})`;
+      label.style.flex="1"; label.style.fontSize="0.85em";
+      row.appendChild(label);
+      const del=document.createElement("button"); del.className="btn"; del.textContent="✕";
+      del.title="Remove this zone";
+      del.onclick=async()=>{
+        await fetch("/keepout/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({index:i})});
+        loadKeepout();
+      };
+      row.appendChild(del);
+      koList.appendChild(row);
+    });
+  }
+  async function saveKeepout(z){
+    try{
+      const r=await fetch("/keepout/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({x1:z.x1,y1:z.y1,x2:z.x2,y2:z.y2})});
+      const j=await r.json();
+      if(j.error){ alert("Keep-out failed: "+j.error); return; }
+    }catch(e){ alert("Keep-out failed (server unreachable)."); }
+    loadKeepout();
+  }
+  $("koClear").onclick=async()=>{
+    if(!confirm("Remove ALL keep-out zones?")) return;
+    await fetch("/keepout/clear",{method:"POST"}).catch(()=>{});
+    loadKeepout();
+  };
+  $("mapKeepout").addEventListener("change",()=>{
+    $("koDrawHint").style.display=$("mapKeepout").checked?"inline":"none";
+    cv.style.cursor=$("mapKeepout").checked?"crosshair":"default";
+  });
+  loadKeepout();
 })();
 </script>
 
