@@ -3061,6 +3061,19 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 30
 
+    def end_headers(self):
+        """NEVER cache anything this gateway serves that isn't already carrying
+        its own Cache-Control (the static page, style.css, JSON, blobs): the page
+        is a single evolving artifact and a stale cached copy silently breaks the
+        SSE-frame/JSON contract (found 2026-09-27: an old cached page read the new
+        normalized keepout JSON as NaN and drew no zones). The MJPEG/SSE streams
+        set their own header first — those are left untouched."""
+        buf = getattr(self, "_headers_buffer", None)
+        if buf is not None and not any(
+                b.lower().startswith(b"cache-control") for b in buf):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def __init__(self, *args, stream=None, audio=None, tts=None, node=None, **kwargs):
         self._stream = stream
         self._audio = audio

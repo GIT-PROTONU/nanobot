@@ -4246,7 +4246,13 @@ connect();   // auto-connect on load
       const r=await fetch("/keepout");
       if(!r.ok) return;
       const j=await r.json();
-      koZones=(j.zones||[]).map(z=>({x:+z.x,y:+z.y,w:+z.w,h:+z.h,rot:+(z.rot||0)}));
+      // Server zones are normalized {x,y,w,h,rot}; legacy {x1,y1,x2,y2} rows
+      // (an old keepout.json behind a stale server) convert here too, so the
+      // page never draws NaN.
+      koZones=(j.zones||[]).map(z=>z.x!=null
+        ?{x:+z.x,y:+z.y,w:+z.w,h:+z.h,rot:+(z.rot||0)}
+        :{x:(+z.x1+ +z.x2)/2,y:(+z.y1+ +z.y2)/2,
+          w:Math.abs(+z.x2-+z.x1),h:Math.abs(+z.y2-+z.y1),rot:0});
       koSel=null; koDrag=null;
       renderKeepout(); repaint();
     }catch(e){ /* offline: keep what we have */ }
