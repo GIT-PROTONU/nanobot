@@ -936,7 +936,8 @@ class WebServerNode(Node):
         self.get_logger().info(
             f"llm: {'enabled' if self._cog.available() else 'idle (no key / disabled)'}"
             f" model={self._cog.llm.model}")
-        self._cog.bank_regen_check()                    # build/refresh the bank if needed
+        self._bank_checks(regen=True)                   # build/refresh the bank if needed
+                                                        # (nav-gated — deferred while driving)
         # --- brain health monitoring ---
         # Publish our health for the behavior layer to monitor; subscribe to its health so
         # the web UI (via /brain/health HTTP) knows whether both layers are alive.
@@ -948,6 +949,11 @@ class WebServerNode(Node):
         # (not a full ActionClient) — one small client, fire-and-forget like /param,
         # created here before spin so the HTTP thread never touches creation.
         self._cancel_client = self.create_client(CancelGoal, "navigate_to_pose/_action/cancel_goal")
+        # Waypoint tours (NavigateThroughPoses) are a SEPARATE action server with
+        # its own cancel_topic — a navigate_to_pose-only cancel would leave a
+        # running tour driving. The STOP button / map ✕ must abort every mode,
+        # so cancel_goal() fires both clients.
+        self._cancel_poses_client = self.create_client(CancelGoal, "navigate_through_poses/_action/cancel_goal")
         # Multi-waypoint navigation (POST /nav/waypoints): bt_navigator's
         # NavigateThroughPoses action. A full ActionClient (unlike the cancel
         # service client above) — the goal carries the whole PoseArray; feedback
@@ -1837,6 +1843,53 @@ class WebServerNode(Node):
             {"value": value, "scope": scope, "target": target_dict})))
         return {"status": "ok", "value": value, "scope": scope}
 
+    def _nav_active(self):
+        """True while Nav2 holds the drivetrain (planning/navigating/canceling).
+        IO-plane background work (phrase-bank regen/grow, any NEW LLM batch) defers
+        while this is true — the control plane owns the board while it drives (the
+        control-plane/IO-plane invariant in AGENTS.md). In-flight background
+        threads can't be cancelled; only NEW work is gated."""
+        tel = getattr(self, "telemetry", None)
+        return tel is not None and getattr(tel, "_goal_status", "idle") in (
+            "planning", "navigating", "canceling")
+
+    def _bank_checks(self, regen=True, grow=False):
+        """The phrase-bank refresh/grow entry points, GATED ON NAV: while a goal is
+        active the checks are deferred and auto-retried every 30 s (a one-shot
+        timer chain) instead of starting an LLM batch mid-drive. All three former
+        direct call sites (boot __init__, reflection entry, trait drift) route
+        through here."""
+        if not regen and not grow:
+            return
+        if self._nav_active():
+            if getattr(self, "_bank_defer_timer", None) is None:
+                self._bank_defer_timer = self.create_timer(
+                    30.0, self._bank_deferred_checks)
+                self.get_logger().info(
+                    "phrase-bank refresh deferred while a goal is active")
+            return
+        self._bank_defer_timer_cancel()
+        if regen:
+            self._cog.bank_regen_check()
+        if grow:
+            self._cog.bank_grow_check()
+
+    def _bank_deferred_checks(self):
+        if self._nav_active():
+            return                    # still driving — the timer stays armed
+        self._bank_defer_timer_cancel()
+        self._cog.bank_regen_check()
+        self._cog.bank_grow_check()
+
+    def _bank_defer_timer_cancel(self):
+        t = getattr(self, "_bank_defer_timer", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            self._bank_defer_timer = None
+
     def brain_reflect(self, data):
         """Toggle reflection mode. Publishes /reflect for the behaviour node (calm face +
         paused beats + local purpose/A/B consolidation) and, on entry, kicks the LLM reflection,
@@ -1849,8 +1902,8 @@ class WebServerNode(Node):
         self._reflect_pub.publish(Bool(data=on))
         if on:
             self._reflect_next = time.monotonic()  # reflect now, then every <=60 s while on
-            self._cog.bank_regen_check()           # refresh the phrase bank if the soul drifted
-            self._cog.bank_grow_check()            # else grow it: add fresh offline lines (background)
+            self._bank_checks(regen=True, grow=True)   # refresh the bank if the soul
+                                                       # drifted / else grow it (nav-gated)
             threading.Thread(target=self._cog.consolidate, daemon=True).start()  # long-term self
             # The skill workshop: mine experience -> mint/adapt a skill on trial (off-thread,
             # it makes several LLM calls). Sweeps the adopt/retire gate when it finishes.
@@ -2050,7 +2103,8 @@ class WebServerNode(Node):
         if isinstance(data.get("traits"), dict):
             self._cog.update_personality(traits=data.get("traits"), registry=data.get("registry"),
                                           drives=data.get("drives"))
-            self._cog.bank_regen_check()                # soul moved -> refresh bank if too far
+            self._bank_checks(regen=True)               # soul moved -> refresh bank if too
+                                                        # far (nav-gated — deferred while driving)
 
     # --- personality reflection (deep/slow tier): scheduled here, done by the core ----
     def _reflect_tick(self):
@@ -2761,16 +2815,22 @@ class WebServerNode(Node):
         return {"ok": True}
 
     def cancel_goal(self):
-        """POST /nav/cancel: cancel every active NavigateToPose goal (web map ✕).
-        Empty GoalInfo = cancel-all per CancelGoal.srv. Fire-and-forget like /param;
-        the goal mirror + status chip reset immediately so the UI reacts now."""
-        if not self._cancel_client.service_is_ready():
+        """POST /nav/cancel: cancel every active Nav2 goal (web map ✕, STOP) —
+        both action servers (NavigateToPose AND NavigateThroughPoses; a waypoint
+        tour is a separate goal on a separate cancel_topic). Empty GoalInfo =
+        cancel-all per CancelGoal.srv. Fire-and-forget like /param; the goal
+        mirror + status chip reset immediately so the UI reacts now."""
+        fired = False
+        for cl in (self._cancel_client, self._cancel_poses_client):
+            if cl.service_is_ready():
+                req = CancelGoal.Request()
+                req.goal_info = GoalInfo()      # zero id + zero stamp = cancel ALL
+                cl.call_async(req)
+                fired = True
+        if not fired:
             return {"error": "bt_navigator not reachable (is nano-nav up?)"}
-        req = CancelGoal.Request()
-        req.goal_info = GoalInfo()          # zero id + zero stamp = cancel ALL
-        self._cancel_client.call_async(req)
         self.telemetry.clear_goal()
-        self.get_logger().info("POST /nav/cancel (web map)")
+        self.get_logger().info("POST /nav/cancel (web)")
         return {"ok": True}
 
     def nav_waypoints(self, d):
@@ -3207,7 +3267,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             except (ValueError, IndexError):
                 since = 0
             return self._respond_json(
-                self._node.get_navlog(since) if self._node else {"error": "no node"})
+                self._node.get_navlog(since)
+                if (self._node is not None and self._hub() is not None)
+                else {"error": "no node"})
         return super().do_GET()
 
     def do_POST(self):
@@ -3550,13 +3612,26 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # stays off the SSE frame.
         self._serve_shm("/dev/shm/nano_scan.bin", "no scan yet")
 
+    def _hub(self):
+        """The TelemetryHub once constructed — None during the __init__ boot window
+        (the HTTP server thread starts ~300 lines BEFORE self.telemetry is assigned,
+        web_server.py:629 vs :935). Every telemetry-dependent route must resolve the
+        hub through this and 503 when it's None: an AttributeError here is an
+        'Exception occurred during processing of request' storm in the journal every
+        boot (the page polls /nav/log + /map at 1 Hz — hit 2026-09-27)."""
+        return getattr(self._node, "telemetry", None)
+
     def _serve_map(self):
         # Nav2 map view: the latest /map OccupancyGrid cached by telemetry (sub is
         # transient-local, so it's ready the instant a browser opens the view).
         # Wire format = the old slam_nav blob's: one JSON header line, '\n', then
         # raw int8 cells (-1 unknown, 0 free .. 100 occupied; row 0 = origin_y).
         # Served from memory, not /dev/shm — slam_toolbox publishes a real topic now.
-        meta, cells = self._node.telemetry.get_map_payload()
+        hub = self._hub()
+        if hub is None:
+            self.send_error(503, "telemetry not ready")
+            return
+        meta, cells = hub.get_map_payload()
         if meta is None:
             # ASCII-only message: send_error writes the error page as latin-1, so
             # non-latin1 characters here would raise inside it and drop the socket.
@@ -3579,7 +3654,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # line {n, t}, '\n', then raw float32 [x0,y0,x1,y1,...] map-frame
         # metres — the page draws the polyline. 503 until the planner has
         # planned at least once (no plan while no goal / nav down).
-        meta, pts = self._node.telemetry.get_plan_payload()
+        hub = self._hub()
+        if hub is None:
+            self.send_error(503, "telemetry not ready")
+            return
+        meta, pts = hub.get_plan_payload()
         if meta is None:
             # ASCII-only message: send_error writes the error page as latin-1
             # (see _serve_map).
@@ -3606,8 +3685,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # kind:"costmap" + yaw (the grid axes' rotation in the map frame) so the
         # page shades and rotates differently. The local costmap's origin is
         # already re-projected into the map frame by telemetry (_on_costmap).
-        meta, cells = (self._node.telemetry.get_local_costmap_payload() if which == "local"
-                       else self._node.telemetry.get_global_costmap_payload())
+        hub = self._hub()
+        if hub is None:
+            self.send_error(503, "telemetry not ready")
+            return
+        meta, cells = (hub.get_local_costmap_payload() if which == "local"
+                       else hub.get_global_costmap_payload())
         if meta is None:
             # ASCII-only message: send_error writes the error page as latin-1
             # (see _serve_map).

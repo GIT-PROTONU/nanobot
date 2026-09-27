@@ -11,6 +11,14 @@ PartOf=nano-robot.target
 Type=notify
 WatchdogSec=90
 User=ibster
+# CPU PLANE PARTITIONING (2026-09-27, structural): app_hub is the IO plane —
+# brain/LLM/web/vision/TTS, all best-effort. It is CONFINED to cores 0-1 so an
+# LLM regen burst, a vision pipeline or a browser fan-out can NEVER preempt the
+# control plane (nav + slam + sensors + router) on cores 2-3, no matter how hard
+# it burns. The inverse is also true: control-plane load can't starve the UI.
+# See the "control plane / IO plane" invariant in AGENTS.md — any NEW process
+# must be declared into one of the two planes and pinned accordingly.
+CPUAffinity=0 1
 # GPU vision (gpu_vision.py) needs the `lima` kernel module. /etc/modules-load.d/lima.conf
 # (see deploy/sbc-setup.sh) is supposed to load it at boot but has proven unreliable —
 # systemd-modules-load.service runs very early, before whatever the Mali GPU platform

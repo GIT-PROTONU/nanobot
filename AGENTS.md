@@ -209,6 +209,67 @@ in RViz from the dev PC while it runs its own systemd stack unchanged — no Gaz
   graph (`ros2 daemon stop` first), and a bare ssh `ros2` runs under fastrtps (wrong
   RMW sees nothing) — export `RMW_IMPLEMENTATION=rmw_zenoh_cpp` first.
 
+## Smooth-navigation invariants (2026-09-27 — structural, not tuning)
+
+The 2026-09-27 stutter analysis (full recording in git history) found autonomous
+go-to-goal freezing ~20% of drive time: RPP `/cmd_vel_nav` gaps of 350-760 ms every
+~2 s, from (a) slam's map→odom cadence stretching under CPU starvation, (b) 1 Hz Smac
+replans costing up to 6.1 s on a starved core (PipelineSequence HALTS FollowPath for
+each), and (c) RPP ticks blocking up to 0.5 s in the tf2 wait. Five invariants now
+GUARANTEE smooth navigation/locomotion regardless of what the brain/LLM/web/vision
+plane does — new features must respect all five:
+
+1. **Control plane / IO plane split.** Cores 2-3 = the real-time plane
+   (`nano-sensors` + `nano-router` Nice=5, `nano-nav` + `nano-slam` Nice=10,
+   all `CPUAffinity=2 3`); cores 0-1 = the best-effort plane (`nano-app`,
+   `CPUAffinity=0 1`). An LLM regen burst, vision pipeline or browser fan-out can
+   NEVER preempt nav/slam/sensors/router, and control load can't starve the UI.
+   ANY new process is declared into a plane and pinned in its unit — an unpinned
+   process floats over the nav cores and reintroduces the starvation.
+2. **Time-critical sensors publish from dedicated threads, never executor
+   timers/callbacks.** `/scan` (lds_node), `/imu/*` (imu_node) and — since
+   2026-09-27 — `/odom` + the `odom→base_link` TF (encoder_node's
+   `_publish_loop` thread) all bypass rclpy executor load entirely. A wedged
+   executor can stall UI work; it can never stall the sensor feed slam/nav
+   consume. New sensor drivers must follow the same pattern.
+3. **Tolerance cascade** (`nav2_params.yaml`): `transform_tolerance (RPP 0.2)` <
+   `velocity_timeout (smoother 0.5)` < `failure_tolerance (1.5)`. A transient TF
+   miss ≤0.2 s makes the RPP tick block briefly while the smoother HOLDS the last
+   command (coast, no zero-brake); only a sustained miss (>0.5 s) zero-brakes;
+   a controller stall >1.5 s fails the goal. Never raise transform_tolerance back
+   past velocity_timeout — the 0.5 s value was the 2026-09-23 STARVATION PATCH,
+   and with the starvation structurally fixed it would only mask regressions.
+4. **Serial budget at 115200 is sized by message-rate design, not baud** (user
+   decision: keep 115200). SBC-side (LIVE): the smoother republishes `/cmd_vel`
+   at 3 Hz (`smoothing_frequency`, the verified-clean rate that still feeds the
+   ESP's 500 ms cmd watchdog). ESP-side rate cuts (BUILT 2026-09-27, **FLASH
+   PENDING** — until flashed the firmware still publishes the old ~59 msg/s
+   set): `/wheel_ticks` 15 Hz (time-critical), `/wheel_stray_ticks` on-change +
+   1 Hz heartbeat, `/lds_*` 2 Hz, heartbeat/trim/pid/params/susp 1 Hz,
+   temp/hall/reset 0.2 Hz → ~30 msg/s total. Every NEW ESP topic costs FIFO
+   headroom — add it here at ≤1 Hz or on-change.
+5. **Replanning is REACTIVE, not periodic** (2026-09-27, user decision):
+   `recovery_bt.xml` has NO RateController — ComputePathToPose runs once per
+   goal and a blocked path reroutes through the RecoveryNode retry (clear
+   costmaps → fresh plan). The 1 Hz proactive replan (added 2026-09-24 when
+   the costmaps had no live obstacle feed) cost a ~380 ms FollowPath halt
+   EVERY second on this CPU (full-res Smac + SmoothPath > the 0.3 s
+   `max_planning_time` cap binds on every replan) = ~25% of drive time
+   coast-paused — the last stutter source. The live ObstacleLayer covers
+   rerouting reactively. Trade-off: a path blocked by an object that appears
+   mid-drive reroutes only after the progress checker (15 s) fails FollowPath.
+   `max_planning_time: 0.3` stays as the bound on the (now rare) blockage
+   replans. Plans stay full-resolution 0.05 m (user decision 2026-09-27; do
+   not "optimize" by downsample). To restore proactive replanning: wrap
+   ComputePathToPose in `<RateController hz="1.0">` (plugin kept in
+   plugin_lib_names for the default tree's validation).
+
+Related: the ESP32 firmware VALIDATES the NVS PID gains at boot against the
+`WHEEL_KP/KI/KD` defines (>20% drift = reset to tuned + log — the 3× NVS-drift
+gotcha becomes self-healing; **built 2026-09-27, FLASH PENDING**), and app_hub's
+phrase-bank regen/grow DEFERS while a Nav2 goal is active (`_bank_checks`,
+retried on a 30 s timer).
+
 ## Architecture
 
 | Package | Role |

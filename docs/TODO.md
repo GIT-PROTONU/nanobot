@@ -15,8 +15,58 @@ in this checkout.
 
 ## Open — needs the physical robot
 
-- [ ] **NEW 2026-09-24: robot crowds obstacles then stops mid-goal — raising the
-      keep-away zone did NOT fix it.** User report: navigating around an object,
+- [ ] **NEW 2026-09-27: ESP32 flash pending — serial publish-rate cuts + PID NVS
+      boot validation are BUILT + COMPILED, not flashed.** Part of the
+      2026-09-27 smooth-navigation work (see the "Smooth-navigation invariants"
+      block in AGENTS.md). `firmware/nanobot_coprocessor/src/main.cpp` carries:
+      (1) **C3b serial cuts** — `/wheel_stray_ticks` on-change + 1 Hz heartbeat
+      (was 15 Hz), `/lds_*` 5→2 Hz, `/esp32_temp`+`/esp32_hall`+`/esp32_reset`
+      1 Hz→0.2 Hz → ~30 msg/s on the 115200 link (was ~59; the SBC-side
+      `smoothing_frequency` 3.0 half is LIVE). (2) **D1 PID validation** —
+      boot loads kp/ki/kd from NVS and RESETS to the `WHEEL_KP/KI/KD` defines
+      when any gain drifts >20% (the 3× NVS-drift gotcha becomes
+      self-healing). Flash from the dev PC with the ESP USB-tethered:
+      `cd firmware/nanobot_coprocessor && pio run -t upload` (cmake from the
+      pixi env: `PATH=~/.pixi…/envs/default/bin:$PATH`), then ONE
+      `sudo -n systemctl restart nano-robot.target` (a flash desyncs the
+      router's serial transport — the documented post-flash bounce). Verify
+      after: `/wheel_stray_ticks` only arrives on change/heartbeat,
+      `/lds_*` ~2 Hz, and a `pid_tune.py state` readback of 5/60/0 after
+      deliberately setting garbage gains + power-cycle.
+- [ ] **NEW 2026-09-27: residual PLANT ripple at cruise — odom speed sawtooths
+      ~0.2-0.35 p2p at the 66 ms wheel-window level** (15 Hz header-stamped
+      /odom during the verification drives, command constant at 0.15). This is
+      BELOW the nav layer (the robot's /cmd_vel stream is continuous — smooth
+      navigation landed; this is wheel-level). Candidate mix: carpet
+      stick-slip + the 2026-09-23 during-motion encoder-noise bursts
+      (documented L-channel 8.4×) + tick-count quantization; the 5 Hz SSE
+      instrument smoothed all earlier measurements, so this may have always
+      been there. Instrument: run `scripts/frame_record.py` alongside a
+      scripted 0.15 m/s drive and compare /wheel_ticks window counts vs odom.
+      Accepted limit: single-channel encoders are PERMANENT (no 2nd channel),
+      the dither was counterproductive (id 6 = 0), so mitigations are PID-side
+      only. Also candidate: nav cruise 0.15 m/s sits above the verified-smooth
+      ≤0.12 band (user wants higher speeds to work — do NOT just cap it).
+- [ ] **NEW 2026-09-27 (cosmetic): idle-parked frozen-TF error storm in
+      `journalctl -u nano-nav`** — with the lidar parked, slam's map→odom
+      stamp freezes and a 1 Hz caller (global costmap update / bt goal-status
+      poll) logs `Extrapolation Error … extrapolation into the past` EVERY
+      second (requested time frozen at the park moment; harmless — the
+      web pose falls back to dead-reckoning and everything recovers on wake,
+      but it floods the journal and burns a little CPU). Candidate fixes:
+      rate-limit the extrapolation error in the costmap/bt path is upstream
+      code — more practical: have web_control wake the lidar BEFORE the
+      window (it already does on goals), or accept + filter in log tooling.
+
+- [ ] **2026-09-24: robot crowds obstacles then stops mid-goal — raising the
+      keep-away zone did NOT fix it.**
+      **2026-09-27 UPDATE: the replan structure changed under this item —
+      RateController is GONE (reactive replanning, see the AGENTS.md
+      invariants): a plan blocked by an obstacle now reroutes only after the
+      progress checker (15 s) fails FollowPath, via the RecoveryNode retry.
+      The 2026-09-24 config levers (obstacle layer, scaling 1.7) are unchanged
+      and live. The PHYSICAL verify below is still open — and the 15 s
+      blockage-response latency is the new knob to watch in it.** User report: navigating around an object,
       the robot comes too close and stops. The web **Keep-away zone** slider
       (`nav_inflation_m` → both costmaps' `inflation_layer.inflation_radius`, live)
       was raised and the behavior PERSISTS, so inflation geometry is not the whole

@@ -10,6 +10,13 @@ PartOf=nano-robot.target
 Type=notify
 WatchdogSec=90
 User=ibster
+# CPU PLANE PARTITIONING (2026-09-27, structural): the sensor hub publishes the
+# control-plane data (/scan, /odom + TF, /imu) — it belongs on the CONTROL plane
+# cores 2-3 next to nav/slam/router. Nice=5 (below IO's 0, above nav/slam's 10):
+# the lightweight time-critical publishes preempt the heavy planner/Ceres spike
+# when they need to, but the IO plane can never preempt any of them.
+CPUAffinity=2 3
+Nice=5
 ExecStart=/home/ibster/Nano/scripts/unit_exec.sh sensors
 Restart=on-failure
 RestartSec=3

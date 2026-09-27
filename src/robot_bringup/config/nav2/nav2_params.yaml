@@ -185,7 +185,18 @@ controller_server:
       # require extrapolation into the future ... from [odom] to [map]") and
       # failure_tolerance then killed every goal mid-drive (2026-09-23). 0.5 s
       # covers the ~190 ms cadence with margin.
-      transform_tolerance: 0.5
+      # was 0.5 — that was the 2026-09-23 PATCH for CPU starvation (slam's map->odom
+      # cadence stretching under load). The starvation is now fixed structurally
+      # (/odom publishes off the executor; the CPU plane partitioning gives nav+slam
+      # dedicated cores), so 0.2 is the structurally correct value.
+      # TOLERANCE CASCADE INVARIANT (do not break):
+      #   transform_tolerance (0.2) < velocity_timeout (0.5) < failure_tolerance (1.5)
+      # a transient TF miss (<=0.2 s) makes the RPP tick BLOCK briefly, but the
+      # velocity_smoother HOLDS the last command (<0.5 s gap = no zero-brake) — a
+      # coast, never a brake pulse; a sustained miss >0.5 s zero-brakes (safe stop);
+      # a controller stall >1.5 s fails the goal. Transients can never produce a
+      # zero-brake stutter pulse.
+      transform_tolerance: 0.2
 
 # ---- velocity_smoother (nav speed + accel caps, live-tunable) ----------------
 # Sits BETWEEN controller_server and /cmd_vel: the controller publishes
@@ -203,7 +214,13 @@ controller_server:
 # so 5.0 Hz, NOT the 20 Hz default.
 velocity_smoother:
   ros__parameters:
-    smoothing_frequency: 5.0
+    # was 5.0 — 3.0 is the VERIFIED-CLEAN /cmd_vel rate over the 115200-baud ESP32
+    # link (3 Hz cruises clean, 10 Hz decays, 5 Hz was marginal — measured 2026-09-20,
+    # kept marginal under sustained nav load 2026-09-27). 3 Hz = 333 ms period, still
+    # feeds the firmware's 500 ms cmd watchdog. RPP still computes at controller_
+    # frequency; only this republish rate drops (serial load, per the serial-budget
+    # invariant: the 115200 link is sized by MESSAGE-RATE design, not baud).
+    smoothing_frequency: 3.0
     feedback: OPEN_LOOP          # integrate own published commands; no odom sub
     scale_velocities: false
     # Drivetrain limits: <=0.35 m/s (the saturation cliff, loaded full-duty
@@ -239,7 +256,12 @@ planner_server:
       allow_unknown: true            # matches NavFn's setting
       max_iterations: 1000000
       max_on_approach_iterations: 1000
-      max_planning_time: 2.0
+      # was 2.0 — a plan on a starved core took 6.1 s (2026-09-27 recording) and the
+      # PipelineSequence HALTS FollowPath for every 1 Hz replan tick, so plan cost IS
+      # mid-drive stutter. 0.3 bounds the pause: with nav on dedicated cores (CPUAffinity
+      # partitioning) Smac on the full-res 480x480 grid plans in <0.1 s normally; 0.3 is
+      # the hard ceiling under ANY future load. Keep full resolution (user decision).
+      max_planning_time: 0.3
       motion_model_for_search: "MOORE"   # 8-connected 2D search
       angle_quantization_bins: 1     # 2D: no heading bins (MOORE model)
       analytic_expansion_ratio: 3.5

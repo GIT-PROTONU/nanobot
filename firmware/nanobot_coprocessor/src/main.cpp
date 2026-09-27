@@ -943,6 +943,16 @@ static void zenohTask(void*){
 #endif
 
     uint8_t buf[80];                                        // 80 needed by the /wheel_params readback (16 floats)
+    // SERIAL BUDGET (2026-09-27): the 115200-baud link was carrying ~59 msg/s
+    // (ticks 15 + stray 15 + lds 4x5 + slow 9) and the zenoh-pico RX FIFO chokes
+    // under sustained nav /cmd_vel. Non-critical telemetry was CUT so the link
+    // carries ~30 msg/s with headroom (user decision: keep 115200 baud, manage the
+    // budget by message-rate design). /wheel_ticks stays 15 Hz (time-critical).
+    // Stray ticks: on-change + 1 Hz heartbeat (same shape as suspension) — usually
+    // silent, but a late-joining subscriber still sees a nonzero count within 1 s.
+    static uint32_t t_stray=0, t_diag=0;
+    static int64_t pub_stray_l=-1, pub_stray_r=-1;
+
     if (now - t_ticks >= 66){                                // wheel_ticks @~15 Hz (was
                                                               // ~30 Hz; odom integrates
                                                               // cumulative counts, so the
@@ -950,7 +960,11 @@ static void zenohTask(void*){
                                                               // but extra SBC executor wakeups)
       t_ticks = now;
       zpub_put(P_ticks, buf, cdr_i64arr2(buf,(int64_t)g_left_ticks,(int64_t)g_right_ticks));
-      zpub_put(P_strayTicks, buf, cdr_i64arr2(buf,(int64_t)g_left_stray,(int64_t)g_right_stray));
+      if (g_left_stray != pub_stray_l || g_right_stray != pub_stray_r
+          || now - t_stray >= 1000){                          // stray: on-change + 1 Hz
+        t_stray = now; pub_stray_l = g_left_stray; pub_stray_r = g_right_stray;
+        zpub_put(P_strayTicks, buf, cdr_i64arr2(buf,(int64_t)g_left_stray,(int64_t)g_right_stray));
+      }
     }
     // suspension: publish immediately on change (every ~2 ms loop), so the web UI
     // tracks a wheel lifting/dropping with no lag; the 1 Hz block below republishes
@@ -960,7 +974,10 @@ static void zenohTask(void*){
     if (!susp_init || g_susp_r!=pub_r){ pub_r=g_susp_r; zpub_put(P_suspR,buf,cdr_bool(buf,pub_r)); }
     susp_init=true;
 #if LDS_ENABLED
-    if (now - t_lds >= 200){                                 // lds @5 Hz
+    if (now - t_lds >= 500){                                 // lds @2 Hz (was 5 Hz — serial
+                                                              // budget cut 2026-09-27; the
+                                                              // SBC idle controller reads at
+                                                              // 1 Hz, the web at 5 Hz frames)
       t_lds = now;
       bool stale = (now - g_lds_last_ms) > LDS_TIMEOUT_MS;
       zpub_put(P_rpm,  buf, cdr_f32(buf, stale?0.0f:g_lds_rpm));
@@ -971,14 +988,10 @@ static void zenohTask(void*){
 #else
     (void)t_lds;
 #endif
-    if (now - t_slow >= 1000){                               // temp/hall/heartbeat @1 Hz + suspension republish
+    if (now - t_slow >= 1000){                               // hb/trim/pid/params/susp-repub @1 Hz
       t_slow = now;
       static int32_t hb=0;
-      zpub_put(P_temp, buf, cdr_f32(buf, g_temp));
-      zpub_put(P_hall, buf, cdr_i32(buf, g_hall));
       zpub_put(P_hb,   buf, cdr_i32(buf, ++hb));
-      zpub_put(P_rst,  buf, cdr_i32(buf, (int32_t)g_reset_reason));  // boot reason, 1 Hz —
-                                     // readable remotely after ANY drop (brownout vs watchdog vs panic)
       zpub_put(P_suspL,buf, cdr_bool(buf, g_susp_l));
       zpub_put(P_suspR,buf, cdr_bool(buf, g_susp_r));
       zpub_put(P_trim, buf, cdr_f32(buf, g_trim));
@@ -992,6 +1005,18 @@ static void zenohTask(void*){
         zpub_put(P_params, buf, cdr_f32arr_n(buf, pv, k));
       }
 #endif
+    }
+    if (now - t_diag >= 5000){                               // temp/hall/reset @0.2 Hz (was
+                                                              // 1 Hz each — slow-moving body
+                                                              // diagnostics; serial budget
+                                                              // cut 2026-09-27. esp32_reset is
+                                                              // a static boot value — 5 s is
+                                                              // plenty to catch it remotely
+                                                              // after a drop/reboot.)
+      t_diag = now;
+      zpub_put(P_temp, buf, cdr_f32(buf, g_temp));
+      zpub_put(P_hall, buf, cdr_i32(buf, g_hall));
+      zpub_put(P_rst,  buf, cdr_i32(buf, (int32_t)g_reset_reason));
     }
     delay(2);
   }
@@ -1184,9 +1209,32 @@ void setup(){
 #if WHEEL_PID_ENABLED
   // Live-tuned PID gains (motor_pid_cb) persist like the trim — a tuning session
   // survives reboot/reflash. Clamped to the same ranges the cb enforces.
+  // BOOT VALIDATION (2026-09-27, structural): the NVS gains are drifted-prone —
+  // an abandoned tuning session has left garbage THREE times (KP 0.7/KI 19.4,
+  // KP 1.0/KI 0.0 feedforward-only experiments, KP 1.4/KI 27.1) and the firmware
+  // silently booted with it, clamping every drive and killing smoothness. Any
+  // loaded gain that differs from the TUNED defines by >20% is treated as drift,
+  // NOT as a deliberate tune: log it + reset to the defines. A deliberate
+  // retune re-persists immediately after its first parked save (the defines are
+  // then updated in the same commit as the tune — the defines are the source of
+  // truth, NVS is a cache of them).
   g_wkp = clampf(g_prefs.getFloat("kp", WHEEL_KP), 0, 20);
   g_wki = clampf(g_prefs.getFloat("ki", WHEEL_KI), 0, 100);
   g_wkd = clampf(g_prefs.getFloat("kd", WHEEL_KD), 0, 5);
+  {
+    float def[3] = { WHEEL_KP, WHEEL_KI, WHEEL_KD };
+    volatile float *got[3] = { &g_wkp, &g_wki, &g_wkd };
+    const char *nm[3] = { "KP", "KI", "KD" };
+    for (int i = 0; i < 3; i++){
+      float d = def[i];
+      if (d != 0.0f && fabsf(*got[i] - d) > 0.20f * fabsf(d)){
+        Serial.printf("[nano] PID NVS DRIFT: %s %.2f (tuned %.2f) — RESET to tuned\n",
+                      nm[i], (double)*got[i], (double)d);
+        *got[i] = d;
+        g_prefs.putFloat(i == 0 ? "kp" : (i == 1 ? "ki" : "kd"), d);
+      }
+    }
+  }
   // Live drivetrain parameters (fall back to the corrected defines when absent).
   set_param(0, g_prefs.getFloat("tpr",   TICKS_PER_REV));
   set_param(1, g_prefs.getFloat("wrad",  WHEEL_RADIUS));
