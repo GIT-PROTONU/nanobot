@@ -107,7 +107,8 @@
             </span>
             <label class="switch"><input type="checkbox" id="mapPlan"><span class="track"></span>
               Plan</label>
-            <span id="koDrawHint" style="display:none;color:var(--amber)">drag to draw</span>
+            <span id="koDrawHint" style="display:none;color:var(--amber)">drag empty map = draw ·
+              drag zone = move · ▣ corners = resize · ○ = rotate</span>
           </div>
           <div class="chiprow" id="mapFeeds">
             <span class="fdot" id="feedEsp32"></span>ESP32
@@ -276,14 +277,17 @@
             <h2>Keep-out zones</h2>
             <div class="chiprow">
               <label class="switch"><input type="checkbox" id="mapKeepout"><span class="track"></span>
-                Draw (drag on map)</label>
+                Edit (drag on map)</label>
               <button id="koClear" class="btn" style="display:none">✕ Clear all</button>
             </div>
             <div id="koList"></div>
             <p class="hint">Draw a box around an area the robot must never enter — the
-              <b>global costmap's keep-out filter</b> turns painted cells into walls, so the
-              planner routes around it (goals fully inside fail visibly). Shown as translucent
-              red. Saved to <b>~/.local/state/nanobot/keepout.json</b>.</p>
+              <b>global costmap's keep-out filter</b> turns painted cells into walls (plus the
+              keep-away margin), so the planner routes around it (goals fully inside fail
+              visibly). Shown as translucent red. With <b>Edit</b> on: drag empty map = new
+              zone, drag a zone = move it, drag a corner square = resize (opposite corner
+              stays put), drag the ○ handle = rotate. Saved to
+              <b>~/.local/state/nanobot/keepout.json</b>.</p>
           </div>
           <div class="card">
             <h2>Odometry</h2>
@@ -3526,20 +3530,45 @@ connect();   // auto-connect on load
     }
     // breadcrumb trail (cyan polyline) — where the robot has been (fed by the
     // SSE nav hook below) — and the planned path above it:
-    // keep-out zones (translucent red + dashed outline): the drawn no-go
-    // rectangles, mirrored from the server's persisted zones. The live drag
-    // rectangle overlays while drawing.
+    // keep-out zones (translucent red + dashed outline): ROTATED no-go
+    // rectangles ({x,y,w,h,rot}: centre + size + angle), mirrored from the
+    // server's persisted zones — drag to move, corner squares to resize, the
+    // round handle to rotate (all live, saved on release). The live drag
+    // rectangle overlays while drawing a new zone.
     if(koZones.length || koDrag){
-      const drawKo=z=>{
-        const [ax,ay]=W2P(Math.min(z.x1,z.x2),Math.min(z.y1,z.y2));
-        const [bx,by]=W2P(Math.max(z.x1,z.x2),Math.max(z.y1,z.y2));
+      const paintKo=(z,sel)=>{
+        const [cx,cy]=koW2P(z.x,z.y), ppm=koPpm();
+        ctx.save();
+        ctx.translate(cx,cy); ctx.rotate(-(z.rot||0)); // screen y is flipped vs world y
         ctx.fillStyle="rgba(255,59,48,0.16)";
-        ctx.strokeStyle="rgba(255,59,48,0.75)"; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
-        ctx.fillRect(ax,ay,bx-ax,by-ay); ctx.strokeRect(ax,ay,bx-ax,by-ay);
-        ctx.setLineDash([]);
+        ctx.strokeStyle=sel?"rgba(255,59,48,0.95)":"rgba(255,59,48,0.75)";
+        ctx.lineWidth=sel?2:1.5; ctx.setLineDash([6,4]);
+        const W=z.w*ppm, H=z.h*ppm;
+        ctx.fillRect(-W/2,-H/2,W,H); ctx.strokeRect(-W/2,-H/2,W,H);
+        ctx.setLineDash([]); ctx.restore();
       };
-      koZones.forEach(drawKo);
-      if(koDrag) drawKo(koDrag);
+      koZones.forEach((z,i)=>paintKo(z,i===koSel));
+      if(koDrag&&koDrag.mode==="draw"){
+        paintKo({x:(koDrag.x1+koDrag.x2)/2,y:(koDrag.y1+koDrag.y2)/2,
+                 w:Math.abs(koDrag.x2-koDrag.x1),h:Math.abs(koDrag.y2-koDrag.y1),rot:0},true);
+      }
+      // edit handles for the selected zone (screen-space size, any zoom):
+      // 4 corner squares = resize (opposite corner anchors), ○ above the top
+      // edge = rotate around the centre.
+      const sel=koZones[koSel];
+      if(sel && !koDrag){
+        const cs=koCornerWorlds(sel).map(p=>koW2P(p[0],p[1]));
+        const rh=koRotHandle(sel);
+        ctx.strokeStyle="rgba(255,59,48,0.9)"; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.moveTo(rh.mx,rh.my); ctx.lineTo(rh.x,rh.y); ctx.stroke();
+        ctx.fillStyle="#ff3b30";
+        cs.forEach(([hx,hy])=>{
+          ctx.fillRect(hx-5,hy-5,10,10);
+          ctx.strokeStyle="#fff"; ctx.lineWidth=1; ctx.strokeRect(hx-5,hy-5,10,10);
+        });
+        ctx.beginPath(); ctx.arc(rh.x,rh.y,6,0,6.2832); ctx.fill();
+        ctx.strokeStyle="#fff"; ctx.stroke();
+      }
     }
     // planned path (GET /plan): cyan dashed polyline under the trail — the
     // route Nav2 is FOLLOWING right now (appears as the replan lands, not
@@ -3657,22 +3686,95 @@ connect();   // auto-connect on load
   // subsequent click still targets cv (click-to-goal), not the wrap container.
   let panDrag=false, panMoved=false, pdsx=0,pdsy=0,pdpx=0,pdpy=0, pinch=null;
   const pointers=new Map();
-  // Keep-out draw state (kept here because the drag math is the pan machinery's
-  // neighbour): when #mapKeepout is on, a one-pointer drag paints a rectangle
-  // instead of panning; on release it's saved (POST /keepout/save).
-  let koZones=[], koDrag=null;         // saved rects + the rect being dragged
+  // Keep-out editing (kept here because the drag math is the pan machinery's
+  // neighbour). When #mapKeepout is on, the pointer works on the zones:
+  //   press on empty space + drag  → draw a new axis-aligned rect (rot 0)
+  //   press inside a zone + drag   → move it
+  //   press a corner square        → resize (the opposite corner anchors)
+  //   press the round handle       → rotate around the centre
+  // Zones are {x,y,w,h,rot}: centre (m, map frame), full extents (m),
+  // rotation (rad, CCW). Every finished gesture POSTs /keepout/save with the
+  // zone's index (an edit) or without one (a new zone); the server clamps,
+  // persists, re-rasterizes the costmap mask and echoes the zones back.
+  let koZones=[], koDrag=null, koSel=null;
+  const KO_MIN_M=0.05;                 // min side (m) — matches the server clamp
+  function koXf(){
+    const z=zoom||fitZoom(), [x0,y0]=origin(z);
+    return {z,x0,y0,m:lastMeta};
+  }
+  const koPpm=()=>{ const xf=koXf(); return xf.z/xf.m.res; };   // screen px per metre
+  function koW2P(wx,wy){                // world metres -> screen px (map hero)
+    const {z,x0,y0,m}=koXf();
+    return [x0+((wx-m.ox)/m.res)*z, y0+((m.h-1)-(wy-m.oy)/m.res)*z];
+  }
   function koWorld(clientX,clientY){
     const rect=cv.getBoundingClientRect();
-    const z=zoom||fitZoom(), [x0,y0]=origin(z);
+    const {z,x0,y0,m}=koXf();
     const gcx=(clientX-rect.left-x0)/z, gcy=(clientY-rect.top-y0)/z;
-    const m=lastMeta;
     return [m.ox+gcx*m.res, m.oy+(m.h-1-gcy)*m.res];
+  }
+  function koLocal(z,wx,wy){            // world point -> zone-local metres (from centre)
+    const dx=wx-z.x, dy=wy-z.y, c=Math.cos(z.rot||0), s=Math.sin(z.rot||0);
+    return [c*dx+s*dy, -s*dx+c*dy];
+  }
+  function koWorldFromLocal(z,lx,ly){   // zone-local metres -> world
+    const c=Math.cos(z.rot||0), s=Math.sin(z.rot||0);
+    return [z.x+c*lx-s*ly, z.y+s*lx+c*ly];
+  }
+  const KO_CORNERS=[[-1,-1],[1,-1],[1,1],[-1,1]];   // local quadrant per corner index
+  function koCornerWorlds(z){
+    return KO_CORNERS.map(([qx,qy])=>koWorldFromLocal(z,qx*z.w/2,qy*z.h/2));
+  }
+  function koRotHandle(z){              // rotation handle: stem from the top-edge
+    const [tx,ty]=koW2P(...koWorldFromLocal(z,0,z.h/2));   // midpoint, 22 px out along
+    const c=Math.cos(z.rot||0), s=Math.sin(z.rot||0);      // local +y (screen y flips)
+    return {mx:tx,my:ty,x:tx-s*22,y:ty-c*22};
+  }
+  function koHitHandle(z,sx,sy){        // pointer (screen px) on a handle of z?
+    const h=koRotHandle(z), near=(x,y)=>Math.hypot(x-sx,y-sy)<=11;
+    if(near(h.x,h.y)) return {type:"rotate"};
+    for(let k=0;k<4;k++){
+      const [hx,hy]=koW2P(...koCornerWorlds(z)[k]);
+      if(near(hx,hy)) return {type:"resize",k};
+    }
+    return null;
+  }
+  function koHitZone(z,wx,wy){          // pointer (world) inside the rotated rect?
+    const [lx,ly]=koLocal(z,wx,wy);
+    return Math.abs(lx)<=z.w/2 && Math.abs(ly)<=z.h/2;
   }
   cv.addEventListener("pointerdown",e=>{
     pointers.set(e.pointerId,[e.clientX,e.clientY]);
     if($("mapKeepout").checked && pointers.size===1 && lastMeta){
+      const rect=cv.getBoundingClientRect();
+      const sx=e.clientX-rect.left, sy=e.clientY-rect.top;
       const [wx,wy]=koWorld(e.clientX,e.clientY);
-      koDrag={x1:wx,y1:wy,x2:wx,y2:wy};
+      const sel=koZones[koSel];
+      if(sel){                           // 1) handles of the selected zone win
+        const hit=koHitHandle(sel,sx,sy);
+        if(hit){
+          cv.setPointerCapture(e.pointerId);
+          if(hit.type==="rotate") koDrag={mode:"rotate",i:koSel};
+          else{
+            const c0=KO_CORNERS[hit.k], co=KO_CORNERS[hit.k<2?hit.k+2:hit.k-2];
+            const aw=koWorldFromLocal(sel,co[0]*sel.w/2,co[1]*sel.h/2);
+            koDrag={mode:"resize",i:koSel,
+                    sx:Math.sign(c0[0]-co[0])||1, sy:Math.sign(c0[1]-co[1])||1,
+                    ax:aw[0], ay:aw[1]};
+          }
+          return;
+        }
+      }
+      for(let i=koZones.length-1;i>=0;i--){   // 2) zone body -> move + select
+        if(koHitZone(koZones[i],wx,wy)){
+          const gl=koLocal(koZones[i],wx,wy);
+          koSel=i; koDrag={mode:"move",i,glx:gl[0],gly:gl[1]};
+          cv.setPointerCapture(e.pointerId); repaint();
+          return;
+        }
+      }
+      koSel=null;                        // 3) empty map -> draw a new rect
+      koDrag={mode:"draw",x1:wx,y1:wy,x2:wx,y2:wy};
       cv.setPointerCapture(e.pointerId);
       return;
     }
@@ -3685,8 +3787,38 @@ connect();   // auto-connect on load
   cv.addEventListener("pointermove",e=>{
     if(koDrag){
       const [wx,wy]=koWorld(e.clientX,e.clientY);
-      koDrag.x2=wx; koDrag.y2=wy; repaint();
+      const z=koZones[koDrag.i];
+      if(koDrag.mode==="draw"){ koDrag.x2=wx; koDrag.y2=wy; }
+      else if(koDrag.mode==="move"){     // keep the grabbed point under the pointer
+        const c=Math.cos(z.rot||0), s=Math.sin(z.rot||0);
+        z.x=wx-(c*koDrag.glx-s*koDrag.gly); z.y=wy-(s*koDrag.glx+c*koDrag.gly);
+      }
+      else if(koDrag.mode==="resize"){   // anchor corner stays fixed in world
+        const dx=wx-koDrag.ax, dy=wy-koDrag.ay;
+        const c=Math.cos(z.rot||0), s=Math.sin(z.rot||0);
+        const ex=c*dx+s*dy, ey=-s*dx+c*dy;         // pointer in the anchored local frame
+        const xm=koDrag.sx*Math.max(KO_MIN_M,koDrag.sx*ex);
+        const ym=koDrag.sy*Math.max(KO_MIN_M,koDrag.sy*ey);
+        z.w=Math.abs(xm); z.h=Math.abs(ym);
+        z.x=koDrag.ax+c*xm/2-s*ym/2; z.y=koDrag.ay+s*xm/2+c*ym/2;
+      }
+      else if(koDrag.mode==="rotate"){   // the handle rides local +y = world angle rot+π/2
+        const r=Math.atan2(wy-z.y,wx-z.x)-Math.PI/2;
+        z.rot=Math.atan2(Math.sin(r),Math.cos(r));
+      }
+      repaint();
       return;
+    }
+    if($("mapKeepout").checked && lastMeta){   // hover cursor over zones/handles
+      const rect=cv.getBoundingClientRect();
+      const sx=e.clientX-rect.left, sy=e.clientY-rect.top;
+      const [wx,wy]=koWorld(e.clientX,e.clientY);
+      let cur="crosshair";
+      const sel=koZones[koSel];
+      if(sel&&koHitHandle(sel,sx,sy)) cur="nwse-resize";
+      else for(let i=koZones.length-1;i>=0;i--)
+        if(koHitZone(koZones[i],wx,wy)){ cur="grab"; break; }
+      if(cv.style.cursor!==cur) cv.style.cursor=cur;
     }
     if(pointers.has(e.pointerId)) pointers.set(e.pointerId,[e.clientX,e.clientY]);
     if(pointers.size===2 && pinch){
@@ -3703,9 +3835,15 @@ connect();   // auto-connect on load
   const upPtr=e=>{
     pointers.delete(e.pointerId);
     if(koDrag){
-      const d=koDrag; koDrag=null;
-      // Ignore degenerate clicks (a tap is not a box).
-      if(Math.hypot(d.x2-d.x1,d.y2-d.y1)>0.1) saveKeepout(d);
+      const g=koDrag; koDrag=null;
+      if(g.mode==="draw"){
+        // Ignore degenerate clicks (a tap is not a box).
+        if(Math.hypot(g.x2-g.x1,g.y2-g.y1)>0.1)
+          saveKeepout({x:(g.x1+g.x2)/2,y:(g.y1+g.y2)/2,
+                       w:Math.abs(g.x2-g.x1),h:Math.abs(g.y2-g.y1),rot:0});
+      }else{
+        saveKeepout(koZones[g.i],g.i);   // a finished move/resize/rotate = an edit
+      }
       repaint();
       return;
     }
@@ -4097,16 +4235,19 @@ connect();   // auto-connect on load
   renderWaypoints();
 
   // ---- Keep-out zones card (Drive tab) ----------------------------------------
-  // Rectangles in map-frame metres, persisted server-side (keepout.json) and
-  // rasterized into the global costmap's KeepoutFilter. Draw = drag on the map
-  // while #mapKeepout is on (the pointer handlers above); list = this card.
+  // Rotated rectangles ({x,y,w,h,rot}: centre + size + angle, map-frame metres),
+  // persisted server-side (keepout.json) and rasterized into the global
+  // costmap's KeepoutFilter. Draw = drag on the map while #mapKeepout is on;
+  // edit = press a zone (move) / its corner squares (resize) / round handle
+  // (rotate) — the pointer handlers in the map IIFE above drive it all.
   const koList=$("koList");
   async function loadKeepout(){
     try{
       const r=await fetch("/keepout");
       if(!r.ok) return;
       const j=await r.json();
-      koZones=(j.zones||[]).map(z=>({x1:z.x1,y1:z.y1,x2:z.x2,y2:z.y2}));
+      koZones=(j.zones||[]).map(z=>({x:+z.x,y:+z.y,w:+z.w,h:+z.h,rot:+(z.rot||0)}));
+      koSel=null; koDrag=null;
       renderKeepout(); repaint();
     }catch(e){ /* offline: keep what we have */ }
   }
@@ -4120,9 +4261,11 @@ connect();   // auto-connect on load
     koList.innerHTML="";
     koZones.forEach((z,i)=>{
       const row=document.createElement("div"); row.className="chiprow";
+      if(i===koSel) row.style.color="var(--amber)";
+      const deg=Math.round((z.rot||0)*180/Math.PI);
       const label=document.createElement("span");
-      label.textContent=`${i+1}. (${Math.min(z.x1,z.x2).toFixed(1)}, ${Math.min(z.y1,z.y2).toFixed(1)}) → `+
-        `(${Math.max(z.x1,z.x2).toFixed(1)}, ${Math.max(z.y1,z.y2).toFixed(1)})`;
+      label.textContent=`${i+1}. (${z.x.toFixed(2)}, ${z.y.toFixed(2)}) `+
+        `${z.w.toFixed(2)}×${z.h.toFixed(2)} m`+(deg?` ⟳${deg}°`:"");
       label.style.flex="1"; label.style.fontSize="0.85em";
       row.appendChild(label);
       const del=document.createElement("button"); del.className="btn"; del.textContent="✕";
@@ -4136,12 +4279,14 @@ connect();   // auto-connect on load
       koList.appendChild(row);
     });
   }
-  async function saveKeepout(z){
+  async function saveKeepout(z,index){
+    const body={x:z.x,y:z.y,w:z.w,h:z.h,rot:z.rot||0};
+    if(index!=null) body.index=index;    // an edit replaces the zone in place
     try{
       const r=await fetch("/keepout/save",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({x1:z.x1,y1:z.y1,x2:z.x2,y2:z.y2})});
+        body:JSON.stringify(body)});
       const j=await r.json();
-      if(j.error){ alert("Keep-out failed: "+j.error); return; }
+      if(j.error){ alert("Keep-out failed: "+j.error); }
     }catch(e){ alert("Keep-out failed (server unreachable)."); }
     loadKeepout();
   }
@@ -4153,6 +4298,7 @@ connect();   // auto-connect on load
   $("mapKeepout").addEventListener("change",()=>{
     $("koDrawHint").style.display=$("mapKeepout").checked?"inline":"none";
     cv.style.cursor=$("mapKeepout").checked?"crosshair":"default";
+    koDrag=null; koSel=null; repaint();   // drop a half-finished gesture/selection
   });
   loadKeepout();
 })();

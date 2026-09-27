@@ -4,8 +4,9 @@
 # bt_navigator · behavior_server · lifecycle_manager (see launch/nav2.launch.py):
 # launch_ros hands this whole file to every ComposableNode and each node picks
 # the section matching its own name. Deliberately ABSENT everywhere: AMCL,
-# collision_monitor, map_server, waypoint_follower, smoother_server,
-# voxel/3D/keepout costmap layers — lean RAM/CPU on the 1 GB NanoPi NEO Plus2
+# collision_monitor, map_server, waypoint_follower, smoother_server (robostack
+# nav2_smoother only ships the BT selector, not SmootherServer — Smac's built-in
+# smooth_path covers it), voxel/3D/keepout costmap layers — lean RAM/CPU on the 1 GB NanoPi NEO Plus2
 # (H5). EXCEPTION (2026-09-24): an ObstacleLayer NOW feeds BOTH costmaps from
 # /scan — live hits become obstacles immediately instead of waiting for slam's
 # ~5 s /map repaint; the fix for "robot crowds an obstacle then stops"
@@ -256,19 +257,6 @@ planner_server:
         w_data: 0.2
         tolerance: 1.0e-10
 
-# ---- smoother_server (SimpleSmoother) ------------------------------------------
-# Post-processes the planned path (SmoothPath BT node in recovery_bt.xml, after
-# ComputePathToPose) to kill residual zigzag before RPP tracks it. Deliberately
-# minimal: one simple smoother; CPU-checked on the 4-core board.
-smoother_server:
-  ros__parameters:
-    smoother_plugins: ["simple_smoother"]
-    simple_smoother:
-      plugin: "nav2_smoother::SimpleSmoother"
-      tolerance: 1.0e-10
-      max_its: 1000
-      do_refinement: true
-
 # ---- bt_navigator --------------------------------------------------------------
 # default_nav_to_pose_bt_xml is injected by launch/nav2.launch.py (Humble key;
 # the older default_bt_xml_filename is silently ignored). bt_loop_duration 100
@@ -298,7 +286,6 @@ bt_navigator:
       - nav2_rate_controller_bt_node
       - nav2_goal_updated_condition_bt_node
       - nav2_wait_action_bt_node
-      - nav2_smooth_path_action_bt_node
 
 # ---- behavior_server (recovery behaviors) ------------------------------------
 # Per-plugin C++ types are REQUIRED in Humble (the node crashes without them).
@@ -425,19 +412,29 @@ global_costmap:
       # resolution). GLOBAL costmap only — a keepout in the local rolling
       # window could trap the robot mid-drive; the planner routes around zones
       # while control still reacts to live obstacles.
+      # The topic MUST be ABSOLUTE ("/keepout_filter_info"): a relative name
+      # resolves against THIS node's namespace -> /global_costmap/keepout_filter_info,
+      # which is a topic nobody publishes — the filter silently never received a
+      # mask and zones were ignored (found live 2026-09-27). Same for the mask
+      # topic carried INSIDE the CostmapFilterInfo message (telemetry.py sets it
+      # absolute too).
       keepout_filter:
         plugin: "nav2_costmap_2d::KeepoutFilter"
         enabled: true
-        filter_info_topic: "keepout_filter_info"
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "keepout_filter"]
+        filter_info_topic: "/keepout_filter_info"
+      # Keepout BEFORE inflation: the inflation layer then wraps a real
+      # inflation_radius margin around the painted lethal cells too — after it,
+      # plans would hug the zone edge (NavFn only avoids LETHAL cells).
+      plugins: ["static_layer", "obstacle_layer", "keepout_filter", "inflation_layer"]
 
 # ---- lifecycle manager: FIVE Nav2 servers ONLY --------------------------------
 # - bt_navigator must be LAST: CONFIGURE/ACTIVATE iterate node_names FORWARD and
 #   the navigator needs planner/controller up first.
-# - smoother_server sits after planner_server (its input) — order among the
-#   first five is not load-bearing, but keep them all before the navigator.
 # - velocity_smoother sits after controller_server (its input) — order among
-#   the first five is not load-bearing, but keep it before the navigator.
+#   the first four is not load-bearing, but keep it before the navigator.
+# - smoother_server is NOT composed: the robostack-staging nav2_smoother package
+#   only ships the BT selector, not the SmootherServer component. SmacPlanner2D's
+#   built-in smooth_path: true covers path smoothing instead.
 # - slam_toolbox is not listed at all: it is a plain node in 2.6.10 with no
 #   lifecycle services to drive (see the slam_toolbox section above).
 nav2_lifecycle_manager:
@@ -445,5 +442,5 @@ nav2_lifecycle_manager:
     autostart: true
     bond_timeout: 4.0
     attempt_respawn_reconnection: true
-    node_names: ['planner_server', 'controller_server', 'smoother_server',
+    node_names: ['planner_server', 'controller_server',
                  'velocity_smoother', 'behavior_server', 'bt_navigator']

@@ -2656,13 +2656,47 @@ class WebServerNode(Node):
     # the live /map geometry + latched on /keepout_mask by telemetry
     # (publish_keepout). The global costmap's KeepoutFilter (nav2_params.yaml)
     # reads the mask and the planner treats painted cells as lethal.
+    # Zones are ROTATED rectangles, stored normalized as {x,y,w,h,rot}
+    # (centre + full extents + rotation rad, CCW) — the page drags/rotates/
+    # resizes them live. Legacy {x1,y1,x2,y2} rows (old keepout.json, old
+    # POSTs) are converted on load/save.
+    KEEPOUT_MIN_SIDE_M = 0.05      # a zone smaller than a cell is useless
+    KEEPOUT_MAX_SIDE_M = 12.0      # the grid is 24x24 m — half of it
+    KEEPOUT_COORD_MAX = 20.0       # centre clamp (grid is ±12 m around slam's origin)
+
+    @classmethod
+    def _norm_zone(cls, d):
+        """One posted/loaded zone dict → the normalized {x,y,w,h,rot} shape,
+        or None on garbage. Accepts both the new and the legacy corner shape."""
+        if not isinstance(d, dict):
+            return None
+        try:
+            if all(k in d for k in ("x", "y", "w", "h")):
+                x, y, w, h = (float(d[k]) for k in ("x", "y", "w", "h"))
+                rot = float(d.get("rot", 0.0))
+            elif all(k in d for k in ("x1", "y1", "x2", "y2")):
+                x1, y1, x2, y2 = (float(d[k]) for k in ("x1", "y1", "x2", "y2"))
+                x, y = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                w, h, rot = abs(x2 - x1), abs(y2 - y1), 0.0
+            else:
+                return None
+        except (TypeError, ValueError):
+            return None
+        if not all(map(math.isfinite, (x, y, w, h, rot))):
+            return None
+        x = max(-cls.KEEPOUT_COORD_MAX, min(cls.KEEPOUT_COORD_MAX, x))
+        y = max(-cls.KEEPOUT_COORD_MAX, min(cls.KEEPOUT_COORD_MAX, y))
+        w = max(cls.KEEPOUT_MIN_SIDE_M, min(cls.KEEPOUT_MAX_SIDE_M, w))
+        h = max(cls.KEEPOUT_MIN_SIDE_M, min(cls.KEEPOUT_MAX_SIDE_M, h))
+        rot = math.atan2(math.sin(rot), math.cos(rot))   # wrap to (-π, π]
+        return {"x": x, "y": y, "w": w, "h": h, "rot": rot}
+
     def _load_keepout(self):
         data = read_json(self._keepout_path)
         zones = data.get("zones") if isinstance(data, dict) else None
         if isinstance(zones, list):
             self._keepout_zones = [
-                z for z in zones
-                if isinstance(z, dict) and all(k in z for k in ("x1", "y1", "x2", "y2"))
+                z for z in map(self._norm_zone, zones) if z
             ][:KEEPOUT_MAX_ZONES]
         if getattr(self, "telemetry", None) is not None:   # boot re-apply: latch the mask
             self.telemetry.set_keepout_zones(self._keepout_zones)
@@ -2672,22 +2706,35 @@ class WebServerNode(Node):
             self.get_logger().warning("keepout: save failed")
 
     def get_keepout(self):
-        """GET /keepout: the persisted rectangles (map-frame metres)."""
+        """GET /keepout: the persisted rectangles (normalized {x,y,w,h,rot})."""
         return {"zones": self._keepout_zones}
 
     def keepout_save(self, d):
-        """POST /keepout/save {x1,y1,x2,y2}: add one keepout rectangle
-        (metres, map frame — any corner order; normalized server-side)."""
-        try:
-            z = {k: float(d[k]) for k in ("x1", "y1", "x2", "y2")}
-        except (TypeError, ValueError, KeyError):
-            return {"error": "need x1,y1,x2,y2 (metres, map frame)"}
-        if len(self._keepout_zones) >= KEEPOUT_MAX_ZONES:
-            return {"error": f"too many keepout zones (max {KEEPOUT_MAX_ZONES})"}
-        self._keepout_zones.append(z)
+        """POST /keepout/save {x,y,w,h,rot} (or legacy {x1,y1,x2,y2}) with an
+        optional {index}: replace the zone at index (the page's drag/resize/
+        rotate edits) or append a new one. Metres, map frame; clamped
+        server-side."""
+        z = self._norm_zone(d)
+        if z is None:
+            return {"error": "need x,y,w,h (,rot) or x1,y1,x2,y2 (metres, map frame)"}
+        idx = d.get("index") if isinstance(d, dict) else None
+        if idx is not None:
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                return {"error": "index must be an integer"}
+            if not (0 <= idx < len(self._keepout_zones)):
+                return {"error": f"no zone at index {idx}"}
+            self._keepout_zones[idx] = z
+            verb = f"edit[{idx}]"
+        else:
+            if len(self._keepout_zones) >= KEEPOUT_MAX_ZONES:
+                return {"error": f"too many keepout zones (max {KEEPOUT_MAX_ZONES})"}
+            self._keepout_zones.append(z)
+            verb = "add"
         self._save_keepout()
         self.telemetry.set_keepout_zones(self._keepout_zones)
-        self.get_logger().info(f"POST /keepout/save rect {z!r} "
+        self.get_logger().info(f"POST /keepout/save {verb} {z!r} "
                                f"({len(self._keepout_zones)} zones)")
         return {"ok": True, "zones": self._keepout_zones}
 

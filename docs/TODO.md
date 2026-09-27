@@ -126,10 +126,37 @@ in this checkout.
       so the costmap's KeepoutFilter gets the current mask on (re)start;
       `_on_map` re-emits on a rebuilt grid so the cells stay aligned. The
       `keepout_filter` layer is in the GLOBAL costmap's plugins (nav2_params.yaml,
-      restart-only — lands with the Smac/smoother bounce). Unit-tested
+      restart-only — lands with the Smac/smoother bounce).       Unit-tested
       (`test_keepout_mask.py`): rasterize/alignment/clamp/re-emit/clear +
       handler round-trip/cap. REMAINING: the board verify (draw → planner routes
       around → survives a nano-slam restart).
+      **2026-09-27: the BOARD VERIFY FAILED — zones were ignored — root-caused
+      + fixed + the zones became ROTATED with full edit gestures.** (1) The
+      filter never received the mask: the KeepoutFilter subscribes from the
+      costmap node (`/global_costmap/global_costmap`), so the RELATIVE topic
+      names resolved to `/global_costmap/keepout_filter_info` and (from the
+      info message) `/global_costmap/keepout_mask` — topics nobody publishes
+      (board evidence: `KeepoutFilter: Filter mask was not received` every 2 s
+      in the nano-nav journal; `ros2 topic info /keepout_filter_info` showed
+      pub 1 / sub 0 while `/global_costmap/keepout_filter_info` showed
+      pub 0 / sub 1). `nav2_params.yaml` now carries
+      `filter_info_topic: "/keepout_filter_info"` and telemetry's
+      CostmapFilterInfo sets `filter_mask_topic = "/keepout_mask"` (both
+      ABSOLUTE). (2) `keepout_filter` moved BEFORE `inflation_layer` in the
+      global plugins so zone cells get the full inflation margin instead of
+      plans hugging the zone edge. (3) Zones are now `{x,y,w,h,rot}` rotated
+      rectangles (centre + extents + rad; legacy corner rows migrate on
+      load/save; `_norm_zone` clamps centre ±20 m, sides 0.05..12 m, rot to
+      (−π,π]); `POST /keepout/save` takes an optional `index` to replace a
+      zone in place. (4) Web Map hero Edit toggle: drag empty map = draw, drag
+      a zone = move, corner squares = resize (opposite corner anchors), ○
+      handle = rotate — saved on release via /keepout/save with index; hover
+      cursor + selected-zone handles; true rotated-rect rendering.
+      Unit tests updated (`test_keepout_mask.py`, 17: rotated rasterization,
+      AABB-corner exclusion, quarter-turn invariance, legacy migration, index
+      edits, clamps). Board verify: restart lands the yaml + code; check
+      `KeepoutFilter: Received filter mask` in the nano-nav journal and that a
+      painted zone turns lethal in `/global_costmap`.
 - [x] **NEW 2026-09-24: persistent robot pose on the web map while the lidar is
       parked (LDS off). CODE-COMPLETE 2026-09-24; board verify pending.**
       Today `f.nav.pose` = a tf2 lookup `map→base_link` at
@@ -291,6 +318,17 @@ in this checkout.
          re-runs with every 1 Hz replan). Note SmacPlanner2D ALSO has built-in
          `smooth_path` — if the board shows double-smoothing artifacts or CPU
          cost, drop the BT node (Smac's alone may suffice).
+         **2026-09-27: BOARD VERIFY FAILED → REMOVED.** The robostack-staging
+         `ros-humble-nav2-smoother` package ships ONLY the BT selector node +
+         the SmoothPath BT action lib — NOT the `SmootherServer` component;
+         composing it failed ("Could not find requested resource in ament
+         index") and that failure HANGS the lifecycle manager forever (the
+         manager waits on a component that never bonds). The component is gone
+         from nav2.launch.py, `<SmoothPath>` from recovery_bt.xml, and
+         `smoother_server` from the lifecycle node_names (FIVE servers).
+         SmacPlanner2D's built-in `smooth_path: true` covers path smoothing.
+         The pkg stays installed for its BT libs (pixi.toml comment guards
+         this; a future source build of the server can revive it).
       4. **`SmacPlanner2D` swap** (pkg `ros-humble-nav2-smac-planner`, one param
          line: `GridBased.plugin: nav2_smac_planner/SmacPlanner2D` + its params) —
          any-angle paths, less staircase-weaving, more robust on small maps.

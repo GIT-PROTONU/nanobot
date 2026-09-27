@@ -1609,21 +1609,43 @@ class TelemetryHub:
 
     # ---- keepout zones (web-drawn no-go rectangles → the global costmap) -------
     def set_keepout_zones(self, zones):
-        """Take the persisted keepout rectangles (map-frame metres,
-        [{x1,y1,x2,y2}, ...]) from web_server and (re)publish the mask. Called
-        on save/delete/clear AND on boot re-apply."""
-        self._keepout_zones = [
-            (float(z["x1"]), float(z["y1"]), float(z["x2"]), float(z["y2"]))
-            for z in (zones or [])
-            if all(k in z for k in ("x1", "y1", "x2", "y2"))
-        ]
+        """Take the persisted keepout rectangles (map-frame metres) from
+        web_server and (re)publish the mask. Called on save/delete/clear AND
+        on boot re-apply. Zones are normalized to (x, y, w, h, rot) tuples —
+        centre + full extents + rotation (rad, CCW); legacy {x1,y1,x2,y2} rows
+        (axis-aligned, rot 0) are still accepted."""
+        self._keepout_zones = [t for t in map(self._zone_tuple, (zones or [])) if t]
         self.publish_keepout()
+
+    @staticmethod
+    def _zone_tuple(z):
+        """One zone dict → (x, y, w, h, rot) or None. Accepts the normalized
+        {x,y,w,h,rot} shape and the legacy {x1,y1,x2,y2} corner shape."""
+        if not isinstance(z, dict):
+            return None
+        try:
+            if all(k in z for k in ("x", "y", "w", "h")):
+                x, y, w, h = (float(z[k]) for k in ("x", "y", "w", "h"))
+                rot = float(z.get("rot", 0.0))
+            elif all(k in z for k in ("x1", "y1", "x2", "y2")):
+                x1, y1, x2, y2 = (float(z[k]) for k in ("x1", "y1", "x2", "y2"))
+                x, y = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                w, h, rot = abs(x2 - x1), abs(y2 - y1), 0.0
+            else:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return (x, y, w, h, rot)
 
     def publish_keepout(self):
         """Rasterize the keepout rectangles into the CURRENT /map grid geometry
         and latch the mask + its filter-info topic. No map yet (boot) or no
         zones → an empty mask is still published once so a deleted zone can
-        clear a previously latched one; nothing at all before the first /map."""
+        clear a previously latched one; nothing at all before the first /map.
+        The info's mask topic MUST be absolute ("/keepout_mask"): the
+        KeepoutFilter subscribes from the costmap node, so a relative name
+        would resolve to /global_costmap/keepout_mask — a topic nobody
+        publishes (the 2026-09-27 zones-ignored bug)."""
         if CostmapFilterInfo is None:
             return
         meta = self._map_payload[0] if self._map_payload else None
@@ -1632,17 +1654,26 @@ class TelemetryHub:
         w, h, res = int(meta["w"]), int(meta["h"]), float(meta["res"])
         ox, oy = float(meta["ox"]), float(meta["oy"])
         cells = bytearray(w * h)            # 0 = free everywhere
-        for x1, y1, x2, y2 in self._keepout_zones:
-            lo_x, hi_x = sorted((x1, x2))
-            lo_y, hi_y = sorted((y1, y2))
-            c0 = max(0, int((lo_x - ox) / res))
-            c1 = min(w - 1, int(math.ceil((hi_x - ox) / res)) - 1)
-            r0 = max(0, int((lo_y - oy) / res))
-            r1 = min(h - 1, int(math.ceil((hi_y - oy) / res)) - 1)
+        for zx, zy, zw, zh, zrot in self._keepout_zones:
+            cos_r, sin_r = math.cos(zrot), math.sin(zrot)
+            # Rotated-rect AABB in world coords (half-extents of the rotated box)
+            ex = abs(cos_r) * zw / 2 + abs(sin_r) * zh / 2
+            ey = abs(sin_r) * zw / 2 + abs(cos_r) * zh / 2
+            c0 = max(0, int(math.floor((zx - ex - ox) / res)))
+            c1 = min(w - 1, int(math.ceil((zx + ex - ox) / res)) - 1)
+            r0 = max(0, int(math.floor((zy - ey - oy) / res)))
+            r1 = min(h - 1, int(math.ceil((zy + ey - oy) / res)) - 1)
+            half_w, half_h = zw / 2, zh / 2
             for r in range(r0, r1 + 1):
+                dyw = oy + (r + 0.5) * res - zy   # cell-centre → centre, world
                 base = r * w
                 for c in range(c0, c1 + 1):
-                    cells[base + c] = 100   # occupied = keepout
+                    dxw = ox + (c + 0.5) * res - zx
+                    # inverse-rotate into the rect's local frame
+                    lx = cos_r * dxw + sin_r * dyw
+                    ly = -sin_r * dxw + cos_r * dyw
+                    if -half_w <= lx <= half_w and -half_h <= ly <= half_h:
+                        cells[base + c] = 100   # occupied = keepout
         mask = OccupancyGrid()
         mask.header.frame_id = "map"
         mask.header.stamp = self._node.get_clock().now().to_msg()
@@ -1654,7 +1685,11 @@ class TelemetryHub:
         mask.data = list(cells)
         info = CostmapFilterInfo()
         info.type = 0                       # KEEPOUT filter
-        info.filter_mask_topic = "keepout_mask"
+        info.filter_mask_topic = "/keepout_mask"
+        # KeepoutFilter reads mask values directly, but it errors on non-default
+        # base/multiplier on every mask update — keep them at the defaults.
+        info.base = 0.0
+        info.multiplier = 1.0
         self._pubs["/keepout_mask"][0].publish(mask)
         self._pubs["/keepout_filter_info"][0].publish(info)
 

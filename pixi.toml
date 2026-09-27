@@ -50,10 +50,14 @@ ros-humble-nav2-velocity-smoother = "*"
 # optional built-in path smoothing. Verify it resolves on linux-aarch64 with
 # `pixi install` before deploying (robostack-staging).
 ros-humble-nav2-smac-planner = "*"
-# smoother: smoother_server + SimpleSmoother — post-processes the planned grid
-# path to kill zigzags BEFORE RPP tracks it (the velocity_smoother above caps
-# speed/accel, this smooths path GEOMETRY). Wired into recovery_bt.xml after
-# ComputePathToPose. Verify resolution on linux-aarch64 before deploying.
+# smoother: the robostack-staging ros-humble-nav2-smoother package only ships
+# the BT selector node (libnav2_smoother_selector_bt_node.so) + the SmoothPath
+# BT action lib (libnav2_smooth_path_action_bt_node.so) — NOT the SmootherServer
+# component. The "Could not find requested resource in ament index" load
+# failure hangs the lifecycle manager forever (found 2026-09-27 on the board).
+# SmacPlanner2D's built-in smooth_path: true covers path smoothing instead;
+# the SmoothPath BT node is removed from recovery_bt.xml. Kept installed for
+# the BT libs (harmless; a future source build of the server can revive it).
 ros-humble-nav2-smoother = "*"
 ros-humble-slam-toolbox = "*"
 # NOTE: rosbridge is GONE. The browser talks only to web_control's own HTTP server

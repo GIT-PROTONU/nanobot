@@ -87,9 +87,12 @@ COMPONENTS = [
     ComposableNode(
         package="nav2_behaviors", plugin="behavior_server::BehaviorServer",
         name="behavior_server", parameters=[PARAMS]),
-    ComposableNode(
-        package="nav2_smoother", plugin="nav2_smoother::SmootherServer",
-        name="smoother_server", parameters=[PARAMS]),
+    # smoother_server REMOVED: the robostack-staging ros-humble-nav2-smoother
+    # package only ships the BT selector node (libnav2_smoother_selector_bt_node.so),
+    # NOT the SmootherServer component — "Could not find requested resource in
+    # ament index" hangs the lifecycle manager forever. SmacPlanner2D's built-in
+    # smooth_path: true covers path smoothing (the AGENTS note "Smac's alone may
+    # suffice" was prescient — the robostack gap forces it).
     ComposableNode(
         package="nav2_bt_navigator", plugin="nav2_bt_navigator::BtNavigator",
         name="bt_navigator", parameters=[
@@ -101,13 +104,12 @@ COMPONENTS = [
         name="lifecycle_manager",
         parameters=[{
             "autostart": True,
-            # SIX servers, bt_navigator LAST so the forward-order activation
-            # finds its dependencies up (smoother_server after planner_server,
-            # velocity_smoother after controller_server). slam_toolbox is not
-            # listed: it is a plain node in 2.6.10 with no lifecycle at all
-            # (docstring).
+            # FIVE servers, bt_navigator LAST so the forward-order activation
+            # finds its dependencies up (velocity_smoother after controller_server).
+            # slam_toolbox is not listed: it is a plain node in 2.6.10 with no
+            # lifecycle at all (docstring). smoother_server removed — see above.
             "node_names": ["planner_server", "controller_server",
-                           "smoother_server", "velocity_smoother",
+                           "velocity_smoother",
                            "behavior_server", "bt_navigator"]}]),
 ]
 
