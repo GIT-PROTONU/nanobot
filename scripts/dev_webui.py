@@ -1071,6 +1071,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # Canned-move no-op (no /odom, no motors here): accept {dist,deg,cancel}
             # so the Drive card's canned controls respond normally off-robot.
             return self._json({"status": "started", "dev": True})
+        if p == "/nav/cancel":
+            # Nav-cancel no-op (no Nav2 here): the STOP button + map ✕ POST it.
+            return self._json({"ok": True, "dev": True})
         if p == "/move/config":
             # Canned-speed sliders: accept + remember for this dev session.
             d = self._body()

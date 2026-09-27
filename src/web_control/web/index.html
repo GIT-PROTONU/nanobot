@@ -168,7 +168,6 @@
               <button id="moveTurn" class="btn">⟲ Turn</button>
             </div>
             <div class="row" style="margin-top:8px">
-              <button id="moveStop" class="btn danger small">■ Stop move</button>
               <span id="moveStatus" class="hint grow" style="text-align:right"></span>
             </div>
             <div class="field"><label>Canned speed <span id="moveLinV">0.12</span> m/s</label>
@@ -2086,7 +2085,6 @@ const HINTS = {
   moveFwd: "Starts the canned drive (Drive N metres). A running canned move is replaced by a new one.",
   moveRev: "Starts the canned drive backwards (the negated field value, −N metres). A running canned move is replaced by a new one.",
   moveTurn: "Starts the canned rotation (Turn N degrees). A running canned move is replaced by a new one.",
-  moveStop: "Cancels the running canned move and stops (same as touching the joystick or pressing STOP).",
   moveStatus: "Live progress of the canned move (phase, target, % done) and its result after it finishes. The maneuver aborts if /odom is lost or the browser disconnects for >5 s.",
   moveLin: "Cruise speed for the canned Drive maneuvers (m/s). Live-tunes the server and persists across reboots. The approach still ramps down into the target, so very short moves peak below this. Above ~0.35 m/s the motors saturate (loaded full-duty ≈0.37 m/s): the PID has no duty headroom and the drive stutters — the page warns past 0.35.",
   moveAng: "Turn-rate cap for the canned Turn maneuvers (rad/s). Live-tunes the server and persists across reboots. Keep at/below 1.0 -- faster spins smear the SLAM map (each 0.2 s lidar scan blurs by w*0.2 rad; there is no deskew).",
@@ -3219,6 +3217,10 @@ function sendDrive(v,w){
     .catch(()=>{})
     .finally(()=>{ driveBusy=false; });
 }
+// STOP must always stop: the /drive {0,0} POST stops teleop AND cancels a running
+// canned move server-side (drive() sets _man_cancel), /nav/cancel aborts any Nav2
+// goal (single + waypoint tours), and the explicit /move cancel is belt-and-braces.
+function cancelNav(){ fetch("/nav/cancel",{method:"POST"}).catch(()=>{}); }
 // 10 Hz refresh while moving: the server's dead-man stops the motors if commands stop
 // arriving. Skip it when the tab is backgrounded; and if we get hidden mid-drive, send
 // one stop right away so the robot halts immediately instead of coasting to the watchdog.
@@ -3226,7 +3228,7 @@ setInterval(()=>{ if(!document.hidden && (curV||curW)) publishCmd(); },100);
 document.addEventListener("visibilitychange",()=>{
   if(document.hidden && (curV||curW)){ setCmd(0,0); publishCmd(); }
 });
-$("stop").onclick=()=>{setCmd(0,0);publishCmd();};
+$("stop").onclick=()=>{setCmd(0,0);publishCmd();cancelNav();postMove({cancel:true});};
 
 // ---- canned moves (POST /move) ----
 // Odom-feedback relative maneuvers served by web_control (drive N m / rotate N°).
@@ -3255,7 +3257,6 @@ function onMove(mv){
 $("moveFwd").onclick=()=>postMove({dist:Number($("moveDist").value)||0});
 $("moveRev").onclick=()=>postMove({dist:-(Number($("moveDist").value)||0)});
 $("moveTurn").onclick=()=>postMove({deg:Number($("moveDeg").value)||0});
-$("moveStop").onclick=()=>postMove({cancel:true});
 // Enter in a field triggers its button (typing(e) already keeps WASD out of teleop).
 $("moveDist").addEventListener("keydown",e=>{ if(e.key==="Enter") $("moveFwd").click(); });
 $("moveDeg").addEventListener("keydown",e=>{ if(e.key==="Enter") $("moveTurn").click(); });
