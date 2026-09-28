@@ -232,22 +232,30 @@ plane does — new features must respect all five:
    `_publish_loop` thread) all bypass rclpy executor load entirely. A wedged
    executor can stall UI work; it can never stall the sensor feed slam/nav
    consume. New sensor drivers must follow the same pattern.
-3. **Tolerance cascade** (`nav2_params.yaml`): `transform_tolerance (RPP 0.2)` <
-   `velocity_timeout (smoother 0.5)` < `failure_tolerance (1.5)`. A transient TF
-   miss ≤0.2 s makes the RPP tick block briefly while the smoother HOLDS the last
-   command (coast, no zero-brake); only a sustained miss (>0.5 s) zero-brakes;
-   a controller stall >1.5 s fails the goal. Never raise transform_tolerance back
-   past velocity_timeout — the 0.5 s value was the 2026-09-23 STARVATION PATCH,
-   and with the starvation structurally fixed it would only mask regressions.
+3. **Tolerance cascade** (`nav2_params.yaml`): `transform_tolerance (RPP 0.35)` <
+   `velocity_timeout (smoother 0.8)` < `failure_tolerance (1.5)`. While RPP waits
+   for the map→odom transform its input goes quiet, so the smoother HOLDS the last
+   command (coast, no zero-brake); only a wait EXPIRY (>0.35 s miss) makes RPP
+   return a ZERO Twist, which the smoother brakes to; a sustained miss (>0.5 s)
+   zero-brakes; a controller stall >1.5 s fails the goal. **The 2026-09-28 session
+   disproved the original "≤tolerance misses are always absorbed" premise**: the
+   catch path on an EXPIRED wait returns a zero Twist (the felt 0.8→0→0.8 chatter
+   + one patience failure), and measured slam map→odom gaps ran 0.24–1.15 s
+   mid-drive — so 0.2 was too tight and every 0.2–0.35 s gap was a hard brake.
+   0.35 covers the measured band while keeping the cascade strictly increasing.
+   Never raise transform_tolerance past velocity_timeout — the 0.5 s value was the
+   2026-09-23 STARVATION PATCH, and with the starvation structurally fixed it
+   would only mask regressions.
 4. **Serial budget at 115200 is sized by message-rate design, not baud** (user
-   decision: keep 115200). SBC-side (LIVE): the smoother republishes `/cmd_vel`
+   decision: keep 115200). SBC-side: the smoother republishes `/cmd_vel`
    at 3 Hz (`smoothing_frequency`, the verified-clean rate that still feeds the
-   ESP's 500 ms cmd watchdog). ESP-side rate cuts (BUILT 2026-09-27, **FLASH
-   PENDING** — until flashed the firmware still publishes the old ~59 msg/s
-   set): `/wheel_ticks` 15 Hz (time-critical), `/wheel_stray_ticks` on-change +
-   1 Hz heartbeat, `/lds_*` 2 Hz, heartbeat/trim/pid/params/susp 1 Hz,
-   temp/hall/reset 0.2 Hz → ~30 msg/s total. Every NEW ESP topic costs FIFO
-   headroom — add it here at ≤1 Hz or on-change.
+   ESP's 500 ms cmd watchdog). **ESP-side rate cuts are LIVE (flashed + verified
+   2026-09-28):** `/wheel_ticks` 15 Hz (time-critical), `/wheel_stray_ticks`
+   on-change + 1 Hz heartbeat, `/lds_*` 2 Hz, heartbeat/trim/pid/params/susp
+   1 Hz, temp/hall/reset 0.2 Hz → ~30 msg/s total (verified: /esp32_temp
+   3 msgs/15 s, stray 1 Hz heartbeat; the NVS boot-validation half of that
+   flash is also live — gains [5,60,0] + all params survived the boot). Every
+   NEW ESP topic costs FIFO headroom — add it here at ≤1 Hz or on-change.
 5. **Replanning is REACTIVE, not periodic** (2026-09-27, user decision):
    `recovery_bt.xml` has NO RateController — ComputePathToPose runs once per
    goal and a blocked path reroutes through the RecoveryNode retry (clear
@@ -266,9 +274,71 @@ plane does — new features must respect all five:
 
 Related: the ESP32 firmware VALIDATES the NVS PID gains at boot against the
 `WHEEL_KP/KI/KD` defines (>20% drift = reset to tuned + log — the 3× NVS-drift
-gotcha becomes self-healing; **built 2026-09-27, FLASH PENDING**), and app_hub's
+gotcha becomes self-healing; **flashed + live 2026-09-28**), and app_hub's
 phrase-bank regen/grow DEFERS while a Nav2 goal is active (`_bank_checks`,
 retried on a 30 s timer).
+
+**2026-09-28 residual-stutter session (goal-time fixes, all deployed + verified):**
+The nav-level fixes above hold (goals complete; the verify drive had 0 transform
+errors, 0 BT-rate warnings, slam drops 13→1), but three goal-time mechanisms
+still bit — all fixed:
+- **Goal pre-wake now waits for slam, not just the turret** (`_slam_tf_fresh`/
+  `_goal_tf_ready` in `telemetry.py`): the old ready-check (/lds_hz ≥ 2 + fresh
+  age) released the goal ~0.5-0.8 s after spin-up — before slam had PROCESSED a
+  scan — so the planner read the FROZEN map→odom stamp: "Starting point in
+  lethal space" instant fails + extrapolated-pose planning (hit live twice).
+  Ready now = frames flowing AND map→odom stamped ≤1.5 s ago (best-effort:
+  no TF buffer — no browser — → don't hold; the planner's own retries cover).
+  Verified: "lidar ready after 0.8s" then a clean 10.1 s goal.
+- **Keepout mask re-emit is geometry-gated** (`telemetry._on_map`): slam
+  republishes /map every ~5 s with unchanged geometry, and re-emitting the
+  identical ~230k-cell mask made KeepoutFilter re-subscribe + re-apply every
+  5 s mid-drive (new churn since the 2026-09-27 keepout fix). Re-emit now only
+  on a (w,h,res,ox,oy) change; zone edits still re-emit directly.
+- **`lds_idle_secs` is 60 again** (the board's persisted lds.json had drifted
+  to 10 — every inter-goal gap >10 s parked the lidar mid-tour, paying a wake
+  + a frozen-TF window per goal). Set via POST /param; drag the Lidar-card
+  slider to change it deliberately.
+- **WATCH — one-off nano-nav SEGV** (07:40:28, the same second a goal landed;
+  param-get probes ran seconds before; not reproduced by a plain goal):
+  `code=killed, status=11/SEGV` — if it repeats on goals, that's a new critical
+  bug; also note a container death mid-goal leaves the web chip stuck
+  "navigating" (no terminal status) until /nav/cancel (docs/TODO.md).
+- The **wheel-level judder** (66 ms tick-window speed sawtooth, p2p 0.22-0.26
+  measured today) is the SEPARATE plant item in docs/TODO.md — nav-level fixes
+  don't touch it.
+
+**2026-09-28 round 2 (the user still felt stutter after the round-1 fixes) —
+root-caused + fixed + verified live.** The last pre-fix goal run showed: `/cmd_vel`
+perfectly continuous, slam TF healthy (10 Hz, zero gaps), NO transform failures —
+yet **`/cmd_vel_nav` gapped 439-626 ms every ~1.0-1.3 s** (metronomic), and at
+every gap >0.5 s the velocity_smoother's `velocity_timeout` deadman RAMPED the
+command toward zero at max_decel (v 0.13→0→0.13 sawtooth in the frame VALUES —
+not a gap, so gap-analysis on /cmd_vel misses it; the wheel speed sags exactly
+there = the felt stutter). Mechanism: RPP's map→odom tf2 WAIT blocks every tick
+(the pose stamp is always slightly ahead of slam's last scan stamp) and a
+DROPPED/late scan stretches the wait to 0.44-0.63 s; the wait never expires
+(no failure logged) — it just stalls the tick. Fixes (one `deploy.sh
+robot_bringup` bounce):
+- **slam `correlation_search_space_dimension` 0.8 → 0.5** — the 2× matcher-cost
+  widening was the 2026-09-19 patch for the *mis-scaled wheel odometry* (5.7×
+  wrong, fixed 2026-09-20 to 253 tpr true units), so the wide window guarded
+  against a defect that no longer exists; halving the matcher cost attacks the
+  scan drops that stretch slam's TF cadence. Re-raise only if localization
+  gets lost on carpet slip.
+- **`velocity_timeout` 0.5 → 0.8** — belt-and-braces: coast on the held
+  command through any residual ≤0.8 s RPP wait-gap instead of deadman-braking
+  (worst-case blind coast ~0.8 s at ≤0.2 m/s ≈ 16 cm; a genuinely wedged
+  controller still deadmans at 0.8 s). Cascade now **0.35 < 0.8 < 1.5**.
+- Verified: a 0.91 m / 4.6 s recorded goal with **ZERO /cmd_vel_nav gaps,
+  ZERO deadman ramps**, slam TF 10 Hz gap-free (pre-fix the same-length goals
+  showed 2-7 gaps). Also NOTE: the goal's lidar pre-wake held the FULL 10 s
+  ("STILL not delivering frames after 10s — sent anyway") yet the goal
+  planned fine — the wake-from-park was slow (>10 s), not the scan processing;
+  watch that (ESP link wake latency family). Diagnostics: `scripts/stutter_rec.py`
+  (records /cmd_vel /cmd_vel_nav /odom /wheel_ticks /scan /tf-map→odom; NOTE the
+  twist rows carry `ang` not `w` — the wall-stamp `w` field) + a per-thread
+  `ps -T` probe, both left in the board's `~/.run/`.
 
 ## Architecture
 

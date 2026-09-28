@@ -294,6 +294,14 @@ class TelemetryHub:
         # KeepoutFilter): rectangles in map-frame metres, owned by web_server
         # (persisted to keepout.json) and mirrored here for mask rasterization.
         self._keepout_zones = []
+        # Geometry key of the /map grid the keepout mask was last rasterized
+        # against (w, h, res, ox, oy). slam_toolbox republishes /map every
+        # map_update_interval (~5 s) with UNCHANGED geometry while driving —
+        # re-rasterizing + re-latching the ~230k-cell mask on every arrival made
+        # the KeepoutFilter re-subscribe + re-apply the mask every 5 s mid-drive
+        # (churn on the nav core; 2026-09-28 stutter session). Re-emit only when
+        # the grid the zones are painted onto actually changes.
+        self._keepout_geo = None
         # map-frame pose via TF (map->odom from slam_toolbox + odom->base_link
         # from wheel_odometry). Listener is lazy — created with the other
         # browser-only subs, unregistered in _drop_subs.
@@ -1071,8 +1079,15 @@ class TelemetryHub:
         self._map_arrival = time.monotonic()
         # A rebuilt map may have new dims/origin — re-rasterize + re-latch the
         # keepout mask so the KeepoutFilter's cells stay aligned with the new
-        # grid (no-op when no zones are set).
-        self.publish_keepout()
+        # grid. Gated on GEOMETRY change: slam republishes the same grid every
+        # map_update_interval while driving, and re-emitting an identical mask
+        # makes the KeepoutFilter re-subscribe + re-apply every 5 s mid-drive.
+        # Zone edits re-emit via their own publish_keepout() calls.
+        geo = (info.width, info.height, round(info.resolution, 6),
+               round(info.origin.position.x, 6), round(info.origin.position.y, 6))
+        if geo != self._keepout_geo:
+            self._keepout_geo = geo
+            self.publish_keepout()
 
     def _on_costmap(self, attr, frame, msg):
         """Cache the latest Nav2 costmap for the /local_costmap + /global_costmap
@@ -1334,6 +1349,30 @@ class TelemetryHub:
             return False
         return float(self._lds.get("hz") or 0.0) >= LDS_READY_MIN_HZ
 
+    def _slam_tf_fresh(self, max_age=1.5):
+        """Is slam's map->odom transform stamped recently? slam_toolbox republishes
+        it once per PROCESSED scan — while the lidar is parked the stamp freezes at
+        the last scan. A goal planned against a frozen map->odom reads a stale/
+        extrapolated pose ("Starting point in lethal space", transform-failure
+        zero-ticks — the 2026-09-28 goal failures). /lds_hz alone is NOT enough:
+        the turret delivers frames for ~0.5 s before slam has processed one."""
+        if self._tf_buf is None:
+            # The TF listener is browser-gated (lazy); with no browser there is
+            # nothing to check with — a best-effort gate must never HOLD a goal
+            # on an uncheckable condition (the planner's own retries recover).
+            return True
+        try:
+            t = self._tf_buf.lookup_transform("map", "odom", Time())
+        except Exception:
+            return False
+        st = t.header.stamp
+        return (time.time() - (float(st.sec) + float(st.nanosec) * 1e-9)) <= max_age
+
+    def _goal_tf_ready(self):
+        """The full goal-release condition: frames flowing AND slam's map->odom
+        fresh enough that the planner sees a current pose."""
+        return self._lds_ready() and self._slam_tf_fresh()
+
     def wake_lidar(self, reason="goal", wait=True):
         """Make sure the lidar is spinning + delivering frames BEFORE a Nav2 goal goes
         out. Fires the spin-when-active setpoint immediately if /lds_hz says no valid
@@ -1344,9 +1383,12 @@ class TelemetryHub:
         the old behaviour) with a Nav-log warning. Returns the seconds held (0.0 when
         the lidar was already ready). A remembered spin target of 0 (slider parked) is
         overridden for the goal — navigation is impossible without scans — falling
-        back to LDS_DEFAULT_RPM; the IMU interference test's lds_hold is never fought."""
+        back to LDS_DEFAULT_RPM; the IMU interference test's lds_hold is never fought.
+        "Ready" = /lds_hz flowing AND slam's map->odom fresh (_slam_tf_fresh): the
+        turret can deliver frames ~0.5 s before slam has processed a scan, and a
+        goal released in that window plans against a frozen TF (2026-09-28)."""
         now = time.monotonic()
-        if self._lds_ready():
+        if self._goal_tf_ready():
             return 0.0
         held = 0.0
         rpm = min(LDS_RPM_MAX, max(0.0, float(self._lds_user_rpm or 0.0)
@@ -1363,10 +1405,10 @@ class TelemetryHub:
                          f"before {reason}")
         if wait:
             deadline = now + LDS_WAKE_WAIT
-            while not self._lds_ready() and time.monotonic() < deadline:
+            while not self._goal_tf_ready() and time.monotonic() < deadline:
                 time.sleep(LDS_WAKE_POLL)
             held = min(time.monotonic() - now, LDS_WAKE_WAIT)
-            if self._lds_ready():
+            if self._goal_tf_ready():
                 self._navlog_add(f"lidar ready after {held:.1f}s — {reason} "
                                  "going out now")
             else:

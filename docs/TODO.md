@@ -15,25 +15,21 @@ in this checkout.
 
 ## Open — needs the physical robot
 
-- [ ] **NEW 2026-09-27: ESP32 flash pending — serial publish-rate cuts + PID NVS
-      boot validation are BUILT + COMPILED, not flashed.** Part of the
-      2026-09-27 smooth-navigation work (see the "Smooth-navigation invariants"
-      block in AGENTS.md). `firmware/nanobot_coprocessor/src/main.cpp` carries:
-      (1) **C3b serial cuts** — `/wheel_stray_ticks` on-change + 1 Hz heartbeat
-      (was 15 Hz), `/lds_*` 5→2 Hz, `/esp32_temp`+`/esp32_hall`+`/esp32_reset`
-      1 Hz→0.2 Hz → ~30 msg/s on the 115200 link (was ~59; the SBC-side
-      `smoothing_frequency` 3.0 half is LIVE). (2) **D1 PID validation** —
-      boot loads kp/ki/kd from NVS and RESETS to the `WHEEL_KP/KI/KD` defines
-      when any gain drifts >20% (the 3× NVS-drift gotcha becomes
-      self-healing). Flash from the dev PC with the ESP USB-tethered:
-      `cd firmware/nanobot_coprocessor && pio run -t upload` (cmake from the
-      pixi env: `PATH=~/.pixi…/envs/default/bin:$PATH`), then ONE
-      `sudo -n systemctl restart nano-robot.target` (a flash desyncs the
-      router's serial transport — the documented post-flash bounce). Verify
-      after: `/wheel_stray_ticks` only arrives on change/heartbeat,
-      `/lds_*` ~2 Hz, and a `pid_tune.py state` readback of 5/60/0 after
-      deliberately setting garbage gains + power-cycle.
-- [ ] **NEW 2026-09-27: residual PLANT ripple at cruise — odom speed sawtooths
+- [ ] **NEW 2026-09-28: nav2_container SEGV — ONE occurrence, coincident with a
+      goal publish.** 07:40:28: `nano-nav.service: Main process exited,
+      code=killed, status=11/SEGV` the same second a `/goal_pose` landed
+      (bt_navigator was active; the goal was never processed — the chip stuck
+      "navigating" until /nav/cancel). `ros2 param get` probes ran seconds
+      before (both rejected with "Failed to get parameters" WARNs) — either
+      could be the trigger; a subsequent plain goal did NOT crash it
+      (NRestarts=1, stable since). WATCH: if a goal reproduces the SEGV, that
+      is a new critical bug (goal-into-bt_navigator crash path); if a param
+      get does, stop using raw param probes against the container. Also note:
+      a container death MID-GOAL leaves the web chip stuck "navigating"
+      forever (no terminal status ever arrives) — /nav/cancel clears it; a
+      "navigating but zero /cmd_vel for N s" watchdog in telemetry is the
+      candidate fix.
+- [ ] **NEW 2026-09-28: residual PLANT ripple at cruise — odom speed sawtooths
       ~0.2-0.35 p2p at the 66 ms wheel-window level** (15 Hz header-stamped
       /odom during the verification drives, command constant at 0.15). This is
       BELOW the nav layer (the robot's /cmd_vel stream is continuous — smooth
@@ -47,6 +43,22 @@ in this checkout.
       the dither was counterproductive (id 6 = 0), so mitigations are PID-side
       only. Also candidate: nav cruise 0.15 m/s sits above the verified-smooth
       ≤0.12 band (user wants higher speeds to work — do NOT just cap it).
+      **2026-09-28 MEASURED during real goal drives (stutter_rec.py, 66 ms
+      tick windows, wall-clock diffs): p2p 0.22-0.26 m/s around means
+      0.04-0.09, bursts to 0.19 m/s (23 burst-windows in a 6.3 s goal), 11
+      zero-speed windows on one goal.** Whether the bursts are physical
+      stick-slip or the during-motion phantom-tick noise is UNRESOLVED — the
+      stray-tick counter only sees stopped-time noise (the documented blind
+      spot), so a firmware per-window excess-rate guard (window delta > 4× the
+      previous window's → clamp) is the candidate discriminator+mitigation.
+      Needs a flash cycle + `frame_record.py` alongside.
+- [ ] **NEW 2026-09-28: slow lidar wake-from-park — the goal pre-wake held the
+      FULL 10 s** ("lidar STILL not delivering frames after 10s — sent anyway")
+      yet the goal planned fine (scans flowed as the goal went out). A parked
+      turret took >10 s to deliver valid frames after the wake POST — either
+      the ESP link acted late (the deaf-after-idle family) or the wake/ramp
+      path is slow. Watch next sessions; a faster wake (or a pre-goal
+      `lds_idle_secs`-aware keep-warm) is the candidate fix.
 - [ ] **NEW 2026-09-27 (cosmetic): idle-parked frozen-TF error storm in
       `journalctl -u nano-nav`** — with the lidar parked, slam's map→odom
       stamp freezes and a 1 Hz caller (global costmap update / bt goal-status

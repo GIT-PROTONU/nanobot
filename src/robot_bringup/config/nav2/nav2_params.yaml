@@ -83,11 +83,15 @@ slam_toolbox:
     debug_logging: false
     # Correlation matcher window (karto): the translational search is centered
     # on the wheel-odom prior. The upstream default (0.5) = only +/-0.25 m of
-    # recovery per scan; with the unverified ticks_per_rev / stiction-crawl
-    # drive chain, scans were locking past that. 0.8 = +/-0.4 m at 2x the
-    # correlation-grid CPU (still small vs the H5 headroom; slam idled ~3.5%
-    # of a core with the default window).
-    correlation_search_space_dimension: 0.8
+    # recovery per scan. Was widened to 0.8 (+/-0.4 m, 2x correlation-grid CPU)
+    # on 2026-09-19 for the UNVERIFIED wheel scale / stiction-crawl drive chain
+    # — but the scale was found 5.7x wrong and FIXED 2026-09-20 (253 tpr, true
+    # units), so the wide window guarded against a defect that no longer exists.
+    # Back to 0.5 (2026-09-28): halving the matcher cost reduces slam's
+    # mid-drive scan drops (the "queue is full" stretches that starve the
+    # map->odom cadence and stall RPP's tf2 waits — the stutter root). If
+    # localization gets lost again on carpet slip, re-raise to 0.8.
+    correlation_search_space_dimension: 0.5
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1
     # Online-async matcher subset. NOTE: the robostack Humble package is
@@ -189,14 +193,23 @@ controller_server:
       # cadence stretching under load). The starvation is now fixed structurally
       # (/odom publishes off the executor; the CPU plane partitioning gives nav+slam
       # dedicated cores), so 0.2 is the structurally correct value.
+      # was 0.2 (2026-09-27 invariant) — but the 2026-09-28 stutter session measured
+      # map->odom cadence gaps of 0.24-1.15 s DURING drives (slam scan drops under
+      # residual core-2/3 congestion), and the RPP catch path on an EXPIRED wait
+      # returns a ZERO Twist — the smoother then hard-brakes (the felt 0.8->0->0.8
+      # chatter + the 07:10:11 patience failure). 0.35 covers the measured
+      # sub-0.35 s gap band: while RPP waits, its input is quiet < velocity_timeout,
+      # so the smoother COASTS on the held command instead of braking; only a miss
+      # longer than the wait still zero-brakes (safe stop). Measured gaps >0.35 s
+      # (the 1.15 s outlier) still brake — correct, that is a real staleness.
       # TOLERANCE CASCADE INVARIANT (do not break):
-      #   transform_tolerance (0.2) < velocity_timeout (0.5) < failure_tolerance (1.5)
-      # a transient TF miss (<=0.2 s) makes the RPP tick BLOCK briefly, but the
+      #   transform_tolerance (0.35) < velocity_timeout (0.8) < failure_tolerance (1.5)
+      # a transient TF miss (<=0.35 s) makes the RPP tick BLOCK briefly, but the
       # velocity_smoother HOLDS the last command (<0.5 s gap = no zero-brake) — a
       # coast, never a brake pulse; a sustained miss >0.5 s zero-brakes (safe stop);
       # a controller stall >1.5 s fails the goal. Transients can never produce a
       # zero-brake stutter pulse.
-      transform_tolerance: 0.2
+      transform_tolerance: 0.35
 
 # ---- velocity_smoother (nav speed + accel caps, live-tunable) ----------------
 # Sits BETWEEN controller_server and /cmd_vel: the controller publishes
@@ -235,9 +248,21 @@ velocity_smoother:
     max_accel: [0.5, 0.0, 1.6]
     max_decel: [-0.5, 0.0, -1.6]
     deadband_velocity: [0.01, 0.0, 0.01]   # kill sub-creep commands
-    velocity_timeout: 0.5        # controller went quiet -> publish zeros (active
+    velocity_timeout: 0.8        # controller went quiet -> ramp toward zeros (active
                                  # brake) for this long, then stop republishing;
-                                 # under the ESP32 500 ms cmd watchdog
+                                 # under the ESP32 500 ms cmd watchdog.
+                                 # was 0.5 (2026-09-28): RPP's map->odom tf2 WAIT
+                                 # (transform_tolerance 0.35) blocks EVERY tick —
+                                 # the pose stamp is always ahead of slam's last
+                                 # scan stamp — and a dropped/late scan stretches
+                                 # the wait to a measured 439-626 ms. At 0.5 the
+                                 # smoother's deadman ramped the command toward
+                                 # zero mid-drive on every such gap (the felt
+                                 # stutter: v 0.13->0->0.13 sawtooth). 0.8 coasts
+                                 # on the held command through them instead;
+                                 # a genuinely wedged controller still deadmans
+                                 # at 0.8 s (~16 cm at crawl). Cascade stays
+                                 # strictly increasing: 0.35 < 0.8 < 1.5.
 
 # ---- planner_server (SmacPlanner2D; was NavFn) --------------------------------
 # Smac2D replaces NavFn (2026-09-24): any-angle paths (no staircase-weaving for

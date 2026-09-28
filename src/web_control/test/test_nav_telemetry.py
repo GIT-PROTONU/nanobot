@@ -493,6 +493,64 @@ def test_publish_json_slider_updates_lds_sent(monkeypatch):
     assert h._lds_user_rpm == 250.0
 
 
+# --- pre-wake "ready" also needs slam's map->odom fresh (2026-09-28) --------
+# The turret can deliver /lds_hz frames ~0.5 s before slam has PROCESSED a scan;
+# a goal released in that window plans against the frozen map->odom stamp
+# ("Starting point in lethal space" / transform-failure zero-ticks).
+
+def _tf_with_stamp(age_s):
+    from builtin_interfaces.msg import Time as TimeMsg
+    t = _xform(x=1.0, y=2.0)
+    now = time.time()
+    t.header.stamp = TimeMsg(sec=int(now - age_s), nanosec=0)
+    return t
+
+
+def test_slam_tf_fresh_no_buffer_is_true():
+    # The TF listener is browser-gated; with nothing to check with the gate must
+    # never hold a goal (best-effort by construction).
+    h = _hub()
+    assert h._slam_tf_fresh() is True
+
+
+def test_slam_tf_fresh_fresh_vs_frozen():
+    h = _hub()
+    h._tf_buf = _FakeTfBuf({("map", "odom"): _tf_with_stamp(0.2)})
+    assert h._slam_tf_fresh() is True
+    h._tf_buf = _FakeTfBuf({("map", "odom"): _tf_with_stamp(30.0)})
+    assert h._slam_tf_fresh() is False
+
+
+def test_slam_tf_fresh_lookup_fail_is_false():
+    h = _hub()
+    h._tf_buf = _FakeTfBuf({})       # no map->odom at all (slam never ran)
+    assert h._slam_tf_fresh() is False
+
+
+def test_wake_lidar_holds_for_frozen_slam_tf(monkeypatch):
+    # lds frames ALREADY flowing but slam's map->odom stale (parked lidar mid-spin)
+    # → the goal must hold until slam processes a scan (bounded), publishing the
+    # setpoint harmlessly (already spinning).
+    h = _hub()
+    _lds_arrival(h)
+    h._tf_buf = _FakeTfBuf({("map", "odom"): _tf_with_stamp(30.0)})
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_WAIT", 0.3)
+    monkeypatch.setattr(telemetry_mod, "LDS_WAKE_POLL", 0.01)
+    held = h.wake_lidar(reason="the goal")
+    assert 0.0 < held <= 0.5
+    # on timeout the goal path proceeds anyway — nothing raised, setpoint asserted
+    assert h._lds_sent == pytest.approx(LDS_DEFAULT_RPM)
+
+
+def test_publish_json_goal_no_hold_when_slam_tf_fresh(monkeypatch):
+    h = _hub()
+    _lds_arrival(h)
+    h._tf_buf = _FakeTfBuf({("map", "odom"): _tf_with_stamp(0.2)})
+    out = h.publish_json({"topic": "/goal_pose", "value": {"x": 0.5, "y": -0.5}})
+    assert out["status"] == "ok" and "lidar_wait" not in out
+    assert h._pubs["/lds_target_rpm"][0].published == []
+
+
 # ---- persistent pose while the lidar parked (pose_src fallback) ------------------
 class _FakeTfBuf:
     """Stands in for tf2_ros.Buffer: scriptable lookup outcomes per frame pair."""

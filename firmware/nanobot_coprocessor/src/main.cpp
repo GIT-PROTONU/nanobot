@@ -174,8 +174,13 @@ static const uint32_t PWM_MAX = (1u << PWM_RES_BITS) - 1u;
 // target m/s to the baseline duty the I-term corrects from. Manual override via
 // /motor_params id 8 (NVS "kff", 0 = derive from the drive limits).
 #define WHEEL_KFF   (1.0f/(MAX_LINEAR_SPEED + MAX_ANGULAR_SPEED*WHEEL_SEPARATION*0.5f))
-#define WHEEL_KP    0.0f            // stiffness — tune after KI (start ~0.5*KFF)
-#define WHEEL_KI    8.0f            // crawl breakaway <0.5 s (0.12 m/s stall -> +0.7 duty in ~0.46 s)
+// TUNED gains (2026-09-21 live sweep, scripts/pid_tune.py — KP the damper, KI 60
+// the breakaway authority; KI <30 can't break away at crawl). The boot validator
+// below treats these defines as the source of truth — keep them in sync with any
+// deliberate retune (update defines + flash in the same session, or the next boot
+// "heals" NVS back to the OLD defines and wipes the tune).
+#define WHEEL_KP    5.0f
+#define WHEEL_KI    60.0f
 #define WHEEL_KD    0.0f
 #define WHEEL_INTEG_MAX 1.0f        // anti-windup: integral clamp (duty units via KI)
 // Stiction-aware I-term (2026-09-21 smoothness pass II): while a wheel is COMMANDED but
