@@ -399,6 +399,84 @@ def test_status_uses_last_entry_of_the_list():
     assert h._goal_status == "navigating"
 
 
+# ---- goal arrival heading (the map's press-hold-drag aim gesture) -----------------
+def test_mk_goal_theta_encodes_heading():
+    m = TelemetryHub._mk_goal({"x": 1.0, "y": 2.0, "theta": math.pi / 2})
+    q = m.pose.orientation
+    assert math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z) == pytest.approx(math.pi / 2)
+
+
+def test_mk_goal_theta_is_wrapped_to_pi():
+    m = TelemetryHub._mk_goal({"x": 1.0, "y": 2.0, "theta": 3.0 * math.pi})
+    q = m.pose.orientation
+    assert math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z) == pytest.approx(-math.pi)
+
+
+def test_mk_goal_theta_rejects_non_numeric():
+    with pytest.raises((TypeError, ValueError)):
+        TelemetryHub._mk_goal({"x": 1.0, "y": 2.0, "theta": "east"})
+
+
+def test_note_goal_records_arrival_heading():
+    h = _hub()
+    h.note_goal(1.0, 2.0, theta=2.0)
+    assert h._goal_yaw == pytest.approx(2.0)
+    h.note_goal(1.0, 2.0)
+    assert h._goal_yaw is None
+
+
+class _RotNode(_FakeNode):
+    """Records the web node's arrival-rotate surface the hub may call."""
+
+    def __init__(self):
+        self.rot_calls = []
+        self.abort_calls = 0
+
+    def arrival_heading_rotate(self, yaw):
+        self.rot_calls.append(yaw)
+
+    def abort_arrival_rotate(self):
+        self.abort_calls += 1
+
+
+def test_publish_json_goal_theta_flows_to_mirror(monkeypatch):
+    h = TelemetryHub(_FakeNode())
+    monkeypatch.setattr(h, "wake_lidar", lambda reason="": 0.0)
+    h.publish_json({"topic": "goal_pose", "value": {"x": 1.0, "y": 2.0, "theta": 1.5}})
+    assert h._goal == [1.0, 2.0]
+    assert h._goal_yaw == pytest.approx(1.5)
+
+
+def test_arrival_rotate_fires_on_arrived_status():
+    n = _RotNode()
+    h = TelemetryHub(n)
+    h.note_goal(1.0, 2.0, theta=0.7)
+    h._on_goal_status(_status_arr(4))
+    assert n.rot_calls == [pytest.approx(0.7)]
+    assert h._goal is None and h._goal_yaw is None   # mirror still cleared
+
+
+def test_no_rotate_without_theta_or_on_failure():
+    n = _RotNode()
+    h = TelemetryHub(n)
+    h.note_goal(1.0, 2.0)
+    h._on_goal_status(_status_arr(4))                # position-only goal
+    assert n.rot_calls == []
+    h.note_goal(1.0, 2.0, theta=0.7)
+    h._on_goal_status(_status_arr(6))                # ABORTED — nothing to rotate
+    assert n.rot_calls == []
+
+
+def test_new_goal_and_cancel_abort_a_running_rotate():
+    n = _RotNode()
+    h = TelemetryHub(n)
+    h.note_goal(1.0, 2.0, theta=0.7)                 # a new goal aborts any stale rotate
+    before = n.abort_calls
+    assert before >= 1
+    h.clear_goal()                                   # ✕ Cancel aborts too
+    assert n.abort_calls == before + 1
+
+
 # --- goal-click lidar pre-wake (2026-09-23) --------------------------------
 # A goal clicked while the idle controller has the lidar parked must NOT reach
 # Nav2 planning against slam's frozen map→odom TF: wake_lidar fires the spin

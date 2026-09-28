@@ -37,6 +37,7 @@ from rclpy.parameter import Parameter as RclpyParameter
 from std_msgs.msg import Bool, Int8, Int32, Float32, Int32MultiArray, Int64MultiArray, Float32MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
+from .pickup_watch import PickupWatch
 try:
     from nav2_msgs.msg import CostmapFilterInfo
 except Exception:                                    # keep telemetry importable without nav2_msgs
@@ -82,6 +83,16 @@ LDS_IDLE_TICK = 1.0       # controller period (s)
 LDS_REASSERT_SECS = 30.0  # re-publish an unchanged setpoint after this long — an ESP32
                           # reboot resets its setpoint to the firmware default, so a
                           # periodic re-assert corrects it without any user action
+# Pickup watch (lift-stop + release turn, 2026-09-28): both wheels up for
+# pickup_stop_secs -> latch a stop (drive zeroed, maneuvers + Nav2 goals
+# cancelled); grounded again for a short confirm -> a ~180° re-orientation
+# turn. Runs on an always-on 0.5 s tick so it works with the page closed
+# (like the LDS idle controller); web_server's suspension callbacks also feed
+# it on arrival for a snappy latch. See pickup_watch.py (pure) + test_pickup_watch.py.
+PICKUP_TICK = 0.5          # controller period (s)
+PICKUP_SPIN_GIVEUP = 30.0  # s to keep retrying the release turn before giving up
+                           # (the latch clears then too — a stuck base must not
+                           # leave the robot drive-refused forever)
 # Nav2 goal states that count as "the lidar must stay up" for the idle controller.
 # "planning" matters: Nav2 needs fresh scans for its costmap BEFORE it starts moving.
 NAV_BUSY = ("planning", "navigating", "canceling")
@@ -123,6 +134,11 @@ MOTOR_ACCEL_MAX = 8.0    # ESP32 firmware's own MOTOR_SLEW_MIN/MAX clamp (main.c
 TRIM_MAX = 0.30          # ESP32 firmware's TRIM_MAX -- |wheel_trim| rebalance range (main.cpp)
 GOAL_MAX_ABS_M = 12.0    # clamp on /goal_pose x/y -- Nav2's global costmap is
                          # 24x24 m; a goal outside it would just fail to plan
+
+
+def _wrap_pi(a):
+    """Wrap an angle to (-pi, pi]."""
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
 NAV_WAYPOINT_MAX = 12    # cap on POST /nav/waypoints stops (a crawl-speed tour
                          # of more would outlive any sane watchdog)
 KEEPOUT_MAX_ZONES = 16   # cap on persisted keepout rectangles (a mask rasterizes
@@ -169,6 +185,8 @@ PARAM_WHITELIST = {
                     "imu_drift_min_secs",
                     # LDS idle spin-down controller (telemetry.py's _lds_ctrl_tick)
                     "lds_idle_enable", "lds_idle_secs", "lds_manual_secs",
+                    # Pickup watch (lift-stop + release turn, _pickup_ctrl_tick)
+                    "pickup_stop_enable", "pickup_stop_secs", "pickup_spin_deg",
                 },
     # velocity_smoother (nav2_container): the nav speed/accel caps. The SCALAR
     # params here are settable via POST /param; the 3-element array params
@@ -311,6 +329,12 @@ class TelemetryHub:
         # last published /goal_pose (browser clicks, locations, skills — all go
         # through publish_json); _goal_status comes from the action status sub.
         self._goal = None              # [x, y] in the map frame, or None
+        # Requested arrival heading (rad, map frame) of the last goal — set by
+        # the web map's press-hold-drag aim gesture ({x, y, theta}). The web
+        # node rotates to it in place once Nav2 reports the goal reached (see
+        # web_server.arrival_heading_rotate); waypoints/locations/skills never
+        # set it (position-only goals).
+        self._goal_yaw = None
         self._goal_status = "idle"
         self._goal_status_at = STALE   # monotonic ts of the last status arrival — the
                                        # busy-state trust window (LDS_NAV_STALE)
@@ -322,6 +346,15 @@ class TelemetryHub:
         # None on a single-goal NavigateToPose (and reset on terminal states).
         self._wp_index = None
         self._wp_total = None
+        # Waypoint LOOP mode (2026-09-28): a tour sent with loop=True is
+        # re-sent as a fresh goal every time it reaches SUCCEEDED (patrol).
+        # _wp_list holds the [(x, y), ...] stops to re-send; any terminal
+        # state ends the lap — SUCCEEDED re-arms via web_server's
+        # restart_waypoint_loop, cancel/fail stop the loop outright (a
+        # blocked route must not retry forever). note_goal (any single-goal
+        # publish) also drops it: a new goal replaces the tour.
+        self._wp_loop = False
+        self._wp_list = None
         self._moving = False           # last /cmd_vel above the motion eps — the
                                        # Nav log's motion start/stop transitions
         self._navlog_warn_at = 0.0     # monotonic ts of the last planning-stuck warning
@@ -407,12 +440,26 @@ class TelemetryHub:
         self._lds_sent_at = STALE
         self._lds_hold = 0             # >0 while the IMU interference test owns the spin motor
         self._last_move_at = None      # monotonic ts of the last commanded motion (/cmd_vel)
+        # --- pickup watch (lift-stop + release turn; see pickup_watch.py) -----
+        # The switch pair itself is read from web_server's ALWAYS-ON suspension
+        # subscriptions (n._susp_l/_susp_r/_susp_override — its _on_susp_* call
+        # note_pickup on arrival); this tick re-evaluates the timers so the 5 s
+        # boundary + the release confirm fire even between messages (the ESP32
+        # publishes on-change + a 1 Hz heartbeat) and retries the release turn
+        # while something else owns the base.
+        self._pickup = PickupWatch()
+        self._pickup_latched = False   # mirrored from the watch; drives/moves/goals
+                                       # are refused while True (web_server reads this)
+        self._pickup_pending = None    # monotonic: release turn queued, retrying
+        self._pickup_goal_refused_at = 0.0   # throttle for the refused-goal log
         # One always-on timer: builds/notifies frames while clients exist, manages the
         # lazy subscriptions, and is a single cheap early-out when nobody's watching.
         node.create_timer(self._period, self._tick)
         # ...plus the idle controller's own 1 Hz tick (runs regardless of browsers —
         # the spin-down must work with the page closed).
         node.create_timer(LDS_IDLE_TICK, self._lds_ctrl_tick)
+        # ...and the pickup watch's own tick (same always-on reasoning).
+        node.create_timer(PICKUP_TICK, self._pickup_ctrl_tick)
         # The controller's ALWAYS-ON subscriptions: /cmd_vel (commanded motion — the
         # teleop keepalive, Nav2's controller, canned moves and skill actions all
         # publish it) + bt_navigator's goal status. Both are tiny and MUST be seen
@@ -676,6 +723,19 @@ class TelemetryHub:
             "lds": dict(self._lds, **self._lds_ctrl_state(now)),
             "oled": self._oled,
         }
+        # Pickup watch (lift-stop + release turn) — additive section: the page's
+        # Coprocessor card seeds its toggle/slider from enable/secs once (the
+        # f.lds pattern) and shows the live latch + both-up timer.
+        enable, psecs, _pdeg = self._pickup_cfg()
+        l_eff, r_eff = PickupWatch.effective(n._susp_l, n._susp_r, n._susp_override)
+        f["pickup"] = {
+            "enable": enable, "secs": psecs,
+            "latched": self._pickup_latched,
+            "up": bool(l_eff and r_eff),
+            "up_for": (round(self._pickup.up_for(now), 1)
+                       if (l_eff and r_eff) else None),
+            "pending": self._pickup_pending is not None,
+        }
         # Canned-move (POST /move) progress — web_server's maneuver state, a plain
         # JSON-safe dict it replaces atomically (getattr: the fake dev node has none).
         mv = getattr(n, "_maneuver_state", None)
@@ -801,6 +861,11 @@ class TelemetryHub:
             # the page). Additive key — older pages ignore it.
             "pose_src": pose[3] if pose else None,
             "goal": self._goal,
+            # Requested arrival heading (rad, map frame) of the last goal —
+            # null on position-only goals. Additive key: the page draws the
+            # goal ring's direction arrow from it (e.g. after a page reload).
+            "goal_yaw": round(self._goal_yaw, 3)
+                        if self._goal_yaw is not None else None,
             "status": self._goal_status,
             "inflation": round(infl, 3),
             "robot_radius": round(diam / 2.0, 3),
@@ -815,6 +880,10 @@ class TelemetryHub:
             # runs. Additive keys — older pages ignore them.
             "wp_index": self._wp_index,
             "wp_total": self._wp_total,
+            # Waypoint loop mode (additive key): True while a looped tour runs
+            # (the page shows the 🔁 badge; the Waypoints card's Loop switch is
+            # the client-side preference, this is the server's truth).
+            "loop": bool(self._wp_loop),
             "plan_age": round(now - self._plan_arrival, 1)
                         if self._plan_arrival != STALE else None,
         }
@@ -1183,6 +1252,7 @@ class TelemetryHub:
         code = int(code)
         new = NAV_STATUS.get(code, "idle")
         prev = self._goal_status
+        yaw = None                       # requested arrival heading, if this goal had one
         if new != prev:
             since = self._goal_status_since
             dur = f" (was {prev} for {now - since:.1f}s)" if since is not None else ""
@@ -1206,10 +1276,51 @@ class TelemetryHub:
                 self._navlog_add(f"goal {verdict} in {now - pub_at:.1f}s",
                                  "info" if code in (4, 5) else "warn")
                 self._goal_published_at = None
+            yaw = self._goal_yaw
             self._goal = None
+            self._goal_yaw = None
             self._wp_index = None            # waypoint progress is done either way
             self._wp_total = None
+            # Waypoint loop: any terminal state ends the current lap. SUCCEEDED
+            # re-sends the tour (below); cancel/fail drop the loop outright.
+            wp_list, wp_loop = self._wp_list, self._wp_loop
+            self._wp_list = None
+            self._wp_loop = False
+        else:
+            wp_list, wp_loop = None, False
         self._goal_status = new
+        if code == 4 and yaw is not None:
+            # The goal asked for an arrival heading (the map's aim drag): hand
+            # the base to web_server's canned-turn machinery for the in-place
+            # rotate. Humble's planners/RPP drive to the goal POSITION — the
+            # final heading is the plan's last tangent, not the goal's
+            # orientation — so the rotate happens after Nav2 reports success.
+            # Runs AFTER the status write (the rotate's busy-check reads it)
+            # and never fatals the executor thread.
+            rot = getattr(self._node, "arrival_heading_rotate", None)
+            if rot is not None:
+                try:
+                    rot(yaw)
+                except Exception as exc:
+                    self._navlog_add(f"arrival heading rotate failed: {exc!r}",
+                                     "warn")
+        if code == 4 and wp_loop and wp_list:
+            # A looped waypoint tour just finished a lap: re-send the same
+            # stops as a fresh NavigateThroughPoses goal. Runs on the executor
+            # thread like the arrival rotate — web_server's restart path is
+            # strictly non-blocking (send_goal_async; the server just
+            # serviced a goal on this client).
+            rst = getattr(self._node, "restart_waypoint_loop", None)
+            if rst is not None:
+                try:
+                    rst(wp_list)
+                except Exception as exc:
+                    self._navlog_add(f"waypoint loop restart failed: {exc!r}",
+                                     "warn")
+        elif wp_loop and code in (5, 6):
+            self._navlog_add("waypoint loop stopped — "
+                             + ("tour canceled" if code == 5 else "tour failed"),
+                             "warn")
 
     def _tf_laser_age(self):
         """base_link→laser static TF existence check for the Map card's feeds
@@ -1292,10 +1403,22 @@ class TelemetryHub:
 
     def clear_goal(self):
         """Drop the goal mirror + chip state (POST /nav/cancel). Nav2's own status
-        topic will corroborate with CANCELED/UNKNOWN on the next tick."""
+        topic will corroborate with CANCELED/UNKNOWN on the next tick. Any
+        arrival-heading rotate left running is aborted too (✕ owns the base)."""
+        abort = getattr(self._node, "abort_arrival_rotate", None)
+        if abort is not None:
+            try:
+                abort()
+            except Exception:
+                pass
         if self._goal is not None or self._goal_status not in ("idle",):
             self._navlog_add("goal cancelled (POST /nav/cancel) — lidar may idle-park now")
+        if self._wp_loop:
+            self._navlog_add("waypoint loop stopped — cancelled")
+        self._wp_loop = False
+        self._wp_list = None
         self._goal = None
+        self._goal_yaw = None
         self._goal_status = "idle"
         self._goal_status_at = time.monotonic()
         self._goal_published_at = None
@@ -1305,10 +1428,14 @@ class TelemetryHub:
         route serves (None, None) until the fresh post-restart grid arrives
         (slam_toolbox republishes transient-local the instant it's up), and
         map_age reads null so the page's feeds strip shows SLAM as down meanwhile.
-        The goal mirror resets too — the map frame it points into is being reset."""
+        The goal mirror resets too — the map frame it points into is being reset,
+        and a waypoint loop dies with it (its stops no longer exist on the map)."""
         self._map_payload = None
         self._map_arrival = STALE
+        self._wp_loop = False
+        self._wp_list = None
         self._goal = None
+        self._goal_yaw = None
         self._goal_status = "idle"
         self._goal_published_at = None
         self._navlog_add("map cleared — nano-slam restart, goal dropped, "
@@ -1509,6 +1636,97 @@ class TelemetryHub:
             return "no motion since boot"
         return f"idle >{idle_secs:.0f}s"
 
+    # ---- pickup watch (lift-stop + release turn, see pickup_watch.py) --------
+    def note_pickup(self, l, r, override):
+        """Feed the watch from web_server's ALWAYS-ON suspension callbacks. The
+        0.5 s tick re-evaluates with the stored values anyway — this makes the
+        latch snappy on the on-change arrival."""
+        self._pickup_eval(time.monotonic(), l, r, override)
+
+    def _pickup_cfg(self):
+        """(enable, stop_secs, spin_deg) from web_control's params; defaults on a
+        dev/fake node without them."""
+        n = self._node
+        try:
+            enable = bool(n.get_parameter("pickup_stop_enable").value)
+            secs = float(n.get_parameter("pickup_stop_secs").value)
+            deg = float(n.get_parameter("pickup_spin_deg").value)
+        except Exception:
+            return True, 5.0, 180.0
+        return enable, max(0.5, secs), deg
+
+    def _pickup_eval(self, now, l=None, r=None, override=None):
+        """One decision step: run the pure watch on the effective switch pair and
+        act on its events. Runs from the suspension callbacks AND the 0.5 s tick.
+        Every action is guarded — a failure here must never kill the executor
+        (a callback exception = app-hub respawn loop)."""
+        n = self._node
+        enable, secs, _deg = self._pickup_cfg()
+        if not enable:
+            if self._pickup.latched or self._pickup_pending is not None:
+                self._pickup.reset()
+                self._pickup_latched = False
+                self._pickup_pending = None
+                self._navlog_add("pickup watch disabled — latch cleared")
+            return
+        if l is None:
+            l, r = n._susp_l, n._susp_r
+        if override is None:
+            override = n._susp_override
+        events = self._pickup.update(bool(l), bool(r), int(override), now, secs)
+        self._pickup_latched = self._pickup.latched
+        for ev in events:
+            if ev == "stop":
+                self._navlog_add(
+                    f"picked up (both wheels up {secs:.0f}s) — stopping: drive "
+                    "zeroed, maneuvers + nav goals cancelled, drives/moves/goals "
+                    "refused until the wheels are back down")
+                try:
+                    n.on_pickup_stop()
+                except Exception as e:
+                    self.get_logger().warning(f"pickup stop action failed: {e!r}")
+            elif ev == "spin":
+                self._pickup_pending = now
+                self._navlog_add("wheels back down — re-orientation turn queued")
+
+    def _pickup_ctrl_tick(self):
+        """Always-on 0.5 s tick: evaluate the watch (the 5 s latch + the release
+        confirm fire on timer boundaries even between switch messages) and retry
+        a queued release turn until the base is free or PICKUP_SPIN_GIVEUP
+        expires (then the latch clears — a stuck base must not leave the robot
+        drive-refused forever)."""
+        now = time.monotonic()
+        self._pickup_eval(now)
+        if self._pickup_pending is None:
+            return
+        _enable, _secs, deg = self._pickup_cfg()
+        try:
+            ok = bool(self._node.on_pickup_release(deg))
+        except Exception as e:
+            ok = False
+            self.get_logger().warning(f"pickup release failed: {e!r}")
+        if ok:
+            self._pickup_pending = None
+            self._navlog_add(f"re-orientation turn started ({deg:.0f}°)")
+        elif now - self._pickup_pending > PICKUP_SPIN_GIVEUP:
+            self._pickup_pending = None
+            self._navlog_add("release turn gave up (base busy / no odom) — "
+                             "drives re-enabled, no turn", "warn")
+            giveup = getattr(self._node, "pickup_release_giveup", None)
+            if giveup is not None:
+                try:
+                    giveup()
+                except Exception:
+                    pass
+
+    def cancel_pickup_spin(self, reason=""):
+        """A queued release turn is user-overridable: any explicit drive/move
+        takes the base back (the spin is a courtesy re-orientation, not a lock)."""
+        if self._pickup_pending is None:
+            return
+        self._pickup_pending = None
+        self._navlog_add("release turn cancelled — " + (reason or "user took over"))
+
     def note_lds_manual(self, rpm, set_target=False):
         """Record a /lds_target_rpm published OUTSIDE the controller (browser slider
         via POST /publish, or a skill action): latch the manual window so the
@@ -1584,8 +1802,29 @@ class TelemetryHub:
             return {"error": f"bad value: {exc}"}
         if msg is None:
             return {"error": "bad value"}
+        if topic == "/goal_pose" and self._pickup_latched:
+            # The robot is in the air: Nav2 must not plan/drive (the wheels spin
+            # free and a put-down would resume the goal). Refused until the
+            # release turn runs. Log throttled — a held map click could spam.
+            if time.monotonic() - self._pickup_goal_refused_at > 2.0:
+                self._pickup_goal_refused_at = time.monotonic()
+                self._node.get_logger().info(
+                    "POST /publish /goal_pose refused — robot is picked up")
+            return {"error": "robot is picked up (both wheels up) — goal refused"}
         held = 0.0
+        theta = None
         if topic == "/goal_pose":
+            # Optional arrival heading (the map's press-hold-drag aim gesture):
+            # a {x, y, theta} value means Nav2 drives to (x, y) and the web
+            # node rotates in place to theta once the goal is reached. A bad
+            # theta already made `build` (_mk_goal) refuse the message above —
+            # this re-read is belt-and-braces and must never raise.
+            try:
+                val = data.get("value")
+                if isinstance(val, dict) and val.get("theta") is not None:
+                    theta = _wrap_pi(float(val["theta"]))
+            except (TypeError, ValueError):
+                theta = None
             # Pre-wake: never let Nav2 plan against slam's frozen map→odom TF — hold
             # the goal (bounded) until the parked lidar is actually delivering frames.
             held = self.wake_lidar(reason="the goal")
@@ -1594,7 +1833,7 @@ class TelemetryHub:
             # Goal mirror for the web map (f["nav"].goal). Nav2 will corroborate
             # via the action status topic within a tick or two; set "planning"
             # here so the chip reacts to the click immediately.
-            self.note_goal(msg.pose.position.x, msg.pose.position.y)
+            self.note_goal(msg.pose.position.x, msg.pose.position.y, theta=theta)
         if topic == "/lds_target_rpm":
             # The browser's Spin slider: remember it as the spin-when-active target
             # AND latch the manual window so the idle controller doesn't fight the
@@ -1615,29 +1854,52 @@ class TelemetryHub:
             out["lidar_wait"] = round(held, 1)
         return out
 
-    def note_goal(self, x, y, source=""):
+    def note_goal(self, x, y, theta=None, source=""):
         """Record a goal published outside POST /publish (skill actions) so the
         web map's goal ring + status chip stay in sync with those too. `source`
-        names the publisher in the Nav log ("skill go-to 'kitchen'")."""
+        names the publisher in the Nav log ("skill go-to 'kitchen'"); `theta`
+        (rad, map frame) is the requested arrival heading, None on plain goals.
+        A new goal also aborts any arrival-heading rotate left over from the
+        previous goal — Nav2 is taking the base back — and drops any waypoint
+        loop (a single-goal publish replaces the tour; note_waypoints re-arms
+        the loop state right after calling this)."""
+        abort = getattr(self._node, "abort_arrival_rotate", None)
+        if abort is not None:
+            try:
+                abort()
+            except Exception:
+                pass                     # dev/fake node — never fatal
+        self._wp_loop = False
+        self._wp_list = None
+        self._wp_index = None
+        self._wp_total = None
         self._goal = [round(float(x), 3), round(float(y), 3)]
+        self._goal_yaw = None if theta is None else _wrap_pi(float(theta))
         self._goal_status = "planning"
         now = time.monotonic()
         self._goal_status_at = now
         self._goal_status_since = now
         self._goal_published_at = now
         via = f" via {source}" if source else ""
+        head = (f"; arrival heading {math.degrees(self._goal_yaw):.0f}°"
+                if self._goal_yaw is not None else "")
         self._navlog_add(f"goal ({self._goal[0]:.2f}, {self._goal[1]:.2f}){via} — "
-                         "planning; lidar must spin for the planner's map→odom TF")
+                         f"planning; lidar must spin for the planner's map→odom TF{head}")
 
-    def note_waypoints(self, poses, source=""):
+    def note_waypoints(self, poses, source="", loop=False):
         """Mirror a multi-waypoint goal (POST /nav/waypoints) for the web map:
         the goal ring sits on the FIRST waypoint, the chip reads planning, and
         f.nav gains wp_total (the action's feedback refines wp_index as it
-        drives). `poses` is the [(x, y), ...] list that was sent."""
+        drives). `poses` is the [(x, y), ...] list that was sent. With
+        `loop=True` the tour is re-sent on SUCCEEDED (restart_waypoint_loop);
+        the list is kept either way so a restart is always available."""
         self.note_goal(poses[0][0], poses[0][1], source=source)
         self._wp_total = len(poses)
         self._wp_index = 0
-        self._navlog_add(f"waypoints: {len(poses)} stops — "
+        self._wp_list = [(float(x), float(y)) for x, y in poses]
+        self._wp_loop = bool(loop)
+        tail = " — LOOPING (repeats until cancelled or failed)" if self._wp_loop else ""
+        self._navlog_add(f"waypoints: {len(poses)} stops{tail} — "
                          + " → ".join(f"({x:.2f},{y:.2f})" for x, y in poses))
 
     @staticmethod
@@ -1646,7 +1908,13 @@ class TelemetryHub:
         m.header.frame_id = "map"
         m.pose.position.x = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, float(v["x"])))
         m.pose.position.y = min(GOAL_MAX_ABS_M, max(-GOAL_MAX_ABS_M, float(v["y"])))
-        m.pose.orientation.w = 1.0
+        theta = v.get("theta")           # optional arrival heading (rad, map frame)
+        if theta is None:
+            m.pose.orientation.w = 1.0   # position-only goal: no requested heading
+        else:
+            theta = _wrap_pi(float(theta))
+            m.pose.orientation.z = math.sin(theta / 2.0)
+            m.pose.orientation.w = math.cos(theta / 2.0)
         return m
 
     # ---- keepout zones (web-drawn no-go rectangles → the global costmap) -------

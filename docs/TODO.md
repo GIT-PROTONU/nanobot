@@ -287,7 +287,13 @@ in this checkout.
       map (current one glows), ordered list with ↑/↓/✕, Go/Clear; mapCancel
       clears the list. Unit-tested (`test_nav_waypoints.py`): validation/
       clamps/cap/refuse-when-down + mirror/feedback/terminal-clear.
-      REMAINING: the board verify (3 clicks → Go → visits in order).
+      Board-verified 2026-09-27 (visits in order, chip + rings track).
+      **2026-09-28 LOOP mode (deployed + live-verified):** `{points, loop:true}`
+      makes the tour a patrol — telemetry keeps the stops + flag (`f.nav.loop`,
+      the Waypoints card's 🔁 badge) and re-sends the list on every SUCCEEDED
+      via `web_server.restart_waypoint_loop` (executor-thread, non-blocking);
+      CANCELED/ABORTED, any single-goal publish, `/nav/cancel` and `/map/clear`
+      end it; pickup refuses a restart. Unit-tested in `test_nav_waypoints.py`.
 - [x] **NEW 2026-09-24: live planned-path polyline on the web map (`/plan`).
       CODE-COMPLETE 2026-09-24; board verify pending.**
       Humble's `planner_server` publishes the computed path on **`/plan`**

@@ -150,6 +150,7 @@ MOVE_BROWSER_GRACE = 5.0     # s   SSE clients gone this long = browser-dead-man
 BRAKE_GRACE = 1.0            # s   keepalive keeps publishing {0,0} after a stop so the
                              #     firmware's PID brakes (see _drive_loop) instead of the
                              #     ESP dead-man's unpowered coast
+ARRIVE_ROT_EPS = 0.05        # rad skip the arrival heading rotate within ~3° of it
 # Live-tunable cruise/turn caps (Drive card sliders, GET/POST /move/config; persisted
 # to move_settings_path). The turn ceiling mirrors drive_max_ang — the SLAM rotation-
 # smear budget (a turn at w rad/s blurs each 0.2 s lidar scan by w*0.2 rad).
@@ -165,6 +166,11 @@ MOVE_ANG_RANGE = (0.10, 1.00)  # rad/s clamp range for move_ang_speed (2026-09-2
 # callback catches both paths (any setter, same file).
 LDS_PERSIST_KEYS = ("lds_idle_enable", "lds_idle_secs", "lds_manual_secs",
                     "lds_active_rpm")
+
+# Pickup watch (lift-stop + release turn) settings persisted to pickup_settings_path
+# so a Coprocessor-card change survives a restart/reboot — the same
+# "persisted UI wins" pattern as the LDS cluster just below.
+PICKUP_PERSIST_KEYS = ("pickup_stop_enable", "pickup_stop_secs", "pickup_spin_deg")
 
 # ---- Nav2 navigation pace (GET/POST /nav/config; persisted to nav_settings_path) --
 # The requested speed/accel caps for Nav2 goals, pushed to the velocity_smoother
@@ -243,14 +249,18 @@ def _maneuver_step(st, pose):
 
     st (mutated): {"phase": "drive"|"turn", "dist": signed m (0 = skip),
       "deg": signed deg (0 = skip), "x0","y0","th0": phase-start pose snapshot,
-      "v_max": m/s, "w_max": rad/s, "turn_kp": 1/s, "e0": |initial yaw err| rad}
-    pose: current (x, y, yaw) from /odom.
+      "abs_yaw": absolute turn target rad (arrival heading rotate; overrides
+      deg), "v_max": m/s, "w_max": rad/s, "turn_kp": 1/s, "e0": |initial yaw
+      err| rad}
+    pose: current (x, y, yaw) from /odom — or the map frame for abs_yaw turns
+    (the arrival heading rotate's target is a map-frame heading).
 
     Returns (v, w, done, progress 0..1, err):
       drive phase — progress along the phase-start heading (projection, so trim
       veer doesn't pad the distance), trapezoid decel into MOVE_DIST_TOL;
-      turn phase — P law on the wrapped yaw error toward th0 + radians(deg),
-      clamped to w_max with a MOVE_TURN_MIN_W floor, done inside MOVE_TURN_TOL.
+      turn phase — P law on the wrapped yaw error toward th0 + radians(deg)
+      (or the absolute abs_yaw target), clamped to w_max with a
+      MOVE_TURN_MIN_W floor, done inside MOVE_TURN_TOL.
     """
     x, y, yaw = pose
     if st["phase"] == "drive":
@@ -276,10 +286,16 @@ def _maneuver_step(st, pose):
         return v, 0.0, False, min(1.0, max(0.0, d / target)), r
 
     # turn phase
+    abs_yaw = st.get("abs_yaw")          # arrival heading rotate: absolute target
     if st["th0"] is None:                          # first tick of the turn: snapshot
         st["th0"] = yaw
-        st["e0"] = abs(math.radians(st["deg"]))
-    err = _wrap_angle(st["th0"] + math.radians(st["deg"]) - yaw) if st["deg"] else 0.0
+        st["e0"] = (abs(_wrap_angle(abs_yaw - yaw)) if abs_yaw is not None
+                    else abs(math.radians(st["deg"])))
+    if abs_yaw is not None:
+        err = _wrap_angle(abs_yaw - yaw)
+    else:
+        err = (_wrap_angle(st["th0"] + math.radians(st["deg"]) - yaw)
+               if st["deg"] else 0.0)
     if abs(err) <= MOVE_TURN_TOL:
         return 0.0, 0.0, True, 1.0, err
     w = st["turn_kp"] * err
@@ -393,6 +409,24 @@ class WebServerNode(Node):
         # push, or an internal set_parameters. Registered after the boot re-apply so
         # loading the saved file doesn't immediately rewrite it.
         self.add_on_set_parameters_callback(self._persist_lds_params)
+        # Pickup watch (lift-stop + release turn, telemetry.py's _pickup_ctrl_tick):
+        # both wheels up for pickup_stop_secs -> stop everything; grounded again ->
+        # a pickup_spin_deg in-place re-orientation turn. The Coprocessor card's
+        # toggle + slider persist via the same on-set-parameters trick.
+        self.declare_parameter("pickup_stop_enable", True)
+        self.declare_parameter("pickup_stop_secs", 5.0)   # s both wheels up -> stop
+        self.declare_parameter("pickup_spin_deg", 180.0)  # deg release re-orientation
+        self.declare_parameter("pickup_settings_path", "")  # "" = ~/.local/state/nanobot/pickup.json
+        try:
+            saved = read_json(self._pickup_settings_file()) or {}
+            applied = [Parameter(k, value=(bool(saved[k]) if k == "pickup_stop_enable"
+                                           else float(saved[k])))
+                       for k in PICKUP_PERSIST_KEYS if k in saved]
+            if applied:
+                self.set_parameters(applied)
+        except (TypeError, ValueError, KeyError) as e:
+            self.get_logger().warning(f"pickup: ignoring bad persisted config: {e!r}")
+        self.add_on_set_parameters_callback(self._persist_pickup_params)
         # Named colour-target palette: calibrations persist here and survive a restart
         # (previously a picked colour was lost on every stack restart).
         self.declare_parameter("vision_targets_path", "")   # "" -> ~/.local/state/nanobot/vision_targets.json
@@ -699,6 +733,7 @@ class WebServerNode(Node):
         self._man_req = None                            # pending request dict (move())
         self._man_cancel = False                        # joystick/STOP/cancel flag
         self._man_running = False                       # a maneuver is executing
+        self._man_tag = "canned move"                   # log label of the active one
         self._maneuver_state = {"active": False, "phase": "idle"}   # SSE snapshot
         self._man_wake = threading.Event()
         self._man_stop = threading.Event()
@@ -996,6 +1031,15 @@ class WebServerNode(Node):
             w = min(max_ang, max(-max_ang, float(data.get("w", 0.0))))
         except (TypeError, ValueError):
             v = w = 0.0
+        tel = getattr(self, "telemetry", None)
+        latched = bool(tel is not None and getattr(tel, "_pickup_latched", False))
+        if (v or w) and latched:
+            # Picked up (both wheels up): the wheels spin free — refuse motion.
+            # A {0,0} still passes (it keeps the firmware braking / stays idle).
+            if time.monotonic() - self._last_drive_log > 2.0:
+                self._last_drive_log = time.monotonic()
+                self.get_logger().info("POST /drive refused — robot is picked up")
+            return {"error": "robot is picked up (both wheels up) — drive refused"}
         with self._drive_lock:
             self._drive_v, self._drive_w = v, w
             self._drive_at = time.monotonic() if (v or w) else 0.0
@@ -1008,6 +1052,13 @@ class WebServerNode(Node):
         with self._man_lock:
             takeover = self._man_running
             self._man_cancel = True
+        # Any explicit drive POST also takes the base back from a queued pickup
+        # release turn (the spin is a courtesy, not a lock).
+        if tel is not None:
+            try:
+                tel.cancel_pickup_spin("user drive took over")
+            except Exception:
+                pass
         # Diagnosability: log the first non-zero /drive after an idle stretch (the hot
         # path runs ~10 Hz while driving, so a throttle keeps the log readable while a
         # single "who drove the robot" line still answers the question).
@@ -1086,6 +1137,8 @@ class WebServerNode(Node):
                 return {"error": "dist/deg must be numbers"}
             if not (dist or deg):
                 return {"error": "dist and deg are both zero"}
+            if getattr(self.telemetry, "_pickup_latched", False):
+                return {"error": "robot is picked up — canned move refused"}
             if self.telemetry._goal_status in ("planning", "navigating", "canceling"):
                 return {"error": f"Nav2 is {self.telemetry._goal_status} — cancel the goal first"}
             if self.telemetry._odom is None:
@@ -1101,6 +1154,10 @@ class WebServerNode(Node):
                 "turn_kp": float(self.get_parameter("move_turn_kp").value),
                 "timeout": float(self.get_parameter("move_timeout").value),
             }
+        try:
+            self.telemetry.cancel_pickup_spin("canned move took over")
+        except Exception:
+            pass                       # dev/fake telemetry stub — never fatal
         self._man_wake.set()
         self.get_logger().info(
             f"POST /move dist {dist:+.2f} m deg {deg:+.0f} (canned move)")
@@ -1126,20 +1183,37 @@ class WebServerNode(Node):
                         self._man_cancel = True    # stop whatever it was commanding
                     self._man_finish("error", {"error": repr(e)})
 
+    def _man_pose(self, frame="odom"):
+        """Maneuver feedback pose (x, y, yaw) in the requested frame: /odom
+        (the canned moves' wheel-integrated source) or the map frame (the
+        arrival heading rotate — its target yaw is a map-frame heading, so its
+        error must be measured against slam's map→base_link pose)."""
+        if frame == "map":
+            p = self.telemetry._tf_pose()
+            return None if p is None else (p[0], p[1], p[2])
+        return self.telemetry._odom
+
     def _run_maneuver(self, req):
-        odo = self.telemetry._odom
-        if odo is None:
-            return self._man_finish("failed", {"error": "/odom not flowing"})
+        frame = req.get("frame", "odom")
+        pose = self._man_pose(frame)
+        if pose is None:
+            return self._man_finish("failed", {"error": (
+                "/odom not flowing" if frame == "odom" else "map TF not flowing")})
         with self._man_lock:
             self._man_running = True
+            self._man_tag = req.get("tag", "canned move")
         st = {"phase": "drive", "dist": req["dist"], "deg": req["deg"],
               "x0": None, "y0": None, "th0": None, "e0": 0.0,
+              "abs_yaw": req.get("abs_yaw"),
               "v_max": req["v_max"], "w_max": req["w_max"], "turn_kp": req["turn_kp"]}
         # Hard-abort timer: move_timeout floors it, but a long request needs
         # proportionally longer (a 5 m crawl at 0.12 m/s is 42 s on its own; the
         # P-law turn averages well under its w_max cap).
         est = (abs(req["dist"]) / max(req["v_max"], 0.01)
                + abs(math.radians(req["deg"])) / max(req["w_max"] * 0.5, 0.01))
+        if req.get("abs_yaw") is not None:
+            est = max(est, abs(_wrap_angle(req["abs_yaw"] - pose[2]))
+                      / max(req["w_max"] * 0.5, 0.01))
         timeout = max(req["timeout"], 1.5 * est + 5.0)
         t0 = time.monotonic()
         dt = 1.0 / MOVE_CTRL_HZ
@@ -1151,18 +1225,19 @@ class WebServerNode(Node):
             if cancelled:
                 result = {"status": "cancelled"}
                 break
-            odo = self.telemetry._odom
+            pose = self._man_pose(frame)
             now = time.monotonic()
             if self.telemetry._clients > 0:
                 last_browser = now
-            if (odo is None or now - t0 > timeout
+            if (pose is None or now - t0 > timeout
                     or now - last_browser > MOVE_BROWSER_GRACE):
                 result = {"status": "failed", "error": (
-                    "/odom lost" if odo is None else
+                    "/odom lost" if pose is None and frame == "odom" else
+                    "map TF lost" if pose is None else
                     "browser gone" if now - last_browser > MOVE_BROWSER_GRACE
                     else "timed out")}
                 break
-            v, w, done, prog, err = _maneuver_step(st, odo)
+            v, w, done, prog, err = _maneuver_step(st, pose)
             with self._drive_lock:
                 self._drive_v, self._drive_w = v, w
                 self._drive_at = time.monotonic()
@@ -1170,8 +1245,10 @@ class WebServerNode(Node):
             with self._man_lock:
                 self._maneuver_state = {
                     "active": True, "phase": "turning" if turning else "driving",
-                    "target": round(math.radians(req["deg"]), 3) if turning
-                              else req["dist"],
+                    "target": (round(req["abs_yaw"], 3)
+                               if turning and req.get("abs_yaw") is not None else
+                               round(math.radians(req["deg"]), 3) if turning
+                               else req["dist"]),
                     "unit": "deg" if turning else "m",
                     "progress": round(prog, 2), "err": round(err, 3)}
             if done:
@@ -1192,8 +1269,113 @@ class WebServerNode(Node):
             self._man_cancel = False
             self._maneuver_state = {"active": False, "phase": "done",
                                     "result": status, **(extra or {})}
-        self.get_logger().info(f"canned move {status}"
+        self.get_logger().info(f"{self._man_tag} {status}"
                                + (f" ({extra['error']})" if extra and extra.get("error") else ""))
+
+    # ---- arrival heading rotate (goal direction set on the web map) -----------
+    ARRIVE_ROT_TAG = "arrival heading"
+
+    def abort_arrival_rotate(self):
+        """Stop a running arrival-heading rotate (a new goal publish or ✕
+        Cancel owns the base now). No-op for user canned moves."""
+        with self._man_lock:
+            if self._man_running and self._man_tag == self.ARRIVE_ROT_TAG:
+                self._man_cancel = True
+
+    def arrival_heading_rotate(self, yaw):
+        """Rotate in place to the goal's requested map-frame heading (rad) once
+        Nav2 reports the goal reached. Nav2 Humble plans and drives to the goal
+        POSITION — the final heading is the plan's last path tangent, not the
+        goal's orientation — so a goal sent with a heading (the web map's
+        press-hold-drag aim gesture) gets this post-arrival canned turn. It
+        rides the SAME maneuver machinery as POST /move (rewrites the keepalive's
+        shared (v,w); the keepalive owns every byte on the wire) and refuses
+        quietly when anything else owns the base: a maneuver running, a busy
+        Nav2, or no slam-verified map pose (the dead-reckoned fallback is
+        display-only and never steers the robot)."""
+        tel = self.telemetry
+        with self._man_lock:
+            busy = self._man_running
+        if busy:
+            tel._navlog_add("arrival heading rotate skipped — a canned move is running")
+            return
+        if tel._goal_status not in ("arrived", "idle"):
+            return                              # nav took over again between ticks
+        pose = tel._tf_pose()
+        if pose is None or pose[3] != "tf":
+            tel._navlog_add("arrival heading rotate skipped — no slam-verified "
+                            "map pose (lidar parked / TF down)", "warn")
+            return
+        err = _wrap_angle(yaw - pose[2])
+        if abs(err) <= ARRIVE_ROT_EPS:
+            return                              # already facing it — nothing to do
+        with self._man_lock:
+            self._man_cancel = False
+            self._man_req = {
+                "dist": 0.0, "deg": 0.0, "abs_yaw": yaw, "frame": "map",
+                "tag": self.ARRIVE_ROT_TAG,
+                "v_max": float(self.get_parameter("move_lin_speed").value),
+                "w_max": float(self.get_parameter("move_ang_speed").value),
+                "turn_kp": float(self.get_parameter("move_turn_kp").value),
+                "timeout": float(self.get_parameter("move_timeout").value),
+            }
+        self._man_wake.set()
+        tel._navlog_add(f"arrival heading rotate to {math.degrees(yaw):.0f}° "
+                        f"(err {math.degrees(err):+.0f}°)")
+        self.get_logger().info(
+            f"arrival heading rotate to {math.degrees(yaw):.0f}° "
+            f"(err {math.degrees(err):+.0f}°)")
+
+    # ---- pickup watch actions (lift-stop + release turn; telemetry.py drives) --
+    # The watch itself lives in telemetry (always-on 0.5 s tick + the suspension
+    # callbacks); these are the two actions it calls, on the executor thread.
+    def on_pickup_stop(self):
+        """Both wheels off the ground for pickup_stop_secs. Kill every motion
+        source: the braked stop (the SAME path as an explicit {0,0} POST —
+        cancels a running maneuver, arms the keepalive's BRAKE_GRACE zero window)
+        plus any Nav2 goal (both action servers), so a put-down can't resume
+        driving off. While latched (until the wheels are back down and the
+        release turn runs), drive()/move()/goal publishes are refused (the
+        gates read telemetry._pickup_latched)."""
+        self.drive({"v": 0.0, "w": 0.0})
+        self.cancel_goal()
+        self.get_logger().info(
+            "picked up — drive zeroed, maneuvers + nav goals cancelled")
+
+    def on_pickup_release(self, deg):
+        """Wheels back down after a pickup stop: the re-orientation turn (a
+        ~180° canned in-place rotation by default). Rides the SAME maneuver
+        machinery as POST /move — the keepalive stays the sole /cmd_vel
+        publisher. Returns False (telemetry keeps retrying) while anything else
+        owns the base; a queued turn is user-overridable (any drive/move cancels
+        it via cancel_pickup_spin)."""
+        tel = self.telemetry
+        with self._man_lock:
+            busy = self._man_running
+        if busy:
+            return False
+        if tel._goal_status in ("planning", "navigating", "canceling"):
+            return False
+        if tel._odom is None:
+            return False
+        with self._man_lock:
+            self._man_cancel = False
+            self._man_req = {
+                "dist": 0.0, "deg": float(deg), "tag": "pickup release",
+                "v_max": float(self.get_parameter("move_lin_speed").value),
+                "w_max": float(self.get_parameter("move_ang_speed").value),
+                "turn_kp": float(self.get_parameter("move_turn_kp").value),
+                "timeout": float(self.get_parameter("move_timeout").value),
+            }
+        self._man_wake.set()
+        self.get_logger().info(f"pickup release — {deg:.0f}° re-orientation turn")
+        return True
+
+    def pickup_release_giveup(self):
+        """The release turn expired (base busy / no odom) — nothing more to do;
+        telemetry already re-enabled drives. Logged for the record."""
+        self.get_logger().warning(
+            "pickup release turn gave up — robot re-enabled without the turn")
 
     # ---- canned-move speed config (GET/POST /move/config) --------------------
     # The /move cruise + turn caps as live Drive-card sliders. Values persist to
@@ -1534,6 +1716,31 @@ class WebServerNode(Node):
                 self.get_logger().warning("lds: could not persist spin-down config")
         except Exception as e:
             self.get_logger().warning(f"lds: could not persist spin-down config: {e!r}")
+        return SetParametersResult(successful=True)
+
+    # ---- persisted pickup-watch settings (the lds.json pattern) --------------
+    # The Coprocessor card's Lift-stop toggle + "stop after" slider arrive via
+    # POST /param; one on-set-parameters callback snapshots the cluster to
+    # pickup_settings_path so a change survives a restart/reboot.
+    def _pickup_settings_file(self):
+        p = self.get_parameter("pickup_settings_path").value
+        return p or os.path.expanduser("~/.local/state/nanobot/pickup.json")
+
+    def _persist_pickup_params(self, params):
+        """on-set-parameters callback for the pickup-watch cluster. Runs BEFORE
+        the values are applied; never vetoes (rclpy combines the results)."""
+        names = {p.name for p in params}
+        if not names.intersection(PICKUP_PERSIST_KEYS):
+            return SetParametersResult(successful=True)
+        try:
+            snap = {k: self.get_parameter(k).value for k in PICKUP_PERSIST_KEYS}
+            for p in params:
+                if p.name in snap:
+                    snap[p.name] = p.value
+            if not write_json(self._pickup_settings_file(), snap):
+                self.get_logger().warning("pickup: could not persist config")
+        except Exception as e:
+            self.get_logger().warning(f"pickup: could not persist config: {e!r}")
         return SetParametersResult(successful=True)
 
     # ---- persisted TTS settings ---------------------------------------------
@@ -2025,6 +2232,10 @@ class WebServerNode(Node):
         """The core's `publish_action` adapter: turn a skill's `action` into a clamped ROS
         message on a whitelisted topic and publish it. Returns (ok, human-readable detail).
         Never raises on bad input. (Gating + logging live in the core's _do_topic_skill.)"""
+        if getattr(self.telemetry, "_pickup_latched", False):
+            # Picked up: no skill may drive/aim the robot (the lift-stop's refusal
+            # covers web drives/moves/goals; this covers the autonomous tier).
+            return False, "picked up — action skill suppressed"
         topic = str(action.get("topic") or "").strip()
         pub = self._skill_pubs.get(topic)
         if pub is None:
@@ -2174,13 +2385,27 @@ class WebServerNode(Node):
 
     def _on_susp_l(self, msg: Bool):
         self._susp_l = bool(msg.data)
+        self._note_susp()
 
     def _on_susp_r(self, msg: Bool):
         self._susp_r = bool(msg.data)
+        self._note_susp()
 
     def _on_pickup_override(self, msg: Int8):
         v = int(msg.data)
         self._susp_override = v if v in (0, 1) else -1
+        self._note_susp()
+
+    def _note_susp(self):
+        """Feed telemetry's pickup watch (lift-stop + release turn). The gateway
+        is constructed after these subscriptions, and a dev/fake node has none —
+        guard both. Cheap: the 0.5 s tick re-evaluates with the stored values."""
+        tel = getattr(self, "telemetry", None)
+        if tel is not None:
+            try:
+                tel.note_pickup(self._susp_l, self._susp_r, self._susp_override)
+            except Exception:
+                pass
 
     def _susp_eff(self):
         """Effective off-ground switch pair, honoring the /pickup_override test hook."""
@@ -2833,17 +3058,39 @@ class WebServerNode(Node):
         self.get_logger().info("POST /nav/cancel (web)")
         return {"ok": True}
 
+    def _build_poses_goal(self, poses):
+        """One NavigateThroughPoses.Goal from [(x, y), ...] (map frame, stamped
+        now, position-only orientation). Shared by POST /nav/waypoints and the
+        waypoint-loop restart."""
+        now = self.get_clock().now().to_msg()
+        goal = NavigateThroughPoses.Goal()
+        for x, y in poses:
+            ps = PoseStamped()
+            ps.header.frame_id = "map"
+            ps.header.stamp = now
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            ps.pose.orientation.w = 1.0
+            goal.poses.append(ps)
+        return goal
+
     def nav_waypoints(self, d):
-        """POST /nav/waypoints {points: [{x,y},...]}: multi-waypoint navigation —
-        publish the ordered stops as ONE NavigateThroughPoses action goal (the
-        default through-poses tree consumes PoseArray natively). Bounded by the
-        same ±12 m clamp as a single goal; ≥1 point. The lidar pre-wake +
-        mirror bookkeeping mirror the single-goal path."""
+        """POST /nav/waypoints {points: [{x,y},...], loop?: bool}: multi-waypoint
+        navigation — publish the ordered stops as ONE NavigateThroughPoses
+        action goal (the default through-poses tree consumes PoseArray
+        natively). Bounded by the same ±12 m clamp as a single goal; ≥1 point.
+        With loop=True the tour repeats (telemetry re-sends it via
+        restart_waypoint_loop every time bt_navigator reports SUCCEEDED; a
+        cancel/failure stops the loop). The lidar pre-wake + mirror
+        bookkeeping mirror the single-goal path."""
         pts_in = (d or {}).get("points")
         if not isinstance(pts_in, list) or not pts_in:
             return {"error": "no points given"}
         if len(pts_in) > NAV_WAYPOINT_MAX:
             return {"error": f"too many waypoints (max {NAV_WAYPOINT_MAX})"}
+        if getattr(self.telemetry, "_pickup_latched", False):
+            return {"error": "robot is picked up — waypoints refused"}
+        loop = bool((d or {}).get("loop"))
         poses = []
         for p in pts_in:
             try:
@@ -2856,21 +3103,30 @@ class WebServerNode(Node):
             return {"error": "bt_navigator not reachable (is nano-nav up?)"}
         # Pre-wake: never let Nav2 plan against slam's frozen map->odom TF.
         self.telemetry.wake_lidar(reason="the waypoints")
-        goal = NavigateThroughPoses.Goal()
-        for x, y in poses:
-            ps = PoseStamped()
-            ps.header.frame_id = "map"
-            ps.header.stamp = self.get_clock().now().to_msg()
-            ps.pose.position.x = x
-            ps.pose.position.y = y
-            ps.pose.orientation.w = 1.0
-            goal.poses.append(ps)
+        goal = self._build_poses_goal(poses)
         self._nav_poses_client.send_goal_async(goal)
-        self.telemetry.note_waypoints(poses, source="web waypoints")
+        self.telemetry.note_waypoints(poses, source="web waypoints", loop=loop)
         self.get_logger().info(
-            "POST /nav/waypoints %d stops: %s" % (
-                len(poses), " → ".join(f"({x:.2f},{y:.2f})" for x, y in poses)))
-        return {"ok": True, "n": len(poses)}
+            "POST /nav/waypoints %d stops%s: %s" % (
+                len(poses), " (loop)" if loop else "",
+                " → ".join(f"({x:.2f},{y:.2f})" for x, y in poses)))
+        return {"ok": True, "n": len(poses), "loop": loop}
+
+    def restart_waypoint_loop(self, poses):
+        """Re-send a looped waypoint tour (called by telemetry._on_goal_status
+        on the EXECUTOR thread every time the tour reaches SUCCEEDED). Strictly
+        non-blocking: no wait_for_server (the server just serviced a goal on
+        this client), send_goal_async only. A picked-up robot drops the loop
+        instead of navigating from the user's hand."""
+        if getattr(self.telemetry, "_pickup_latched", False):
+            self.telemetry._navlog_add(
+                "waypoint loop stopped — robot picked up", "warn")
+            return
+        self.telemetry.wake_lidar(reason="the next waypoint lap", wait=False)
+        goal = self._build_poses_goal(poses)
+        self._nav_poses_client.send_goal_async(goal)
+        self.telemetry.note_waypoints(poses, source="waypoint loop", loop=True)
+        self.get_logger().info("waypoint loop: re-sending %d stops" % len(poses))
 
     def clear_map(self):
         """POST /map/clear: wipe the SLAM map = restart nano-slam (web Map card).

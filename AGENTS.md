@@ -1587,6 +1587,43 @@ reliable"). Rebuilt as THREE coordinated pieces:
   stay ≤3-4 Hz. (If higher rates are ever needed: raise the serial baud on BOTH
   ends — router config `serial//dev/ttyS1#baudrate=…` + firmware UART2 — noted in
   docs/TODO.md.)
+### Pickup lift-stop + release turn (2026-09-28)
+
+- **The behaviour:** both wheels' off-ground microswitches read UP continuously for
+  `pickup_stop_secs` (5 s default) ⇒ the robot is **picked up** — everything stops:
+  a braked stop (the SAME path as an explicit `{0,0}` POST — cancels a running
+  maneuver, arms the keepalive's `BRAKE_GRACE` zero window), maneuvers cancelled, and
+  ANY Nav2 goal cancelled (both action servers via `cancel_goal`), so a put-down can't
+  resume driving off. While latched, new motion is REFUSED: `POST /drive` (non-zero),
+  `POST /move`, `/goal_pose` publishes (map clicks, Locations Go — gated in
+  `telemetry.publish_json`), `/nav/waypoints`, and ALL skill actions
+  (`_publish_skill_action` — covers the autonomous tier too). When both wheels read
+  grounded again for a 1 s debounce (`RELEASE_CONFIRM_SECS`, switch-bounce), the robot
+  does a **~180° in-place re-orientation turn** (`pickup_spin_deg`) — riding the SAME
+  maneuver machinery as POST /move (the keepalive stays the sole `/cmd_vel` publisher;
+  `_man_req` tag `"pickup release"`). The queued turn is user-overridable: any explicit
+  drive/move POST cancels it (`telemetry.cancel_pickup_spin`) — a courtesy, not a lock.
+- **Ownership:** the decision lives in **`telemetry.py`** (pure state machine in
+  **`pickup_watch.py`**, unit-tested in `test_pickup_watch.py`; hub wiring tests in the
+  same file): web_server's ALWAYS-ON suspension callbacks (`_on_susp_l/r/override`)
+  call `telemetry.note_pickup`, and an always-on **0.5 s** `_pickup_ctrl_tick`
+  re-evaluates (the 5 s latch + release confirm fire on timer boundaries even between
+  the ESP32's on-change + 1 Hz heartbeat messages) and retries the release turn until
+  the base is free or `PICKUP_SPIN_GIVEUP` (30 s) expires — then the latch clears (a
+  stuck base must not leave the robot drive-refused forever). It works with the page
+  closed, honors the **`/pickup_override`** test hook (force up from the web
+  Coprocessor card = a full test path: stop fires, force down → 180° turn), and
+  logging is all in the **Nav log** (picked up / turn queued / started / gave up /
+  cancelled).
+- **Tunables (web Coprocessor card):** "Lift stop" toggle (`pickup_stop_enable`) +
+  "Stop after N s up" slider (`pickup_stop_secs`, 1-30 s) + `pickup_spin_deg` (param
+  only, no slider) — all whitelisted in `PARAM_WHITELIST`, live via POST /param, and
+  PERSISTED to `~/.local/state/nanobot/pickup.json` via the lds.json
+  on-set-parameters-callback pattern (`_persist_pickup_params`, boot re-apply BEFORE
+  the TelemetryHub is constructed; delete the file to return to robot.yaml).
+  Frame contract: additive **`f.pickup`** `{enable, secs, latched, up, up_for,
+  pending}` (smoke test pins it; the card's controls re-seed from it once, and the
+  "lift stop" kv row shows ready/up Ns/STOPPED (lifted)/turning/off).
 ### Text-to-speech (TTS)
 
 - **Text-to-speech** (`tts.py`): `POST /tts {text,voice?}` synthesises with
@@ -1717,6 +1754,20 @@ keepout bullet below). Everything else verified live.
   (`number_of_poses_remaining`) refines additive `f.nav.wp_index`/`wp_total`. UI:
   Waypoints card beside Locations (Add-by-map-click toggle, numbered rings —
   current glows, ↑/↓/✕ ordered list, Go/Clear; mapCancel clears).
+  **LOOP mode (2026-09-28, user ask): `{points, loop:true}` makes the tour a
+  patrol** — telemetry keeps the sent stops (`_wp_list`) + the flag (`_wp_loop`,
+  additive frame key `f.nav.loop` → the Waypoints card's 🔁 badge, survives a
+  page reload), and on every SUCCEEDED (code 4) `_on_goal_status` re-sends the
+  same list via `web_server.restart_waypoint_loop(poses)` (the arrival-rotate
+  pattern: executor-thread, strictly non-blocking — `send_goal_async` only, the
+  server just serviced a goal; `wake_lidar(wait=False)` safety; refused while
+  picked up). **Any terminal state ends the loop** — CANCELED/ABORTED stop it
+  (a blocked route must not retry forever), and `note_goal` (ANY single-goal
+  publish: map click, Locations Go, skill go-to) kills it too, so a replacement
+  goal's own success can't resurrect the tour; `/nav/cancel` + `/map/clear`
+  clear it as well. Each lap's duration lands in the Nav log (`goal reached in
+  Xs`), and loop start/stop events are logged there too. Loop state is
+  in-memory (not persisted) — a stack restart ends it.
 - **`/plan` polyline**: telemetry lazily subs `/plan` (VOLATILE d1), downsamples
   to 200 poses, `GET /plan` serves `JSON{n,t}+\n+float32[x,y…]` (503 pre-first-
   plan); additive `f.nav.plan_age`; the Map card's **Plan** toggle draws a cyan
@@ -1738,7 +1789,7 @@ keepout bullet below). Everything else verified live.
   `.bak`) before the nano-slam restart, so the clear heal still works.
 
 **New frame keys (additive):** `f.nav.pose_src`, `f.nav.wp_index`, `f.nav.wp_total`,
-`f.nav.plan_age`. **New routes:** `GET /plan`, `GET /keepout`,
+`f.nav.plan_age`, `f.nav.loop` (waypoint patrol mode). **New routes:** `GET /plan`, `GET /keepout`,
 `POST /keepout/save|delete|clear`, `POST /nav/waypoints`, `POST /map/save`.
 
 **SLAM rotation-smear tuning (2026-09-19, live-verified):** the first slam_toolbox map came out
@@ -1767,6 +1818,7 @@ RPP cap, skill motion) tied to the `w·0.2 rad/scan` smear budget, and note the 
 - **Page (index.html)**: `#view-map` hero canvas + a trimmed `#ctlMap` hero card (Motion toggle, status chip, ✕ Cancel, Sharp-walls toggle, **feeds-health strip**) + a Sensors "Map (Nav2)" readout card + a rebuilt **Locations card** ("Save spot" with NO x/y falls back server-side to the TF pose; Go publishes like a click). The map IIFE ports the deleted panel: zoom/pan/pinch, click-to-goal (`panMoved` suppression, y-flip), sharp/linear wall shading (≥70 = solid black), trail + robot + goal overlays, an **inflation bubble** (ORANGE dashed circle, radius = `f.nav.inflation` — live from web_control's `nav_inflation_m` param, see the Nav2 pace block below), a **robot footprint circle** (translucent red, radius = `f.nav.robot_radius` = ⌀/2), and a click-feedback ring.
 - **Feeds-health strip (`#mapFeeds`, added 2026-09-17)**: five green/red dots in the Map card — `ESP32 · LDS · Odom · TF · SLAM` — one per link in the map-building chain, so a not-building map pinpoints the broken feed without shell access: **ESP32** = `f.esp.hb_age` < 3 s (heartbeat flowing); **LDS** = `f.lds.rpm` > 0 AND `f.lds.age` < 3 s (spin motor turning, `/lds_*` fresh — the age catches a dead ESP32 link whose last rpm lingers); **Odom** = `f.pipeline.feeds.odom` starts with "ok" (sys_monitor's pipeline watcher); **TF** = `f.nav.tf_laser` != null (the static `base_link→laser` TF resolves → nano-tf up; one extra tf2 lookup per tick, same lazy buffer as `_tf_pose`); **SLAM** = `f.nav.map_age` < 10 s (`/map` arriving — covers slam_toolbox itself AND the whole TF chain, since slam_toolbox drops scans on a missing TF and then publishes nothing). Diagnosis table: ESP32 red → power-cycle the coprocessor (documented wedge); LDS red + ESP32 green → set Spin target ≠ 0 on the Lidar card; Odom red → `/wheel_ticks` not flowing; TF red → `systemctl restart nano-tf`; SLAM red with all others green → `systemctl restart nano-slam`.
 - **Motion toggle semantics (deliberate):** a map click with Motion OFF only marks the goal locally (browse mode — an accidental tap can't move the robot); Motion ON publishes `/goal_pose` and Nav2 drives. Locations **Go** is never gated (explicit intent).
+- **Goal arrival heading (press-hold-drag aim, added 2026-09-28):** on the map hero, a **press held ~0.4 s then dragged** sets the goal's DIRECTION (RViz-style: press point = position, drag = heading, release = send; a quick drag still pans, a tap still = a position-only goal, and the aim never fires in keep-out or waypoint mode). The page publishes `{x, y, theta}` (rad, map frame) on `/goal_pose`; `_mk_goal` encodes theta into the pose quaternion (wrapped ±π), `note_goal(theta=…)` mirrors it as `f.nav.goal_yaw` (additive key — the goal ring draws a direction arrow, also restored after a page reload), and the Nav log names the heading. **The robot arrives FACING the set heading via an in-place rotate**: Humble's planners/RPP drive to the goal POSITION only (final heading = the plan's last tangent), so when the action status hits SUCCEEDED with a latched heading, telemetry's `_on_goal_status` calls `web_server.arrival_heading_rotate(yaw)` — a canned turn to the ABSOLUTE map-frame yaw riding the same maneuver machinery as POST /move (`_maneuver_step` gained `abs_yaw` + the loop a `frame:"map"` pose source = `telemetry._tf_pose`); it refuses without a slam-verified pose (`pose_src != "tf"` — the dead-reckon fallback never steers), while another maneuver runs, or within 3° (`ARRIVE_ROT_EPS`), and progress shows in `f.move` (turning → heading°). A new goal publish or ✕ Cancel aborts a running rotate (`note_goal`/`clear_goal` → `abort_arrival_rotate`, tagged runs only — user canned moves are never touched). Unit-tested in `test_nav_telemetry.py` (theta ingest/mirror/rotate trigger) + `test_maneuver.py` (abs-yaw turn, map-frame loop, rotate guards).
 - **Sim removed (2026-09-16):** the in-browser Sim tab/`sim.js` were deleted (the dev sim was the last consumer of the removed fetch overrides). Dev-PC testing is `scripts/dev_webui.py` (page + cognition, no ROS) — the Lidar/Map hero views render only on the robot now.
 - **Deliberate omissions:** no server-side wall guard (Nav2's costmap enforces keep-away; the bubble + robot circle are live mirror visuals of the costmap geometry — radius/robot-radius read from web_control's `nav_inflation_m`/`nav_robot_diam_m` params each tick, which the Navigation pace card's Keep-away/Robot-size sliders set and push to the costmaps LIVE, 2026-09-23; robot.yaml's two defaults should stay in step with nav2_params.yaml); no map Save buttons (map persistence is a `nano-slam` restart) — but the **✕ Clear-map button exists now** (added 2026-09-21): `POST /map/clear` (Drive tab's Map card) cancels any active goal, drops telemetry's cached grid + goal mirror (page shows mapWait), then runs `sudo -n systemctl restart nano-slam` **synchronously (20 s bound)** — 2.6.10 async mode has no clear service and no `map_file_name` is configured, so a restart IS the map clear. The sudo failure is REPORTED to the page (`{"ok":false,"error":...}` → the button alerts; fire-and-forget used to fail silently and slam kept republishing the old grid, which the 1 Hz poll pulled right back); the page's 503 `/map` poll now also re-shows mapWait + blanks the hero so a stale grid can't linger. It also arms `telemetry.note_map_clear()` — a lidar **rebuild window** (one `lds_idle_secs` period treated as recent motion) so a parked lidar wakes and the fresh map actually builds instead of slam sitting on no-map until someone drives. Needs the scoped sudoers rule (`deploy/sudoers/nano-power`, install via sbc-setup.sh or one `install -m 0440`); no no-go brush; Nav2 tuning is live for the velocity_smoother caps + the costmap zone geometry (the /nav/config sliders, see above) and restart-only for everything else in nav2_params.yaml. Nav2 doesn't expose a plan topic, so there is no plan polyline (the sim that drew one was removed 2026-09-16).
 - **Verify after deploy:** Map view renders → click with Motion ON → `/goal_pose` published (app log `POST /publish /goal_pose`) → chip idle→navigating→arrived; ✕ mid-nav → chip back to idle; Locations Save (robot parked) → list shows the spot → Go → Nav2 drives; `/map` 503 while `nano-slam` is down (graceful placeholder in the hero); ✕ Wipe → `ok:true` (or a sudo/sudoers alert) → nano-slam restarts → fresh grid builds from the woken lidar (2026-09-21, after the silent-sudo-failure bug); **Costmap toggle** → local shows the 2×2 m window tracking the robot, global shows the full inflated planning space (2026-09-22 — remember the lidar parks on a quiet robot and slam then publishes nothing: wake it via a Spin-slider drag or `POST /publish /lds_target_rpm` before expecting grids).

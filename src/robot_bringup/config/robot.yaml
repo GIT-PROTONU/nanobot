@@ -393,6 +393,19 @@ web_control:
     lds_idle_secs: 60.0       # s of quiet (no motion, no goal) before the spin-down
     lds_manual_secs: 300.0    # s a manual slider/skill post owns the topic
     lds_active_rpm: 300.0     # boot spin-when-active rpm (the slider re-syncs from the frame)
+    # Pickup watch (telemetry.py's 0.5 s always-on controller): both wheels' off-ground
+    # switches up for pickup_stop_secs = the robot is picked up — the drive is zeroed
+    # (braked stop), running maneuvers + Nav2 goals are cancelled, and new
+    # drives/moves/goals/skill actions are refused while latched. When both wheels are
+    # grounded again (~1 s debounce) the robot does a pickup_spin_deg in-place
+    # re-orientation turn (rides the canned-move machinery — the /cmd_vel keepalive
+    # stays the sole publisher). Honors the /pickup_override test hook (force up/down
+    # from the web Coprocessor card). Live-tunable via POST /param; the Coprocessor
+    # card's toggle + slider PERSIST to ~/.local/state/nanobot/pickup.json and WIN
+    # over these defaults on boot (the lds.json pattern; delete the file to revert).
+    pickup_stop_enable: true
+    pickup_stop_secs: 5.0     # s both wheels up before the stop fires
+    pickup_spin_deg: 180.0    # deg release re-orientation turn (CCW positive)
     # GPU vision (Mali-450/GLES2 via lima, gpu_vision.py): continuous on-device motion
     # detection ("PIR") + colour-blob tracking, off the camera feed. OFF by default —
     # when off, /stream.mjpg + /snapshot.jpg use the original hardware-MJPEG passthrough

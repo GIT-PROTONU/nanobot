@@ -129,7 +129,8 @@ def main():
             break
         check("telemetry frame arrives", first is not None)
         if first:
-            missing = [k for k in ("susp", "oled", "esp", "lds", "nav") if k not in first]
+            missing = [k for k in ("susp", "oled", "esp", "lds", "nav", "pickup")
+                       if k not in first]
             check("frame has base keys", not missing, f"missing={missing}")
             nav = first.get("nav") or {}
             # f.nav is a typed contract with the page's Map drawing: the
@@ -140,6 +141,19 @@ def main():
                   and isinstance(nav.get("robot_radius"), (int, float))
                   and nav["inflation"] >= 0 and nav["robot_radius"] > 0,
                   f"nav={nav}")
+            # f.nav.loop is the waypoint-loop mode's contract with the page's
+            # 🔁 badge (Waypoints card): present + bool (False before any tour).
+            check("frame f.nav carries the waypoint-loop flag",
+                  isinstance(nav.get("loop"), bool), f"nav={nav}")
+            # f.pickup is the lift-stop watch's contract with the Coprocessor
+            # card (toggle/slider seed from enable/secs; the row shows the latch).
+            pk = first.get("pickup") or {}
+            check("frame f.pickup carries the lift-stop state",
+                  isinstance(pk.get("enable"), bool)
+                  and isinstance(pk.get("secs"), (int, float))
+                  and isinstance(pk.get("latched"), bool)
+                  and isinstance(pk.get("up"), bool),
+                  f"pickup={pk}")
 
         st, body = req("POST", "/publish", {"topic": "/oled_face", "value": "happy"})
         check("publish whitelisted topic", st == 200 and b'"ok"' in body, body[:80])

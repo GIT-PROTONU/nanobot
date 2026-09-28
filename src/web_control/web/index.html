@@ -121,7 +121,10 @@
             <b>/map</b> (slam_toolbox republishes it every ~5 s). Scroll/pinch to zoom, drag to
             pan, ⤢ Fit recentres. <b>Tap the map to set a goal</b> — with <b>Motion</b> on the
             click publishes <b>/goal_pose</b> and Nav2 drives there (Motion off = browse-only, so
-            an accidental tap can't move the robot). <span class="map-dot robot"></span>red = robot,
+            an accidental tap can't move the robot). <b>Press-and-hold (~0.4 s), then drag, to
+            also set the arrival direction</b>: the press point is the goal, the drag sets its
+            heading (the arrow on the goal ring), and the robot turns to face it after arriving.
+            <span class="map-dot robot"></span>red = robot,
             <span class="map-dot goal"></span>yellow = goal, <span class="map-dot trail"></span>cyan =
             trail, orange dashed circle = the keep-away zone (the costmap's
             inflation radius — how close Nav2 will pass to walls; tunable via the
@@ -264,13 +267,18 @@
             <div class="chiprow">
               <label class="switch"><input type="checkbox" id="mapWaypoint"><span class="track"></span>
                 Add by map click</label>
+              <label class="switch"><input type="checkbox" id="wpLoop"><span class="track"></span>
+                Loop</label>
               <button id="wpGo" class="btn" style="display:none">▶ Go</button>
               <button id="wpClear" class="btn" style="display:none">✕ Clear</button>
+              <span id="wpLoopOn" class="navchip navigating" style="display:none">🔁 looping</span>
             </div>
             <div id="wpList"></div>
             <p class="hint">With <b>Add by map click</b> on, map taps drop numbered stops
               instead of setting a single goal. <b>Go</b> sends the whole ordered list as one
-              NavigateThroughPoses goal — the robot visits them in order. Cancel clears.</p>
+              NavigateThroughPoses goal — the robot visits them in order. With <b>Loop</b> on,
+              the tour repeats forever (patrol) until ✕ Cancel or a failure stops it; the
+              🔁 badge shows a live loop (survives a page reload). Cancel clears.</p>
           </div>
           <div class="card">
             <h2>Keep-out zones</h2>
@@ -312,6 +320,7 @@
               <span>temp</span><b id="espTemp">–</b>
               <span>hall</span><b id="espHall">–</b>
               <span>stray ticks L/R</span><b id="espStray">–</b>
+              <span>lift stop</span><b id="pickupState">–</b>
             </div>
             <button id="espResetTicks" class="btn">🔁 Reset ticks</button>
             <div class="field"><label>Wheel trim <span id="motorTrimV">0.00</span> <span id="motorTrimLive" class="live"></span></label>
@@ -369,6 +378,10 @@
                 <option value="0">force down — ignore pick-up</option>
                 <option value="1">force up — simulate pick-up</option>
               </select></div>
+            <label class="switch"><input type="checkbox" id="pickupStopEn" checked><span class="track"></span>
+              Lift stop</label>
+            <div class="field"><label>Stop after <span id="pickupStopSecsV">5</span> s up</label>
+              <input id="pickupStopSecs" type="range" min="1" max="30" step="1" value="5"></div>
             <p class="hint">Live from the ESP32 (zenoh-pico over UART). LDS spin telemetry
               + target rpm moved to the <b>Sensors tab's Lidar (LDS)</b> card. The override publishes
               <b>/pickup_override</b> so pick-up-gated behaviour (mood reflex) can be tested
@@ -379,6 +392,12 @@
               (ground bounce, a loose signal wire), not real rotation. <b>Reset ticks</b>
               zeros both counters (and the stray counters) for a clean baseline —
               odometry re-seeds automatically so /odom doesn't jump.</p>
+            <p class="hint"><b>Lift stop</b>: both wheels off the ground for the set seconds
+              = the robot is picked up — everything stops (drive zeroed, maneuvers and Nav2
+              goals cancelled; new drives/moves/goals are refused). When both wheels are
+              grounded again it does a ~180° in-place re-orientation turn. Works with the
+              page closed; the toggle + seconds persist on the robot. Test it with the
+              <b>Wheels-up override</b> (force up → wait → force down).</p>
           </div>
         </section>
 
@@ -1516,7 +1535,15 @@ $("ldsRate").onchange=()=>setNodeRate("lds_driver",Number($("ldsRate").value));
 $("odoRate").oninput=()=>$("odoRateV").textContent=$("odoRate").value;
 $("odoRate").onchange=()=>setNodeRate("wheel_odometry",Number($("odoRate").value));
 // publish a navigation goal in the map frame (Nav2's bt_navigator navigates to it).
-function mapSetGoal(wx,wy){ pub("/goal_pose",{x:wx,y:wy}); mapGoal=[wx,wy]; }
+// theta (rad, map frame) is the optional arrival heading from the map's
+// press-hold-drag aim gesture: Nav2 drives to (x,y), then web_control rotates
+// the robot in place to theta once the goal is reached.
+function mapSetGoal(wx,wy,theta){
+  const v={x:wx,y:wy};
+  if(theta!=null) v.theta=theta;
+  pub("/goal_pose",v);
+  mapGoal=[wx,wy,theta!=null?theta:null];
+}
 // Lidar spin-speed setpoint -> /lds_target_rpm (Float32) on the ESP32. The web
 // gateway's idle controller owns the topic (spin-while-active, park after
 // `lds idle secs`); dragging the slider publishes the target AND latches a 5-min
@@ -1536,6 +1563,12 @@ $("ldsIdleSecs").onchange=()=>setParam("web_control","lds_idle_secs",Number($("l
 // Wheels-up test override -> /pickup_override (Int8, latched): -1 auto, 0 down, 1 up.
 $("pickupOv").onchange=()=>publishPickupOv();
 function publishPickupOv(){ pub("/pickup_override",Number($("pickupOv").value)); }
+// Lift stop: both wheels up for N s = picked up (telemetry.py's pickup watch zeroes
+// the drive and cancels goals); wheels back down -> a ~180° re-orientation turn.
+// Tune it live (web_control params, whitelisted in telemetry.py; persisted robot-side).
+$("pickupStopEn").onchange=()=>setParam("web_control","pickup_stop_enable",$("pickupStopEn").checked);
+$("pickupStopSecs").oninput=()=>$("pickupStopSecsV").textContent=$("pickupStopSecs").value;
+$("pickupStopSecs").onchange=()=>setParam("web_control","pickup_stop_secs",Number($("pickupStopSecs").value));
 // Zero the ESP32's raw + stray tick counters (bench calibration / clearing a stray-tick
 // count after fixing a wiring issue); wheel_odometry re-seeds itself off the same topic
 // so /odom doesn't jump.
@@ -1989,6 +2022,7 @@ function onFrame(f){
   if(f.move) onMove(f.move);
   onEsp(f.esp||{}, f.susp||[]);
   onLds(f.lds||{});
+  if(f.pickup) onPickup(f.pickup);
   if(f.fan!==undefined) $("fanDuty").textContent=(f.fan*100).toFixed(0)+"%";
   onVision(f.vision);
   // IMU mag readout for eyeballing calibration quality (see the IMU card's hint) +
@@ -2026,7 +2060,11 @@ function onFrame(f){
     }
     const cancel=$("mapCancel");
     if(cancel) cancel.style.display=(f.nav.goal && (f.nav.status==="planning"||f.nav.status==="navigating"))?"":"none";
-    if(f.nav.goal) mapGoal=f.nav.goal;       // adopt the server's goal mirror (clicks set it locally first)
+    // Waypoint loop badge (server truth, additive key): a looped tour repeats
+    // until cancelled/failed — show it so a reloaded page can still see it.
+    const wpl=$("wpLoopOn");
+    if(wpl) wpl.style.display=f.nav.loop?"":"none";
+    if(f.nav.goal) mapGoal=[...f.nav.goal, f.nav.goal_yaw??null];   // adopt the server's goal mirror (clicks set it locally first); yaw = the arrival-heading arrow
     // Feeds-health strip (Map card): one dot per link in the map-building
     // chain — green = OK, red = down, grey = no data yet. Pinpoints which
     // feed broke when the map stops growing: ESP32 (heartbeat), LDS (spin),
@@ -2184,6 +2222,9 @@ const HINTS = {
   imuBandwidth: "The BWT901CL's own internal analog low-pass filter on accel/gyro (separate from the publish-rate slider above). Lower rejects more motor/chassis vibration noise at the source, at the cost of response lag. Try 10 Hz if readings are noisy even while genuinely stationary.",
   imuInterferenceStart: "Automates the mounting-interference hunt: while parked, cycles the LDS spin / cooling fan / LED (and optionally a brief motor wiggle) one at a time and scores each one's magnetometer disturbance, worst first -- no more holding the loose IMU near each part by hand. Runs on its own publishers regardless of skills_allow_actions (that flag only gates AUTONOMOUS skills) -- this WILL actuate the LDS/fan/LED and, if checked, briefly turn the robot.",
   imuInterferenceStop: "Cancel a running interference self-test and restore every actuator (fan/LED/motors) to its resting state.",
+  pickupStopEn: "Lift stop: both wheels' off-ground switches read UP continuously for the set seconds = the robot is picked up -- the drive is zeroed, any running maneuver and Nav2 goal is cancelled, and new drives/moves/goals are refused. When both wheels are grounded again (after a short settle), the robot does a ~180-degree in-place re-orientation turn. Works with the page closed; the setting persists on the robot. Test off the ground with the Wheels-up override.",
+  pickupStopSecs: "How long BOTH wheels must be off the ground before the lift stop fires. Short = reacts quickly (a real pickup always lifts both wheels together); long = immune to briefly tipping over an edge. The release turn fires when both wheels are grounded again for ~1 s (switch-bounce debounce).",
+  pickupState: "Live lift-stop watch: 'ready' = grounded and armed; 'up Ns' = both wheels off the ground, counting toward the stop; 'STOPPED (lifted)' = picked up -- everything stopped and motion is refused; 'turning' = the release re-orientation turn is running/queued; 'off' = the watch is disabled.",
   imuInterferenceMotor: "Add a brief in-place turn as a 4th test phase. Mag magnitude is rotation-invariant so it still attributes cleanly; this phase is scored on yaw wobble instead of the stationary-only mag-noise numbers the other phases use.",
 };
 function applyHints(on){
@@ -2559,6 +2600,25 @@ function suspTxt(id,val){
   if(val===true){ el.textContent="UP (suspended)"; el.style.color="var(--amber)"; }
   else if(val===false){ el.textContent="down"; el.style.color="var(--green)"; }
   else { el.textContent="–"; el.style.color=""; }
+}
+// Lift-stop watch state (f.pickup): the card's toggle/slider re-seed once from the
+// persisted values (the f.lds pattern); the row shows the live latch + both-up timer.
+let pickupCtlSynced=false;
+function onPickup(p){
+  if(p.enable!=null && !pickupCtlSynced){
+    pickupCtlSynced=true;
+    $("pickupStopEn").checked=!!p.enable;
+    const s=Math.round(p.secs);
+    $("pickupStopSecs").value=String(s);
+    $("pickupStopSecsV").textContent=s;
+  }
+  const el=$("pickupState");
+  if(p.enable===false){ el.textContent="off"; el.style.color=""; }
+  else if(p.latched){ el.textContent="STOPPED (lifted)"; el.style.color="var(--red)"; }
+  else if(p.up){ el.textContent="up "+((p.up_for!=null)?p.up_for.toFixed(0):0)+"s";
+                 el.style.color="var(--amber)"; }
+  else if(p.pending){ el.textContent="turning"; el.style.color="var(--amber)"; }
+  else { el.textContent="ready"; el.style.color="var(--green)"; }
 }
 // Heartbeat liveness: the counter ticks ~1 Hz; if it stops advancing the link is down.
 setInterval(()=>{
@@ -3593,11 +3653,33 @@ connect();   // auto-connect on load
       navTrail.forEach((pt,i)=>{ const [x,y]=W2P(pt[0],pt[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
       ctx.stroke(); ctx.globalAlpha=1;
     }
-    // goal marker (yellow ring)
+    // goal marker (yellow ring) + its requested arrival heading (the arrow —
+    // mapGoal[2] rad, from the aim gesture or f.nav.goal_yaw after a reload).
+    // Screen angle = -world yaw (the canvas y axis points down).
+    const drawArrow=(x,y,ang,len)=>{
+      const ex=x+Math.cos(ang)*len, ey=y+Math.sin(ang)*len;
+      ctx.strokeStyle="#ffd60a"; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(ex,ey);
+      ctx.moveTo(ex,ey); ctx.lineTo(ex-Math.cos(ang-0.5)*6, ey-Math.sin(ang-0.5)*6);
+      ctx.moveTo(ex,ey); ctx.lineTo(ex-Math.cos(ang+0.5)*6, ey-Math.sin(ang+0.5)*6);
+      ctx.stroke();
+    };
     if(mapGoal){
       const [gx,gy]=W2P(mapGoal[0],mapGoal[1]);
       ctx.strokeStyle="#ffd60a"; ctx.lineWidth=1.5;
       ctx.beginPath(); ctx.arc(gx,gy,5,0,6.2832); ctx.stroke();
+      if(mapGoal[2]!=null) drawArrow(gx,gy,-mapGoal[2],16);
+    }
+    // goal-direction aim in progress: the press ring (the goal position) +
+    // a dashed guide to the pointer (the heading being aimed).
+    if(aim){
+      const [ax,ay]=W2P(aim.wx,aim.wy);
+      const [px,py]=W2P(...koWorld(aim.hx,aim.hy));
+      ctx.strokeStyle="#ffd60a"; ctx.lineWidth=1.5; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(px,py); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(ax,ay,7,0,6.2832); ctx.stroke();
+      if(aim.th!=null) drawArrow(px,py,Math.atan2(py-ay,px-ax),10);
     }
     // waypoint stops (numbered yellow rings) — the collected multi-waypoint
     // list while it's being built; the CURRENT one (f.nav.wp_index) glows.
@@ -3686,6 +3768,12 @@ connect();   // auto-connect on load
   // pan with one pointer, pinch-zoom with two. Capture on the canvas so the
   // subsequent click still targets cv (click-to-goal), not the wrap container.
   let panDrag=false, panMoved=false, pdsx=0,pdsy=0,pdpx=0,pdpy=0, pinch=null;
+  // Goal-direction aim (RViz-style): a press held ~0.4 s on the map becomes a
+  // heading gesture — the press point is the goal, dragging sets its heading,
+  // release sends {x, y, theta} (a quick drag stays a pan; a tap stays a
+  // position-only goal). Works with Motion off too (local marker, no publish).
+  const AIM_HOLD_MS=420, AIM_MIN_PX=12;
+  let aimPend=null, aimTimer=null, aim=null, aimConsumed=false;
   const pointers=new Map();
   // Keep-out editing (kept here because the drag math is the pan machinery's
   // neighbour). When #mapKeepout is on, the pointer works on the zones:
@@ -3746,6 +3834,7 @@ connect();   // auto-connect on load
   }
   cv.addEventListener("pointerdown",e=>{
     pointers.set(e.pointerId,[e.clientX,e.clientY]);
+    aimConsumed=false;                   // fresh gesture: the next click is a real one
     if($("mapKeepout").checked && pointers.size===1 && lastMeta){
       const rect=cv.getBoundingClientRect();
       const sx=e.clientX-rect.left, sy=e.clientY-rect.top;
@@ -3780,12 +3869,39 @@ connect();   // auto-connect on load
       return;
     }
     if(pointers.size===2){
+      if(aimTimer){ clearTimeout(aimTimer); aimTimer=null; }   // a 2nd finger = pinch, not aim
+      aimPend=null;
+      if(aim){ aim=null; repaint(); }
       const [[ax,ay],[bx,by]]=[...pointers.values()];
       pinch={d:Math.hypot(bx-ax,by-ay), mx:(ax+bx)/2, my:(ay+by)/2};
-    } else { panDrag=true; panMoved=false; pdsx=e.clientX; pdsy=e.clientY; pdpx=panX; pdpy=panY; }
+    } else {
+      panDrag=true; panMoved=false; pdsx=e.clientX; pdsy=e.clientY; pdpx=panX; pdpy=panY;
+      // arm the hold-to-aim timer (cancelled by movement >4 px = a pan, a
+      // second pointer, or a quick release = a plain tap)
+      if(lastMeta && !$("mapWaypoint").checked){
+        const [wx,wy]=koWorld(e.clientX,e.clientY);
+        aimPend={x:e.clientX,y:e.clientY};
+        aimTimer=setTimeout(()=>{
+          aimTimer=null;
+          if(pointers.size!==1||!aimPend) return;
+          aim={wx,wy,x:aimPend.x,y:aimPend.y,hx:aimPend.x,hy:aimPend.y,th:null};
+          aimPend=null; panDrag=false;                 // aim owns the pointer now
+          repaint();
+        },AIM_HOLD_MS);
+      }
+    }
     cv.setPointerCapture(e.pointerId);
   });
   cv.addEventListener("pointermove",e=>{
+    if(aim){                             // heading drag: aim from the press point
+      aim.hx=e.clientX; aim.hy=e.clientY;
+      const [wpx,wpy]=koWorld(e.clientX,e.clientY);
+      aim.th=Math.atan2(wpy-aim.wy, wpx-aim.wx);
+      repaint(); return;
+    }
+    if(aimTimer && aimPend && Math.hypot(e.clientX-aimPend.x,e.clientY-aimPend.y)>4){
+      clearTimeout(aimTimer); aimTimer=null; aimPend=null;   // moving early = a pan
+    }
     if(koDrag){
       const [wx,wy]=koWorld(e.clientX,e.clientY);
       const z=koZones[koDrag.i];
@@ -3835,6 +3951,20 @@ connect();   // auto-connect on load
   });
   const upPtr=e=>{
     pointers.delete(e.pointerId);
+    if(aimTimer){ clearTimeout(aimTimer); aimTimer=null; }
+    aimPend=null;
+    if(aim){
+      const a=aim; aim=null;
+      if(Math.hypot(a.hx-a.x,a.hy-a.y)>=AIM_MIN_PX && a.th!=null){
+        aimConsumed=true;                // the trailing click would re-place it position-only
+        flash={x:a.wx,y:a.wy,t:performance.now()};
+        if($("mapMotion").checked) mapSetGoal(a.wx,a.wy,a.th);   // publish + drive
+        else mapGoal=[a.wx,a.wy,a.th];   // browse-only marker with the heading
+        repaint();
+      }
+      // a short hold released without a real drag falls through to the click
+      // handler = a plain position-only goal (aim never consumed it)
+    }
     if(koDrag){
       const g=koDrag; koDrag=null;
       if(g.mode==="draw"){
@@ -3997,6 +4127,7 @@ connect();   // auto-connect on load
   // Nav2's bt_navigator drives there.
   cv.addEventListener("click",e=>{
     if(!lastMeta) return;
+    if(aimConsumed){ aimConsumed=false; return; }   // an aim release just sent this goal
     if(panMoved){ panMoved=false; return; }   // a pan just ended, not a goal tap
     if($("mapKeepout").checked) return;       // keep-out draw mode: clicks paint, not goals
     const rect=cv.getBoundingClientRect();
@@ -4227,7 +4358,7 @@ connect();   // auto-connect on load
     if(!waypoints.length) return;
     try{
       const r=await fetch("/nav/waypoints",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({points:waypoints.map(w=>({x:w[0],y:w[1]}))})});
+        body:JSON.stringify({points:waypoints.map(w=>({x:w[0],y:w[1]})),loop:$("wpLoop").checked})});
       const j=await r.json();
       if(j.error){ alert("Waypoints failed: "+j.error); return; }
       mapGoal=[waypoints[waypoints.length-1][0], waypoints[waypoints.length-1][1]];

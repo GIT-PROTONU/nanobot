@@ -276,3 +276,127 @@ def test_clamp_move_cfg():
     # garbage is a ValueError (update_move_config turns it into an error reply)
     with pytest.raises(ValueError):
         ws._clamp_move_cfg("fast", 0.5)
+
+
+# ---- absolute turn target (the goal arrival-heading rotate) -----------------------
+def _run_abs(target, start=(0.0, 0.0, 0.0)):
+    """Integrate a pure rollout toward an ABSOLUTE yaw target (web_server's
+    arrival heading rotate). Returns the final pose."""
+    st = _st()
+    st["abs_yaw"] = target
+    pose = start
+    for _ in range(6000):
+        v, w, done, _p, _e = _maneuver_step(st, pose)
+        if done:
+            return pose
+        pose = (pose[0], pose[1], _wrap_angle(pose[2] + w * DT))
+    raise AssertionError("abs-yaw turn never finished")
+
+
+def test_turn_abs_yaw_takes_the_short_way_through_pi():
+    # -170° -> +170° is a 20° clockwise correction, not a 340° sweep
+    pose = _run_abs(math.radians(170), start=(0.0, 0.0, math.radians(-170)))
+    assert abs(_wrap_angle(pose[2] - math.radians(170))) <= MOVE_TURN_TOL + 1e-9
+
+
+def test_turn_abs_yaw_negative():
+    pose = _run_abs(math.radians(-90), start=(0.0, 0.0, math.radians(90)))
+    assert abs(_wrap_angle(pose[2] + math.pi / 2)) <= MOVE_TURN_TOL + 1e-9
+
+
+def test_run_maneuver_abs_yaw_map_frame(monkeypatch):
+    """The full loop on a fake node with a MAP-frame pose source: the arrival
+    heading rotate turns to the absolute yaw and stops exactly once."""
+    monkeypatch.setattr(ws, "MOVE_CTRL_HZ", 100000)
+    n = _fake_node()
+    target = math.radians(90)
+    yaw = [0.0]
+    n.telemetry._tf_pose = lambda: (0.0, 0.0, yaw[0], "tf")
+
+    def advance():                        # the map pose follows the commanded w
+        with n._drive_lock:
+            _v, w = n._drive_v, n._drive_w
+        yaw[0] = _wrap_angle(yaw[0] + w * DT)
+
+    real_step = ws._maneuver_step
+
+    def step_and_advance(st, pose):
+        out = real_step(st, pose)
+        advance()
+        return out
+
+    monkeypatch.setattr(ws, "_maneuver_step", step_and_advance)
+    n._run_maneuver({"dist": 0.0, "deg": 0.0, "abs_yaw": target, "frame": "map",
+                     "v_max": V_MAX, "w_max": W_MAX, "turn_kp": KP, "timeout": 30.0})
+    assert n._maneuver_state["result"] == "done"
+    assert abs(_wrap_angle(yaw[0] - target)) <= MOVE_TURN_TOL + 1e-9
+    assert n._maneuver_state["active"] is False
+    assert len(n._drive_pub.published) == 1          # the single direct stop
+
+
+# ---- arrival_heading_rotate / abort_arrival_rotate (web_server node surface) ------
+class _ManTelemetry(_FakeTelemetry):
+    """Adds the pieces arrival_heading_rotate reads off the hub."""
+
+    def __init__(self, pose, status="arrived"):
+        super().__init__()
+        self._tf_pose = lambda: pose
+        self._goal_status = status
+        self._navlog = []
+
+    def _navlog_add(self, text, level="info"):
+        self._navlog.append((level, text))
+
+
+def _man_node(pose=(0.0, 0.0, 0.0, "tf"), status="arrived", running=False):
+    n = ws.WebServerNode.__new__(ws.WebServerNode)
+    n.telemetry = _ManTelemetry(pose, status)
+    n._man_lock = threading.Lock()
+    n._man_running = running
+    n._man_cancel = False
+    n._man_req = None
+    n._man_wake = threading.Event()
+    params = {"move_lin_speed": 0.12, "move_ang_speed": 0.8,
+              "move_turn_kp": 2.5, "move_timeout": 30.0}
+    n.get_parameter = lambda name: type("P", (), {"value": params[name]})()
+    n.get_logger = _FakeLog
+    return n
+
+
+def test_arrival_rotate_queues_a_map_frame_turn():
+    n = _man_node()
+    n.arrival_heading_rotate(math.pi / 2)
+    assert n._man_req is not None
+    assert n._man_req["abs_yaw"] == pytest.approx(math.pi / 2)
+    assert n._man_req["frame"] == "map"
+    assert n._man_wake.is_set()
+
+
+def test_arrival_rotate_skips_when_already_facing_it():
+    n = _man_node(pose=(0.0, 0.0, math.radians(2), "tf"))
+    n.arrival_heading_rotate(0.0)                     # 2° off — inside the eps band
+    assert n._man_req is None
+
+
+def test_arrival_rotate_refuses_extrapolated_pose():
+    # the dead-reckoned fallback is DISPLAY-ONLY — it must never steer the robot
+    n = _man_node(pose=(0.0, 0.0, 0.0, "extrap"))
+    n.arrival_heading_rotate(1.0)
+    assert n._man_req is None
+
+
+def test_arrival_rotate_refuses_while_a_maneuver_runs():
+    n = _man_node(running=True)
+    n.arrival_heading_rotate(1.0)
+    assert n._man_req is None
+
+
+def test_abort_arrival_rotate_touches_only_its_own_runs():
+    n = _man_node(running=True)
+    n._man_tag = n.ARRIVE_ROT_TAG
+    n.abort_arrival_rotate()
+    assert n._man_cancel is True
+    n._man_cancel = False
+    n._man_tag = "canned move"                        # a user move is not ours to kill
+    n.abort_arrival_rotate()
+    assert n._man_cancel is False
